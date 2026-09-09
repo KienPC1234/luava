@@ -220,6 +220,46 @@ public final class Interpreter {
                     } else {
                         throw new LuaException("invalid target in assignment");
                     }
+                } else if (targetCount == 2 && assign.targets().get(0) instanceof Expressions.VariableExpr v0 && assign.targets().get(1) instanceof Expressions.VariableExpr v1) {
+                    LuaValue val0, val1;
+                    int valCount = assign.values().size();
+                    if (valCount == 2) {
+                        val0 = evaluate(assign.values().get(0), env);
+                        if (val0 instanceof Varargs va) val0 = va.first();
+                        val1 = evaluate(assign.values().get(1), env);
+                        if (val1 instanceof Varargs va) val1 = va.first();
+                    } else if (valCount == 1) {
+                        LuaValue res = evaluate(assign.values().get(0), env);
+                        if (res instanceof Varargs va) {
+                            val0 = va.arg(1);
+                            val1 = va.arg(2);
+                        } else {
+                            val0 = res;
+                            val1 = LuaNil.NIL;
+                        }
+                    } else if (valCount == 0) {
+                        val0 = LuaNil.NIL;
+                        val1 = LuaNil.NIL;
+                    } else {
+                        val0 = evaluate(assign.values().get(0), env);
+                        if (val0 instanceof Varargs va) val0 = va.first();
+                        val1 = evaluate(assign.values().get(1), env);
+                        if (val1 instanceof Varargs va) val1 = va.first();
+                    }
+                    int storeLine = assign.line();
+                    if (!assign.values().isEmpty()) {
+                        Expression lastVal = assign.values().get(assign.values().size() - 1);
+                        if (lastVal instanceof Expressions.BinaryExpr bin && bin.right().line() > 0) {
+                            storeLine = bin.right().line();
+                        } else if (lastVal.line() > 0) {
+                            storeLine = lastVal.line();
+                        }
+                    }
+                    if (storeLine > 0) {
+                        CallStack.setLine(storeLine);
+                    }
+                    env.set(v0.name(), val0);
+                    env.set(v1.name(), val1);
                 } else {
                     record PreTarget(String varName, LuaValue table, LuaValue key, Expression tableExpr) {}
                     PreTarget[] preTargets = new PreTarget[targetCount];
@@ -238,22 +278,27 @@ public final class Interpreter {
                         }
                     }
 
-                    List<LuaValue> values = new ArrayList<>(targetCount);
+                    LuaValue[] values = new LuaValue[targetCount];
+                    int valIdx = 0;
                     int valCount = assign.values().size();
                     for (int i = 0; i < valCount; i++) {
                         LuaValue res = evaluate(assign.values().get(i), env);
                         boolean isLast = (i == valCount - 1);
                         if (res instanceof Varargs va) {
                             if (isLast) {
-                                for (LuaValue v : va.toArray()) {
-                                    values.add(v);
+                                LuaValue[] arr = va.toArray();
+                                for (int j = 0; j < arr.length && valIdx < targetCount; j++) {
+                                    values[valIdx++] = arr[j];
                                 }
                             } else {
-                                values.add(va.first());
+                                if (valIdx < targetCount) values[valIdx++] = va.first();
                             }
                         } else {
-                            values.add(res);
+                            if (valIdx < targetCount) values[valIdx++] = res;
                         }
+                    }
+                    while (valIdx < targetCount) {
+                        values[valIdx++] = LuaNil.NIL;
                     }
 
                     int storeLine = assign.line();
@@ -271,7 +316,7 @@ public final class Interpreter {
 
                     for (int i = 0; i < targetCount; i++) {
                         PreTarget pt = preTargets[i];
-                        LuaValue val = i < values.size() ? values.get(i) : LuaNil.NIL;
+                        LuaValue val = values[i];
                         if (pt.varName() != null) {
                             env.set(pt.varName(), val);
                         } else {
@@ -1181,7 +1226,6 @@ public final class Interpreter {
         LuaValue target = evaluate(call.target(), env);
         if (target instanceof Varargs va) target = va.first();
         LuaValue callable;
-        List<LuaValue> args = new ArrayList<>(call.arguments().size() + 1);
 
         String funcName;
         String namewhat;
@@ -1194,7 +1238,6 @@ public final class Interpreter {
                 attachDesc(le, call.target(), env);
                 throw le;
             }
-            args.add(target);
             funcName = call.methodName();
             namewhat = "method";
             isMethod = true;
@@ -1221,20 +1264,42 @@ public final class Interpreter {
         }
 
         int argCount = call.arguments().size();
-        for (int i = 0; i < argCount; i++) {
-            LuaValue argVal = evaluate(call.arguments().get(i), env);
-            boolean isLast = (i == argCount - 1);
-            if (argVal instanceof Varargs va) {
-                if (isLast) {
-                    for (LuaValue v : va.toArray()) args.add(v);
-                } else {
-                    args.add(va.first());
-                }
+        LuaValue[] callArgs;
+        int baseOffset = isMethod ? 1 : 0;
+        if (argCount == 0) {
+            if (isMethod) {
+                callArgs = new LuaValue[] { target };
             } else {
-                args.add(argVal);
+                callArgs = LuaValue.EMPTY_ARRAY;
             }
+        } else {
+            LuaValue[] tempArgs = new LuaValue[baseOffset + argCount];
+            if (isMethod) {
+                tempArgs[0] = target;
+            }
+            for (int i = 0; i < argCount; i++) {
+                LuaValue argVal = evaluate(call.arguments().get(i), env);
+                boolean isLast = (i == argCount - 1);
+                if (argVal instanceof Varargs va) {
+                    if (isLast) {
+                        LuaValue[] vaArr = va.toArray();
+                        if (vaArr.length == 1) {
+                            tempArgs[baseOffset + i] = vaArr[0];
+                        } else {
+                            LuaValue[] expanded = new LuaValue[baseOffset + i + vaArr.length];
+                            System.arraycopy(tempArgs, 0, expanded, 0, baseOffset + i);
+                            System.arraycopy(vaArr, 0, expanded, baseOffset + i, vaArr.length);
+                            tempArgs = expanded;
+                        }
+                    } else {
+                        tempArgs[baseOffset + i] = va.first();
+                    }
+                } else {
+                    tempArgs[baseOffset + i] = argVal;
+                }
+            }
+            callArgs = tempArgs;
         }
-        LuaValue[] callArgs = args.toArray(new LuaValue[0]);
         while (!(callable instanceof LuaFunction)) {
             LuaTable mt = callable.getMetatable();
             if (mt != null) {
