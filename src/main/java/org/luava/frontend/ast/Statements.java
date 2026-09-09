@@ -8,8 +8,13 @@ public final class Statements {
     public record BlockStmt(
         List<Statement> statements,
         int line,
-        int column
-    ) implements Statement {}
+        int column,
+        int endLine
+    ) implements Statement {
+        public BlockStmt(List<Statement> statements, int line, int column) {
+            this(statements, line, column, line);
+        }
+    }
 
     public enum VariableAttribute {
         NONE,
@@ -38,8 +43,13 @@ public final class Statements {
 
     public record IfBranch(
         Expression condition,
-        BlockStmt block
-    ) {}
+        BlockStmt block,
+        int thenLine
+    ) {
+        public IfBranch(Expression condition, BlockStmt block) {
+            this(condition, block, condition != null ? condition.line() : 0);
+        }
+    }
 
     public record IfStmt(
         List<IfBranch> branches,
@@ -52,8 +62,13 @@ public final class Statements {
         Expression condition,
         BlockStmt body,
         int line,
-        int column
-    ) implements Statement {}
+        int column,
+        int endLine
+    ) implements Statement {
+        public WhileStmt(Expression condition, BlockStmt body, int line, int column) {
+            this(condition, body, line, column, line);
+        }
+    }
 
     public record RepeatStmt(
         BlockStmt body,
@@ -69,16 +84,26 @@ public final class Statements {
         Expression step,
         BlockStmt body,
         int line,
-        int column
-    ) implements Statement {}
+        int column,
+        int endLine
+    ) implements Statement {
+        public ForNumericStmt(String variableName, Expression start, Expression limit, Expression step, BlockStmt body, int line, int column) {
+            this(variableName, start, limit, step, body, line, column, line);
+        }
+    }
 
     public record ForGenericStmt(
         List<String> variableNames,
         List<Expression> iterators,
         BlockStmt body,
         int line,
-        int column
-    ) implements Statement {}
+        int column,
+        int endLine
+    ) implements Statement {
+        public ForGenericStmt(List<String> variableNames, List<Expression> iterators, BlockStmt body, int line, int column) {
+            this(variableNames, iterators, body, line, column, line);
+        }
+    }
 
     public record FunctionDefStmt(
         Expression targetName,
@@ -87,8 +112,13 @@ public final class Statements {
         boolean isVararg,
         BlockStmt body,
         int line,
-        int column
-    ) implements Statement {}
+        int column,
+        int endLine
+    ) implements Statement {
+        public FunctionDefStmt(Expression targetName, boolean isMethod, List<String> parameters, boolean isVararg, BlockStmt body, int line, int column) {
+            this(targetName, isMethod, parameters, isVararg, body, line, column, line);
+        }
+    }
 
     public record LocalFunctionDefStmt(
         String name,
@@ -96,8 +126,13 @@ public final class Statements {
         boolean isVararg,
         BlockStmt body,
         int line,
-        int column
-    ) implements Statement {}
+        int column,
+        int endLine
+    ) implements Statement {
+        public LocalFunctionDefStmt(String name, List<String> parameters, boolean isVararg, BlockStmt body, int line, int column) {
+            this(name, parameters, isVararg, body, line, column, line);
+        }
+    }
 
     public record ReturnStmt(
         List<Expression> values,

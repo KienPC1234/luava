@@ -4,6 +4,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.luava.frontend.parser.ParseException;
+import org.luava.runtime.LuaValue;
 
 public final class Lexer {
     private static final Map<String, TokenType> KEYWORDS = new HashMap<>();
@@ -35,18 +37,51 @@ public final class Lexer {
 
     private final String source;
     private final int length;
+    private final boolean skipShebang;
     private int start = 0;
     private int current = 0;
     private int line = 1;
     private int lineStartOffset = 0;
 
     public Lexer(String source) {
+        this(source, true);
+    }
+
+    public Lexer(String source, boolean skipShebang) {
         this.source = source != null ? source : "";
         this.length = this.source.length();
+        this.skipShebang = skipShebang;
     }
 
     public List<Token> scanTokens() {
         List<Token> tokens = new ArrayList<>();
+        if (current == 0 && !isAtEnd() && peek() == '\uFEFF') {
+            advance();
+        }
+        int p = current;
+        while (p < length && (source.charAt(p) == ' ' || source.charAt(p) == '\t' || source.charAt(p) == '\r' || source.charAt(p) == '\n')) {
+            p++;
+        }
+        boolean hasShebang = false;
+        if (p < length && source.charAt(p) == '#') {
+            if (skipShebang && p == current) {
+                hasShebang = true;
+            } else if (p + 1 < length && source.charAt(p + 1) == '!') {
+                hasShebang = true;
+            }
+        }
+        if (hasShebang) {
+            while (current < p) {
+                if (peek() == '\n') {
+                    line++;
+                    lineStartOffset = current + 1;
+                }
+                advance();
+            }
+            while (!isAtEnd() && peek() != '\n' && peek() != '\r') {
+                advance();
+            }
+        }
         while (!isAtEnd()) {
             start = current;
             Token token = scanToken();
@@ -61,8 +96,15 @@ public final class Lexer {
     private Token scanToken() {
         char c = advance();
         return switch (c) {
-            case ' ', '\r', '\t' -> null;
+            case ' ', '\t', '\f', '\u000B' -> null;
+            case '\r' -> {
+                if (peek() == '\n') advance();
+                line++;
+                lineStartOffset = current;
+                yield null;
+            }
             case '\n' -> {
+                if (peek() == '\r') advance();
                 line++;
                 lineStartOffset = current;
                 yield null;
@@ -154,9 +196,10 @@ public final class Lexer {
             }
 
             case '[' -> {
+                int strStartLine = line;
                 int level = checkLongBracketOpening();
                 if (level >= 0) {
-                    yield scanLongString(level);
+                    yield scanLongString(level, strStartLine);
                 }
                 yield makeToken(TokenType.LBRACKET);
             }
@@ -169,7 +212,7 @@ public final class Lexer {
                 } else if (isAlphaOrUnderscore(c)) {
                     yield scanIdentifierOrKeyword();
                 }
-                throw new LexerException("Unexpected character '" + c + "' at line " + line + ", col " + getColumn());
+                yield makeToken(TokenType.INVALID, String.valueOf(c));
             }
         };
     }
@@ -184,14 +227,15 @@ public final class Lexer {
     }
 
     private void skipComment() {
+        int commentStartLine = line;
         if (match('[')) {
             int level = checkLongBracketOpening();
             if (level >= 0) {
-                skipLongComment(level);
+                skipLongComment(level, commentStartLine);
                 return;
             }
         }
-        while (peek() != '\n' && !isAtEnd()) {
+        while (peek() != '\n' && peek() != '\r' && !isAtEnd()) {
             advance();
         }
     }
@@ -205,9 +249,15 @@ public final class Lexer {
         }
         if (peek() == '[') {
             advance();
-            if (peek() == '\n') {
-                line++;
+            if (peek() == '\r') {
                 advance();
+                if (peek() == '\n') advance();
+                line++;
+                lineStartOffset = current;
+            } else if (peek() == '\n') {
+                advance();
+                if (peek() == '\r') advance();
+                line++;
                 lineStartOffset = current;
             }
             return level;
@@ -216,20 +266,23 @@ public final class Lexer {
         return -1;
     }
 
-    private void skipLongComment(int level) {
+    private void skipLongComment(int level, int startLine) {
         while (!isAtEnd()) {
-            if (peek() == '\n') {
-                line++;
-                advance();
-                lineStartOffset = current;
-                continue;
-            }
             if (peek() == ']' && checkLongBracketClosing(level)) {
                 return;
             }
-            advance();
+            char ch = advance();
+            if (ch == '\r') {
+                if (peek() == '\n') advance();
+                line++;
+                lineStartOffset = current;
+            } else if (ch == '\n') {
+                if (peek() == '\r') advance();
+                line++;
+                lineStartOffset = current;
+            }
         }
-        throw new LexerException("Unfinished long comment starting at line " + line);
+        throw new ParseException("unfinished long comment (starting at line " + startLine + ") near <eof>", line, getColumn());
     }
 
     private boolean checkLongBracketClosing(int level) {
@@ -248,37 +301,77 @@ public final class Lexer {
         return false;
     }
 
-    private Token scanLongString(int level) {
-        int contentStart = current;
+    private Token scanLongString(int level, int startLine) {
+        StringBuilder sb = new StringBuilder();
         while (!isAtEnd()) {
-            if (peek() == '\n') {
-                line++;
-                advance();
-                lineStartOffset = current;
-                continue;
-            }
             if (peek() == ']' && checkLongBracketClosing(level)) {
-                int contentEnd = current - (level + 2);
-                String literal = source.substring(contentStart, contentEnd);
-                return makeToken(TokenType.STRING_LITERAL, literal);
+                return makeToken(TokenType.STRING_LITERAL, sb.toString());
             }
-            advance();
+            char ch = advance();
+            if (ch == '\r') {
+                if (peek() == '\n') advance();
+                line++;
+                lineStartOffset = current;
+                sb.append('\n');
+            } else if (ch == '\n') {
+                if (peek() == '\r') advance();
+                line++;
+                lineStartOffset = current;
+                sb.append('\n');
+            } else {
+                sb.append(ch);
+            }
         }
-        throw new LexerException("Unfinished long string starting at line " + line);
+        throw new ParseException("unfinished long string (starting at line " + startLine + ") near <eof>", line, getColumn());
+    }
+
+    private static void appendUtf8(StringBuilder sb, long x) {
+        if (x < 0x80) {
+            sb.append((char) x);
+        } else {
+            int[] buff = new int[8];
+            int n = 1;
+            long mfb = 0x3f;
+            do {
+                buff[8 - (n++)] = (int) (0x80 | (x & 0x3f));
+                x >>= 6;
+                mfb >>= 1;
+            } while (x > mfb);
+            buff[8 - n] = (int) (((~mfb << 1) & 0xFF) | x);
+            for (; n > 0; n--) {
+                sb.append((char) (buff[8 - n] & 0xFF));
+            }
+        }
+    }
+
+    private int readHexDigit(StringBuilder tokenBuff) {
+        if (isAtEnd()) {
+            throw new ParseException("hexadecimal digit expected near '" + tokenBuff + "'", line, getColumn());
+        }
+        char c = advance();
+        tokenBuff.append(c);
+        if (!isHexDigit(c)) {
+            throw new ParseException("hexadecimal digit expected near '" + tokenBuff + "'", line, getColumn());
+        }
+        return Character.digit(c, 16);
     }
 
     private Token scanShortString(char quote) {
         StringBuilder sb = new StringBuilder();
-        while (peek() != quote && !isAtEnd()) {
+        StringBuilder tokenBuff = new StringBuilder();
+        tokenBuff.append(quote);
+        while (!isAtEnd() && peek() != quote) {
             if (peek() == '\n' || peek() == '\r') {
-                throw new LexerException("Unfinished string literal at line " + line);
+                throw new ParseException("unfinished string near '" + tokenBuff + "'", line, getColumn());
             }
             char c = advance();
+            tokenBuff.append(c);
             if (c == '\\') {
                 if (isAtEnd()) {
-                    throw new LexerException("Unfinished string escape at line " + line);
+                    throw new ParseException("unfinished string near <eof>", line, getColumn());
                 }
                 char esc = advance();
+                tokenBuff.append(esc);
                 switch (esc) {
                     case 'a' -> sb.append('\u0007');
                     case 'b' -> sb.append('\b');
@@ -290,52 +383,96 @@ public final class Lexer {
                     case '\\' -> sb.append('\\');
                     case '\"' -> sb.append('\"');
                     case '\'' -> sb.append('\'');
-                    case 'z' -> {
-                        // Lua 5.4: skip following whitespace characters
-                        while (!isAtEnd() && Character.isWhitespace(peek())) {
-                            if (peek() == '\n') {
-                                line++;
-                                lineStartOffset = current + 1;
-                            }
+                    case '\n' -> {
+                        if (peek() == '\r') {
                             advance();
+                            tokenBuff.append('\r');
+                        }
+                        line++;
+                        lineStartOffset = current;
+                        sb.append('\n');
+                    }
+                    case '\r' -> {
+                        if (peek() == '\n') {
+                            advance();
+                            tokenBuff.append('\n');
+                        }
+                        line++;
+                        lineStartOffset = current;
+                        sb.append('\n');
+                    }
+                    case 'z' -> {
+                        while (!isAtEnd() && isLuaWhitespace(peek())) {
+                            char ws = advance();
+                            tokenBuff.append(ws);
+                            if (ws == '\r') {
+                                if (peek() == '\n') {
+                                    advance();
+                                    tokenBuff.append('\n');
+                                }
+                                line++;
+                                lineStartOffset = current;
+                            } else if (ws == '\n') {
+                                if (peek() == '\r') {
+                                    advance();
+                                    tokenBuff.append('\r');
+                                }
+                                line++;
+                                lineStartOffset = current;
+                            }
                         }
                     }
                     case 'x' -> {
-                        char h1 = advance();
-                        char h2 = advance();
-                        int hexVal = Integer.parseInt("" + h1 + h2, 16);
-                        sb.append((char) hexVal);
+                        int h1 = readHexDigit(tokenBuff);
+                        int h2 = readHexDigit(tokenBuff);
+                        sb.append((char) ((h1 << 4) | h2));
                     }
                     case 'u' -> {
-                        if (peek() != '{') {
-                            throw new LexerException("Malformed UTF-8 escape at line " + line);
+                        if (isAtEnd() || peek() != '{') {
+                            if (!isAtEnd()) {
+                                tokenBuff.append(advance());
+                            }
+                            throw new ParseException("missing '{' near '" + tokenBuff + "'", line, getColumn());
                         }
-                        advance(); // consume '{'
-                        StringBuilder hexSb = new StringBuilder();
-                        while (peek() != '}' && !isAtEnd()) {
-                            hexSb.append(advance());
+                        tokenBuff.append(advance()); // consume '{'
+                        int firstHex = readHexDigit(tokenBuff);
+                        long r = firstHex;
+                        while (!isAtEnd() && isHexDigit(peek())) {
+                            char nextHex = advance();
+                            tokenBuff.append(nextHex);
+                            if (r > (0x7FFFFFFFL >> 4)) {
+                                throw new ParseException("UTF-8 value too large near '" + tokenBuff + "'", line, getColumn());
+                            }
+                            r = (r << 4) | Character.digit(nextHex, 16);
                         }
-                        if (peek() != '}') {
-                            throw new LexerException("Unfinished UTF-8 escape at line " + line);
+                        if (isAtEnd() || peek() != '}') {
+                            if (!isAtEnd()) {
+                                tokenBuff.append(advance());
+                            }
+                            throw new ParseException("missing '}' near '" + tokenBuff + "'", line, getColumn());
                         }
-                        advance(); // consume '}'
-                        int codePoint = Integer.parseInt(hexSb.toString(), 16);
-                        sb.append(Character.toChars(codePoint));
+                        tokenBuff.append(advance()); // consume '}'
+                        appendUtf8(sb, r);
                     }
                     default -> {
                         if (isDigit(esc)) {
-                            StringBuilder numSb = new StringBuilder();
-                            numSb.append(esc);
-                            if (isDigit(peek())) {
-                                numSb.append(advance());
-                                if (isDigit(peek())) {
-                                    numSb.append(advance());
-                                }
+                            int r = esc - '0';
+                            int count = 1;
+                            while (count < 3 && !isAtEnd() && isDigit(peek())) {
+                                char d = advance();
+                                tokenBuff.append(d);
+                                r = r * 10 + (d - '0');
+                                count++;
                             }
-                            int decVal = Integer.parseInt(numSb.toString());
-                            sb.append((char) decVal);
+                            if (r > 255) {
+                                if (!isAtEnd()) {
+                                    tokenBuff.append(advance());
+                                }
+                                throw new ParseException("decimal escape too large near '" + tokenBuff + "'", line, getColumn());
+                            }
+                            sb.append((char) r);
                         } else {
-                            sb.append(esc);
+                            throw new ParseException("invalid escape sequence near '" + tokenBuff + "'", line, getColumn());
                         }
                     }
                 }
@@ -344,88 +481,51 @@ public final class Lexer {
             }
         }
         if (isAtEnd()) {
-            throw new LexerException("Unfinished string literal at line " + line);
+            throw new ParseException("unfinished string near <eof>", line, getColumn());
         }
         advance(); // consume closing quote
         return makeToken(TokenType.STRING_LITERAL, sb.toString());
     }
 
     private Token scanNumber(boolean startedWithDot) {
-        boolean isHex = false;
-        boolean isFloat = startedWithDot;
-
-        if (!startedWithDot && source.charAt(start) == '0' && (peek() == 'x' || peek() == 'X')) {
-            isHex = true;
+        String expo = "Ee";
+        char first = source.charAt(start);
+        if (startedWithDot) {
+            advance(); // consume the first digit after dot
+        } else if (first == '0' && (peek() == 'x' || peek() == 'X')) {
+            expo = "Pp";
             advance(); // consume 'x' / 'X'
         }
 
-        if (isHex) {
-            while (isHexDigit(peek())) {
+        while (!isAtEnd()) {
+            char p = peek();
+            if (p == expo.charAt(0) || p == expo.charAt(1)) {
                 advance();
-            }
-            if (peek() == '.' && peekNext() != '.') {
-                isFloat = true;
-                advance(); // consume '.'
-                while (isHexDigit(peek())) {
+                if (!isAtEnd() && (peek() == '+' || peek() == '-')) {
                     advance();
                 }
-            }
-            if (peek() == 'p' || peek() == 'P') {
-                isFloat = true;
-                advance(); // consume 'p' / 'P'
-                if (peek() == '+' || peek() == '-') {
-                    advance();
-                }
-                while (isDigit(peek())) {
-                    advance();
-                }
-            }
-            String raw = source.substring(start, current);
-            if (isFloat) {
-                double val = Double.parseDouble(raw);
-                return makeToken(TokenType.FLOAT_LITERAL, val);
-            } else {
-                long val = parseHexLong(raw);
-                return makeToken(TokenType.INTEGER_LITERAL, val);
-            }
-        } else {
-            while (isDigit(peek())) {
+            } else if (isHexDigit(p) || p == '.') {
                 advance();
-            }
-            if (!startedWithDot && peek() == '.' && peekNext() != '.') {
-                isFloat = true;
-                advance(); // consume '.'
-                while (isDigit(peek())) {
-                    advance();
-                }
-            }
-            if (peek() == 'e' || peek() == 'E') {
-                isFloat = true;
-                advance(); // consume 'e' / 'E'
-                if (peek() == '+' || peek() == '-') {
-                    advance();
-                }
-                while (isDigit(peek())) {
-                    advance();
-                }
-            }
-            String raw = source.substring(start, current);
-            if (isFloat) {
-                double val = Double.parseDouble(raw);
-                return makeToken(TokenType.FLOAT_LITERAL, val);
             } else {
-                long val = Long.parseLong(raw);
-                return makeToken(TokenType.INTEGER_LITERAL, val);
+                break;
             }
         }
-    }
 
-    private long parseHexLong(String raw) {
-        String num = raw.substring(2);
-        if (num.length() > 16) {
-            num = num.substring(num.length() - 16);
+        if (!isAtEnd() && isAlphaOrUnderscore(peek())) {
+            advance(); // force an error
         }
-        return Long.parseUnsignedLong(num, 16);
+
+        String raw = source.substring(start, current);
+        LuaValue num = LuaValue.parseNumber(raw);
+        if (num == null) {
+            throw new ParseException("malformed number near '" + raw + "'", line, getColumn());
+        }
+
+        if (num.isInteger()) {
+            return makeToken(TokenType.INTEGER_LITERAL, num.toLong());
+        } else {
+            return makeToken(TokenType.FLOAT_LITERAL, num.toDouble());
+        }
     }
 
     private Token scanIdentifierOrKeyword() {
@@ -463,6 +563,10 @@ public final class Lexer {
         return source.charAt(current + 1);
     }
 
+    private static boolean isLuaWhitespace(char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\u000B';
+    }
+
     private boolean isAtEnd() {
         return current >= length;
     }
@@ -496,9 +600,13 @@ public final class Lexer {
         return new Token(type, lexeme, literal, line, getColumn());
     }
 
-    public static class LexerException extends RuntimeException {
+    public static class LexerException extends ParseException {
         public LexerException(String message) {
-            super(message);
+            super(message, 1, 1);
+        }
+
+        public LexerException(String message, int line, int column) {
+            super(message, line, column);
         }
     }
 }

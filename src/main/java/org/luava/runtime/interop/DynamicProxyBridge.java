@@ -35,15 +35,15 @@ public final class DynamicProxyBridge {
             LuaValue[] luaArgs = new LuaValue[argCount + 1];
             luaArgs[0] = table; // pass 'self'
             for (int i = 0; i < argCount; i++) {
-                luaArgs[i + 1] = LuaUserdata.wrap(args[i]);
+                luaArgs[i + 1] = org.luava.binding.LuaDataConverter.toLua(args[i]);
             }
 
             LuaValue result = member.call(luaArgs);
             Class<?> returnType = method.getReturnType();
-            if (returnType == void.class) {
+            if (returnType == void.class || returnType == Void.class) {
                 return null;
             }
-            return LuaUserdata.unwrap(result);
+            return org.luava.binding.LuaDataConverter.toJava(result, returnType);
         };
 
         return (T) Proxy.newProxyInstance(interfaceClass.getClassLoader(), new Class<?>[]{interfaceClass}, handler);

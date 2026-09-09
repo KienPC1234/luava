@@ -13,5 +13,6 @@ public sealed interface Expression extends AstNode
             Expressions.TableConstructorExpr,
             Expressions.TableAccessExpr,
             Expressions.FunctionCallExpr,
-            Expressions.FunctionDefExpr {
+            Expressions.FunctionDefExpr,
+            Expressions.ParenExpr {
 }
