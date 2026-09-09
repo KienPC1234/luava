@@ -280,9 +280,92 @@ public final class LuaState {
             Parser parser = new Parser(tokens);
             Statements.BlockStmt block = parser.parse();
 
+            if (USE_BYTECODE_VM) {
+                org.luava.runtime.bytecode.LuaProto proto = org.luava.runtime.bytecode.BytecodeCompiler.compile(block, chunkName);
+                org.luava.runtime.eval.Upvalue envUpval = new org.luava.runtime.eval.Upvalue("_ENV", chunkEnvVal);
+                return new org.luava.runtime.bytecode.LuaClosure(proto, new org.luava.runtime.eval.Upvalue[]{envUpval}, chunkGlobals, this);
+            }
+
             return Interpreter.INSTANCE.createMainChunk(block, rootEnvironment, chunkEnvVal, globals, chunkName, luaSource);
         } catch (org.luava.frontend.parser.ParseException pe) {
             throw new LuaException(pe.format(chunkName != null ? chunkName : luaSource));
+        }
+    }
+
+    public static boolean USE_BYTECODE_VM = false;
+
+    private long[] primitiveStack = new long[1024];
+    private byte[] typeStack = new byte[1024];
+    private LuaValue[] objectStack = new LuaValue[1024];
+    private org.luava.runtime.eval.Upvalue openUpvaluesHead = null;
+
+    public long[] getPrimitiveStack() {
+        return primitiveStack;
+    }
+
+    public byte[] getTypeStack() {
+        return typeStack;
+    }
+
+    public LuaValue[] getObjectStack() {
+        return objectStack;
+    }
+
+    public void ensureStackCapacity(int needed) {
+        if (needed > primitiveStack.length) {
+            int newCap = Math.max(primitiveStack.length * 2, needed + 256);
+            long[] newP = new long[newCap];
+            byte[] newT = new byte[newCap];
+            LuaValue[] newO = new LuaValue[newCap];
+            System.arraycopy(primitiveStack, 0, newP, 0, primitiveStack.length);
+            System.arraycopy(typeStack, 0, newT, 0, typeStack.length);
+            System.arraycopy(objectStack, 0, newO, 0, objectStack.length);
+            primitiveStack = newP;
+            typeStack = newT;
+            objectStack = newO;
+        }
+    }
+
+    public LuaValue[] ensureStack(int needed) {
+        ensureStackCapacity(needed);
+        return objectStack;
+    }
+
+    public LuaValue getStackValue(int index) {
+        return org.luava.runtime.bytecode.BytecodeVM.getLuaValue(primitiveStack, typeStack, objectStack, index);
+    }
+
+    public void setStackValue(int index, LuaValue val) {
+        org.luava.runtime.bytecode.BytecodeVM.setLuaValue(primitiveStack, typeStack, objectStack, index, val);
+    }
+
+    public org.luava.runtime.eval.Upvalue findOrCreateOpenUpvalue(int stackIndex, String name) {
+        org.luava.runtime.eval.Upvalue prev = null;
+        org.luava.runtime.eval.Upvalue curr = openUpvaluesHead;
+        while (curr != null && curr.getStackIndex() >= stackIndex) {
+            if (curr.getStackIndex() == stackIndex) {
+                return curr;
+            }
+            prev = curr;
+            curr = curr.nextOpen;
+        }
+
+        org.luava.runtime.eval.Upvalue newUv = new org.luava.runtime.eval.Upvalue(name, this, stackIndex);
+        newUv.nextOpen = curr;
+        if (prev == null) {
+            openUpvaluesHead = newUv;
+        } else {
+            prev.nextOpen = newUv;
+        }
+        return newUv;
+    }
+
+    public void closeUpvalues(int fromIndex) {
+        while (openUpvaluesHead != null && openUpvaluesHead.getStackIndex() >= fromIndex) {
+            org.luava.runtime.eval.Upvalue uv = openUpvaluesHead;
+            openUpvaluesHead = uv.nextOpen;
+            uv.nextOpen = null;
+            uv.close();
         }
     }
 }

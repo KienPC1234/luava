@@ -111,7 +111,7 @@ public final class GCManager {
             uncollectedBytes = Math.max(0, uncollectedBytes - (bytes * 2));
         }
         allocCount++;
-        if (allocCount >= 5) {
+        if (allocCount >= 100) {
             allocCount = 0;
             if (!FINALIZERS.isEmpty() && !runningFinalizer) {
                 checkAndRunDeadFinalizers();
