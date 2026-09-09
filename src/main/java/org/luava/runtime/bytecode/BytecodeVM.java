@@ -25,6 +25,21 @@ public final class BytecodeVM {
         }
     }
 
+    public static LuaValue getLuaValueFromRaw(long raw, byte tag, LuaValue obj) {
+        switch (tag) {
+            case TYPE_NIL:
+                return LuaNil.NIL;
+            case TYPE_BOOLEAN:
+                return raw != 0 ? LuaBoolean.TRUE : LuaBoolean.FALSE;
+            case TYPE_INT:
+                return LuaInteger.valueOf(raw);
+            case TYPE_FLOAT:
+                return LuaFloat.valueOf(Double.longBitsToDouble(raw));
+            default:
+                return obj != null ? obj : LuaNil.NIL;
+        }
+    }
+
     public static void setLuaValue(long[] pStack, byte[] tStack, LuaValue[] oStack, int idx, LuaValue val) {
         if (val == null || val.isNil()) {
             tStack[idx] = TYPE_NIL;
@@ -454,8 +469,12 @@ public final class BytecodeVM {
 
                     if (func instanceof LuaClosure childClosure) {
                         state.closeUpvalues(base);
-                        for (int i = 0; i < nActualArgs; i++) {
-                            copyReg(pStack, tStack, oStack, base + i, funcIdx + 1 + i);
+                        int oldTop = top;
+                        System.arraycopy(pStack, funcIdx + 1, pStack, base, nActualArgs);
+                        System.arraycopy(tStack, funcIdx + 1, tStack, base, nActualArgs);
+                        System.arraycopy(oStack, funcIdx + 1, oStack, base, nActualArgs);
+                        if (oldTop > base + nActualArgs) {
+                            java.util.Arrays.fill(oStack, base + nActualArgs, oldTop, null);
                         }
                         closure = childClosure;
                         proto = closure.proto;

@@ -297,7 +297,7 @@ public final class LuaState {
     private long[] primitiveStack = new long[1024];
     private byte[] typeStack = new byte[1024];
     private LuaValue[] objectStack = new LuaValue[1024];
-    private final List<org.luava.runtime.eval.Upvalue> openUpvalues = new ArrayList<>();
+    private org.luava.runtime.eval.Upvalue openUpvaluesHead = null;
 
     public long[] getPrimitiveStack() {
         return primitiveStack;
@@ -340,23 +340,32 @@ public final class LuaState {
     }
 
     public org.luava.runtime.eval.Upvalue findOrCreateOpenUpvalue(int stackIndex, String name) {
-        for (org.luava.runtime.eval.Upvalue uv : openUpvalues) {
-            if (uv.isOpenOnStack() && uv.getStackIndex() == stackIndex) {
-                return uv;
+        org.luava.runtime.eval.Upvalue prev = null;
+        org.luava.runtime.eval.Upvalue curr = openUpvaluesHead;
+        while (curr != null && curr.getStackIndex() >= stackIndex) {
+            if (curr.getStackIndex() == stackIndex) {
+                return curr;
             }
+            prev = curr;
+            curr = curr.nextOpen;
         }
+
         org.luava.runtime.eval.Upvalue newUv = new org.luava.runtime.eval.Upvalue(name, this, stackIndex);
-        openUpvalues.add(newUv);
+        newUv.nextOpen = curr;
+        if (prev == null) {
+            openUpvaluesHead = newUv;
+        } else {
+            prev.nextOpen = newUv;
+        }
         return newUv;
     }
 
     public void closeUpvalues(int fromIndex) {
-        for (int i = openUpvalues.size() - 1; i >= 0; i--) {
-            org.luava.runtime.eval.Upvalue uv = openUpvalues.get(i);
-            if (uv.isOpenOnStack() && uv.getStackIndex() >= fromIndex) {
-                uv.close();
-                openUpvalues.remove(i);
-            }
+        while (openUpvaluesHead != null && openUpvaluesHead.getStackIndex() >= fromIndex) {
+            org.luava.runtime.eval.Upvalue uv = openUpvaluesHead;
+            openUpvaluesHead = uv.nextOpen;
+            uv.nextOpen = null;
+            uv.close();
         }
     }
 }

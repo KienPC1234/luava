@@ -189,57 +189,67 @@ public final class LuaClosure extends LuaFunction {
 }
 ```
 
-### 3. Cấu Trúc Ngăn Xếp Phẳng Kép/Ba Cho Zero-Allocation Hot Paths
+#### 3. Cấu Trúc Ngăn Xếp Phẳng Kép/Ba & Quy Ước Bất Biến (Lazy Materialization Invariant)
 Để giải quyết triệt để vấn đề boxing overhead trên HotSpot JVM (tránh cấp phát hàng triệu object `LuaInteger` / `LuaFloat` trong vòng lặp):
 - **`long[] primitiveStack`**: Lưu trực tiếp giá trị 64-bit thô (giá trị nguyên `long`, bit-cast của `double` qua `Double.doubleToRawLongBits`, hoặc boolean `1L`/`0L`).
-- **`byte[] typeStack`**: Lưu thẻ kiểu dữ liệu byte (`TYPE_NIL = 0`, `TYPE_INT = 1`, `TYPE_FLOAT = 2`, `TYPE_BOOLEAN = 3`, `TYPE_OBJECT = 4`).
+- **`byte[] typeStack`**: Lưu thẻ kiểu dữ liệu byte (`TYPE_NIL = 0`, `TYPE_BOOLEAN = 1`, `TYPE_INT = 2`, `TYPE_FLOAT = 3`, `TYPE_OBJECT = 4`).
 - **`LuaValue[] objectStack`**: Chỉ lưu các tham chiếu đối tượng Heap thực thụ (`LuaTable`, `LuaClosure`, `LuaString`, `LuaUserdata`).
 
+**Quy Ước Bất Biến Đọc/Ghi (Execution Invariant):**
+```text
+typeStack[reg] == TYPE_INT     --> Đọc rawValue dạng long từ primitiveStack[reg]
+typeStack[reg] == TYPE_FLOAT   --> Đọc Double.longBitsToDouble(primitiveStack[reg])
+typeStack[reg] == TYPE_BOOLEAN --> Đọc boolean từ (primitiveStack[reg] != 0)
+typeStack[reg] == TYPE_NIL     --> Trả về LuaNil.NIL (không cần đọc dữ liệu)
+typeStack[reg] >= TYPE_OBJECT  --> Đọc tham chiếu đối tượng từ objectStack[reg]
 ```
-Hot Path Execution (OP_ADD, OP_ADDI, OP_MOVE, OP_EQ, OP_LT):
-  -> Thao tác trực tiếp 100% trên primitiveStack[reg] và typeStack[reg].
-  -> Hoàn toàn KHÔNG gọi `new`, KHÔNG tạo rác trên Heap, tận dụng tối đa CPU L1 Cache.
-  -> Chỉ khi gọi Java Host API / Thư viện chuẩn mới thực hiện đóng gói lười (Lazy Materialization) sang LuaValue.
-```
+- **Khi ghi giá trị nguyên thủy**: Ghi `rawValue` vào `primitiveStack[reg]`, gán `typeStack[reg] = TYPE_*`, và bắt buộc gán `objectStack[reg] = null` để JVM GC thu hồi ngay đối tượng cũ từng nằm tại ô nhớ đó.
+- **Khi ghi đối tượng Heap**: Gán đối tượng vào `objectStack[reg]`, gán `typeStack[reg] = TYPE_OBJECT`, và không cần bận tâm giá trị cũ trong `primitiveStack[reg]`.
 
-### 4. Open & Closed Upvalue (`Upvalue.java`)
-Hỗ trợ liên kết trực tiếp với stack khi đang mở và đóng gói khi frame bị hủy:
+### 4. Open & Closed Upvalue Không Boxing (`Upvalue.java`)
+`Upvalue` được thiết kế để không box kiểu nguyên thủy ngay cả khi đã bị đóng (closed):
 ```java
 public final class Upvalue {
-    private LuaValue[] stack;           // Tham chiếu tới stack khi open
-    private int stackIndex;              // Chỉ số ô stack khi open
-    private LuaValue value;              // Giá trị chốt lại khi closed
-    private boolean open;                // true nếu vẫn đang trỏ vào stack
-    
-    public Upvalue(LuaValue[] stack, int stackIndex) {
-        this.stack = stack;
+    // Khi Open: liên kết trực tiếp với stack của LuaState
+    private LuaState state;
+    private int stackIndex;
+    private boolean open;
+
+    // Khi Closed: lưu trực tiếp không qua boxing nếu là primitive
+    private long rawValue;
+    private byte typeTag;
+    private LuaValue objectValue; // Chỉ dùng khi typeTag == TYPE_OBJECT
+
+    // Con trỏ danh sách liên kết đơn (Open Upvalue Linked List)
+    public Upvalue nextOpen;
+
+    public Upvalue(LuaState state, int stackIndex) {
+        this.state = state;
         this.stackIndex = stackIndex;
         this.open = true;
     }
-    
-    public LuaValue getValue() {
-        return open ? stack[stackIndex] : value;
-    }
-    
-    public void setValue(LuaValue val) {
-        if (open) {
-            stack[stackIndex] = val;
-        } else {
-            this.value = val;
-        }
-    }
-    
+
     public void close() {
         if (open) {
-            this.value = stack[stackIndex];
-            this.stack = null;
+            this.typeTag = state.getTypeStack()[stackIndex];
+            this.rawValue = state.getPrimitiveStack()[stackIndex];
+            this.objectValue = state.getObjectStack()[stackIndex];
+            this.state = null;
             this.open = false;
         }
     }
 }
 ```
 
-### 5. Khung Ngăn Xếp Cuộc Gọi (`CallInfo.java`)
+### 5. Danh Sách Quản Lý Open Upvalues (Open Upvalue Linked List & Instance Deduplication)
+Quy chuẩn Lua 5.4 yêu cầu mọi closure capture cùng một biến $R[A]$ trên cùng một frame **bắt buộc phải chia sẻ chung đúng một thể hiện (instance) `Upvalue` duy nhất**.
+- `LuaState` duy trì một con trỏ đầu `Upvalue openUpvaluesHead`, danh sách được sắp xếp theo chiều giảm dần của `stackIndex`.
+- **Khi tạo Upvalue mở (`findOrCreateOpenUpvalue(stackIndex)`)**:
+  Duyệt qua danh sách. Nếu tìm thấy upvalue có cùng `stackIndex`, trả về ngay instance có sẵn. Nếu chưa có, tạo mới và chèn vào đúng vị trí để giữ trật tự sắp xếp giảm dần.
+- **Khi đóng Upvalues (`closeUpvalues(fromIndex)`)**:
+  Được gọi trong `OP_CLOSE`, `OP_RETURN`, `OP_TAILCALL`, và biến to-be-closed `OP_TBC`. Duyệt từ đầu danh sách (`openUpvaluesHead`), đóng tất cả node có `stackIndex >= fromIndex` và ngắt liên kết chúng ra khỏi danh sách.
+
+### 6. Khung Ngăn Xếp Cuộc Gọi (`CallInfo.java`)
 Tái sử dụng bằng pooling, hoàn toàn không cấp phát mới:
 ```java
 public final class CallInfo {
@@ -289,13 +299,19 @@ Theo đặc tả HotSpot VM, khi phương thức có bytecode vượt quá 8,000
   - `executeMetamethodBin(state, inst, op, stack, base, k, a)` -> fallback cho `OP_MMBIN*`.
 - Nhờ phân tách này, kích thước bytecode của phương thức chính `execute()` được duy trì ổn định dưới 2,500 bytes (thấp hơn nhiều so với ngưỡng 8,000 bytes), đảm bảo HotSpot C2 biên dịch thành mã máy tối ưu.
 
-
-### 2. Tối Ưu Hóa Đệ Quy Đuôi (`OP_TAILCALL`)
+### 2. Tối Ưu Hóa Đệ Quy Đuôi Chuẩn Mảng Phẳng (`OP_TAILCALL`)
 Khi gặp `OP_TAILCALL`:
 1. Tính toán địa chỉ hàm mới $R[A]$ và các tham số $R[A+1..A+B-1]$.
 2. Đóng toàn bộ upvalues mở của frame hiện tại: `state.closeUpvalues(base)`.
-3. Dịch chuyển các tham số mới về vị trí $R[0..B-2]$ của frame hiện tại (`System.arraycopy(stack, base + a, stack, base, b)`).
-4. Cập nhật `closure = targetClosure`, `proto = closure.proto`, `code = proto.code`, `k = proto.constants`, `upvals = closure.upvalues`.
+3. Dịch chuyển đồng thời các tham số mới trên cả 3 mảng phẳng:
+   ```java
+   System.arraycopy(primitiveStack, base + a + 1, primitiveStack, base, nActualArgs);
+   System.arraycopy(typeStack,      base + a + 1, typeStack,      base, nActualArgs);
+   System.arraycopy(objectStack,    base + a + 1, objectStack,    base, nActualArgs);
+   // Dọn null vùng nhớ trên objectStack để triệt tiêu rò rỉ tham chiếu (GC Leak Prevention)
+   Arrays.fill(objectStack, base + nActualArgs, oldTop, null);
+   ```
+4. Cập nhật `closure = targetClosure`, `proto = closure.proto`, `code = proto.code`, `k = proto.constants`, `upvals = closure.upvals`.
 5. Đặt lại `pc = 0` và tiếp tục vòng lặp mà không tạo thêm bất kỳ Java call frame nào.
 
 ---

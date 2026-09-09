@@ -2,16 +2,27 @@ package org.luava.runtime.eval;
 
 import org.luava.runtime.LuaNil;
 import org.luava.runtime.LuaValue;
+import org.luava.runtime.LuaState;
+import org.luava.runtime.bytecode.BytecodeVM;
 
 public final class Upvalue {
     private final String name;
     private Environment.VariableSlot slot;
 
+    // Bytecode VM execution binding
     private LuaValue[] stack;
-    private org.luava.runtime.LuaState state;
+    private LuaState state;
     private int stackIndex = -1;
-    private LuaValue closedValue = LuaNil.NIL;
     private boolean isOpenOnStack = false;
+
+    // Unboxed storage for closed primitive upvalues (Zero-Allocation on close)
+    private long rawValue;
+    private byte typeTag = BytecodeVM.TYPE_NIL;
+    private LuaValue objectValue;
+    private LuaValue closedValue = null;
+
+    // Intrusive singly-linked list pointer (managed by LuaState in descending order of stackIndex)
+    public Upvalue nextOpen;
 
     public Upvalue(String name, Environment.VariableSlot slot) {
         this.name = name != null ? name : "?";
@@ -25,7 +36,7 @@ public final class Upvalue {
         this.isOpenOnStack = true;
     }
 
-    public Upvalue(String name, org.luava.runtime.LuaState state, int stackIndex) {
+    public Upvalue(String name, LuaState state, int stackIndex) {
         this.name = name != null ? name : "?";
         this.state = state;
         this.stackIndex = stackIndex;
@@ -58,9 +69,23 @@ public final class Upvalue {
         return stackIndex;
     }
 
+    public long getRawValue() {
+        return rawValue;
+    }
+
+    public byte getTypeTag() {
+        return typeTag;
+    }
+
+    public LuaValue getObjectValue() {
+        return objectValue;
+    }
+
     public void close() {
         if (isOpenOnStack && state != null && stackIndex >= 0) {
-            this.closedValue = state.getStackValue(stackIndex);
+            this.typeTag = state.getTypeStack()[stackIndex];
+            this.rawValue = state.getPrimitiveStack()[stackIndex];
+            this.objectValue = state.getObjectStack()[stackIndex];
             this.state = null;
             this.isOpenOnStack = false;
         } else if (isOpenOnStack && stack != null && stackIndex >= 0) {
@@ -80,6 +105,9 @@ public final class Upvalue {
         if (isOpenOnStack && stack != null && stackIndex >= 0) {
             LuaValue v = stack[stackIndex];
             return v != null ? v : LuaNil.NIL;
+        }
+        if (typeTag != BytecodeVM.TYPE_NIL || objectValue != null) {
+            return BytecodeVM.getLuaValueFromRaw(rawValue, typeTag, objectValue);
         }
         if (slot != null) {
             return slot.get();
@@ -102,5 +130,7 @@ public final class Upvalue {
             return;
         }
         this.closedValue = v;
+        this.objectValue = v;
+        this.typeTag = BytecodeVM.TYPE_OBJECT;
     }
 }
