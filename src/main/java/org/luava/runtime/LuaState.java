@@ -17,6 +17,10 @@ import org.luava.runtime.standard.PackageLib;
 import org.luava.runtime.standard.StringLib;
 import org.luava.runtime.standard.TableLib;
 import org.luava.runtime.standard.Utf8Lib;
+import org.luava.runtime.standard.OsLib;
+import org.luava.runtime.standard.IoLib;
+import org.luava.runtime.standard.DebugLib;
+import org.luava.runtime.concurrency.LuaCoroutine;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -36,11 +40,17 @@ import java.util.function.Supplier;
 
 public final class LuaState {
     private final LuaTable globals = new LuaTable();
+    private final LuaTable registry = new LuaTable();
+    private final LuaCoroutine mainThread = LuaCoroutine.createMainThread();
     private final Environment rootEnvironment;
     private final List<ModuleBinder.ModuleInfo> registeredModules = new ArrayList<>();
 
     public LuaState() {
+        LuaValue.resetBasicMetatables();
+        registry.rawset(LuaInteger.valueOf(1), mainThread);
+        registry.rawset(LuaInteger.valueOf(2), globals);
         this.rootEnvironment = new Environment(null, globals);
+        org.luava.runtime.eval.GCManager.registerState(this);
         openStandardLibraries();
     }
 
@@ -49,13 +59,33 @@ public final class LuaState {
         MathLib.open(globals);
         StringLib.open(globals);
         TableLib.open(globals);
-        CoroutineLib.open(globals);
+        CoroutineLib.open(globals, mainThread);
         Utf8Lib.open(globals);
+        OsLib.open(globals);
+        IoLib.open(globals);
+        DebugLib.open(this, globals);
         PackageLib.open(this, globals);
+        org.luava.binding.JavaInteropLib.open(globals);
+        LuaTable argTable = new LuaTable();
+        String progName = System.getProperty("lua.prog");
+        if (progName == null || progName.isEmpty()) {
+            java.io.File localLua = new java.io.File("lua-source/src/lua");
+            progName = localLua.exists() ? localLua.getAbsolutePath() : "lua";
+        }
+        argTable.rawset(LuaInteger.valueOf(0), LuaString.valueOf(progName));
+        globals.rawset(LuaString.valueOf("arg"), argTable);
+    }
+
+    public LuaTable getRegistry() {
+        return registry;
     }
 
     public LuaTable getGlobals() {
         return globals;
+    }
+
+    public LuaCoroutine getMainThread() {
+        return mainThread;
     }
 
     public LuaValue get(String name) {
@@ -69,6 +99,18 @@ public final class LuaState {
 
     public void set(String name, Object value) {
         globals.set(LuaString.valueOf(name), LuaDataConverter.toLua(value));
+    }
+
+    public void setLive(String name, Object value) {
+        globals.set(LuaString.valueOf(name), LuaDataConverter.toLuaLive(value));
+    }
+
+    public void registerClass(Class<?> clazz) {
+        registerClass(clazz.getSimpleName(), clazz);
+    }
+
+    public void registerClass(String alias, Class<?> clazz) {
+        globals.rawset(LuaString.valueOf(alias), new LuaUserdata(clazz));
     }
 
     public void registerFunction(String name, LuaInvokable invokable) {
@@ -147,8 +189,22 @@ public final class LuaState {
     }
 
     public LuaValue eval(String luaSource) {
-        LuaFunction chunk = compile(luaSource);
-        return chunk.call();
+        return eval(luaSource, "chunk");
+    }
+
+    public LuaValue eval(String luaSource, String chunkName) {
+        LuaCoroutine prev = LuaCoroutine.running();
+        if (prev == null) {
+            LuaCoroutine.setCurrent(mainThread);
+        }
+        try {
+            LuaFunction chunk = compile(luaSource, chunkName, globals);
+            return chunk.call();
+        } finally {
+            if (prev == null) {
+                LuaCoroutine.setCurrent(null);
+            }
+        }
     }
 
     public LuaValue eval(String luaSource, Map<String, Object> context) {
@@ -199,23 +255,34 @@ public final class LuaState {
     }
 
     public LuaFunction compile(String luaSource) {
-        Lexer lexer = new Lexer(luaSource);
-        List<Token> tokens = lexer.scanTokens();
-        Parser parser = new Parser(tokens);
-        Statements.BlockStmt block = parser.parse();
+        return compile(luaSource, "=(load)", globals);
+    }
 
-        return new LuaFunction() {
-            @Override
-            public LuaValue invoke(LuaValue... args) {
-                Environment chunkEnv = new Environment(rootEnvironment, globals);
-                if (args != null && args.length > 0) {
-                    chunkEnv.defineLocal("...", Varargs.of(args), false, false);
-                } else {
-                    chunkEnv.defineLocal("...", Varargs.EMPTY, false, false);
-                }
-                Interpreter interpreter = new Interpreter();
-                return interpreter.execute(block, chunkEnv);
-            }
-        };
+    public Environment getRootEnvironment() {
+        return rootEnvironment;
+    }
+
+    public LuaFunction compile(String luaSource, String chunkName, LuaValue env) {
+        LuaValue chunkEnvVal = (env != null) ? env : globals;
+        LuaTable chunkGlobals = (chunkEnvVal instanceof LuaTable t) ? t : globals;
+
+        if (luaSource.startsWith("\u001b")) {
+            return org.luava.runtime.standard.ChunkSerializer.undump(
+                luaSource.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1),
+                chunkName, chunkEnvVal, globals, rootEnvironment
+            );
+        }
+
+        try {
+            boolean isFile = chunkName != null && chunkName.startsWith("@");
+            Lexer lexer = new Lexer(luaSource, isFile);
+            List<Token> tokens = lexer.scanTokens();
+            Parser parser = new Parser(tokens);
+            Statements.BlockStmt block = parser.parse();
+
+            return Interpreter.INSTANCE.createMainChunk(block, rootEnvironment, chunkEnvVal, globals, chunkName, luaSource);
+        } catch (org.luava.frontend.parser.ParseException pe) {
+            throw new LuaException(pe.format(chunkName != null ? chunkName : luaSource));
+        }
     }
 }

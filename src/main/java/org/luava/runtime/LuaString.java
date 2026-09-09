@@ -1,20 +1,48 @@
 package org.luava.runtime;
 
-import java.util.concurrent.ConcurrentHashMap;
 
 public final class LuaString extends LuaValue {
-    private static final ConcurrentHashMap<String, LuaString> STRING_POOL = new ConcurrentHashMap<>();
+    public static final LuaString EMPTY = new LuaString("");
+    private static final LuaString[] ASCII_CACHE = new LuaString[256];
+    static {
+        for (int i = 0; i < 256; i++) {
+            ASCII_CACHE[i] = new LuaString(String.valueOf((char) i));
+        }
+    }
+    private static final int MAX_SHORT_STRING = 40;
+    private static final java.util.concurrent.ConcurrentHashMap<String, LuaString> SHORT_STRING_CACHE = new java.util.concurrent.ConcurrentHashMap<>(1024);
 
     private final String value;
 
-    private LuaString(String value) {
+    public static void setStringMetatable(LuaTable mt) {
+        LuaValue.setBasicMetatable(LuaType.STRING, mt);
+    }
+
+    @Override
+    public LuaTable getMetatable() {
+        return LuaValue.getBasicMetatable(LuaType.STRING);
+    }
+
+    public LuaString(String value) {
         this.value = value != null ? value : "";
+        if (this.value.length() >= 1024) {
+            org.luava.runtime.eval.GCManager.onAllocLargeString(this);
+        }
+        org.luava.runtime.eval.GCManager.onAlloc(Math.max(16, this.value.length()));
+    }
+
+    public static LuaString newString(String s) {
+        return valueOf(s);
     }
 
     public static LuaString valueOf(String s) {
-        if (s == null) return valueOf("");
-        if (s.length() <= 64) {
-            return STRING_POOL.computeIfAbsent(s, LuaString::new);
+        if (s == null || s.isEmpty()) return EMPTY;
+        if (s.length() == 1) {
+            char c = s.charAt(0);
+            if (c < 256) return ASCII_CACHE[c];
+        }
+        if (s.length() <= MAX_SHORT_STRING) {
+            return SHORT_STRING_CACHE.computeIfAbsent(s, LuaString::new);
         }
         return new LuaString(s);
     }
@@ -35,20 +63,21 @@ public final class LuaString extends LuaValue {
 
     @Override
     public long toLong() {
-        try {
-            return Long.parseLong(value.trim());
-        } catch (NumberFormatException e) {
-            throw new LuaException("attempt to convert string '" + value + "' to integer");
+        LuaValue num = parseNumber(value);
+        if (num != null) {
+            LuaInteger i = num.toLuaInteger();
+            if (i != null) return i.toLong();
         }
+        throw new LuaException("attempt to convert string '" + value + "' to integer");
     }
 
     @Override
     public double toDouble() {
-        try {
-            return Double.parseDouble(value.trim());
-        } catch (NumberFormatException e) {
-            throw new LuaException("attempt to convert string '" + value + "' to float");
+        LuaValue num = parseNumber(value);
+        if (num != null) {
+            return num.toDouble();
         }
+        throw new LuaException("attempt to convert string '" + value + "' to float");
     }
 
     @Override

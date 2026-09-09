@@ -23,7 +23,8 @@ public final class LuaFloat extends LuaValue {
 
     @Override
     public long toLong() {
-        if (Math.floor(value) == value && !Double.isInfinite(value) && !Double.isNaN(value)) {
+        if (value >= -9223372036854775808.0 && value < 9223372036854775808.0 &&
+            Math.floor(value) == value && !Double.isInfinite(value) && !Double.isNaN(value)) {
             return (long) value;
         }
         throw new LuaException("number has no integer representation");
@@ -45,13 +46,43 @@ public final class LuaFloat extends LuaValue {
     }
 
     @Override
+    public LuaValue add(LuaValue other) {
+        if (other instanceof LuaFloat f) {
+            return LuaFloat.valueOf(this.value + f.value);
+        }
+        if (other instanceof LuaInteger i) {
+            return LuaFloat.valueOf(this.value + (double) i.toLong());
+        }
+        return super.add(other);
+    }
+
+    @Override
+    public LuaValue sub(LuaValue other) {
+        if (other instanceof LuaFloat f) {
+            return LuaFloat.valueOf(this.value - f.value);
+        }
+        if (other instanceof LuaInteger i) {
+            return LuaFloat.valueOf(this.value - (double) i.toLong());
+        }
+        return super.sub(other);
+    }
+
+    @Override
+    public LuaValue mul(LuaValue other) {
+        if (other instanceof LuaFloat f) {
+            return LuaFloat.valueOf(this.value * f.value);
+        }
+        if (other instanceof LuaInteger i) {
+            return LuaFloat.valueOf(this.value * (double) i.toLong());
+        }
+        return super.mul(other);
+    }
+
+    @Override
     public boolean equals(Object obj) {
         if (this == obj) return true;
         if (obj instanceof LuaFloat other) {
             return Double.compare(this.value, other.value) == 0;
-        }
-        if (obj instanceof LuaInteger other) {
-            return this.value == (double) other.toLong();
         }
         return false;
     }

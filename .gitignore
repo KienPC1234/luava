@@ -6,3 +6,7 @@ target/
 *.iml
 .vscode/
 tests/*.tar.gz
+lua-source/
+*.so
+*.out
+/libs
