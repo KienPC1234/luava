@@ -294,54 +294,46 @@ public final class LuaState {
 
     public static boolean USE_BYTECODE_VM = false;
 
-    private long[] primitiveStack = new long[1024];
-    private byte[] typeStack = new byte[1024];
-    private LuaValue[] objectStack = new LuaValue[1024];
-    private org.luava.runtime.eval.Upvalue openUpvaluesHead = null;
+    public LuaCoroutine getCurrentThread() {
+        LuaCoroutine cur = LuaCoroutine.running();
+        return (cur != null) ? cur : mainThread;
+    }
 
     public long[] getPrimitiveStack() {
-        return primitiveStack;
+        return getCurrentThread().getPrimitiveStack();
     }
 
     public byte[] getTypeStack() {
-        return typeStack;
+        return getCurrentThread().getTypeStack();
     }
 
     public LuaValue[] getObjectStack() {
-        return objectStack;
+        return getCurrentThread().getObjectStack();
     }
 
     public void ensureStackCapacity(int needed) {
-        if (needed > primitiveStack.length) {
-            int newCap = Math.max(primitiveStack.length * 2, needed + 256);
-            long[] newP = new long[newCap];
-            byte[] newT = new byte[newCap];
-            LuaValue[] newO = new LuaValue[newCap];
-            System.arraycopy(primitiveStack, 0, newP, 0, primitiveStack.length);
-            System.arraycopy(typeStack, 0, newT, 0, typeStack.length);
-            System.arraycopy(objectStack, 0, newO, 0, objectStack.length);
-            primitiveStack = newP;
-            typeStack = newT;
-            objectStack = newO;
-        }
+        getCurrentThread().ensureStackCapacity(needed);
     }
 
     public LuaValue[] ensureStack(int needed) {
         ensureStackCapacity(needed);
-        return objectStack;
+        return getCurrentThread().getObjectStack();
     }
 
     public LuaValue getStackValue(int index) {
-        return org.luava.runtime.bytecode.BytecodeVM.getLuaValue(primitiveStack, typeStack, objectStack, index);
+        LuaCoroutine th = getCurrentThread();
+        return org.luava.runtime.bytecode.BytecodeVM.getLuaValue(th.getPrimitiveStack(), th.getTypeStack(), th.getObjectStack(), index);
     }
 
     public void setStackValue(int index, LuaValue val) {
-        org.luava.runtime.bytecode.BytecodeVM.setLuaValue(primitiveStack, typeStack, objectStack, index, val);
+        LuaCoroutine th = getCurrentThread();
+        org.luava.runtime.bytecode.BytecodeVM.setLuaValue(th.getPrimitiveStack(), th.getTypeStack(), th.getObjectStack(), index, val);
     }
 
     public org.luava.runtime.eval.Upvalue findOrCreateOpenUpvalue(int stackIndex, String name) {
+        LuaCoroutine thread = getCurrentThread();
         org.luava.runtime.eval.Upvalue prev = null;
-        org.luava.runtime.eval.Upvalue curr = openUpvaluesHead;
+        org.luava.runtime.eval.Upvalue curr = thread.getOpenUpvaluesHead();
         while (curr != null && curr.getStackIndex() >= stackIndex) {
             if (curr.getStackIndex() == stackIndex) {
                 return curr;
@@ -350,10 +342,10 @@ public final class LuaState {
             curr = curr.nextOpen;
         }
 
-        org.luava.runtime.eval.Upvalue newUv = new org.luava.runtime.eval.Upvalue(name, this, stackIndex);
+        org.luava.runtime.eval.Upvalue newUv = new org.luava.runtime.eval.Upvalue(name, thread, stackIndex);
         newUv.nextOpen = curr;
         if (prev == null) {
-            openUpvaluesHead = newUv;
+            thread.setOpenUpvaluesHead(newUv);
         } else {
             prev.nextOpen = newUv;
         }
@@ -361,9 +353,10 @@ public final class LuaState {
     }
 
     public void closeUpvalues(int fromIndex) {
-        while (openUpvaluesHead != null && openUpvaluesHead.getStackIndex() >= fromIndex) {
-            org.luava.runtime.eval.Upvalue uv = openUpvaluesHead;
-            openUpvaluesHead = uv.nextOpen;
+        LuaCoroutine thread = getCurrentThread();
+        while (thread.getOpenUpvaluesHead() != null && thread.getOpenUpvaluesHead().getStackIndex() >= fromIndex) {
+            org.luava.runtime.eval.Upvalue uv = thread.getOpenUpvaluesHead();
+            thread.setOpenUpvaluesHead(uv.nextOpen);
             uv.nextOpen = null;
             uv.close();
         }
@@ -383,8 +376,6 @@ public final class LuaState {
         }
     }
 
-    private TbcEntry tbcHead = null;
-
     public void pushTbc(int stackIndex, LuaValue val, String varName) {
         if (val == null || val.isNil() || val.equals(LuaBoolean.FALSE)) {
             return;
@@ -393,14 +384,16 @@ public final class LuaState {
         if (mt == null || mt.rawget(LuaString.valueOf("__close")).isNil()) {
             throw new LuaException("variable '" + (varName != null ? varName : "?") + "' got a non-closable value");
         }
-        tbcHead = new TbcEntry(stackIndex, val, varName, tbcHead);
+        LuaCoroutine thread = getCurrentThread();
+        thread.setTbcHead(new TbcEntry(stackIndex, val, varName, thread.getTbcHead()));
     }
 
     public void closeTbc(int fromIndex, LuaValue errorObj) {
+        LuaCoroutine thread = getCurrentThread();
         Throwable lastError = null;
-        while (tbcHead != null && tbcHead.stackIndex >= fromIndex) {
-            TbcEntry entry = tbcHead;
-            tbcHead = entry.next;
+        while (thread.getTbcHead() != null && thread.getTbcHead().stackIndex >= fromIndex) {
+            TbcEntry entry = thread.getTbcHead();
+            thread.setTbcHead(entry.next);
             LuaValue val = entry.value;
             LuaTable mt = val.getMetatable();
             LuaValue closeMth = mt != null ? mt.rawget(LuaString.valueOf("__close")) : LuaNil.NIL;

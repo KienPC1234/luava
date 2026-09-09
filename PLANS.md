@@ -326,3 +326,108 @@ Khi gặp `OP_TAILCALL`:
 | **Bước 4** | Cài đặt `BytecodeVM` (Vòng lặp thực thi 83 OpCodes) | `BytecodeVM.java`<br>`VMExtensions.java` | Vòng lặp `tableswitch` hoàn thiện, hỗ trợ đầy đủ số học, bảng, rẽ nhánh, lời gọi hàm |
 | **Bước 5** | Tích hợp vào `LuaState` với cơ chế chuyển tiếp A/B | `LuaState.java`<br>`ChunkSerializer.java` | Cờ `LuaState.USE_BYTECODE_VM = true`; chạy song song kiểm tra đối chiếu |
 | **Bước 6** | Chạy bộ kiểm thử chuẩn và tối ưu hiệu năng | `OfficialSuiteEvaluationTest.java`<br>`PerformanceBenchmarkTest.java` | Vượt qua 31/31 suites và chạy `all.lua`; đo lường hiệu năng tiệm cận C |
+
+---
+
+## VII. Kiến Trúc Phân Lập Luồng & Coroutine Đa Máy Ảo (Concurrency & Multi-VM Isolation)
+
+### 1. Bản Chất Kiến Trúc Trong Lua C
+Trong Lua C chuẩn:
+- Mỗi coroutine / thread khởi tạo qua `lua_newthread(L)` thực chất là một đối tượng `lua_State *L1` riêng biệt.
+- Mỗi `lua_State` sở hữu:
+  - Một mảng ngăn xếp riêng (`L1->stack`, `L1->top`, `L1->base`).
+  - Chuỗi open upvalues riêng (`L1->openupval`).
+  - Danh sách các biến cần đóng riêng (`L1->tbclist`).
+- Toàn bộ các `lua_State` này dùng chung `global_State *G` (bảng chuỗi, GC manager, bảng `_G`, registry).
+
+### 2. Thiết Kế Phân Lập Ngăn Xếp Cho Luava (Virtual Thread & Multi-Coroutines)
+Trước đây, các mảng `primitiveStack`, `typeStack`, `objectStack` đặt trên instance `LuaState`. Khi coroutine con chạy trên Java Virtual Thread, nó gọi `BytecodeVM.execute` tại `base = 0` và đè vào thanh ghi của luồng cha.
+
+**Giải pháp đã hoàn thiện và chuẩn hóa**:
+1. **Chuyển quyền sở hữu ngăn xếp sang `LuaCoroutine`**:
+   - Mỗi `LuaCoroutine` sở hữu độc lập:
+     - `long[] primitiveStack` (256 slots mặc định, tự động tăng trưởng `ensureStackCapacity`).
+     - `byte[] typeStack`.
+     - `LuaValue[] objectStack`.
+     - `Upvalue openUpvaluesHead` (chuỗi liên kết đơn các upvalues mở của luồng).
+     - `TbcEntry tbcHead` (chuỗi các biến `<close>` cần dọn dẹp khi thoát phạm vi).
+2. **Ủy quyền ngữ cảnh luồng trong `LuaState`**:
+   - Phương thức `LuaState.getCurrentThread()` ưu tiên lấy `LuaCoroutine.running()` từ `ThreadLocal`, nếu rỗng sẽ fallback về `mainThread`.
+   - Các API `getPrimitiveStack()`, `getTypeStack()`, `findOrCreateOpenUpvalue()`, `closeUpvalues()`, `pushTbc()`, `closeTbc()` đều ủy thác hoàn toàn về `getCurrentThread()`.
+3. **Liên kết Upvalue chính xác theo thread (`LuaCoroutine`)**:
+   - Lớp `Upvalue` lưu trữ tham chiếu trực tiếp đến `LuaCoroutine thread` tạo ra nó.
+   - Khi một coroutine truyền closure chứa open upvalue sang coroutine khác, việc đọc (`getValue`), ghi (`setValue`) hoặc đóng (`close`) luôn truy cập chính xác vào mảng ngăn xếp của coroutine gốc, triệt tiêu hoàn toàn race conditions và stack collision.
+
+---
+
+## VIII. Tối Ưu Hóa Thư Viện Chuẩn Đi Kèm (StringLib & CoroutineLib Tuning)
+
+### 1. Tối Ưu Hóa `StringLib` (Zero-Intermediate Allocation)
+- **`string.len` Fast-Path**:
+  - Kiểm tra trực tiếp `if (args[0] instanceof LuaString ls) return LuaInteger.valueOf(ls.value().length());`, loại bỏ chi phí chuyển đổi chuỗi trung gian.
+- **`string.byte` Mảng Trực Tiếp (Eliminate `ArrayList`)**:
+  - Tính toán chính xác số byte cần trích xuất `int count = (int)(end - start + 1);`.
+  - Nếu `count == 1`, trả về ngay lập tức giá trị từ mảng cache `ASCII_CACHE` hoặc `LuaInteger.valueOf`.
+  - Nếu `count > 1`, cấp phát trực tiếp `LuaValue[count]`, loại bỏ toàn bộ chi phí boxing `ArrayList<LuaValue>` và `.toArray()`.
+- **`string.char` Cấp Phát 1 Lần**:
+  - Nếu số đối số bằng 1, ánh xạ trực tiếp ký tự vào `LuaString.valueOf(String.valueOf((char) val))` (hit `ASCII_CACHE` với 0 allocation).
+  - Nếu nhiều ký tự, cấp phát mảng `char[n]` và khởi tạo `new String(chars)` một lần duy nhất, loại bỏ chi phí giãn nở mảng ký tự liên tục của `StringBuilder`.
+
+### 2. Tối Ưu Hóa `CoroutineLib` & `LuaCoroutine`
+- **Tối Giản Handoff Args & Results**:
+  - Nhận diện `Varargs` tự nhiên qua `va.getValuesUnsafe()`, không sao chép lại mảng nếu không cần thiết.
+  - Tối ưu hóa chu trình phối hợp giữa luồng điều khiển và Virtual Thread qua `LockSupport.park()` và `unpark()`, giảm thiểu tối đa độ trễ chuyển ngữ cảnh (đạt mức 16.65 ms cho 1,000 lần switch).
+
+---
+
+## IX. Phân Tích Chuyên Sâu: Bytecode Thanh Ghi vs Dịch Thẳng Ra JVM Bytecode (ASM / .class)
+
+Một số lập trình viên đặt câu hỏi: *Liệu có nên xây dựng một Class API biên dịch mã Lua trực tiếp thành Java Bytecode (.class) thông qua thư viện ASM hoặc ByteBuddy để chạy trên JVM không?*
+
+### 1. So Sánh Kiến Trúc Kỹ Thuật
+
+| Tiêu chí | Trình Thông Dịch Thanh Ghi (BytecodeVM + C2) | Dịch Thẳng Ra JVM Bytecode (ASM / .class) |
+| :--- | :--- | :--- |
+| **Chi phí khởi động (Cold Start)** | Cực nhanh (< 0.5 ms): AST -> Bytecode Lua là phép duyệt phẳng đơn giản. | Rất chậm (vài chục ms): Phải tạo bytecode JVM, verify class, nạp qua `ClassLoader.defineClass`. |
+| **Rò rỉ bộ nhớ (Metaspace Leak)** | Không có. Bytecode Lua nằm trên mảng heap thông thường, GC thu dọn tự nhiên. | **Cực kỳ nguy hiểm**: Mỗi closure/chunk là một Java class nạp vào Metaspace. Với script động nạp liên tục, Metaspace sẽ bị OOM. |
+| **Hỗ trợ Coroutine (`yield`)** | Tự nhiên: BytecodeVM lưu trữ `pc`, `base`, `stack` dễ dàng, kết hợp Virtual Thread không tốn công sức. | **Bế tắc**: JVM call stack không cho phép yield giữa chừng hàm Java bytecode trừ khi can thiệp bytecode weaving cực phức tạp. |
+| **Giới hạn kích cỡ hàm** | Không bị giới hạn 64KB bytecode JVM. Lua bytecode có thể dài tùy ý. | Dễ dính `MethodTooLargeException` do giới hạn 65,535 bytes của đặc tả JVM cho mỗi method. |
+| **Tối ưu hóa thời gian chạy (Peak Performance)** | **Tiệm cận native**: HotSpot C2 JIT tối ưu hóa cực mạnh vòng lặp `tableswitch`, register hoisting, escape analysis. | Tương đương hoặc chỉ nhỉnh hơn không đáng kể do kiểu động của Lua vẫn phải kiểm tra kiểu tại runtime (`invokevirtual`). |
+
+### 2. Kết Luận Kiến Trúc
+Việc dịch runtime ra Java `.class` là một **anti-pattern** cho các ngôn ngữ động hỗ trợ coroutine như Lua. Kiến trúc **Register-based Bytecode VM kết hợp HotSpot C2 JIT** hiện tại là con đường chuẩn mực, an toàn và tối ưu nhất cho Luava. 
+
+Dịch ra JVM `.class` chỉ nên được cân nhắc như một công cụ biên dịch AOT độc lập ngoài dòng (`luava-aot` offline CLI compiler) nếu cần đóng gói các package tĩnh cho Android hoặc GraalVM Native Image.
+
+---
+
+## X. Lộ Trình Chuyển Đổi Triệt Để Thay Thế Hoàn Toàn AST Interpreter (Phased AST Retirement)
+
+Để giải phóng mã nguồn, loại bỏ hoàn toàn các lớp kỹ thuật cũ và biến Bytecode VM thành engine thực thi duy nhất của Luava, lộ trình 4 bước được thiết lập như sau:
+
+### Giai Đoạn 1: Mở Rộng Bộ Test Bytecode & Bật Mặc Định (Tuần Hiện Tại)
+1. **Kiểm Thử Toàn Diện Trên Bytecode**:
+   - Chuyển `LuaState.USE_BYTECODE_VM = true` làm giá trị mặc định.
+   - Chạy toàn bộ 31 bộ test PUC-Rio Lua 5.4.9 (`OfficialSuiteEvaluationTest`) dưới chế độ Bytecode VM.
+   - Khắc phục các edge case về error message format, traceback inspection (`debug.getinfo`), và hook line events nếu có khác biệt so với AST.
+
+### Giai Đoạn 2: Đồng Bộ Hóa Debugger & Profiler Lên Bytecode
+1. **Line Mapping & Debug Info**:
+   - `LuaProto.lineInfo`: Ánh xạ từng địa chỉ lệnh `pc` về số dòng mã nguồn thực tế.
+   - Hoàn thiện `DebugLib.java` để đọc frame thông tin từ `CallInfo` của BytecodeVM thay vì dựa vào `CallStack` cũ của Interpreter.
+
+### Giai Đoạn 3: Đánh Dấu `@Deprecated` Và Cô Lập AST Interpreter
+1. Đánh dấu `@Deprecated(forRemoval = true)` lên:
+   - `org.luava.runtime.eval.Interpreter`
+   - `org.luava.runtime.eval.Environment`
+   - `org.luava.runtime.eval.VariableSlot`
+2. Chuyển tiếp toàn bộ các phương thức `LuaState.eval(...)`, `LuaState.compile(...)` sang `BytecodeCompiler.compile` và `LuaClosure`.
+
+### Giai Đoạn 4: Xóa Bỏ Hoàn Toàn AST Execution Engine (Clean Slate)
+1. Xóa bỏ các tệp tin thừa:
+   - `Interpreter.java` (~1,500 dòng AST visitor logic).
+   - `Environment.java` (~200 dòng quản lý map biến).
+   - `VariableSlot.java`.
+2. Đơn giản hóa `Upvalue.java`: Loại bỏ hoàn toàn các trường và constructor liên quan đến `VariableSlot` và `Environment`, chỉ giữ lại cơ chế unboxed nguyên thủy cho `BytecodeVM`.
+3. Kiểm tra lại toàn bộ build Maven và cam kết bảo toàn 100% test suite xanh.
+

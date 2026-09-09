@@ -1,6 +1,7 @@
 package org.luava.runtime.bytecode;
 
 import org.luava.runtime.*;
+import org.luava.runtime.concurrency.LuaCoroutine;
 import org.luava.runtime.eval.Upvalue;
 
 public final class BytecodeVM {
@@ -483,7 +484,13 @@ public final class BytecodeVM {
                         }
                         top = base + proto.numParams;
                     } else if (func instanceof LuaFunction fn) {
-                        executeExternalCall(fn, pStack, tStack, oStack, funcIdx, nActualArgs, nResults);
+                        int newTop = executeExternalCall(state, fn, funcIdx, nActualArgs, nResults);
+                        if (nResults < 0) {
+                            top = newTop;
+                        }
+                        pStack = state.getPrimitiveStack();
+                        tStack = state.getTypeStack();
+                        oStack = state.getObjectStack();
                     } else {
                         throw new LuaException("attempt to call a " + func.type().name().toLowerCase() + " value");
                     }
@@ -525,9 +532,14 @@ public final class BytecodeVM {
                         }
                         top = base + proto.numParams;
                     } else if (func instanceof LuaFunction fn) {
-                        LuaValue res = executeExternalCall(fn, pStack, tStack, oStack, funcIdx, nActualArgs, 1);
+                        state.closeUpvalues(base);
+                        state.closeTbc(base, null);
+                        LuaValue res = fn.invoke(getArgsForCall(pStack, tStack, oStack, funcIdx + 1, nActualArgs));
+                        LuaValue[] retVals = (res instanceof Varargs va) ? va.getValuesUnsafe() : (res != null ? new LuaValue[]{res} : new LuaValue[0]);
+                        int nReturns = retVals.length;
                         if (callDepth > 0) {
                             CallInfo ci = callStack[--callDepth];
+                            int callerFunc = ci.funcIndex;
                             base = ci.baseIndex;
                             closure = ci.closure;
                             proto = closure.proto;
@@ -536,11 +548,21 @@ public final class BytecodeVM {
                             upvals = closure.upvals;
                             pc = ci.savedPc;
                             varargs = ci.varargs;
+                            pStack = state.getPrimitiveStack();
+                            tStack = state.getTypeStack();
+                            oStack = state.getObjectStack();
                             if (ci.expectedResults > 0) {
-                                setLuaValue(pStack, tStack, oStack, ci.funcIndex, res);
+                                for (int i = 0; i < ci.expectedResults; i++) {
+                                    setLuaValue(pStack, tStack, oStack, callerFunc + i, (i < nReturns) ? retVals[i] : LuaNil.NIL);
+                                }
+                            } else if (ci.expectedResults < 0) {
+                                for (int i = 0; i < nReturns; i++) {
+                                    setLuaValue(pStack, tStack, oStack, callerFunc + i, retVals[i]);
+                                }
+                                top = callerFunc + nReturns;
                             }
                         } else {
-                            return new LuaValue[]{res};
+                            return retVals;
                         }
                     }
                 }
@@ -1001,17 +1023,57 @@ public final class BytecodeVM {
         setLuaValue(pStack, tStack, oStack, base + a, res);
     }
 
-    private static LuaValue executeExternalCall(LuaFunction fn, long[] pStack, byte[] tStack, LuaValue[] oStack, int funcIdx, int nActualArgs, int nResults) {
-        LuaValue[] cArgs = new LuaValue[nActualArgs];
-        for (int i = 0; i < nActualArgs; i++) {
-            cArgs[i] = getLuaValue(pStack, tStack, oStack, funcIdx + 1 + i);
+    private static LuaValue[] getArgsForCall(long[] pStack, byte[] tStack, LuaValue[] oStack, int startIdx, int count) {
+        if (count <= 0) return LuaCoroutine.EMPTY_VALUES;
+        LuaValue[] args = new LuaValue[count];
+        for (int i = 0; i < count; i++) {
+            args[i] = getLuaValue(pStack, tStack, oStack, startIdx + i);
         }
+        return args;
+    }
+
+    private static int executeExternalCall(LuaState state, LuaFunction fn, int funcIdx, int nActualArgs, int nResults) {
+        long[] pStack = state.getPrimitiveStack();
+        byte[] tStack = state.getTypeStack();
+        LuaValue[] oStack = state.getObjectStack();
+        LuaValue[] cArgs = getArgsForCall(pStack, tStack, oStack, funcIdx + 1, nActualArgs);
         LuaValue res = fn.invoke(cArgs);
+        state.ensureStackCapacity(funcIdx + (nResults > 0 ? nResults : 16) + 32);
+        pStack = state.getPrimitiveStack();
+        tStack = state.getTypeStack();
+        oStack = state.getObjectStack();
         if (nResults > 0) {
-            setLuaValue(pStack, tStack, oStack, funcIdx, res != null ? res : LuaNil.NIL);
-            for (int i = 1; i < nResults; i++) setLuaValue(pStack, tStack, oStack, funcIdx + i, LuaNil.NIL);
+            if (res instanceof Varargs va) {
+                LuaValue[] vals = va.getValuesUnsafe();
+                for (int i = 0; i < nResults; i++) {
+                    setLuaValue(pStack, tStack, oStack, funcIdx + i, (i < vals.length) ? vals[i] : LuaNil.NIL);
+                }
+            } else {
+                setLuaValue(pStack, tStack, oStack, funcIdx, res != null ? res : LuaNil.NIL);
+                for (int i = 1; i < nResults; i++) {
+                    setLuaValue(pStack, tStack, oStack, funcIdx + i, LuaNil.NIL);
+                }
+            }
+            return funcIdx + nResults;
+        } else if (nResults < 0) {
+            if (res instanceof Varargs va) {
+                LuaValue[] vals = va.getValuesUnsafe();
+                state.ensureStackCapacity(funcIdx + vals.length + 32);
+                pStack = state.getPrimitiveStack();
+                tStack = state.getTypeStack();
+                oStack = state.getObjectStack();
+                for (int i = 0; i < vals.length; i++) {
+                    setLuaValue(pStack, tStack, oStack, funcIdx + i, vals[i]);
+                }
+                return funcIdx + vals.length;
+            } else if (res != null && !res.isNil()) {
+                setLuaValue(pStack, tStack, oStack, funcIdx, res);
+                return funcIdx + 1;
+            } else {
+                return funcIdx;
+            }
         }
-        return res != null ? res : LuaNil.NIL;
+        return funcIdx;
     }
 
     private static int executeForPrepSlow(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int bx, int pc) {
@@ -1039,11 +1101,23 @@ public final class BytecodeVM {
     }
 
     private static void executeTForCall(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+        int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         LuaValue f = getLuaValue(pStack, tStack, oStack, base + a);
         LuaValue s = getLuaValue(pStack, tStack, oStack, base + a + 1);
         LuaValue var = getLuaValue(pStack, tStack, oStack, base + a + 2);
         LuaValue res = f.call(s, var);
-        setLuaValue(pStack, tStack, oStack, base + a + 4, res != null ? res : LuaNil.NIL);
+        int nVars = Math.max(1, c);
+        if (res instanceof Varargs va) {
+            LuaValue[] vals = va.getValuesUnsafe();
+            for (int i = 0; i < nVars; i++) {
+                setLuaValue(pStack, tStack, oStack, base + a + 4 + i, (i < vals.length) ? vals[i] : LuaNil.NIL);
+            }
+        } else {
+            setLuaValue(pStack, tStack, oStack, base + a + 4, res != null ? res : LuaNil.NIL);
+            for (int i = 1; i < nVars; i++) {
+                setLuaValue(pStack, tStack, oStack, base + a + 4 + i, LuaNil.NIL);
+            }
+        }
     }
 
     private BytecodeVM() {}

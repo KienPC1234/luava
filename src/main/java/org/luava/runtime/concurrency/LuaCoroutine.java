@@ -52,6 +52,56 @@ public final class LuaCoroutine extends LuaValue {
 
     private final CallStack.CallStackState callStackState = new CallStack.CallStackState();
 
+    // Per-thread execution stacks for BytecodeVM (Zero-Allocation hot-paths & stack isolation)
+    private long[] primitiveStack = new long[256];
+    private byte[] typeStack = new byte[256];
+    private LuaValue[] objectStack = new LuaValue[256];
+    private org.luava.runtime.eval.Upvalue openUpvaluesHead = null;
+    private org.luava.runtime.LuaState.TbcEntry tbcHead = null;
+
+    public long[] getPrimitiveStack() {
+        return primitiveStack;
+    }
+
+    public byte[] getTypeStack() {
+        return typeStack;
+    }
+
+    public LuaValue[] getObjectStack() {
+        return objectStack;
+    }
+
+    public void ensureStackCapacity(int needed) {
+        if (needed > primitiveStack.length) {
+            int newCap = Math.max(primitiveStack.length * 2, needed + 256);
+            long[] newP = new long[newCap];
+            byte[] newT = new byte[newCap];
+            LuaValue[] newO = new LuaValue[newCap];
+            System.arraycopy(primitiveStack, 0, newP, 0, primitiveStack.length);
+            System.arraycopy(typeStack, 0, newT, 0, typeStack.length);
+            System.arraycopy(objectStack, 0, newO, 0, objectStack.length);
+            primitiveStack = newP;
+            typeStack = newT;
+            objectStack = newO;
+        }
+    }
+
+    public org.luava.runtime.eval.Upvalue getOpenUpvaluesHead() {
+        return openUpvaluesHead;
+    }
+
+    public void setOpenUpvaluesHead(org.luava.runtime.eval.Upvalue openUpvaluesHead) {
+        this.openUpvaluesHead = openUpvaluesHead;
+    }
+
+    public org.luava.runtime.LuaState.TbcEntry getTbcHead() {
+        return tbcHead;
+    }
+
+    public void setTbcHead(org.luava.runtime.LuaState.TbcEntry tbcHead) {
+        this.tbcHead = tbcHead;
+    }
+
     public CallStack.CallStackState getCallStackState() {
         return callStackState;
     }

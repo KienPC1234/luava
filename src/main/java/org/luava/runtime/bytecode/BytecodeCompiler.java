@@ -125,7 +125,19 @@ public final class BytecodeCompiler {
             code.set(jmpPc, Instruction.setsJ(inst, offset));
         }
 
+        private int minFreereg() {
+            int minReg = 0;
+            for (LocalVar lv : locals) {
+                if (lv.reg + 1 > minReg) minReg = lv.reg + 1;
+            }
+            return minReg;
+        }
+
         int allocReg() {
+            int minReg = minFreereg();
+            if (freereg < minReg) {
+                freereg = minReg;
+            }
             int r = freereg++;
             if (freereg > maxstacksize) {
                 maxstacksize = freereg;
@@ -134,8 +146,9 @@ public final class BytecodeCompiler {
         }
 
         void freeRegs(int toReg) {
-            if (freereg > toReg) {
-                freereg = toReg;
+            int target = Math.max(toReg, minFreereg());
+            if (freereg > target) {
+                freereg = target;
             }
         }
 
@@ -266,19 +279,18 @@ public final class BytecodeCompiler {
                     compileExprToReg(lvd.initializers().get(i), varRegs[i]);
                 } else if (i == numFixedVals && lastIsCall) {
                     int neededResults = nvars - numFixedVals;
-                    varRegs[i] = allocReg();
-                    compileFunctionCall((Expressions.FunctionCallExpr) lvd.initializers().get(nvals - 1), varRegs[i], neededResults);
-                    for (int j = 1; j < neededResults; j++) {
+                    for (int j = 0; j < neededResults; j++) {
                         varRegs[i + j] = allocReg();
                     }
+                    compileFunctionCall((Expressions.FunctionCallExpr) lvd.initializers().get(nvals - 1), varRegs[i], neededResults);
+                    freeRegs(varRegs[i] + neededResults);
                     i += (neededResults - 1);
                 } else if (i == numFixedVals && lastIsVararg) {
                     int neededResults = nvars - numFixedVals;
-                    varRegs[i] = allocReg();
-                    emit(Instruction.encodeABC(OpCode.OP_VARARG, varRegs[i], neededResults + 1, 0), lvd.line());
-                    for (int j = 1; j < neededResults; j++) {
+                    for (int j = 0; j < neededResults; j++) {
                         varRegs[i + j] = allocReg();
                     }
+                    emit(Instruction.encodeABC(OpCode.OP_VARARG, varRegs[i], neededResults + 1, 0), lvd.line());
                     i += (neededResults - 1);
                 } else {
                     varRegs[i] = allocReg();
@@ -312,19 +324,18 @@ public final class BytecodeCompiler {
                     compileExprToReg(as.values().get(i), valRegs[i]);
                 } else if (i == numFixedVals && lastIsCall) {
                     int neededResults = nvars - numFixedVals;
-                    valRegs[i] = allocReg();
-                    compileFunctionCall((Expressions.FunctionCallExpr) as.values().get(nvals - 1), valRegs[i], neededResults);
-                    for (int j = 1; j < neededResults; j++) {
+                    for (int j = 0; j < neededResults; j++) {
                         valRegs[i + j] = allocReg();
                     }
+                    compileFunctionCall((Expressions.FunctionCallExpr) as.values().get(nvals - 1), valRegs[i], neededResults);
+                    freeRegs(valRegs[i] + neededResults);
                     i += (neededResults - 1);
                 } else if (i == numFixedVals && lastIsVararg) {
                     int neededResults = nvars - numFixedVals;
-                    valRegs[i] = allocReg();
-                    emit(Instruction.encodeABC(OpCode.OP_VARARG, valRegs[i], neededResults + 1, 0), as.line());
-                    for (int j = 1; j < neededResults; j++) {
+                    for (int j = 0; j < neededResults; j++) {
                         valRegs[i + j] = allocReg();
                     }
+                    emit(Instruction.encodeABC(OpCode.OP_VARARG, valRegs[i], neededResults + 1, 0), as.line());
                     i += (neededResults - 1);
                 } else {
                     valRegs[i] = allocReg();
@@ -491,17 +502,18 @@ public final class BytecodeCompiler {
                 varLocals.add(lv);
             }
 
-            LoopInfo loop = new LoopInfo(code.size(), locals.size());
+            int loopStartPc = code.size();
+            LoopInfo loop = new LoopInfo(loopStartPc, locals.size());
             loopStack.push(loop);
 
             compileBlock(fgs.body());
 
-            emit(Instruction.encodeABC(OpCode.OP_TFORCALL, fReg, 0, fgs.variableNames().size()), fgs.line());
+            int callPc = emit(Instruction.encodeABC(OpCode.OP_TFORCALL, fReg, 0, fgs.variableNames().size()), fgs.line());
             int loopPc = emit(Instruction.encodeABx(OpCode.OP_TFORLOOP, fReg, 0), fgs.endLine());
 
-            int prepOffset = loopPc - prepPc;
+            int prepOffset = callPc - (prepPc + 1);
             code.set(prepPc, Instruction.encodeABx(OpCode.OP_TFORPREP, fReg, prepOffset));
-            int backOffset = loopPc - (prepPc + 1);
+            int backOffset = (loopPc + 1) - loopStartPc;
             code.set(loopPc, Instruction.encodeABx(OpCode.OP_TFORLOOP, fReg, backOffset));
 
             int loopEnd = code.size();
@@ -703,25 +715,29 @@ public final class BytecodeCompiler {
                     int r = compileExprToAnyReg(lastVal);
                     emit(Instruction.encodeABC(OpCode.OP_RETURN1, r, 0, 0), ret.line());
                 } else if (lastIsCall || lastIsVararg) {
-                    int startReg = freereg;
-                    for (int i = 0; i < nvals - 1; i++) {
-                        int r = allocReg();
-                        compileExprToReg(ret.values().get(i), r);
+                    int[] retRegs = new int[nvals];
+                    for (int i = 0; i < nvals; i++) {
+                        retRegs[i] = allocReg();
                     }
-                    int lastReg = allocReg();
+                    for (int i = 0; i < nvals - 1; i++) {
+                        compileExprToReg(ret.values().get(i), retRegs[i]);
+                    }
+                    int lastReg = retRegs[nvals - 1];
                     if (lastIsCall) {
                         compileFunctionCall((Expressions.FunctionCallExpr) lastVal, lastReg, -1);
                     } else {
                         emit(Instruction.encodeABC(OpCode.OP_VARARG, lastReg, 0, 0), lastVal.line());
                     }
-                    emit(Instruction.encodeABC(OpCode.OP_RETURN, startReg, 0, 0), ret.line());
+                    emit(Instruction.encodeABC(OpCode.OP_RETURN, retRegs[0], 0, 0), ret.line());
                 } else {
-                    int startReg = freereg;
+                    int[] retRegs = new int[nvals];
                     for (int i = 0; i < nvals; i++) {
-                        int r = allocReg();
-                        compileExprToReg(ret.values().get(i), r);
+                        retRegs[i] = allocReg();
                     }
-                    emit(Instruction.encodeABC(OpCode.OP_RETURN, startReg, nvals + 1, 0), ret.line());
+                    for (int i = 0; i < nvals; i++) {
+                        compileExprToReg(ret.values().get(i), retRegs[i]);
+                    }
+                    emit(Instruction.encodeABC(OpCode.OP_RETURN, retRegs[0], nvals + 1, 0), ret.line());
                 }
             }
         }

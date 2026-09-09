@@ -307,4 +307,55 @@ public class BytecodeVMTest {
         executor.shutdown();
         assertEquals(numThreads, successCount.get());
     }
+
+    @Test
+    void testCoroutineBasicYieldResume() {
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local co = coroutine.create(function(x)
+                local y = coroutine.yield(x + 10)
+                return y * 2
+            end)
+            local ok1, val1 = coroutine.resume(co, 5)
+            local ok2, val2 = coroutine.resume(co, 20)
+            return val1 + val2
+        """);
+        assertEquals(55, res.toLong()); // val1 = 15, val2 = 40 => 55
+    }
+
+    @Test
+    void testCoroutineMultretYieldResume() {
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local co = coroutine.create(function(a, b)
+                local x, y = coroutine.yield(a + 1, b + 2)
+                return x * 10, y * 20
+            end)
+            local ok1, r1, r2 = coroutine.resume(co, 10, 20)
+            local ok2, r3, r4 = coroutine.resume(co, 3, 4)
+            return r1 + r2 + r3 + r4
+        """);
+        assertEquals(143, res.toLong()); // r1=11, r2=22, r3=30, r4=80 => 143
+    }
+
+    @Test
+    void testCoroutineProducerConsumer() {
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local function producer()
+                return coroutine.wrap(function()
+                    for i = 1, 5 do
+                        coroutine.yield(i * 10)
+                    end
+                end)
+            end
+            local sum = 0
+            local gen = producer()
+            for v in gen do
+                sum = sum + v
+            end
+            return sum
+        """);
+        assertEquals(150, res.toLong()); // 10 + 20 + 30 + 40 + 50 = 150
+    }
 }
