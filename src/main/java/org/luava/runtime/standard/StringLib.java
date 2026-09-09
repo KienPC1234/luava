@@ -20,6 +20,9 @@ public final class StringLib {
 
         stringTable.rawset(LuaString.valueOf("len"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'string.len'");
+            if (args[0] instanceof LuaString ls) {
+                return LuaInteger.valueOf(ls.value().length());
+            }
             return LuaInteger.valueOf(args[0].toLuaString().length());
         }));
 
@@ -99,7 +102,7 @@ public final class StringLib {
 
         stringTable.rawset(LuaString.valueOf("byte"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'string.byte'");
-            String s = args[0].toLuaString();
+            String s = (args[0] instanceof LuaString ls) ? ls.value() : args[0].toLuaString();
             int len = s.length();
             long start = (args.length > 1 && !args[1].isNil()) ? args[1].toLong() : 1;
             long end = (args.length > 2 && !args[2].isNil()) ? args[2].toLong() : start;
@@ -110,18 +113,35 @@ public final class StringLib {
             if (end > len) end = len;
             if (start > end) return Varargs.EMPTY;
 
-            List<LuaValue> bytes = new ArrayList<>();
-            for (int i = (int) start - 1; i < (int) end; i++) {
-                bytes.add(LuaInteger.valueOf((int) s.charAt(i)));
+            int count = (int) (end - start + 1);
+            if (count == 1) {
+                return LuaInteger.valueOf((int) s.charAt((int) start - 1));
             }
-            return Varargs.of(bytes.toArray(new LuaValue[0]));
+            LuaValue[] bytes = new LuaValue[count];
+            int sIdx = (int) start - 1;
+            for (int i = 0; i < count; i++) {
+                bytes[i] = LuaInteger.valueOf((int) s.charAt(sIdx + i));
+            }
+            return Varargs.of(bytes);
         }));
 
         stringTable.rawset(LuaString.valueOf("char"), LuaFunction.of(args -> {
-            StringBuilder sb = new StringBuilder();
-            for (int i = 0; i < args.length; i++) {
-                LuaValue arg = args[i];
-                LuaInteger intVal = arg.toLuaInteger();
+            int n = args.length;
+            if (n == 0) return LuaString.EMPTY;
+            if (n == 1) {
+                LuaInteger intVal = args[0].toLuaInteger();
+                if (intVal == null) {
+                    throw new LuaException("bad argument #1 to 'char' (number has no integer representation)");
+                }
+                long val = intVal.toLong();
+                if (val < 0 || val > 255) {
+                    throw new LuaException("bad argument #1 to 'char' (value out of range)");
+                }
+                return LuaString.valueOf(String.valueOf((char) val));
+            }
+            char[] chars = new char[n];
+            for (int i = 0; i < n; i++) {
+                LuaInteger intVal = args[i].toLuaInteger();
                 if (intVal == null) {
                     throw new LuaException("bad argument #" + (i + 1) + " to 'char' (number has no integer representation)");
                 }
@@ -129,9 +149,9 @@ public final class StringLib {
                 if (val < 0 || val > 255) {
                     throw new LuaException("bad argument #" + (i + 1) + " to 'char' (value out of range)");
                 }
-                sb.append((char) val);
+                chars[i] = (char) val;
             }
-            return LuaString.valueOf(sb.toString());
+            return LuaString.valueOf(new String(chars));
         }));
 
         stringTable.rawset(LuaString.valueOf("format"), LuaFunction.of(args -> {
