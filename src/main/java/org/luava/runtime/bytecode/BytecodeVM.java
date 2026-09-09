@@ -108,6 +108,15 @@ public final class BytecodeVM {
         }
         top = base + proto.numParams;
 
+        LuaValue[] varargs = null;
+        if (proto.isVararg && nArgs > proto.numParams) {
+            int nv = nArgs - proto.numParams;
+            varargs = new LuaValue[nv];
+            for (int i = 0; i < nv; i++) {
+                varargs[i] = initialArgs[proto.numParams + i];
+            }
+        }
+
         while (true) {
             int inst = code[pc++];
             int op = (inst >>> Instruction.POS_OP) & Instruction.MASK_OP;
@@ -328,8 +337,15 @@ public final class BytecodeVM {
                     setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).len());
                 }
                 case OpCode.OP_CONCAT -> executeConcat(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_CLOSE -> state.closeUpvalues(base + a);
-                case OpCode.OP_TBC -> {}
+                case OpCode.OP_CLOSE -> {
+                    state.closeUpvalues(base + a);
+                    state.closeTbc(base + a, null);
+                }
+                case OpCode.OP_TBC -> {
+                    LuaValue val = getLuaValue(pStack, tStack, oStack, base + a);
+                    String varName = (proto.locVars != null && a < proto.locVars.length) ? proto.locVars[a] : null;
+                    state.pushTbc(base + a, val, varName);
+                }
                 case OpCode.OP_JMP -> {
                     int sj = ((inst >>> Instruction.POS_sJ) & Instruction.MASK_sJ) - Instruction.OFFSET_sJ;
                     pc += sj;
@@ -437,6 +453,7 @@ public final class BytecodeVM {
                         }
                         CallInfo ci = callStack[callDepth++];
                         ci.init(closure, funcIdx, base, top, pc, nResults);
+                        ci.varargs = varargs;
 
                         base = funcIdx + 1;
                         closure = childClosure;
@@ -450,6 +467,16 @@ public final class BytecodeVM {
                         pStack = state.getPrimitiveStack();
                         tStack = state.getTypeStack();
                         oStack = state.getObjectStack();
+
+                        if (proto.isVararg && nActualArgs > proto.numParams) {
+                            int nv = nActualArgs - proto.numParams;
+                            varargs = new LuaValue[nv];
+                            for (int i = 0; i < nv; i++) {
+                                varargs[i] = getLuaValue(pStack, tStack, oStack, base + proto.numParams + i);
+                            }
+                        } else {
+                            varargs = null;
+                        }
 
                         for (int i = nActualArgs; i < proto.numParams; i++) {
                             setLuaValue(pStack, tStack, oStack, base + i, LuaNil.NIL);
@@ -483,6 +510,16 @@ public final class BytecodeVM {
                         upvals = closure.upvals;
                         pc = 0;
 
+                        if (proto.isVararg && nActualArgs > proto.numParams) {
+                            int nv = nActualArgs - proto.numParams;
+                            varargs = new LuaValue[nv];
+                            for (int i = 0; i < nv; i++) {
+                                varargs[i] = getLuaValue(pStack, tStack, oStack, base + proto.numParams + i);
+                            }
+                        } else {
+                            varargs = null;
+                        }
+
                         for (int i = nActualArgs; i < proto.numParams; i++) {
                             setLuaValue(pStack, tStack, oStack, base + i, LuaNil.NIL);
                         }
@@ -498,6 +535,7 @@ public final class BytecodeVM {
                             k = proto.constants;
                             upvals = closure.upvals;
                             pc = ci.savedPc;
+                            varargs = ci.varargs;
                             if (ci.expectedResults > 0) {
                                 setLuaValue(pStack, tStack, oStack, ci.funcIndex, res);
                             }
@@ -508,6 +546,7 @@ public final class BytecodeVM {
                 }
                 case OpCode.OP_RETURN0 -> {
                     state.closeUpvalues(base);
+                    state.closeTbc(base, null);
                     if (callDepth > 0) {
                         CallInfo ci = callStack[--callDepth];
                         int callerFunc = ci.funcIndex;
@@ -518,6 +557,7 @@ public final class BytecodeVM {
                         k = proto.constants;
                         upvals = closure.upvals;
                         pc = ci.savedPc;
+                        varargs = ci.varargs;
                         if (ci.expectedResults > 0) {
                             for (int i = 0; i < ci.expectedResults; i++) {
                                 setLuaValue(pStack, tStack, oStack, callerFunc + i, LuaNil.NIL);
@@ -529,6 +569,7 @@ public final class BytecodeVM {
                 }
                 case OpCode.OP_RETURN1 -> {
                     state.closeUpvalues(base);
+                    state.closeTbc(base, null);
                     LuaValue ret = getLuaValue(pStack, tStack, oStack, base + a);
                     if (callDepth > 0) {
                         CallInfo ci = callStack[--callDepth];
@@ -540,11 +581,15 @@ public final class BytecodeVM {
                         k = proto.constants;
                         upvals = closure.upvals;
                         pc = ci.savedPc;
+                        varargs = ci.varargs;
                         if (ci.expectedResults > 0) {
                             setLuaValue(pStack, tStack, oStack, callerFunc, ret);
                             for (int i = 1; i < ci.expectedResults; i++) {
                                 setLuaValue(pStack, tStack, oStack, callerFunc + i, LuaNil.NIL);
                             }
+                        } else if (ci.expectedResults < 0) {
+                            setLuaValue(pStack, tStack, oStack, callerFunc, ret);
+                            top = callerFunc + 1;
                         }
                     } else {
                         return new LuaValue[]{ret};
@@ -552,6 +597,7 @@ public final class BytecodeVM {
                 }
                 case OpCode.OP_RETURN -> {
                     state.closeUpvalues(base);
+                    state.closeTbc(base, null);
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int nReturns = b > 0 ? b - 1 : (top - (base + a));
                     LuaValue[] retVals = new LuaValue[nReturns];
@@ -568,10 +614,16 @@ public final class BytecodeVM {
                         k = proto.constants;
                         upvals = closure.upvals;
                         pc = ci.savedPc;
+                        varargs = ci.varargs;
                         if (ci.expectedResults > 0) {
                             for (int i = 0; i < ci.expectedResults; i++) {
                                 setLuaValue(pStack, tStack, oStack, callerFunc + i, (i < nReturns) ? retVals[i] : LuaNil.NIL);
                             }
+                        } else if (ci.expectedResults < 0) {
+                            for (int i = 0; i < nReturns; i++) {
+                                setLuaValue(pStack, tStack, oStack, callerFunc + i, retVals[i]);
+                            }
+                            top = callerFunc + nReturns;
                         }
                     } else {
                         return retVals;
@@ -626,8 +678,16 @@ public final class BytecodeVM {
                 case OpCode.OP_CLOSURE -> executeClosure(state, proto, closure, upvals, pStack, tStack, oStack, base, a, inst);
                 case OpCode.OP_VARARG -> {
                     int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-                    for (int i = 0; i < c - 1; i++) {
-                        setLuaValue(pStack, tStack, oStack, base + a + i, LuaNil.NIL);
+                    int vLen = varargs != null ? varargs.length : 0;
+                    if (c > 1) {
+                        for (int i = 0; i < c - 1; i++) {
+                            setLuaValue(pStack, tStack, oStack, base + a + i, i < vLen ? varargs[i] : LuaNil.NIL);
+                        }
+                    } else if (c == 0) {
+                        for (int i = 0; i < vLen; i++) {
+                            setLuaValue(pStack, tStack, oStack, base + a + i, varargs[i]);
+                        }
+                        top = base + a + vLen;
                     }
                 }
                 case OpCode.OP_VARARGPREP -> {
@@ -660,26 +720,26 @@ public final class BytecodeVM {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-        int offset = c;
-        if (flagK == 1 || c == 0) {
+        int last = c;
+        if (flagK == 1) {
             if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_EXTRAARG) {
                 int extraInst = code[pc++];
-                offset = (extraInst >>> Instruction.POS_Ax) & Instruction.MASK_Ax;
+                int ax = (extraInst >>> Instruction.POS_Ax) & Instruction.MASK_Ax;
+                last += ax * (Instruction.MASK_C + 1);
             }
         }
         int n = b > 0 ? b : (top - (base + a) - 1);
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + a);
-        int startIndex = (offset - 1) * 50;
-        if (startIndex < 0) startIndex = 0;
+        int regBase = base + a;
         if (tbl instanceof LuaTable lt) {
             for (int i = 1; i <= n; i++) {
-                LuaValue val = getLuaValue(pStack, tStack, oStack, base + a + i);
-                lt.rawset(LuaInteger.valueOf(startIndex + i), val);
+                LuaValue val = getLuaValue(pStack, tStack, oStack, regBase + i);
+                lt.rawset(LuaInteger.valueOf(last + i), val);
             }
         } else {
             for (int i = 1; i <= n; i++) {
-                LuaValue val = getLuaValue(pStack, tStack, oStack, base + a + i);
-                tbl.set(LuaInteger.valueOf(startIndex + i), val);
+                LuaValue val = getLuaValue(pStack, tStack, oStack, regBase + i);
+                tbl.set(LuaInteger.valueOf(last + i), val);
             }
         }
         return pc;

@@ -8,6 +8,7 @@ public final class CallInfo {
     public int savedPc;
     public int expectedResults;
     public boolean isTailCall;
+    public org.luava.runtime.LuaValue[] varargs;
 
     public CallInfo() {}
 
@@ -19,6 +20,7 @@ public final class CallInfo {
         this.savedPc = savedPc;
         this.expectedResults = expectedResults;
         this.isTailCall = false;
+        this.varargs = null;
     }
 
     public void clear() {
@@ -29,5 +31,6 @@ public final class CallInfo {
         this.savedPc = 0;
         this.expectedResults = 0;
         this.isTailCall = false;
+        this.varargs = null;
     }
 }

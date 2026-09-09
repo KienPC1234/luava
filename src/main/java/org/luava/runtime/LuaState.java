@@ -368,4 +368,57 @@ public final class LuaState {
             uv.close();
         }
     }
+
+    public static final class TbcEntry {
+        public final int stackIndex;
+        public final LuaValue value;
+        public final String varName;
+        public TbcEntry next;
+
+        public TbcEntry(int stackIndex, LuaValue value, String varName, TbcEntry next) {
+            this.stackIndex = stackIndex;
+            this.value = value;
+            this.varName = varName;
+            this.next = next;
+        }
+    }
+
+    private TbcEntry tbcHead = null;
+
+    public void pushTbc(int stackIndex, LuaValue val, String varName) {
+        if (val == null || val.isNil() || val.equals(LuaBoolean.FALSE)) {
+            return;
+        }
+        LuaTable mt = val.getMetatable();
+        if (mt == null || mt.rawget(LuaString.valueOf("__close")).isNil()) {
+            throw new LuaException("variable '" + (varName != null ? varName : "?") + "' got a non-closable value");
+        }
+        tbcHead = new TbcEntry(stackIndex, val, varName, tbcHead);
+    }
+
+    public void closeTbc(int fromIndex, LuaValue errorObj) {
+        Throwable lastError = null;
+        while (tbcHead != null && tbcHead.stackIndex >= fromIndex) {
+            TbcEntry entry = tbcHead;
+            tbcHead = entry.next;
+            LuaValue val = entry.value;
+            LuaTable mt = val.getMetatable();
+            LuaValue closeMth = mt != null ? mt.rawget(LuaString.valueOf("__close")) : LuaNil.NIL;
+            try {
+                if (!closeMth.isNil()) {
+                    closeMth.call(val, errorObj != null ? errorObj : LuaNil.NIL);
+                }
+            } catch (LuaException le) {
+                lastError = le;
+                errorObj = le.getErrorObject();
+            } catch (Throwable t) {
+                lastError = t;
+                errorObj = LuaString.valueOf(t.getMessage() != null ? t.getMessage() : t.toString());
+            }
+        }
+        if (lastError != null) {
+            if (lastError instanceof RuntimeException re) throw re;
+            throw new LuaException(lastError.getMessage());
+        }
+    }
 }
