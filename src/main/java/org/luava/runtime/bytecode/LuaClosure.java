@@ -44,7 +44,9 @@ public final class LuaClosure extends LuaFunction {
             state = new LuaState();
         }
         LuaValue[] res = BytecodeVM.execute(state, this, args);
-        return (res != null && res.length > 0) ? res[0] : LuaNil.NIL;
+        if (res == null || res.length == 0) return LuaNil.NIL;
+        if (res.length == 1) return res[0];
+        return org.luava.runtime.Varargs.of(res);
     }
 
     @Override

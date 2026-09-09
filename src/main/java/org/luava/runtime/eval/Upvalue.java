@@ -12,6 +12,7 @@ public final class Upvalue {
     // Bytecode VM execution binding
     private LuaValue[] stack;
     private LuaState state;
+    private org.luava.runtime.concurrency.LuaCoroutine thread;
     private int stackIndex = -1;
     private boolean isOpenOnStack = false;
 
@@ -37,8 +38,13 @@ public final class Upvalue {
     }
 
     public Upvalue(String name, LuaState state, int stackIndex) {
-        this.name = name != null ? name : "?";
+        this(name, state != null ? state.getCurrentThread() : null, stackIndex);
         this.state = state;
+    }
+
+    public Upvalue(String name, org.luava.runtime.concurrency.LuaCoroutine thread, int stackIndex) {
+        this.name = name != null ? name : "?";
+        this.thread = thread;
         this.stackIndex = stackIndex;
         this.isOpenOnStack = true;
     }
@@ -82,7 +88,14 @@ public final class Upvalue {
     }
 
     public void close() {
-        if (isOpenOnStack && state != null && stackIndex >= 0) {
+        if (isOpenOnStack && thread != null && stackIndex >= 0) {
+            this.typeTag = thread.getTypeStack()[stackIndex];
+            this.rawValue = thread.getPrimitiveStack()[stackIndex];
+            this.objectValue = thread.getObjectStack()[stackIndex];
+            this.thread = null;
+            this.state = null;
+            this.isOpenOnStack = false;
+        } else if (isOpenOnStack && state != null && stackIndex >= 0) {
             this.typeTag = state.getTypeStack()[stackIndex];
             this.rawValue = state.getPrimitiveStack()[stackIndex];
             this.objectValue = state.getObjectStack()[stackIndex];
@@ -99,6 +112,9 @@ public final class Upvalue {
     }
 
     public LuaValue getValue() {
+        if (isOpenOnStack && thread != null && stackIndex >= 0) {
+            return BytecodeVM.getLuaValue(thread.getPrimitiveStack(), thread.getTypeStack(), thread.getObjectStack(), stackIndex);
+        }
         if (isOpenOnStack && state != null && stackIndex >= 0) {
             return state.getStackValue(stackIndex);
         }
@@ -117,6 +133,10 @@ public final class Upvalue {
 
     public void setValue(LuaValue val) {
         LuaValue v = val != null ? val : LuaNil.NIL;
+        if (isOpenOnStack && thread != null && stackIndex >= 0) {
+            BytecodeVM.setLuaValue(thread.getPrimitiveStack(), thread.getTypeStack(), thread.getObjectStack(), stackIndex, v);
+            return;
+        }
         if (isOpenOnStack && state != null && stackIndex >= 0) {
             state.setStackValue(stackIndex, v);
             return;
