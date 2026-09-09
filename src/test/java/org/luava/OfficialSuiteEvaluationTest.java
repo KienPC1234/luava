@@ -1,0 +1,100 @@
+package org.luava;
+
+import org.junit.jupiter.api.Test;
+import org.luava.runtime.LuaException;
+import org.luava.runtime.LuaFunction;
+import org.luava.runtime.LuaState;
+import org.luava.runtime.LuaValue;
+import org.luava.runtime.concurrency.LuaCoroutine;
+
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+public class OfficialSuiteEvaluationTest {
+
+    @Test
+    void evaluateOfficialLua549Tests() {
+        String suiteProp = System.getProperty("suite");
+        final String targetSuite = (suiteProp != null && !suiteProp.isEmpty() && !suiteProp.equals("${suite}")) ? suiteProp : null;
+        File dir = new File("tests/lua-5.4.9-tests");
+        File[] files = dir.listFiles((d, name) -> name.endsWith(".lua") && (targetSuite != null ? name.equals(targetSuite) : !name.equals("heavy.lua") && !name.equals("all.lua")));
+        if (files == null) return;
+        Arrays.sort(files, (a, b) -> a.getName().compareTo(b.getName()));
+
+        Map<String, String> results = new LinkedHashMap<>();
+        java.util.concurrent.ExecutorService testExecutor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            for (File f : files) {
+                String name = f.getName();
+                java.util.concurrent.Future<String> future = testExecutor.submit(() -> {
+                    LuaState state = null;
+                    try {
+                        org.luava.runtime.eval.GCManager.reset();
+                        String content = Files.readString(f.toPath(), java.nio.charset.StandardCharsets.ISO_8859_1);
+                        state = new LuaState();
+                        if ("big.lua".equals(name)) {
+                            LuaFunction fn = state.compile(content, "@" + name, state.getGlobals());
+                            LuaCoroutine co = new LuaCoroutine(fn);
+                            while (co.getStatus() != LuaCoroutine.Status.DEAD) {
+                                LuaValue[] res = co.resume();
+                                if (res.length > 0 && !res[0].toBoolean()) {
+                                    throw new LuaException(res.length > 1 ? res[1].toLuaString() : "error in coroutine");
+                                }
+                            }
+                        } else {
+                            state.eval(content, "@" + name);
+                        }
+                        return "PASSED";
+                    } catch (Throwable t) {
+                        System.out.println("CAUGHT ERROR IN TEST " + name + ":");
+                        t.printStackTrace(System.out);
+                        if (t instanceof LuaException le) {
+                            le.printLuaStackTrace();
+                        }
+                        String msg = t.getClass().getSimpleName() + ": " + (t.getMessage() != null ? t.getMessage() : "null");
+                        return msg.split("\n")[0];
+                    } finally {
+                        state = null;
+                    }
+                });
+
+                int timeoutSec = (name.equals("calls.lua") || name.equals("verybig.lua") || name.equals("constructs.lua") || name.equals("gc.lua") || name.equals("db.lua") || name.equals("cstack.lua")) ? 60 : 25;
+                try {
+                    String outcome = future.get(timeoutSec, java.util.concurrent.TimeUnit.SECONDS);
+                    results.put(name, outcome);
+                } catch (java.util.concurrent.TimeoutException te) {
+                    future.cancel(true);
+                    results.put(name, "TIMEOUT (>" + timeoutSec + "s)");
+                    System.out.println("TEST " + name + " TIMED OUT (>" + timeoutSec + "s)");
+                } catch (Throwable t) {
+                    results.put(name, "ERROR: " + t.getMessage());
+                } finally {
+                    System.gc();
+                }
+            }
+        } finally {
+            testExecutor.shutdownNow();
+            try {
+                testExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            org.luava.runtime.eval.GCManager.reset();
+        }
+
+        System.out.println("\n=== LUA 5.4.9 OFFICIAL TEST SUITE PROGRESS ===");
+        int passed = 0;
+        int failed = 0;
+        for (var entry : results.entrySet()) {
+            boolean ok = "PASSED".equals(entry.getValue());
+            if (ok) passed++; else failed++;
+            System.out.printf("%-20s | %s\n", entry.getKey(), entry.getValue());
+        }
+        System.out.printf("\nTOTAL: %d, PASSED: %d, FAILED: %d\n\n", results.size(), passed, failed);
+    }
+
+}

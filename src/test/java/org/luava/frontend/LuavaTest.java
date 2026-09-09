@@ -236,6 +236,7 @@ public class LuavaTest {
         assertTrue(res.toBoolean());
     }
 
+
     public interface Calculator {
         long add(long a, long b);
         String greet(String name);

@@ -57,5 +57,6 @@ public enum TokenType {
     LBRACE,      // {
     RBRACE,      // }
 
+    INVALID,
     EOF
 }

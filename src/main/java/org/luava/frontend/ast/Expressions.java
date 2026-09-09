@@ -14,7 +14,11 @@ public final class Expressions {
 
     public record FloatLiteral(double value, int line, int column) implements Expression {}
 
-    public record StringLiteral(String value, int line, int column) implements Expression {}
+    public record StringLiteral(String value, int line, int column, org.luava.runtime.LuaString luaString) implements Expression {
+        public StringLiteral(String value, int line, int column) {
+            this(value, line, column, org.luava.runtime.LuaString.valueOf(value));
+        }
+    }
 
     public record VarargLiteral(int line, int column) implements Expression {}
 
@@ -62,6 +66,17 @@ public final class Expressions {
         List<String> parameters,
         boolean isVararg,
         Statements.BlockStmt body,
+        int line,
+        int column,
+        int endLine
+    ) implements Expression {
+        public FunctionDefExpr(List<String> parameters, boolean isVararg, Statements.BlockStmt body, int line, int column) {
+            this(parameters, isVararg, body, line, column, line);
+        }
+    }
+
+    public record ParenExpr(
+        Expression expression,
         int line,
         int column
     ) implements Expression {}

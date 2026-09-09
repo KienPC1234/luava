@@ -2,7 +2,7 @@ package org.luava.runtime;
 
 public final class LuaInteger extends LuaValue {
     private static final int CACHE_LOW = -128;
-    private static final int CACHE_HIGH = 127;
+    private static final int CACHE_HIGH = 2048;
     private static final LuaInteger[] CACHE = new LuaInteger[CACHE_HIGH - CACHE_LOW + 1];
 
     static {
@@ -50,13 +50,43 @@ public final class LuaInteger extends LuaValue {
     }
 
     @Override
+    public LuaValue add(LuaValue other) {
+        if (other instanceof LuaInteger i) {
+            return LuaInteger.valueOf(this.value + i.value);
+        }
+        if (other instanceof LuaFloat f) {
+            return LuaFloat.valueOf((double) this.value + f.toDouble());
+        }
+        return super.add(other);
+    }
+
+    @Override
+    public LuaValue sub(LuaValue other) {
+        if (other instanceof LuaInteger i) {
+            return LuaInteger.valueOf(this.value - i.value);
+        }
+        if (other instanceof LuaFloat f) {
+            return LuaFloat.valueOf((double) this.value - f.toDouble());
+        }
+        return super.sub(other);
+    }
+
+    @Override
+    public LuaValue mul(LuaValue other) {
+        if (other instanceof LuaInteger i) {
+            return LuaInteger.valueOf(this.value * i.value);
+        }
+        if (other instanceof LuaFloat f) {
+            return LuaFloat.valueOf((double) this.value * f.toDouble());
+        }
+        return super.mul(other);
+    }
+
+    @Override
     public boolean equals(Object obj) {
         if (this == obj) return true;
         if (obj instanceof LuaInteger other) {
             return this.value == other.value;
-        }
-        if (obj instanceof LuaFloat other) {
-            return (double) this.value == other.toDouble();
         }
         return false;
     }
