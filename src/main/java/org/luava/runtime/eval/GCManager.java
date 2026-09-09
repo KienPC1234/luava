@@ -332,12 +332,12 @@ public final class GCManager {
             if (cur.getGlobals() != null) {
                 worklist.add(cur.getGlobals());
             }
-            for (Environment.VariableSlot slot : cur.getSlots()) {
+            cur.forEachSlot(slot -> {
                 LuaValue v = slot.get();
                 if (isTracked(v)) {
                     worklist.add(v);
                 }
-            }
+            });
             cur = cur.getParent();
         }
     }

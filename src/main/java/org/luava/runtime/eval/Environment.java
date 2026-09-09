@@ -53,8 +53,11 @@ public final class Environment {
     }
 
     private final Environment parent;
-    private final Map<String, VariableSlot> locals = new HashMap<>();
-    private final List<NamedSlot> orderedLocals = new ArrayList<>();
+    private String name0, name1, name2, name3;
+    private VariableSlot slot0, slot1, slot2, slot3;
+    private int localCount = 0;
+    private Map<String, VariableSlot> overflowLocals = null;
+    private List<NamedSlot> overflowOrderedLocals = null;
     private LuaValue[] varargsArray = null;
     private List<VariableSlot> toCloseSlots = null;
     private LuaTable globals;
@@ -80,7 +83,16 @@ public final class Environment {
         }
         List<NamedSlot> result = new ArrayList<>();
         for (int i = chain.size() - 1; i >= 0; i--) {
-            result.addAll(chain.get(i).orderedLocals);
+            Environment env = chain.get(i);
+            if (env.localCount > 0) {
+                if (!"...".equals(env.name0)) result.add(new NamedSlot(env.name0, env.slot0));
+                if (env.localCount > 1 && !"...".equals(env.name1)) result.add(new NamedSlot(env.name1, env.slot1));
+                if (env.localCount > 2 && !"...".equals(env.name2)) result.add(new NamedSlot(env.name2, env.slot2));
+                if (env.localCount > 3 && !"...".equals(env.name3)) result.add(new NamedSlot(env.name3, env.slot3));
+            }
+            if (env.overflowOrderedLocals != null) {
+                result.addAll(env.overflowOrderedLocals);
+            }
         }
         return result;
     }
@@ -108,7 +120,7 @@ public final class Environment {
     }
 
     public boolean hasAnyLocalSlot() {
-        if (!locals.isEmpty()) return true;
+        if (localCount > 0) return true;
         if (parent != null) return parent.hasAnyLocalSlot();
         return false;
     }
@@ -135,10 +147,7 @@ public final class Environment {
             }
         }
         VariableSlot slot = new VariableSlot(value, isClose, isConst);
-        locals.put(name, slot);
-        if (!"...".equals(name)) {
-            orderedLocals.add(new NamedSlot(name, slot));
-        }
+        defineSlot(name, slot);
         if (isClose) {
             if (toCloseSlots == null) {
                 toCloseSlots = new ArrayList<>(2);
@@ -186,18 +195,76 @@ public final class Environment {
         return parent;
     }
 
+    public void forEachSlot(java.util.function.Consumer<VariableSlot> action) {
+        if (localCount > 0) {
+            action.accept(slot0);
+            if (localCount > 1) {
+                action.accept(slot1);
+                if (localCount > 2) {
+                    action.accept(slot2);
+                    if (localCount > 3) {
+                        action.accept(slot3);
+                    }
+                }
+            }
+        }
+        if (overflowLocals != null) {
+            overflowLocals.values().forEach(action);
+        }
+    }
+
     public java.util.Collection<VariableSlot> getSlots() {
-        return locals.values();
+        if (overflowLocals != null) {
+            List<VariableSlot> list = new ArrayList<>(localCount + overflowLocals.size());
+            if (localCount > 0) list.add(slot0);
+            if (localCount > 1) list.add(slot1);
+            if (localCount > 2) list.add(slot2);
+            if (localCount > 3) list.add(slot3);
+            list.addAll(overflowLocals.values());
+            return list;
+        }
+        if (localCount == 0) return java.util.Collections.emptyList();
+        VariableSlot[] arr = new VariableSlot[localCount];
+        if (localCount > 0) arr[0] = slot0;
+        if (localCount > 1) arr[1] = slot1;
+        if (localCount > 2) arr[2] = slot2;
+        if (localCount > 3) arr[3] = slot3;
+        return java.util.Arrays.asList(arr);
     }
 
     public void defineSlot(String name, VariableSlot slot) {
-        locals.put(name, slot);
+        if (localCount < 4) {
+            if (localCount == 0) {
+                name0 = name; slot0 = slot; localCount = 1;
+            } else if (localCount == 1) {
+                name1 = name; slot1 = slot; localCount = 2;
+            } else if (localCount == 2) {
+                name2 = name; slot2 = slot; localCount = 3;
+            } else {
+                name3 = name; slot3 = slot; localCount = 4;
+            }
+        } else {
+            if (overflowLocals == null) {
+                overflowLocals = new HashMap<>(4);
+                overflowOrderedLocals = new ArrayList<>(4);
+            }
+            overflowLocals.put(name, slot);
+            if (!"...".equals(name)) {
+                overflowOrderedLocals.add(new NamedSlot(name, slot));
+            }
+        }
     }
 
     public VariableSlot findSlot(String name) {
-        VariableSlot slot = locals.get(name);
-        if (slot != null) {
-            return slot;
+        if (overflowLocals != null) {
+            VariableSlot s = overflowLocals.get(name);
+            if (s != null) return s;
+        }
+        if (localCount > 0) {
+            if (localCount == 4 && name.equals(name3)) return slot3;
+            if (localCount >= 3 && name.equals(name2)) return slot2;
+            if (localCount >= 2 && name.equals(name1)) return slot1;
+            if (localCount >= 1 && name.equals(name0)) return slot0;
         }
         if (parent != null) {
             return parent.findSlot(name);
@@ -205,19 +272,30 @@ public final class Environment {
         return null;
     }
 
+    public boolean hasLocal(String name) {
+        if (overflowLocals != null && overflowLocals.containsKey(name)) return true;
+        if (localCount > 0) {
+            if (name.equals(name0)) return true;
+            if (localCount > 1 && name.equals(name1)) return true;
+            if (localCount > 2 && name.equals(name2)) return true;
+            if (localCount > 3 && name.equals(name3)) return true;
+        }
+        return false;
+    }
+
     public boolean isUpvalue(String name) {
         // If defined in the current function scope (before hitting any function boundary), it's a local.
         // If defined in an outer function scope (across a function boundary), it's an upvalue.
         Environment cur = this;
         while (cur != null) {
-            if (cur.locals.containsKey(name)) {
+            if (cur.hasLocal(name)) {
                 return false;
             }
             if (cur.isFunctionBoundary) {
                 // If it wasn't found in current function, search outer scopes
                 Environment outer = cur.parent;
                 while (outer != null) {
-                    if (outer.locals.containsKey(name)) {
+                    if (outer.hasLocal(name)) {
                         return true;
                     }
                     outer = outer.parent;

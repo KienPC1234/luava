@@ -1,6 +1,8 @@
 package org.luava.runtime;
 
 public abstract class LuaValue {
+    public static final LuaValue[] EMPTY_ARRAY = new LuaValue[0];
+
     public static LuaBoolean valueOf(boolean b) {
         return LuaBoolean.valueOf(b);
     }

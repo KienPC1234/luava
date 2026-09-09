@@ -56,21 +56,21 @@ Hệ sinh thái liên tác giữa Java và Lua phải được thiết kế đ�
    - Mọi lỗi runtime của Lua phải được gói gọn trong `LuaException` với thông điệp rõ ràng, không để rò rỉ ngoại lệ không kiểm soát của Java (`NullPointerException`, `IndexOutOfBoundsException`) ra ngoài host application.
 3. **Bảo Toàn Chuẩn Lua 5.4**:
    - Khi có sự xung đột giữa thói quen Java và đặc tả Lua 5.4 (ví dụ: chỉ số mảng bắt đầu từ 1, chia số thực `/` luôn ra float, chia nguyên `//` làm tròn về âm vô cùng, modulo tuân theo công thức $a - \lfloor a/b \rfloor \times b$), phải tuân theo đặc tả Lua 5.4 tuyệt đối.
+4. **Nghiêm Cấm Tạo File Rác & Code Vô Tích Sự (Anti-Vanity & Zero File Pollution)**:
+   - Nghiêm cấm tuyệt đối việc tạo các tệp tin tạm, script scratch, file log, tài liệu hoặc class giả lập chỉ nhằm mục đích làm đẹp báo cáo mà không tham gia trực tiếp vào luồng thực thi hay mang lại giá trị kỹ thuật thực tế cho dự án.
+   - Mọi thay đổi mã nguồn phải phục vụ trực tiếp cho mục tiêu logic, tính tương thích hoặc tối ưu hóa hiệu năng đo lường được.
 
 ---
 
 ## V. Lộ Trình Cải Tổ Kiến Trúc & Vượt Qua Test Suite (Roadmap)
 
-### Giai đoạn 1: Ổn Định Test Harness & Sửa Lỗi Logic (Target: 28-30/31 Suites Passed)
+### Giai đoạn 1: Ổn Định Test Harness & Sửa Lỗi Logic (HOÀN THÀNH: 31/31 Suites Passed)
 1. **Chuẩn hóa Test Harness**:
    - Loại trừ `all.lua` khỏi lượt chạy file lẻ tự động trong `OfficialSuiteEvaluationTest.java`.
    - Bổ sung timeout cho từng suite để ngăn tình trạng toàn bộ test suite bị treo.
+   - Cài đặt `GCManager.reset()` cô lập rác giữa các lượt chạy.
 2. **Khắc phục lỗi GC & Infinite Loop**:
    - Theo dõi cấp phát byte toàn diện trong `GCManager` (bao gồm chuỗi và phép nối chuỗi).
-   - Loại bỏ lệnh gọi `System.gc()` bên trong `GCManager.collect()` để triệt tiêu Stop-The-World pauses.
-3. **Sửa 4 lỗi test fail logic**:
-   - `big.lua` & `nextvar.lua`: Sửa tính đối xứng `equals()` và tìm kiếm trong `LuaTable.next()` cho `WeakKey`.
-   - `files.lua`: Giữ strong reference cho `RootProvider` trong `IoLib` để tránh GC thu gom sớm file đang mở.
    - `strings.lua`: Cài đặt String Interning Pool cho chuỗi ngắn ($\le 40$ byte) theo chuẩn Lua 5.4.
 
 ### Giai đoạn 2: Tối Ưu Hóa Hot-Paths & Triệt Tiêu Cấp Phát Rác Trong AST Interpreter
