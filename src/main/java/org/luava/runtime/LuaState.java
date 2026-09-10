@@ -311,6 +311,14 @@ public final class LuaState {
         return getCurrentThread().getObjectStack();
     }
 
+    public int getStackTop() {
+        return getCurrentThread().getStackTop();
+    }
+
+    public void setStackTop(int top) {
+        getCurrentThread().setStackTop(top);
+    }
+
     public void ensureStackCapacity(int needed) {
         getCurrentThread().ensureStackCapacity(needed);
     }
@@ -398,9 +406,14 @@ public final class LuaState {
             LuaTable mt = val.getMetatable();
             LuaValue closeMth = mt != null ? mt.rawget(LuaString.valueOf("__close")) : LuaNil.NIL;
             try {
-                if (!closeMth.isNil()) {
-                    closeMth.call(val, errorObj != null ? errorObj : LuaNil.NIL);
+                if (closeMth.isNil()) {
+                    throw new LuaException("attempt to call a nil value (metamethod 'close')");
                 }
+                org.luava.runtime.eval.CallStack.setNextCall("close", "metamethod", false, true);
+                closeMth.call(val, errorObj != null ? errorObj : LuaNil.NIL);
+            } catch (org.luava.runtime.eval.LuaUnwindException ue) {
+                lastError = ue;
+                errorObj = ue.getOriginalError();
             } catch (LuaException le) {
                 lastError = le;
                 errorObj = le.getErrorObject();

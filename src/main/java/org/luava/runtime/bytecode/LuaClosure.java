@@ -23,7 +23,18 @@ public final class LuaClosure extends LuaFunction {
         this.what = proto.lineDefined == 0 ? "main" : "Lua";
         this.nparams = proto.numParams;
         this.isVararg = proto.isVararg;
-        this.upvalues = Arrays.asList(this.upvals);
+        this.upvalues = new java.util.ArrayList<>(Arrays.asList(this.upvals));
+        this.rawSource = proto.rawSource;
+        this.body = proto.body;
+        if (proto.locVarInfos != null && proto.numParams > 0) {
+            this.params = new java.util.ArrayList<>(proto.numParams);
+            for (int i = 0; i < proto.numParams && i < proto.locVarInfos.length; i++) {
+                this.params.add(proto.locVarInfos[i].name());
+            }
+        }
+        if (proto.name != null) {
+            this.setName(proto.name);
+        }
     }
 
     public LuaClosure(LuaProto proto, Upvalue[] upvals, LuaTable env) {
@@ -36,6 +47,12 @@ public final class LuaClosure extends LuaFunction {
 
     public void setState(LuaState state) {
         this.state = state;
+    }
+
+    @Override
+    public void replaceUpvalue(int index, org.luava.runtime.eval.Upvalue uv) {
+        upvals[index] = uv;
+        upvalues.set(index, uv);
     }
 
     @Override

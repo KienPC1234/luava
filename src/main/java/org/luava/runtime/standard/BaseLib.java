@@ -201,7 +201,7 @@ public final class BaseLib {
             throw le;
         }));
 
-        globals.rawset(LuaString.valueOf("pcall"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.valueOf("pcall"), LuaFunction.of("pcall", args -> {
             if (args.length == 0) {
                 return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("bad argument #1 to 'pcall' (value expected)"));
             }
@@ -210,7 +210,7 @@ public final class BaseLib {
             System.arraycopy(args, 1, fnArgs, 0, fnArgs.length);
             org.luava.runtime.eval.CallStack.pushProtectedFrame(null);
             boolean pushedCFrame = false;
-            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction)) {
+            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
                 org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
                 org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
                 pushedCFrame = true;
@@ -242,7 +242,7 @@ public final class BaseLib {
             }
         }));
 
-        globals.rawset(LuaString.valueOf("xpcall"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.valueOf("xpcall"), LuaFunction.of("xpcall", args -> {
             if (args.length < 2) {
                 return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("bad arguments to 'xpcall' (value expected)"));
             }
@@ -253,7 +253,7 @@ public final class BaseLib {
 
             org.luava.runtime.eval.CallStack.pushProtectedFrame(msgh);
             boolean pushedCFrame = false;
-            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction)) {
+            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
                 org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
                 org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
                 pushedCFrame = true;

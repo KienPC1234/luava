@@ -52,6 +52,10 @@ public class LuaException extends RuntimeException {
         return errorObject;
     }
 
+    public void setErrorObject(LuaValue errorObject) {
+        this.errorObject = errorObject;
+    }
+
     public void setMessage(String message) {
         this.customMessage = message;
         this.errorObject = message != null ? LuaString.valueOf(message) : LuaNil.NIL;

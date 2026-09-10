@@ -107,14 +107,11 @@ public final class GCManager {
     public static synchronized void onAlloc(long bytes) {
         uncollectedBytes += bytes;
         if (!gcRunning) return;
-        if (uncollectedBytes > 0) {
-            uncollectedBytes = Math.max(0, uncollectedBytes - (bytes * 2));
-        }
         allocCount++;
         if (allocCount >= 100) {
             allocCount = 0;
-            if (!FINALIZERS.isEmpty() && !runningFinalizer) {
-                checkAndRunDeadFinalizers();
+            if ((!FINALIZERS.isEmpty() || !WEAK_TABLES.isEmpty()) && !runningFinalizer) {
+                collect();
             }
         }
     }
@@ -290,6 +287,15 @@ public final class GCManager {
             } else {
                 if (state.getRegistry() != null) worklist.add(state.getRegistry());
                 if (state.getGlobals() != null) worklist.add(state.getGlobals());
+                LuaValue[] oStack = state.getObjectStack();
+                if (oStack != null) {
+                    int top = state.getStackTop();
+                    int max = Math.min(top, oStack.length);
+                    for (int s = 0; s < max; s++) {
+                        LuaValue v = oStack[s];
+                        if (isTracked(v)) worklist.add(v);
+                    }
+                }
             }
         }
 

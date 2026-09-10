@@ -12,21 +12,52 @@ import java.util.*;
 public final class BytecodeCompiler {
 
     public static LuaProto compile(Statements.BlockStmt block, String source) {
-        FuncState fs = new FuncState(null, source, 0, 0, true, 0);
-        // Upvalue 0 for main chunk is _ENV
-        fs.upvalues.add(new UpvalueDesc("_ENV", true, 0));
-        fs.upvalMap.put("_ENV", 0);
+        return compile(block, source, Collections.emptyList(), true, 0, 0, null);
+    }
+
+    public static LuaProto compile(Statements.BlockStmt block, String source, List<String> params, boolean isVararg) {
+        return compile(block, source, params, isVararg, 0, 0, null);
+    }
+
+    public static LuaProto compile(Statements.BlockStmt block, String source, List<String> params, boolean isVararg, int lineDefined, int lastLineDefined) {
+        return compile(block, source, params, isVararg, lineDefined, lastLineDefined, null);
+    }
+
+    public static LuaProto compile(Statements.BlockStmt block, String source, List<String> params, boolean isVararg, int lineDefined, int lastLineDefined, List<String> upvalueNames) {
+        FuncState fs = new FuncState(null, null, source, lineDefined, lastLineDefined, isVararg, params != null ? params.size() : 0);
+        if (upvalueNames != null && !upvalueNames.isEmpty()) {
+            for (int i = 0; i < upvalueNames.size(); i++) {
+                String upName = upvalueNames.get(i);
+                fs.upvalues.add(new UpvalueDesc(upName, false, 0));
+                fs.upvalMap.put(upName, i);
+            }
+        } else {
+            // Upvalue 0 for main chunk is _ENV
+            fs.upvalues.add(new UpvalueDesc("_ENV", true, 0));
+            fs.upvalMap.put("_ENV", 0);
+        }
+
+        if (params != null) {
+            for (String p : params) {
+                int r = fs.allocReg();
+                fs.registerLocal(p, r, Statements.VariableAttribute.NONE);
+            }
+        }
 
         fs.compileBlock(block);
         fs.checkUnresolvedGotos();
         fs.emit(Instruction.encodeABC(OpCode.OP_RETURN0, 0, 0, 0), block != null ? block.endLine() : 1);
-        return fs.toProto();
+        LuaProto proto = fs.toProto();
+        proto.rawSource = org.luava.frontend.ast.AstPrinter.print(block);
+        proto.body = block;
+        return proto;
     }
 
     private static final class LocalVar {
         final String name;
         final int reg;
         final Statements.VariableAttribute attr;
+        boolean isCaptured = false;
         int startPc;
         int endPc;
 
@@ -65,19 +96,22 @@ public final class BytecodeCompiler {
     private static final class GotoDesc {
         final String name;
         final int pc;
-        final int nactvar;
+        int nactvar;
         final int line;
+        final List<LocalVar> localsSnapshot;
 
-        GotoDesc(String name, int pc, int nactvar, int line) {
+        GotoDesc(String name, int pc, int nactvar, int line, List<LocalVar> localsSnapshot) {
             this.name = name;
             this.pc = pc;
             this.nactvar = nactvar;
             this.line = line;
+            this.localsSnapshot = localsSnapshot;
         }
     }
 
     private static final class FuncState {
         final FuncState parent;
+        final String name;
         final String source;
         final int lineDefined;
         final int lastLineDefined;
@@ -93,14 +127,33 @@ public final class BytecodeCompiler {
         final Map<String, Integer> upvalMap = new HashMap<>();
 
         final List<LocalVar> locals = new ArrayList<>();
+        final List<LuaProto.LocVarInfo> allLocVars = new ArrayList<>();
         final Deque<LoopInfo> loopStack = new ArrayDeque<>();
         final List<LabelDesc> labelList = new ArrayList<>();
         final List<GotoDesc> pendingGotos = new ArrayList<>();
         int freereg = 0;
         int maxstacksize = 2;
+        boolean hasTbc = false;
 
-        FuncState(FuncState parent, String source, int lineDefined, int lastLineDefined, boolean isVararg, int numParams) {
+        void emitLoadK(int targetReg, int kIdx, int line) {
+            if (kIdx <= Instruction.MASK_Bx) {
+                emit(Instruction.encodeABx(OpCode.OP_LOADK, targetReg, kIdx), line);
+            } else {
+                emit(Instruction.encodeABC(OpCode.OP_LOADKX, targetReg, 0, 0), line);
+                emit(Instruction.encodeAx(OpCode.OP_EXTRAARG, kIdx), line);
+            }
+        }
+
+        LocalVar registerLocal(String name, int reg, Statements.VariableAttribute attr) {
+            LocalVar lv = new LocalVar(name, reg, attr);
+            locals.add(lv);
+            allLocVars.add(new LuaProto.LocVarInfo(name, reg, code.size(), -1));
+            return lv;
+        }
+
+        FuncState(FuncState parent, String name, String source, int lineDefined, int lastLineDefined, boolean isVararg, int numParams) {
             this.parent = parent;
+            this.name = name;
             this.source = source != null ? source : "=?";
             this.lineDefined = lineDefined;
             this.lastLineDefined = lastLineDefined;
@@ -179,11 +232,18 @@ public final class BytecodeCompiler {
                 return idx;
             }
             if (parent == null) {
+                if ("_ENV".equals(name)) {
+                    int newIdx = upvalues.size();
+                    upvalues.add(new UpvalueDesc(name, true, 0));
+                    upvalMap.put(name, newIdx);
+                    return newIdx;
+                }
                 return -1;
             }
             // Check if it's local in parent
             LocalVar parentLocal = parent.findLocal(name);
             if (parentLocal != null) {
+                parentLocal.isCaptured = true;
                 int newIdx = upvalues.size();
                 upvalues.add(new UpvalueDesc(name, true, parentLocal.reg));
                 upvalMap.put(name, newIdx);
@@ -204,28 +264,62 @@ public final class BytecodeCompiler {
             if (block == null) return;
             int baseLocals = locals.size();
             int baseFreereg = freereg;
+            int firstLabel = labelList.size();
+            int firstGoto = pendingGotos.size();
 
-            for (Statement stmt : block.statements()) {
-                compileStatement(stmt);
+            List<Statement> stmts = block.statements();
+            for (int i = 0; i < stmts.size(); i++) {
+                Statement stmt = stmts.get(i);
+                if (stmt instanceof Statements.LabelStmt ls) {
+                    boolean isLast = true;
+                    for (int j = i + 1; j < stmts.size(); j++) {
+                        Statement next = stmts.get(j);
+                        if (!(next instanceof Statements.LabelStmt)) {
+                            isLast = false;
+                            break;
+                        }
+                    }
+                    compileLabel(ls, isLast, baseLocals);
+                } else {
+                    compileStatement(stmt);
+                }
             }
 
             closeLocalsTo(baseLocals, block.endLine());
             freeRegs(baseFreereg);
+
+            for (int i = firstGoto; i < pendingGotos.size(); i++) {
+                GotoDesc gt = pendingGotos.get(i);
+                if (gt.nactvar > baseLocals) {
+                    gt.nactvar = baseLocals;
+                }
+            }
+
+            while (labelList.size() > firstLabel) {
+                labelList.remove(labelList.size() - 1);
+            }
         }
 
         void closeLocalsTo(int baseLocals, int line) {
-            boolean hasClose = false;
+            emitCloseLocalsTo(baseLocals, line);
+            while (locals.size() > baseLocals) {
+                locals.remove(locals.size() - 1);
+            }
+        }
+
+        void emitCloseLocalsTo(int baseLocals, int line) {
+            boolean needClose = false;
             int firstReg = Integer.MAX_VALUE;
             for (int i = locals.size() - 1; i >= baseLocals; i--) {
-                LocalVar v = locals.remove(i);
-                if (v.attr == Statements.VariableAttribute.CLOSE) {
-                    hasClose = true;
-                }
-                if (v.reg < firstReg) {
-                    firstReg = v.reg;
+                LocalVar v = locals.get(i);
+                if (v.isCaptured || v.attr == Statements.VariableAttribute.CLOSE) {
+                    needClose = true;
+                    if (v.reg < firstReg) {
+                        firstReg = v.reg;
+                    }
                 }
             }
-            if (hasClose && firstReg != Integer.MAX_VALUE) {
+            if (needClose && firstReg != Integer.MAX_VALUE) {
                 emit(Instruction.encodeABC(OpCode.OP_CLOSE, firstReg, 0, 0), line);
             }
         }
@@ -276,7 +370,8 @@ public final class BytecodeCompiler {
             for (int i = 0; i < nvars; i++) {
                 if (i < numFixedVals) {
                     varRegs[i] = allocReg();
-                    compileExprToReg(lvd.initializers().get(i), varRegs[i]);
+                    String inferredName = lvd.bindings().get(i).name();
+                    compileExprToReg(lvd.initializers().get(i), varRegs[i], inferredName);
                 } else if (i == numFixedVals && lastIsCall) {
                     int neededResults = nvars - numFixedVals;
                     for (int j = 0; j < neededResults; j++) {
@@ -290,7 +385,7 @@ public final class BytecodeCompiler {
                     for (int j = 0; j < neededResults; j++) {
                         varRegs[i + j] = allocReg();
                     }
-                    emit(Instruction.encodeABC(OpCode.OP_VARARG, varRegs[i], neededResults + 1, 0), lvd.line());
+                    emit(Instruction.encodeABC(OpCode.OP_VARARG, varRegs[i], 0, neededResults + 1), lvd.line());
                     i += (neededResults - 1);
                 } else {
                     varRegs[i] = allocReg();
@@ -300,10 +395,10 @@ public final class BytecodeCompiler {
 
             for (int i = 0; i < nvars; i++) {
                 Statements.LocalVarBinding b = lvd.bindings().get(i);
-                LocalVar lv = new LocalVar(b.name(), varRegs[i], b.attribute());
-                locals.add(lv);
+                registerLocal(b.name(), varRegs[i], b.attribute());
                 if (b.attribute() == Statements.VariableAttribute.CLOSE) {
                     emit(Instruction.encodeABC(OpCode.OP_TBC, varRegs[i], 0, 0), lvd.line());
+                    hasTbc = true;
                 }
             }
         }
@@ -318,10 +413,28 @@ public final class BytecodeCompiler {
             boolean lastIsVararg = nvals > 0 && as.values().get(nvals - 1) instanceof Expressions.VarargLiteral;
             int numFixedVals = (lastIsCall || lastIsVararg) ? nvals - 1 : nvals;
 
+            // Pre-resolve upvalue indices for assignment targets BEFORE compiling values.
+            // This mirrors C Lua's lparser.c where singlevar() is called on each LHS target
+            // first (establishing upvalue indices), then explist() compiles the RHS.
+            // Without this, `a = 10+b` would register `b` (from RHS) before `a` (LHS target).
+            for (Expression tgt : as.targets()) {
+                if (tgt instanceof Expressions.VariableExpr ve) {
+                    if (findLocal(ve.name()) == null) {
+                        findOrAddUpval(ve.name());
+                    }
+                }
+            }
+
             for (int i = 0; i < nvars; i++) {
                 if (i < numFixedVals) {
                     valRegs[i] = allocReg();
-                    compileExprToReg(as.values().get(i), valRegs[i]);
+                    String inferredName = null;
+                    if (as.targets().get(i) instanceof Expressions.VariableExpr ve) {
+                        inferredName = ve.name();
+                    } else if (as.targets().get(i) instanceof Expressions.TableAccessExpr tae && tae.key() instanceof Expressions.StringLiteral sl) {
+                        inferredName = (String) sl.value();
+                    }
+                    compileExprToReg(as.values().get(i), valRegs[i], inferredName);
                 } else if (i == numFixedVals && lastIsCall) {
                     int neededResults = nvars - numFixedVals;
                     for (int j = 0; j < neededResults; j++) {
@@ -335,7 +448,7 @@ public final class BytecodeCompiler {
                     for (int j = 0; j < neededResults; j++) {
                         valRegs[i + j] = allocReg();
                     }
-                    emit(Instruction.encodeABC(OpCode.OP_VARARG, valRegs[i], neededResults + 1, 0), as.line());
+                    emit(Instruction.encodeABC(OpCode.OP_VARARG, valRegs[i], 0, neededResults + 1), as.line());
                     i += (neededResults - 1);
                 } else {
                     valRegs[i] = allocReg();
@@ -343,8 +456,28 @@ public final class BytecodeCompiler {
                 }
             }
 
+            int[] tblRegs = new int[nvars];
+            int[] keyRegs = new int[nvars];
             for (int i = 0; i < nvars; i++) {
-                assignTarget(as.targets().get(i), valRegs[i], as.line());
+                if (as.targets().get(i) instanceof Expressions.TableAccessExpr tae) {
+                    int tr = allocReg();
+                    compileExprToReg(tae.table(), tr);
+                    tblRegs[i] = tr;
+                    int kr = allocReg();
+                    compileExprToReg(tae.key(), kr);
+                    keyRegs[i] = kr;
+                } else {
+                    tblRegs[i] = -1;
+                    keyRegs[i] = -1;
+                }
+            }
+
+            for (int i = 0; i < nvars; i++) {
+                if (tblRegs[i] >= 0) {
+                    emit(Instruction.encodeABC(OpCode.OP_SETTABLE, tblRegs[i], keyRegs[i], valRegs[i], 0), as.line());
+                } else {
+                    assignTarget(as.targets().get(i), valRegs[i], as.line());
+                }
             }
 
             freeRegs(saveFreereg);
@@ -363,15 +496,29 @@ public final class BytecodeCompiler {
                     return;
                 }
                 // Assign to global via _ENV
-                int envUp = findOrAddUpval("_ENV");
+                LocalVar envLocal = findLocal("_ENV");
                 int kKey = addConst(LuaString.valueOf(ve.name()));
+                if (envLocal != null) {
+                    if (kKey <= 255) {
+                        emit(Instruction.encodeABC(OpCode.OP_SETFIELD, envLocal.reg, kKey, valReg, 0), line);
+                    } else {
+                        int kReg = allocReg();
+                        emitLoadK(kReg, kKey, line);
+                        emit(Instruction.encodeABC(OpCode.OP_SETTABLE, envLocal.reg, kReg, valReg, 0), line);
+                        freeRegs(kReg);
+                    }
+                    return;
+                }
+                int envUp = findOrAddUpval("_ENV");
                 if (kKey <= 255) {
                     emit(Instruction.encodeABC(OpCode.OP_SETTABUP, envUp, kKey, valReg, 0), line);
                 } else {
+                    int tmpReg = allocReg();
+                    emit(Instruction.encodeABC(OpCode.OP_GETUPVAL, tmpReg, envUp, 0), line);
                     int kReg = allocReg();
-                    emit(Instruction.encodeABx(OpCode.OP_LOADK, kReg, kKey), line);
-                    emit(Instruction.encodeABC(OpCode.OP_SETTABLE, envUp, kReg, valReg, 0), line);
-                    freeRegs(kReg);
+                    emitLoadK(kReg, kKey, line);
+                    emit(Instruction.encodeABC(OpCode.OP_SETTABLE, tmpReg, kReg, valReg, 0), line);
+                    freeRegs(tmpReg);
                 }
             } else if (target instanceof Expressions.TableAccessExpr tae) {
                 int tblReg = compileExprToAnyReg(tae.table());
@@ -424,15 +571,44 @@ public final class BytecodeCompiler {
 
         void compileRepeat(Statements.RepeatStmt rs) {
             int loopStart = code.size();
-            LoopInfo loop = new LoopInfo(loopStart, locals.size());
+            int baseLocals = locals.size();
+            int baseFreereg = freereg;
+            LoopInfo loop = new LoopInfo(loopStart, baseLocals);
             loopStack.push(loop);
 
-            compileBlock(rs.body());
+            for (Statement stmt : rs.body().statements()) {
+                compileStatement(stmt);
+            }
 
             int condReg = compileExprToAnyReg(rs.condition());
-            emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), rs.line());
-            int repeatJmp = emitJmp(rs.line());
-            patchJmp(repeatJmp, loopStart);
+
+            boolean hasClose = false;
+            int firstCloseReg = Integer.MAX_VALUE;
+            for (int i = baseLocals; i < locals.size(); i++) {
+                LocalVar v = locals.get(i);
+                if (v.attr == Statements.VariableAttribute.CLOSE) {
+                    hasClose = true;
+                }
+                if (v.reg < firstCloseReg) {
+                    firstCloseReg = v.reg;
+                }
+            }
+
+            if (hasClose && firstCloseReg != Integer.MAX_VALUE) {
+                emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 1, 0), rs.line());
+                int exitJmpTarget = emitJmp(rs.line());
+                emit(Instruction.encodeABC(OpCode.OP_CLOSE, firstCloseReg, 0, 0), rs.line());
+                int backJmp = emitJmp(rs.line());
+                patchJmp(backJmp, loopStart);
+                patchJmp(exitJmpTarget, code.size());
+            } else {
+                emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), rs.line());
+                int repeatJmp = emitJmp(rs.line());
+                patchJmp(repeatJmp, loopStart);
+            }
+
+            closeLocalsTo(baseLocals, rs.line());
+            freeRegs(baseFreereg);
 
             int loopEnd = code.size();
             for (int brk : loop.breakList) {
@@ -446,6 +622,7 @@ public final class BytecodeCompiler {
             int initReg = allocReg();
             int limitReg = allocReg();
             int stepReg = allocReg();
+            int varReg = allocReg();
 
             compileExprToReg(fns.start(), initReg);
             compileExprToReg(fns.limit(), limitReg);
@@ -455,13 +632,17 @@ public final class BytecodeCompiler {
                 emit(Instruction.encodesBx(OpCode.OP_LOADI, stepReg, 1), fns.line());
             }
 
+            freeRegs(varReg + 1);
+
             int prepPc = emit(Instruction.encodeABx(OpCode.OP_FORPREP, initReg, 0), fns.line());
 
-            int varReg = allocReg();
-            LocalVar loopVar = new LocalVar(fns.variableName(), varReg, Statements.VariableAttribute.NONE);
-            locals.add(loopVar);
+            int baseLocals = locals.size();
+            registerLocal("(for state)", initReg, Statements.VariableAttribute.NONE);
+            registerLocal("(for state)", limitReg, Statements.VariableAttribute.NONE);
+            registerLocal("(for state)", stepReg, Statements.VariableAttribute.NONE);
+            registerLocal(fns.variableName(), varReg, Statements.VariableAttribute.NONE);
 
-            LoopInfo loop = new LoopInfo(code.size(), locals.size());
+            LoopInfo loop = new LoopInfo(code.size(), baseLocals);
             loopStack.push(loop);
 
             compileBlock(fns.body());
@@ -476,34 +657,58 @@ public final class BytecodeCompiler {
                 patchJmp(brk, loopEnd);
             }
             loopStack.pop();
-            locals.remove(loopVar);
+            closeLocalsTo(baseLocals, fns.endLine());
             freeRegs(baseFreereg);
         }
 
         void compileForGeneric(Statements.ForGenericStmt fgs) {
             int baseFreereg = freereg;
+            int baseLocals = locals.size();
             int fReg = allocReg();
             int sReg = allocReg();
             int varReg = allocReg();
             int closeReg = allocReg();
 
             int nIter = fgs.iterators().size();
-            if (nIter > 0) compileExprToReg(fgs.iterators().get(0), fReg);
-            if (nIter > 1) compileExprToReg(fgs.iterators().get(1), sReg);
-            if (nIter > 2) compileExprToReg(fgs.iterators().get(2), varReg);
+            boolean lastIsCall = nIter > 0 && fgs.iterators().get(nIter - 1) instanceof Expressions.FunctionCallExpr;
+            boolean lastIsVararg = nIter > 0 && fgs.iterators().get(nIter - 1) instanceof Expressions.VarargLiteral;
+            int numFixedIter = (lastIsCall || lastIsVararg) ? nIter - 1 : nIter;
+
+            for (int i = 0; i < 4; i++) {
+                int reg = fReg + i;
+                if (i < numFixedIter) {
+                    compileExprToReg(fgs.iterators().get(i), reg);
+                } else if (i == numFixedIter && lastIsCall) {
+                    int neededResults = 4 - numFixedIter;
+                    compileFunctionCall((Expressions.FunctionCallExpr) fgs.iterators().get(nIter - 1), reg, neededResults);
+                    freeRegs(reg + neededResults);
+                    i += (neededResults - 1);
+                } else if (i == numFixedIter && lastIsVararg) {
+                    int neededResults = 4 - numFixedIter;
+                    emit(Instruction.encodeABC(OpCode.OP_VARARG, reg, 0, neededResults + 1), fgs.line());
+                    i += (neededResults - 1);
+                } else {
+                    emit(Instruction.encodeABC(OpCode.OP_LOADNIL, reg, 0, 0), fgs.line());
+                }
+            }
+
+            freeRegs(closeReg + 1);
 
             int prepPc = emit(Instruction.encodeABx(OpCode.OP_TFORPREP, fReg, 0), fgs.line());
 
-            List<LocalVar> varLocals = new ArrayList<>();
+            registerLocal("(for state)", fReg, Statements.VariableAttribute.NONE);
+            registerLocal("(for state)", sReg, Statements.VariableAttribute.NONE);
+            registerLocal("(for state)", varReg, Statements.VariableAttribute.NONE);
+            registerLocal("(for state)", closeReg, Statements.VariableAttribute.CLOSE);
+            hasTbc = true;
+
             for (String name : fgs.variableNames()) {
                 int r = allocReg();
-                LocalVar lv = new LocalVar(name, r, Statements.VariableAttribute.NONE);
-                locals.add(lv);
-                varLocals.add(lv);
+                registerLocal(name, r, Statements.VariableAttribute.NONE);
             }
 
             int loopStartPc = code.size();
-            LoopInfo loop = new LoopInfo(loopStartPc, locals.size());
+            LoopInfo loop = new LoopInfo(loopStartPc, baseLocals);
             loopStack.push(loop);
 
             compileBlock(fgs.body());
@@ -521,7 +726,7 @@ public final class BytecodeCompiler {
                 patchJmp(brk, loopEnd);
             }
             loopStack.pop();
-            locals.removeAll(varLocals);
+            closeLocalsTo(baseLocals, fgs.endLine());
             freeRegs(baseFreereg);
         }
 
@@ -530,10 +735,19 @@ public final class BytecodeCompiler {
         void compileBreak(Statements.BreakStmt bs) {
             if (!loopStack.isEmpty()) {
                 LoopInfo loop = loopStack.peek();
-                closeLocalsTo(loop.baseLocals, bs.line());
+                emitCloseLocalsTo(loop.baseLocals, bs.line());
                 int brkJmp = emitJmp(bs.line());
                 loop.breakList.add(brkJmp);
             }
+        }
+
+        int regLevel(int nvar) {
+            while (nvar-- > 0) {
+                if (nvar < locals.size()) {
+                    return locals.get(nvar).reg + 1;
+                }
+            }
+            return 0;
         }
 
         void compileGoto(Statements.GotoStmt gs) {
@@ -541,7 +755,7 @@ public final class BytecodeCompiler {
                 LabelDesc lb = labelList.get(i);
                 if (lb.name.equals(gs.label())) {
                     if (locals.size() > lb.nactvar) {
-                        closeLocalsTo(lb.nactvar, gs.line());
+                        emitCloseLocalsTo(lb.nactvar, gs.line());
                     }
                     int jmp = emitJmp(gs.line());
                     patchJmp(jmp, lb.pc);
@@ -549,17 +763,24 @@ public final class BytecodeCompiler {
                 }
             }
             int jmp = emitJmp(gs.line());
-            pendingGotos.add(new GotoDesc(gs.label(), jmp, locals.size(), gs.line()));
+            pendingGotos.add(new GotoDesc(gs.label(), jmp, locals.size(), gs.line(), new ArrayList<>(locals)));
         }
 
         void compileLabel(Statements.LabelStmt ls) {
+            compileLabel(ls, false, locals.size());
+        }
+
+        void compileLabel(Statements.LabelStmt ls, boolean isLast, int baseLocals) {
             for (LabelDesc existing : labelList) {
                 if (existing.name.equals(ls.name())) {
                     throw new LuaException("label '" + ls.name() + "' already defined on line " + existing.line);
                 }
             }
-            LabelDesc lb = new LabelDesc(ls.name(), code.size(), locals.size(), ls.line());
+            int labelPc = code.size();
+            int nactvar = isLast ? baseLocals : locals.size();
+            LabelDesc lb = new LabelDesc(ls.name(), labelPc, nactvar, ls.line());
             labelList.add(lb);
+            boolean needsClose = false;
             Iterator<GotoDesc> it = pendingGotos.iterator();
             while (it.hasNext()) {
                 GotoDesc gt = it.next();
@@ -569,8 +790,20 @@ public final class BytecodeCompiler {
                         throw new LuaException("<goto " + gt.name + "> at line " + gt.line + " jumps into the scope of local '" + varname + "'");
                     }
                     patchJmp(gt.pc, lb.pc);
+                    if (gt.localsSnapshot != null) {
+                        for (int i = gt.localsSnapshot.size() - 1; i >= lb.nactvar; i--) {
+                            LocalVar v = gt.localsSnapshot.get(i);
+                            if (v.isCaptured || v.attr == Statements.VariableAttribute.CLOSE) {
+                                needsClose = true;
+                                break;
+                            }
+                        }
+                    }
                     it.remove();
                 }
+            }
+            if (needsClose) {
+                emit(Instruction.encodeABC(OpCode.OP_CLOSE, regLevel(lb.nactvar), 0, 0), ls.line());
             }
         }
 
@@ -582,7 +815,13 @@ public final class BytecodeCompiler {
         }
 
         void compileFunctionDef(Statements.FunctionDefStmt fds) {
-            LuaProto childProto = compileChildFunction(fds.parameters(), fds.isVararg(), fds.body(), fds.line(), fds.endLine());
+            String fnName = null;
+            if (fds.targetName() instanceof Expressions.VariableExpr v) {
+                fnName = v.name();
+            } else if (fds.targetName() instanceof Expressions.TableAccessExpr t && t.key() instanceof Expressions.StringLiteral sl) {
+                fnName = (String) sl.value();
+            }
+            LuaProto childProto = compileChildFunction(fnName, fds.parameters(), fds.isVararg(), fds.body(), fds.line(), fds.endLine());
             int protoIdx = protos.size();
             protos.add(childProto);
 
@@ -594,26 +833,28 @@ public final class BytecodeCompiler {
 
         void compileLocalFunctionDef(Statements.LocalFunctionDefStmt lfds) {
             int r = allocReg();
-            LocalVar lv = new LocalVar(lfds.name(), r, Statements.VariableAttribute.NONE);
-            locals.add(lv);
+            registerLocal(lfds.name(), r, Statements.VariableAttribute.NONE);
 
-            LuaProto childProto = compileChildFunction(lfds.parameters(), lfds.isVararg(), lfds.body(), lfds.line(), lfds.endLine());
+            LuaProto childProto = compileChildFunction(lfds.name(), lfds.parameters(), lfds.isVararg(), lfds.body(), lfds.line(), lfds.endLine());
             int protoIdx = protos.size();
             protos.add(childProto);
 
             emit(Instruction.encodeABx(OpCode.OP_CLOSURE, r, protoIdx), lfds.line());
         }
 
-        LuaProto compileChildFunction(List<String> params, boolean isVararg, Statements.BlockStmt body, int lineDefined, int lastLineDefined) {
-            FuncState child = new FuncState(this, source, lineDefined, lastLineDefined, isVararg, params.size());
+        LuaProto compileChildFunction(String name, List<String> params, boolean isVararg, Statements.BlockStmt body, int lineDefined, int lastLineDefined) {
+            FuncState child = new FuncState(this, name, source, lineDefined, lastLineDefined, isVararg, params.size());
             for (String p : params) {
                 int r = child.allocReg();
-                child.locals.add(new LocalVar(p, r, Statements.VariableAttribute.NONE));
+                child.registerLocal(p, r, Statements.VariableAttribute.NONE);
             }
             child.compileBlock(body);
             child.checkUnresolvedGotos();
             child.emit(Instruction.encodeABC(OpCode.OP_RETURN0, 0, 0, 0), lastLineDefined);
-            return child.toProto();
+            LuaProto proto = child.toProto();
+            proto.rawSource = org.luava.frontend.ast.AstPrinter.print(body);
+            proto.body = body;
+            return proto;
         }
 
         int compileExprToAnyReg(Expression expr) {
@@ -627,6 +868,10 @@ public final class BytecodeCompiler {
         }
 
         void compileExprToReg(Expression expr, int targetReg) {
+            compileExprToReg(expr, targetReg, null);
+        }
+
+        void compileExprToReg(Expression expr, int targetReg, String inferredName) {
             if (expr instanceof Expressions.NilLiteral nl) {
                 emit(Instruction.encodeABC(OpCode.OP_LOADNIL, targetReg, 0, 0), nl.line());
             } else if (expr instanceof Expressions.BooleanLiteral bl) {
@@ -636,14 +881,14 @@ public final class BytecodeCompiler {
                     emit(Instruction.encodesBx(OpCode.OP_LOADI, targetReg, (int) il.value()), il.line());
                 } else {
                     int k = addConst(LuaInteger.valueOf(il.value()));
-                    emit(Instruction.encodeABx(OpCode.OP_LOADK, targetReg, k), il.line());
+                    emitLoadK(targetReg, k, il.line());
                 }
             } else if (expr instanceof Expressions.FloatLiteral fl) {
                 int k = addConst(LuaFloat.valueOf(fl.value()));
-                emit(Instruction.encodeABx(OpCode.OP_LOADK, targetReg, k), fl.line());
+                emitLoadK(targetReg, k, fl.line());
             } else if (expr instanceof Expressions.StringLiteral sl) {
                 int k = addConst(sl.luaString());
-                emit(Instruction.encodeABx(OpCode.OP_LOADK, targetReg, k), sl.line());
+                emitLoadK(targetReg, k, sl.line());
             } else if (expr instanceof Expressions.VariableExpr ve) {
                 LocalVar lv = findLocal(ve.name());
                 if (lv != null) {
@@ -657,16 +902,30 @@ public final class BytecodeCompiler {
                     emit(Instruction.encodeABC(OpCode.OP_GETUPVAL, targetReg, up, 0), ve.line());
                     return;
                 }
-                int envUp = findOrAddUpval("_ENV");
+                LocalVar envLocal = findLocal("_ENV");
                 int kKey = addConst(LuaString.valueOf(ve.name()));
+                if (envLocal != null) {
+                    if (kKey <= 255) {
+                        emit(Instruction.encodeABC(OpCode.OP_GETFIELD, targetReg, envLocal.reg, kKey, 0), ve.line());
+                    } else {
+                        int kReg = allocReg();
+                        emitLoadK(kReg, kKey, ve.line());
+                        emit(Instruction.encodeABC(OpCode.OP_GETTABLE, targetReg, envLocal.reg, kReg, 0), ve.line());
+                        freeRegs(kReg);
+                    }
+                    return;
+                }
+                int envUp = findOrAddUpval("_ENV");
                 if (kKey <= 255) {
                     emit(Instruction.encodeABC(OpCode.OP_GETTABUP, targetReg, envUp, kKey, 0), ve.line());
                 } else {
+                    emit(Instruction.encodeABC(OpCode.OP_GETUPVAL, targetReg, envUp, 0), ve.line());
                     int kReg = allocReg();
-                    emit(Instruction.encodeABx(OpCode.OP_LOADK, kReg, kKey), ve.line());
-                    emit(Instruction.encodeABC(OpCode.OP_GETTABLE, targetReg, envUp, kReg, 0), ve.line());
+                    emitLoadK(kReg, kKey, ve.line());
+                    emit(Instruction.encodeABC(OpCode.OP_GETTABLE, targetReg, targetReg, kReg, 0), ve.line());
                     freeRegs(kReg);
                 }
+                return;
             } else if (expr instanceof Expressions.BinaryExpr be) {
                 compileBinaryExpr(be, targetReg);
             } else if (expr instanceof Expressions.UnaryExpr ue) {
@@ -680,12 +939,12 @@ public final class BytecodeCompiler {
             } else if (expr instanceof Expressions.FunctionCallExpr fce) {
                 compileFunctionCall(fce, targetReg, 1);
             } else if (expr instanceof Expressions.FunctionDefExpr fde) {
-                LuaProto child = compileChildFunction(fde.parameters(), fde.isVararg(), fde.body(), fde.line(), fde.endLine());
+                LuaProto child = compileChildFunction(inferredName, fde.parameters(), fde.isVararg(), fde.body(), fde.line(), fde.endLine());
                 int pIdx = protos.size();
                 protos.add(child);
                 emit(Instruction.encodeABx(OpCode.OP_CLOSURE, targetReg, pIdx), fde.line());
             } else if (expr instanceof Expressions.VarargLiteral val) {
-                emit(Instruction.encodeABC(OpCode.OP_VARARG, targetReg, 2, 0), val.line());
+                emit(Instruction.encodeABC(OpCode.OP_VARARG, targetReg, 0, 2), val.line());
             } else if (expr instanceof Expressions.ParenExpr pe) {
                 compileExprToReg(pe.expression(), targetReg);
             }
@@ -714,6 +973,10 @@ public final class BytecodeCompiler {
                 if (nvals == 1 && !lastIsCall && !lastIsVararg) {
                     int r = compileExprToAnyReg(lastVal);
                     emit(Instruction.encodeABC(OpCode.OP_RETURN1, r, 0, 0), ret.line());
+                } else if (nvals == 1 && lastIsCall && !hasTbc) {
+                    int r = allocReg();
+                    compileFunctionCall((Expressions.FunctionCallExpr) lastVal, r, -1, true);
+                    emit(Instruction.encodeABC(OpCode.OP_RETURN, r, 0, 0), ret.line());
                 } else if (lastIsCall || lastIsVararg) {
                     int[] retRegs = new int[nvals];
                     for (int i = 0; i < nvals; i++) {
@@ -743,22 +1006,27 @@ public final class BytecodeCompiler {
         }
 
         void compileFunctionCall(Expressions.FunctionCallExpr fce, int funcReg, int nResults) {
+            compileFunctionCall(fce, funcReg, nResults, false);
+        }
+
+        void compileFunctionCall(Expressions.FunctionCallExpr fce, int funcReg, int nResults, boolean isTailCall) {
             int saveFreereg = freereg;
             freereg = funcReg + 1;
 
             if (fce.methodName() != null) {
                 int tblReg = compileExprToAnyReg(fce.target());
                 int kMethod = addConst(LuaString.valueOf(fce.methodName()));
-                emit(Instruction.encodeABC(OpCode.OP_SELF, funcReg, tblReg, kMethod, 0), fce.line());
+                emit(Instruction.encodeABC(OpCode.OP_SELF, funcReg, tblReg, kMethod, 1), fce.line());
             } else {
                 compileExprToReg(fce.target(), funcReg);
             }
 
             int nArgs = fce.arguments().size();
             int argStart = (fce.methodName() != null ? funcReg + 2 : funcReg + 1);
+            int callOp = isTailCall ? OpCode.OP_TAILCALL : OpCode.OP_CALL;
             if (nArgs == 0) {
                 int actualArgs = fce.methodName() != null ? 1 : 0;
-                emit(Instruction.encodeABC(OpCode.OP_CALL, funcReg, actualArgs + 1, nResults + 1), fce.line());
+                emit(Instruction.encodeABC(callOp, funcReg, actualArgs + 1, isTailCall ? 0 : nResults + 1), fce.line());
             } else {
                 Expression lastArg = fce.arguments().get(nArgs - 1);
                 boolean lastIsCall = lastArg instanceof Expressions.FunctionCallExpr;
@@ -778,25 +1046,28 @@ public final class BytecodeCompiler {
                     } else {
                         emit(Instruction.encodeABC(OpCode.OP_VARARG, lastArgReg, 0, 0), lastArg.line());
                     }
-                    emit(Instruction.encodeABC(OpCode.OP_CALL, funcReg, 0, nResults + 1), fce.line());
+                    emit(Instruction.encodeABC(callOp, funcReg, 0, isTailCall ? 0 : nResults + 1), fce.line());
                 } else {
                     int lastArgReg = argStart + (nArgs - 1);
                     freereg = lastArgReg + 1;
                     compileExprToReg(lastArg, lastArgReg);
                     int actualArgs = fce.methodName() != null ? nArgs + 1 : nArgs;
-                    emit(Instruction.encodeABC(OpCode.OP_CALL, funcReg, actualArgs + 1, nResults + 1), fce.line());
+                    emit(Instruction.encodeABC(callOp, funcReg, actualArgs + 1, isTailCall ? 0 : nResults + 1), fce.line());
                 }
             }
-            freeRegs(Math.max(saveFreereg, funcReg + Math.max(1, nResults)));
+            int targetFreereg = Math.max(saveFreereg, funcReg + (nResults == -1 ? 1 : nResults));
+            freereg = Math.max(targetFreereg, minFreereg());
         }
 
         void compileBinaryExpr(Expressions.BinaryExpr be, int targetReg) {
+            int saveFreereg = freereg;
             if (be.operator() == TokenType.AND) {
                 int regA = compileExprToAnyReg(be.left());
                 emit(Instruction.encodeABC(OpCode.OP_TESTSET, targetReg, regA, 0, 0), be.line());
                 int jmp = emitJmp(be.line());
                 compileExprToReg(be.right(), targetReg);
                 patchJmp(jmp, code.size());
+                freeRegs(Math.max(saveFreereg, targetReg + 1));
                 return;
             }
             if (be.operator() == TokenType.OR) {
@@ -805,6 +1076,7 @@ public final class BytecodeCompiler {
                 int jmp = emitJmp(be.line());
                 compileExprToReg(be.right(), targetReg);
                 patchJmp(jmp, code.size());
+                freeRegs(Math.max(saveFreereg, targetReg + 1));
                 return;
             }
             if (be.operator() == TokenType.TILDE_EQUAL) {
@@ -813,6 +1085,7 @@ public final class BytecodeCompiler {
                 emit(Instruction.encodeABC(OpCode.OP_EQ, b, c, 0, 1), be.line());
                 emit(Instruction.encodeABC(OpCode.OP_LFALSESKIP, targetReg, 0, 0), be.line());
                 emit(Instruction.encodeABC(OpCode.OP_LOADTRUE, targetReg, 0, 0), be.line());
+                freeRegs(Math.max(saveFreereg, targetReg + 1));
                 return;
             }
             if (be.operator() == TokenType.GREATER) {
@@ -821,6 +1094,7 @@ public final class BytecodeCompiler {
                 emit(Instruction.encodeABC(OpCode.OP_LT, c, b, 0, 0), be.line());
                 emit(Instruction.encodeABC(OpCode.OP_LFALSESKIP, targetReg, 0, 0), be.line());
                 emit(Instruction.encodeABC(OpCode.OP_LOADTRUE, targetReg, 0, 0), be.line());
+                freeRegs(Math.max(saveFreereg, targetReg + 1));
                 return;
             }
             if (be.operator() == TokenType.GREATER_EQUAL) {
@@ -829,6 +1103,7 @@ public final class BytecodeCompiler {
                 emit(Instruction.encodeABC(OpCode.OP_LE, c, b, 0, 0), be.line());
                 emit(Instruction.encodeABC(OpCode.OP_LFALSESKIP, targetReg, 0, 0), be.line());
                 emit(Instruction.encodeABC(OpCode.OP_LOADTRUE, targetReg, 0, 0), be.line());
+                freeRegs(Math.max(saveFreereg, targetReg + 1));
                 return;
             }
             if (be.operator() == TokenType.DOT_DOT) {
@@ -869,9 +1144,11 @@ public final class BytecodeCompiler {
             } else {
                 emit(Instruction.encodeABC(op, targetReg, b, c, 0), be.line());
             }
+            freeRegs(Math.max(saveFreereg, targetReg + 1));
         }
 
         void compileUnaryExpr(Expressions.UnaryExpr ue, int targetReg) {
+            int saveFreereg = freereg;
             int b = compileExprToAnyReg(ue.operand());
             int op = switch (ue.operator()) {
                 case MINUS -> OpCode.OP_UNM;
@@ -881,6 +1158,7 @@ public final class BytecodeCompiler {
                 default -> OpCode.OP_NOT;
             };
             emit(Instruction.encodeABC(op, targetReg, b, 0, 0), ue.line());
+            freeRegs(Math.max(saveFreereg, targetReg + 1));
         }
 
         void compileTableConstructor(Expressions.TableConstructorExpr tce, int targetReg) {
@@ -976,6 +1254,7 @@ public final class BytecodeCompiler {
             for (int i = 0; i < locals.size(); i++) locArr[i] = locals.get(i).name;
 
             return new LuaProto(
+                    name,
                     source,
                     lineDefined,
                     lastLineDefined,
@@ -987,7 +1266,8 @@ public final class BytecodeCompiler {
                     protoArr,
                     upArr,
                     lineArr,
-                    locArr
+                    locArr,
+                    allLocVars.toArray(new LuaProto.LocVarInfo[0])
             );
         }
     }

@@ -19,6 +19,10 @@ public final class CallStack {
         public int ftransfer = 0;
         public int ntransfer = 0;
         public boolean isTailCall = false;
+        public int baseIndex = -1;
+        public int pc = -1;
+        public org.luava.runtime.LuaState state;
+        public org.luava.runtime.LuaValue[] varargs;
 
         public void pushTemp(org.luava.runtime.LuaValue v) {
             temps.add(v);
@@ -34,6 +38,10 @@ public final class CallStack {
             f.lastLine = this.lastLine;
             f.env = this.env;
             f.isTailCall = this.isTailCall;
+            f.baseIndex = this.baseIndex;
+            f.pc = this.pc;
+            f.state = this.state;
+            f.varargs = this.varargs;
             f.temps.addAll(this.temps);
             if (this.cArgs != null) {
                 f.cArgs = this.cArgs.clone();
@@ -429,6 +437,11 @@ public final class CallStack {
         if (cur != null) {
             cur.resetLastLine();
         }
+    }
+
+    public static Frame topFrame() {
+        CallStackState state = currentState();
+        return (state != null && state.top > 0) ? state.stack[state.top - 1] : null;
     }
 
     public static void pop() {

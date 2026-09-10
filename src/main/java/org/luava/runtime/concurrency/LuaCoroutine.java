@@ -58,6 +58,15 @@ public final class LuaCoroutine extends LuaValue {
     private LuaValue[] objectStack = new LuaValue[256];
     private org.luava.runtime.eval.Upvalue openUpvaluesHead = null;
     private org.luava.runtime.LuaState.TbcEntry tbcHead = null;
+    private int stackTop = 0;
+
+    public int getStackTop() {
+        return stackTop;
+    }
+
+    public void setStackTop(int top) {
+        this.stackTop = Math.max(0, top);
+    }
 
     public long[] getPrimitiveStack() {
         return primitiveStack;
