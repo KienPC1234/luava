@@ -20,6 +20,7 @@ public final class CallStack {
         public int ntransfer = 0;
         public boolean isTailCall = false;
         public int baseIndex = -1;
+        public int funcIndex = -1;
         public int pc = -1;
         public org.luava.runtime.LuaState state;
         public org.luava.runtime.LuaValue[] varargs;
@@ -39,6 +40,7 @@ public final class CallStack {
             f.env = this.env;
             f.isTailCall = this.isTailCall;
             f.baseIndex = this.baseIndex;
+            f.funcIndex = this.funcIndex;
             f.pc = this.pc;
             f.state = this.state;
             f.varargs = this.varargs;
@@ -100,6 +102,11 @@ public final class CallStack {
         public int nextNtransfer = 0;
         public org.luava.runtime.LuaValue[] nextCArgs = null;
         public Environment nextEnv = null;
+        public int nextBaseIndex = -1;
+        public int nextFuncIndex = -1;
+        public int nextPc = -1;
+        public org.luava.runtime.LuaState nextVmState = null;
+        public org.luava.runtime.LuaValue[] nextVarargs = null;
         public int closingCount = 0;
         public final java.util.List<ProtectedFrame> protectedFrames = new java.util.ArrayList<>();
 
@@ -186,6 +193,15 @@ public final class CallStack {
 
     public static void setNextTransfer(int ftransfer, int ntransfer, org.luava.runtime.LuaValue[] cArgs) {
         setNextTransfer(ftransfer, ntransfer, cArgs, null);
+    }
+
+    public static void setNextVmFrame(org.luava.runtime.LuaState vmState, int baseIndex, int funcIndex, org.luava.runtime.LuaValue[] varargs, int pc) {
+        CallStackState state = currentState();
+        state.nextVmState = vmState;
+        state.nextBaseIndex = baseIndex;
+        state.nextFuncIndex = funcIndex;
+        state.nextVarargs = varargs;
+        state.nextPc = pc;
     }
 
     public static void pushProtectedFrame(org.luava.runtime.LuaValue handler) {
@@ -310,6 +326,12 @@ public final class CallStack {
             frame.retValues = null;
             frame.ftransfer = 0;
             frame.ntransfer = 0;
+            frame.env = null;
+            frame.baseIndex = -1;
+            frame.funcIndex = -1;
+            frame.pc = -1;
+            frame.state = null;
+            frame.varargs = null;
         }
         frame.isTailCall = isTailCall;
         frame.ftransfer = state.nextFtransfer;
@@ -318,6 +340,16 @@ public final class CallStack {
         if (state.nextEnv != null) {
             frame.env = state.nextEnv;
         }
+        frame.baseIndex = state.nextBaseIndex;
+        frame.funcIndex = state.nextFuncIndex;
+        frame.pc = state.nextPc;
+        frame.state = state.nextVmState;
+        frame.varargs = state.nextVarargs;
+        state.nextBaseIndex = -1;
+        state.nextFuncIndex = -1;
+        state.nextPc = -1;
+        state.nextVmState = null;
+        state.nextVarargs = null;
         state.nextFtransfer = 0;
         state.nextNtransfer = 0;
         state.nextCArgs = null;
@@ -362,23 +394,28 @@ public final class CallStack {
     }
 
     public static void replaceTailCall(LuaFunction fn, String name, int line) {
+        replaceTailCall(fn, name, null, line, false, false);
+    }
+
+    public static void replaceTailCall(LuaFunction fn, String name, String namewhat, int line, boolean isMethod, boolean isMetamethod) {
         CallStackState state = currentState();
         if (state.top > 0) {
             String overrideName = state.nextName;
-            String namewhat = state.nextNamewhat;
-            boolean isMeta = state.nextMetamethod;
-            boolean m = state.nextMethod;
+            String overrideNamewhat = state.nextNamewhat;
+            boolean isMeta = isMetamethod || state.nextMetamethod;
+            boolean m = isMethod || state.nextMethod;
             state.nextName = null;
             state.nextNamewhat = null;
             state.nextMetamethod = false;
             state.nextMethod = false;
 
             String finalName = (overrideName != null) ? overrideName : (name != null ? name : (fn != null ? fn.getName() : null));
+            String finalNamewhat = (overrideNamewhat != null) ? overrideNamewhat : namewhat;
 
             Frame frame = state.stack[state.top - 1];
             frame.function = fn;
             frame.name = finalName;
-            frame.namewhat = namewhat;
+            frame.namewhat = finalNamewhat;
             frame.line = line;
             frame.lastLine = -1;
             frame.isMethod = m;
@@ -392,6 +429,16 @@ public final class CallStack {
             if (state.nextEnv != null) {
                 frame.env = state.nextEnv;
             }
+            frame.baseIndex = state.nextBaseIndex;
+            frame.funcIndex = state.nextFuncIndex;
+            frame.pc = state.nextPc;
+            frame.state = state.nextVmState;
+            frame.varargs = state.nextVarargs;
+            state.nextBaseIndex = -1;
+            state.nextFuncIndex = -1;
+            state.nextPc = -1;
+            state.nextVmState = null;
+            state.nextVarargs = null;
             state.nextFtransfer = 0;
             state.nextNtransfer = 0;
             state.nextCArgs = null;
@@ -465,6 +512,11 @@ public final class CallStack {
                 topFrame.ftransfer = 0;
                 topFrame.ntransfer = 0;
                 topFrame.isTailCall = false;
+                topFrame.baseIndex = -1;
+                topFrame.funcIndex = -1;
+                topFrame.pc = -1;
+                topFrame.state = null;
+                topFrame.varargs = null;
             }
             if (cur != null) {
                 if (state.top > 0) {
@@ -493,6 +545,11 @@ public final class CallStack {
                 topFrame.ftransfer = 0;
                 topFrame.ntransfer = 0;
                 topFrame.isTailCall = false;
+                topFrame.baseIndex = -1;
+                topFrame.funcIndex = -1;
+                topFrame.pc = -1;
+                topFrame.state = null;
+                topFrame.varargs = null;
             }
             LuaCoroutine cur = LuaCoroutine.running();
             if (cur != null) {

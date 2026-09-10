@@ -35,6 +35,7 @@ public final class LuaClosure extends LuaFunction {
         if (proto.name != null) {
             this.setName(proto.name);
         }
+        org.luava.runtime.eval.GCManager.onAlloc(64 + this.upvals.length * 16);
     }
 
     public LuaClosure(LuaProto proto, Upvalue[] upvals, LuaTable env) {

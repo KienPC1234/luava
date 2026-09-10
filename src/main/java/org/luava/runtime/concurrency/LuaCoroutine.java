@@ -245,6 +245,32 @@ public final class LuaCoroutine extends LuaValue {
         }
     }
 
+    /**
+     * Directly fires the line hook for BytecodeVM execution.
+     * Lua 5.4 semantics (ldebug.c: npci <= oldpc || changedline) are evaluated in BytecodeVM loop.
+     */
+    public void fireLineHookDirect(int line, CallStack.Frame frame) {
+        if (hookConfig.hook.isNil() || hookConfig.inHook || !hookConfig.hookLine) {
+            if (line > 0 && frame != null) {
+                frame.lastLine = line;
+            }
+            return;
+        }
+        if (frame != null) {
+            frame.lastLine = line;
+        }
+        hookConfig.lastLine = line;
+        int hookLine = (frame != null && frame.function != null && frame.function.isStripped()) ? -1 : line;
+        try {
+            invokeHook("line", hookLine);
+        } catch (LuaException le) {
+            if (le.getMessage() != null && le.getMessage().contains("wrong trace!!")) {
+                throw new LuaException("wrong trace at hook line " + line + ": " + le.getMessage());
+            }
+            throw le;
+        }
+    }
+
     private void invokeHook(String event, int line) {
         boolean prevInHook = hookConfig.inHook;
         hookConfig.inHook = true;
