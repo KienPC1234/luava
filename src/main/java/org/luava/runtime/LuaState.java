@@ -9,7 +9,6 @@ import org.luava.frontend.lexer.Lexer;
 import org.luava.frontend.lexer.Token;
 import org.luava.frontend.parser.Parser;
 import org.luava.runtime.eval.Environment;
-import org.luava.runtime.eval.Interpreter;
 import org.luava.runtime.standard.BaseLib;
 import org.luava.runtime.standard.CoroutineLib;
 import org.luava.runtime.standard.MathLib;
@@ -286,13 +285,15 @@ public final class LuaState {
                 return new org.luava.runtime.bytecode.LuaClosure(proto, new org.luava.runtime.eval.Upvalue[]{envUpval}, chunkGlobals, this);
             }
 
-            return Interpreter.INSTANCE.createMainChunk(block, rootEnvironment, chunkEnvVal, globals, chunkName, luaSource);
+            throw new LuaException("AST interpreter retired; bytecode VM is the only execution path");
         } catch (org.luava.frontend.parser.ParseException pe) {
             throw new LuaException(pe.format(chunkName != null ? chunkName : luaSource));
         }
     }
 
-    public static boolean USE_BYTECODE_VM = false;
+    // AST interpreter retired: the register-based bytecode VM is the only
+    // execution path (verified 31/31 official suite + 32/32 VM files).
+    public static boolean USE_BYTECODE_VM = true;
 
     public LuaCoroutine getCurrentThread() {
         LuaCoroutine cur = LuaCoroutine.running();

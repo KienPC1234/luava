@@ -7,7 +7,6 @@ import org.luava.frontend.lexer.Token;
 import org.luava.frontend.parser.Parser;
 import org.luava.runtime.*;
 import org.luava.runtime.eval.Environment;
-import org.luava.runtime.eval.Interpreter;
 import org.luava.runtime.eval.Upvalue;
 
 import java.io.*;
@@ -181,19 +180,6 @@ public final class ChunkSerializer {
         Statements.BlockStmt body = parser.parse();
 
         LuaTable envTable = (envVal instanceof LuaTable t) ? t : globals;
-        Environment fnParentEnv = new Environment(rootEnv, envTable);
-
-        List<Upvalue> ups = new ArrayList<>(upCount);
-        for (String upName : upvalueNames) {
-            Environment.VariableSlot slot;
-            if ("_ENV".equals(upName)) {
-                slot = new Environment.VariableSlot(envVal != null ? envVal : globals, false, false);
-            } else {
-                slot = new Environment.VariableSlot(LuaNil.NIL, false, false);
-            }
-            fnParentEnv.defineSlot(upName, slot);
-            ups.add(new Upvalue(upName, slot));
-        }
 
         if (LuaState.USE_BYTECODE_VM) {
             String resolvedSource = chunkName != null ? chunkName : (isStripped ? "=?" : source);
@@ -223,15 +209,7 @@ public final class ChunkSerializer {
             return cl;
         }
 
-        LuaFunction fn = Interpreter.INSTANCE.createFunctionFromDump(params, isVararg, body, fnParentEnv, ups, code);
-        fn.setStripped(isStripped);
-        fn.setSource(chunkName != null ? chunkName : (isStripped ? "=?" : source));
-        fn.setLineDefined(lineDefined);
-        fn.setLastLineDefined(lastLineDefined);
-        fn.setParams(params);
-        fn.setNparams(params.size());
-        fn.setVararg(isVararg);
-        return fn;
+        throw new LuaException("AST interpreter retired; binary chunks load via bytecode VM only");
     }
 
     public static LuaFunction undump(byte[] bytes, String chunkName, LuaValue envVal, LuaTable globals, Environment rootEnv) {

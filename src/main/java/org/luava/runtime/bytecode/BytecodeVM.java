@@ -589,6 +589,10 @@ public final class BytecodeVM {
                             setLuaValue(pStack, tStack, oStack, funcIdx, tm);
                             nActualArgs++;
                             func = tm;
+                        } else if (func instanceof LuaUserdata) {
+                            // Java userdata (incl. SAM functional interfaces):
+                            // adapt to the external-call path instead of throwing.
+                            func = new UserdataCallFunction((LuaUserdata) func);
                         } else {
                             String[] info = getobjname(proto, pc - 1, a);
                             String extra = (info != null && info[0] != null) ? " (" + info[1] + " '" + info[0] + "')" : "";
@@ -696,6 +700,10 @@ public final class BytecodeVM {
                             setLuaValue(pStack, tStack, oStack, funcIdx, tm);
                             nActualArgs++;
                             func = tm;
+                        } else if (func instanceof LuaUserdata) {
+                            // Java userdata (incl. SAM functional interfaces):
+                            // adapt to the external-call path instead of throwing.
+                            func = new UserdataCallFunction((LuaUserdata) func);
                         } else {
                             String[] info = getobjname(proto, pc - 1, a);
                             String extra = (info != null && info[0] != null) ? " (" + info[1] + " '" + info[0] + "')" : "";
@@ -1604,8 +1612,28 @@ public final class BytecodeVM {
         return null;
     }
 
-    private static int executeExternalCall(LuaState state, LuaProto proto, int pc, int base, LuaFunction fn, int funcIdx, int nActualArgs, int nResults, int curLine) {
-        long[] pStack = state.getPrimitiveStack();
+    /**
+     * Adapter routing userdata calls (including Java SAM functional
+     * interfaces) through the standard external-call path. LuaUserdata.call
+     * already forwards SAM invocations; the adapter only supplies the
+     * LuaFunction shape the VM dispatch expects.
+     */
+    private static final class UserdataCallFunction extends LuaFunction {
+        private final LuaUserdata target;
+
+        UserdataCallFunction(LuaUserdata target) {
+            this.target = target;
+            setName("userdata");
+            setWhat("C");
+        }
+
+        @Override
+        public LuaValue invoke(LuaValue... args) {
+            return target.call(args);
+        }
+    }
+
+    private static int executeExternalCall(LuaState state, LuaProto proto, int pc, int base, LuaFunction fn, int funcIdx, int nActualArgs, int nResults, int curLine) {        long[] pStack = state.getPrimitiveStack();
         byte[] tStack = state.getTypeStack();
         LuaValue[] oStack = state.getObjectStack();
         LuaValue[] cArgs = getArgsForCall(pStack, tStack, oStack, funcIdx + 1, nActualArgs);

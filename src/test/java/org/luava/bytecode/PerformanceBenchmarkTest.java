@@ -12,12 +12,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class PerformanceBenchmarkTest {
 
-    private record BenchmarkResult(String name, double astMs, double bytecodeMs, double speedup) {}
+    private record BenchmarkResult(String name, double bytecodeMs) {}
 
-    private BenchmarkResult runComparison(String name, String script, int warmup, int runs) {
-        LuaState astState = new LuaState();
-        LuaFunction astFunc = astState.compile(script);
-
+    private BenchmarkResult runTimed(String name, String script, long expected, int warmup, int runs) {
         org.luava.frontend.lexer.Lexer lexer = new org.luava.frontend.lexer.Lexer(script, false);
         java.util.List<org.luava.frontend.lexer.Token> tokens = lexer.scanTokens();
         org.luava.frontend.parser.Parser parser = new org.luava.frontend.parser.Parser(tokens);
@@ -28,26 +25,14 @@ public class PerformanceBenchmarkTest {
         Upvalue envUpval = new Upvalue("_ENV", bcState.getGlobals());
         LuaClosure bcClosure = new LuaClosure(proto, new Upvalue[]{envUpval}, bcState.getGlobals(), bcState);
 
-        // Warmup
-        LuaValue astWarmup = null;
-        for (int i = 0; i < warmup; i++) {
-            astWarmup = astFunc.call();
-        }
-        LuaValue bcWarmup = null;
+        // Warmup (JIT + caches)
+        LuaValue warmupRes = LuaNil.NIL;
         for (int i = 0; i < warmup; i++) {
             LuaValue[] res = BytecodeVM.execute(bcState, bcClosure, new LuaValue[0]);
-            bcWarmup = res.length > 0 ? res[0] : LuaNil.NIL;
+            warmupRes = res.length > 0 ? res[0] : LuaNil.NIL;
         }
 
-        assertEquals(astWarmup.toLong(), bcWarmup.toLong(), "Outputs must match identically for " + name);
-
-        // Benchmark AST Interpreter
-        long startAst = System.nanoTime();
-        for (int i = 0; i < runs; i++) {
-            astFunc.call();
-        }
-        long durAst = System.nanoTime() - startAst;
-        double astMs = (durAst / 1_000_000.0) / runs;
+        assertEquals(expected, warmupRes.toLong(), "Wrong output for " + name);
 
         // Benchmark Bytecode VM
         long startBc = System.nanoTime();
@@ -57,17 +42,16 @@ public class PerformanceBenchmarkTest {
         long durBc = System.nanoTime() - startBc;
         double bcMs = (durBc / 1_000_000.0) / runs;
 
-        double speedup = astMs / bcMs;
-        return new BenchmarkResult(name, astMs, bcMs, speedup);
+        return new BenchmarkResult(name, bcMs);
     }
 
     @Test
     public void runFullBenchmarkSuite() {
         System.out.println("================================================================================");
-        System.out.println("                 LUAVA PERFORMANCE BENCHMARK: AST vs BYTECODE VM               ");
+        System.out.println("                 LUAVA PERFORMANCE BENCHMARK: BYTECODE VM                        ");
         System.out.println("================================================================================");
 
-        // 1. Arithmetic Loop: 1,000,000 iterations
+        // 1. Arithmetic Loop: 1,000,000 iterations; sum 1..1e6 = 500000500000
         String arithScript = """
             local sum = 0
             for i = 1, 1000000 do
@@ -75,9 +59,9 @@ public class PerformanceBenchmarkTest {
             end
             return sum
         """;
-        BenchmarkResult r1 = runComparison("1,000,000 Loop Arithmetic", arithScript, 5, 10);
+        BenchmarkResult r1 = runTimed("1,000,000 Loop Arithmetic", arithScript, 500000500000L, 5, 10);
 
-        // 2. Table Array Operations: 100,000 writes & reads
+        // 2. Table Array Operations: 100,000 writes & reads; sum 2*i = 10000100000
         String tableScript = """
             local t = {}
             for i = 1, 100000 do
@@ -89,7 +73,7 @@ public class PerformanceBenchmarkTest {
             end
             return sum
         """;
-        BenchmarkResult r2 = runComparison("100,000 Table Reads & Writes", tableScript, 3, 5);
+        BenchmarkResult r2 = runTimed("100,000 Table Reads & Writes", tableScript, 10000100000L, 3, 5);
 
         // 3. Closure Upvalues: 500,000 upvalue mutations
         String upvalScript = """
@@ -104,9 +88,9 @@ public class PerformanceBenchmarkTest {
             end
             return total
         """;
-        BenchmarkResult r3 = runComparison("500,000 Closure Upvalue Mutations", upvalScript, 3, 5);
+        BenchmarkResult r3 = runTimed("500,000 Closure Upvalue Mutations", upvalScript, 500000L, 3, 5);
 
-        // 4. Fibonacci Recursion: fib(24) = 46,368 recursive calls
+        // 4. Fibonacci Recursion: fib(24) = 46368
         String fibScript = """
             local function fib(n)
                 if n <= 1 then return n end
@@ -114,14 +98,14 @@ public class PerformanceBenchmarkTest {
             end
             return fib(24)
         """;
-        BenchmarkResult r4 = runComparison("Fibonacci(24) Deep Call Stack", fibScript, 3, 5);
+        BenchmarkResult r4 = runTimed("Fibonacci(24) Deep Call Stack", fibScript, 46368L, 3, 5);
 
-        System.out.printf("%-35s | %-12s | %-12s | %-10s%n", "Benchmark Workload", "AST (ms)", "Bytecode (ms)", "Speedup");
-        System.out.println("------------------------------------+--------------+--------------+-----------");
-        System.out.printf("%-35s | %10.3f ms | %10.3f ms | %8.2fx%n", r1.name(), r1.astMs(), r1.bytecodeMs(), r1.speedup());
-        System.out.printf("%-35s | %10.3f ms | %10.3f ms | %8.2fx%n", r2.name(), r2.astMs(), r2.bytecodeMs(), r2.speedup());
-        System.out.printf("%-35s | %10.3f ms | %10.3f ms | %8.2fx%n", r3.name(), r3.astMs(), r3.bytecodeMs(), r3.speedup());
-        System.out.printf("%-35s | %10.3f ms | %10.3f ms | %8.2fx%n", r4.name(), r4.astMs(), r4.bytecodeMs(), r4.speedup());
+        System.out.printf("%-35s | %-12s%n", "Benchmark Workload", "Bytecode (ms)");
+        System.out.println("------------------------------------+--------------");
+        System.out.printf("%-35s | %10.3f ms%n", r1.name(), r1.bytecodeMs());
+        System.out.printf("%-35s | %10.3f ms%n", r2.name(), r2.bytecodeMs());
+        System.out.printf("%-35s | %10.3f ms%n", r3.name(), r3.bytecodeMs());
+        System.out.printf("%-35s | %10.3f ms%n", r4.name(), r4.bytecodeMs());
         System.out.println("================================================================================");
     }
 }
