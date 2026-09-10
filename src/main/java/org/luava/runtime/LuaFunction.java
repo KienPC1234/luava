@@ -49,6 +49,10 @@ public abstract class LuaFunction extends LuaValue {
     protected java.util.List<org.luava.runtime.eval.Upvalue> upvalues = new java.util.ArrayList<>();
     public java.util.List<org.luava.runtime.eval.Upvalue> getUpvalues() { return upvalues; }
     public void setUpvalues(java.util.List<org.luava.runtime.eval.Upvalue> upvalues) { this.upvalues = upvalues != null ? upvalues : new java.util.ArrayList<>(); }
+    /** Replace upvalue at 0-based index; subclasses may override to update internal arrays. */
+    public void replaceUpvalue(int index, org.luava.runtime.eval.Upvalue uv) {
+        upvalues.set(index, uv);
+    }
     protected java.util.List<String> params = new java.util.ArrayList<>();
     public java.util.List<String> getParams() { return params; }
     public void setParams(java.util.List<String> params) { this.params = params != null ? params : new java.util.ArrayList<>(); }
@@ -58,6 +62,12 @@ public abstract class LuaFunction extends LuaValue {
     protected org.luava.frontend.ast.Statements.BlockStmt body = null;
     public org.luava.frontend.ast.Statements.BlockStmt getBody() { return body; }
     public void setBody(org.luava.frontend.ast.Statements.BlockStmt body) { this.body = body; }
+
+    public static LuaFunction of(String name, LuaInvokable invokable) {
+        LuaFunction fn = of(invokable);
+        fn.setName(name);
+        return fn;
+    }
 
     public static LuaFunction of(LuaInvokable invokable) {
         LuaFunction fn = new LuaFunction() {

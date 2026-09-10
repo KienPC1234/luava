@@ -58,6 +58,15 @@ public final class LuaCoroutine extends LuaValue {
     private LuaValue[] objectStack = new LuaValue[256];
     private org.luava.runtime.eval.Upvalue openUpvaluesHead = null;
     private org.luava.runtime.LuaState.TbcEntry tbcHead = null;
+    private int stackTop = 0;
+
+    public int getStackTop() {
+        return stackTop;
+    }
+
+    public void setStackTop(int top) {
+        this.stackTop = Math.max(0, top);
+    }
 
     public long[] getPrimitiveStack() {
         return primitiveStack;
@@ -236,6 +245,32 @@ public final class LuaCoroutine extends LuaValue {
         }
     }
 
+    /**
+     * Directly fires the line hook for BytecodeVM execution.
+     * Lua 5.4 semantics (ldebug.c: npci <= oldpc || changedline) are evaluated in BytecodeVM loop.
+     */
+    public void fireLineHookDirect(int line, CallStack.Frame frame) {
+        if (hookConfig.hook.isNil() || hookConfig.inHook || !hookConfig.hookLine) {
+            if (line > 0 && frame != null) {
+                frame.lastLine = line;
+            }
+            return;
+        }
+        if (frame != null) {
+            frame.lastLine = line;
+        }
+        hookConfig.lastLine = line;
+        int hookLine = (frame != null && frame.function != null && frame.function.isStripped()) ? -1 : line;
+        try {
+            invokeHook("line", hookLine);
+        } catch (LuaException le) {
+            if (le.getMessage() != null && le.getMessage().contains("wrong trace!!")) {
+                throw new LuaException("wrong trace at hook line " + line + ": " + le.getMessage());
+            }
+            throw le;
+        }
+    }
+
     private void invokeHook(String event, int line) {
         boolean prevInHook = hookConfig.inHook;
         hookConfig.inHook = true;
@@ -344,6 +379,9 @@ public final class LuaCoroutine extends LuaValue {
             handoffArgs = resumeArgs;
             status = Status.RUNNING;
             callStackState.clearSavedErrorStack();
+            callStackState.preserveForDeath = false;
+            callStackState.deathStack = null;
+            callStackState.deathTop = 0;
             error = null;
 
             if (virtualThread == null) {
@@ -363,7 +401,26 @@ public final class LuaCoroutine extends LuaValue {
                         callStackState.clearSavedErrorStack();
                     } catch (Throwable t) {
                         error = t;
-                        callStackState.snapshotErrorStack();
+                        // Transfer death frames saved by reference during fatal
+                        // unwind (no copy). Pops save innermost-first, but stack
+                        // layout is outermost-first, so reverse (pointer swaps).
+                        // Falls back to snapshot if none.
+                        if (callStackState.deathTop > 0 && callStackState.deathStack != null) {
+                            org.luava.runtime.eval.CallStack.Frame[] ds = callStackState.deathStack;
+                            int dn = callStackState.deathTop;
+                            for (int i = 0, j = dn - 1; i < j; i++, j--) {
+                                org.luava.runtime.eval.CallStack.Frame tmp = ds[i];
+                                ds[i] = ds[j];
+                                ds[j] = tmp;
+                            }
+                            callStackState.errorStack = ds;
+                            callStackState.errorTop = dn;
+                            callStackState.deathStack = null;
+                            callStackState.deathTop = 0;
+                        } else {
+                            callStackState.snapshotErrorStack();
+                        }
+                        callStackState.preserveForDeath = false;
                         LuaValue errVal;
                         if (t instanceof LuaException le && le.getErrorObject() != null) {
                             errVal = le.getErrorObject();

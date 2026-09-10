@@ -26,10 +26,11 @@ public final class GCManager {
     private static final List<FinalizerEntry> FINALIZERS = new ArrayList<>();
     private static final List<java.lang.ref.WeakReference<LuaTable>> WEAK_TABLES = new ArrayList<>();
     private static final List<StringRef> LARGE_STRINGS = new ArrayList<>();
-    private static int allocCount = 0;
     private static long uncollectedBytes = 0;
     private static boolean runningFinalizer = false;
     private static volatile boolean gcRunning = true;
+    private static boolean collecting = false;
+    private static long gcThreshold = 256L * 1024;
 
     private static final class StringRef {
         final java.lang.ref.WeakReference<LuaString> ref;
@@ -40,8 +41,11 @@ public final class GCManager {
         }
     }
 
+    private static volatile LuaString allocatingString = null;
+
     public static synchronized void onAllocLargeString(LuaString s) {
         if (s == null) return;
+        allocatingString = s;
         LARGE_STRINGS.add(new StringRef(s));
     }
 
@@ -85,9 +89,10 @@ public final class GCManager {
         ROOT_PROVIDERS.clear();
         STATES.clear();
         uncollectedBytes = 0;
-        allocCount = 0;
         gcRunning = true;
         runningFinalizer = false;
+        collecting = false;
+        gcThreshold = 256L * 1024;
     }
 
     public static synchronized void register(LuaValue target, LuaValue gcHandler) {
@@ -105,17 +110,17 @@ public final class GCManager {
     }
 
     public static synchronized void onAlloc(long bytes) {
-        uncollectedBytes += bytes;
-        if (!gcRunning) return;
-        if (uncollectedBytes > 0) {
-            uncollectedBytes = Math.max(0, uncollectedBytes - (bytes * 2));
-        }
-        allocCount++;
-        if (allocCount >= 100) {
-            allocCount = 0;
-            if (!FINALIZERS.isEmpty() && !runningFinalizer) {
-                checkAndRunDeadFinalizers();
+        try {
+            uncollectedBytes += bytes;
+            if (!gcRunning) return;
+            if (uncollectedBytes >= gcThreshold) {
+                uncollectedBytes = 0;
+                if ((!FINALIZERS.isEmpty() || !WEAK_TABLES.isEmpty()) && !runningFinalizer) {
+                    collect();
+                }
             }
+        } finally {
+            allocatingString = null;
         }
     }
 
@@ -124,8 +129,10 @@ public final class GCManager {
     }
 
     public static synchronized boolean collect() {
-        if (runningFinalizer) return false;
-        uncollectedBytes = 0;
+        if (runningFinalizer || collecting) return false;
+        collecting = true;
+        try {
+            uncollectedBytes = 0;
 
         // 1. Mark phase from normal roots (excluding dead objects with finalizers)
         Set<LuaValue> liveNormal = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
@@ -184,7 +191,7 @@ public final class GCManager {
         for (int i = LARGE_STRINGS.size() - 1; i >= 0; i--) {
             StringRef sr = LARGE_STRINGS.get(i);
             LuaString str = sr.ref.get();
-            if (str == null || !liveAll.contains(str)) {
+            if (str == null || (str != allocatingString && !liveAll.contains(str))) {
                 LARGE_STRINGS.remove(i);
             }
         }
@@ -215,16 +222,16 @@ public final class GCManager {
             }
         }
 
-        // Clear dead large strings
-        for (int i = LARGE_STRINGS.size() - 1; i >= 0; i--) {
-            StringRef sr = LARGE_STRINGS.get(i);
-            LuaString ls = sr.ref.get();
-            if (ls == null || !liveNormal.contains(ls)) {
-                LARGE_STRINGS.remove(i);
-            }
-        }
+        // Dynamic GC threshold (Lua 5.4 pause semantics): scale the allocation
+        // threshold with the live heap so "repeat until GC" loops exit fast
+        // on small heaps while allocation-heavy workloads avoid O(N^2).
+        long liveBytes = (long) liveAll.size() * 256L;
+        gcThreshold = Math.max(256L * 1024, Math.min(16L * 1024 * 1024, liveBytes * 2));
 
         return true;
+        } finally {
+            collecting = false;
+        }
     }
 
     public static synchronized boolean step(long stepSizeKb) {
@@ -290,6 +297,15 @@ public final class GCManager {
             } else {
                 if (state.getRegistry() != null) worklist.add(state.getRegistry());
                 if (state.getGlobals() != null) worklist.add(state.getGlobals());
+                LuaValue[] oStack = state.getObjectStack();
+                if (oStack != null) {
+                    int top = state.getStackTop();
+                    int max = Math.min(top, oStack.length);
+                    for (int s = 0; s < max; s++) {
+                        LuaValue v = oStack[s];
+                        if (isTracked(v)) worklist.add(v);
+                    }
+                }
             }
         }
 

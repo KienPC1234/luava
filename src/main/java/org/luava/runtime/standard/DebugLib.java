@@ -125,7 +125,7 @@ public final class DebugLib {
             }
 
             if (what.contains("l")) {
-                int cl = (fn != null && (fn.isStripped() || !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction))) ? -1 : currentLine;
+                int cl = (fn != null && (fn.isStripped() || (!(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)))) ? -1 : currentLine;
                 info.rawset(LuaString.valueOf("currentline"), LuaInteger.valueOf(cl));
             }
 
@@ -300,7 +300,7 @@ public final class DebugLib {
             int n = (int) args[1].toLong();
             java.util.List<org.luava.runtime.eval.Upvalue> ups = fn.getUpvalues();
             if (n >= 1 && n <= ups.size()) {
-                return new LuaUserdata(ups.get(n - 1).getSlot(), true);
+                return new LuaUserdata(ups.get(n - 1).getId(), true);
             }
             return LuaNil.NIL;
         }));
@@ -317,9 +317,16 @@ public final class DebugLib {
             if (n2 < 1 || n2 > f2.getUpvalues().size()) {
                 throw new LuaException("invalid upvalue index 2 to 'debug.upvaluejoin'");
             }
+            // C lua_upvaluejoin: f1.upvals[n1] = f2.upvals[n2] (re-point, not merge).
+            // Replace with an alias that keeps f1's upvalue name (AST resolves by
+            // name) but shares live storage + identity with up2. Must REPLACE in
+            // the list (not mutate in place) because up1 may be shared with other
+            // closures capturing the same variable.
             org.luava.runtime.eval.Upvalue up1 = f1.getUpvalues().get(n1 - 1);
             org.luava.runtime.eval.Upvalue up2 = f2.getUpvalues().get(n2 - 1);
-            up1.setSlot(up2.getSlot());
+            // replaceUpvalue syncs both the list and VM's array (LuaClosure).
+            f1.replaceUpvalue(n1 - 1,
+                    org.luava.runtime.eval.Upvalue.joinedAlias(up1.getName(), up2));
             return LuaNil.NIL;
         }));
 
@@ -337,7 +344,19 @@ public final class DebugLib {
             int nvar = (int) (args.length > argOffset + 1 ? args[argOffset + 1].toLong() : 0);
 
             if (first instanceof LuaFunction fn) {
-                if (fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction ifn) {
+                if (fn instanceof org.luava.runtime.bytecode.LuaClosure cl) {
+                    if (cl.proto != null && cl.proto.locVarInfos != null) {
+                        int paramCount = 0;
+                        for (org.luava.runtime.bytecode.LuaProto.LocVarInfo lvi : cl.proto.locVarInfos) {
+                            if (lvi.reg() < cl.proto.numParams) {
+                                paramCount++;
+                                if (paramCount == nvar) {
+                                    return LuaString.valueOf(lvi.name());
+                                }
+                            }
+                        }
+                    }
+                } else if (fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction ifn) {
                     java.util.List<String> params = ifn.getParams();
                     if (nvar >= 1 && nvar <= params.size()) {
                         return LuaString.valueOf(params.get(nvar - 1));
@@ -366,6 +385,69 @@ public final class DebugLib {
             org.luava.runtime.eval.CallStack.Frame frame = state.getFrame(actualLevel);
             if (frame == null) {
                 throw new LuaException("bad argument #" + (argOffset + 1) + " to 'getlocal' (level out of range)");
+            }
+
+            if (nvar > 0 && frame.retValues != null && frame.ftransfer > 0 && nvar >= frame.ftransfer && nvar < frame.ftransfer + frame.ntransfer) {
+                int retIdx = nvar - frame.ftransfer;
+                boolean isLua = (frame.function instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction)
+                        || (frame.function instanceof org.luava.runtime.bytecode.LuaClosure);
+                String name = isLua ? "(temporary)" : "(C temporary)";
+                return Varargs.of(LuaString.valueOf(name), frame.retValues[retIdx]);
+            }
+
+            if (frame.function instanceof org.luava.runtime.bytecode.LuaClosure cl) {
+                if (nvar < 0) {
+                    int idx = -nvar;
+                    if (frame.varargs != null && idx >= 1 && idx <= frame.varargs.length) {
+                        return Varargs.of(LuaString.valueOf("(vararg)"), frame.varargs[idx - 1]);
+                    }
+                    return LuaNil.NIL;
+                } else if (nvar > 0) {
+                    if (cl.proto != null && frame.state != null && frame.baseIndex >= 0) {
+                        int pc = frame.pc >= 0 ? frame.pc : 0;
+                        int count = 0;
+                        if (cl.proto.locVarInfos != null) {
+                            for (org.luava.runtime.bytecode.LuaProto.LocVarInfo lvi : cl.proto.locVarInfos) {
+                                if (lvi.startPc() <= pc && (lvi.endPc() == -1 || pc <= lvi.endPc())) {
+                                    count++;
+                                    if (count == nvar) {
+                                        LuaValue val = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(
+                                                target.getPrimitiveStack(),
+                                                target.getTypeStack(),
+                                                target.getObjectStack(),
+                                                frame.baseIndex + lvi.reg()
+                                        );
+                                        String varName = cl.isStripped() ? "(temporary)" : lvi.name();
+                                        return Varargs.of(LuaString.valueOf(varName), val);
+                                    }
+                                }
+                            }
+                        }
+                        // Lua 5.4 semantics (ldebug.c: luaG_findlocal):
+                        // If nvar is not a named local, check whether it is an active temporary on the stack frame.
+                        int limit;
+                        if (actualLevel > 0) {
+                            org.luava.runtime.eval.CallStack.Frame calleeFrame = state.getFrame(actualLevel - 1);
+                            limit = (calleeFrame != null && calleeFrame.funcIndex >= 0)
+                                    ? calleeFrame.funcIndex
+                                    : frame.baseIndex + cl.proto.maxStackSize;
+                        } else {
+                            limit = frame.baseIndex + cl.proto.maxStackSize;
+                        }
+                        int maxSlot = limit - frame.baseIndex;
+                        if (nvar <= maxSlot) {
+                            int reg = frame.baseIndex + (nvar - 1);
+                            LuaValue val = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(
+                                    target.getPrimitiveStack(),
+                                    target.getTypeStack(),
+                                    target.getObjectStack(),
+                                    reg
+                            );
+                            return Varargs.of(LuaString.valueOf("(temporary)"), val);
+                        }
+                    }
+                    return LuaNil.NIL;
+                }
             }
 
             if (nvar < 0) {
@@ -440,6 +522,73 @@ public final class DebugLib {
             org.luava.runtime.eval.CallStack.Frame frame = state.getFrame(actualLevel);
             if (frame == null) {
                 throw new LuaException("bad argument #" + (argOffset + 1) + " to 'setlocal' (level out of range)");
+            }
+
+            if (nvar > 0 && frame.retValues != null && frame.ftransfer > 0 && nvar >= frame.ftransfer && nvar < frame.ftransfer + frame.ntransfer) {
+                int retIdx = nvar - frame.ftransfer;
+                frame.retValues[retIdx] = val;
+                boolean isLua = (frame.function instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction)
+                        || (frame.function instanceof org.luava.runtime.bytecode.LuaClosure);
+                String name = isLua ? "(temporary)" : "(C temporary)";
+                return LuaString.valueOf(name);
+            }
+
+            if (frame.function instanceof org.luava.runtime.bytecode.LuaClosure cl) {
+                if (nvar < 0) {
+                    int idx = -nvar;
+                    if (frame.varargs != null && idx >= 1 && idx <= frame.varargs.length) {
+                        frame.varargs[idx - 1] = val;
+                        return LuaString.valueOf("(vararg)");
+                    }
+                    return LuaNil.NIL;
+                } else if (nvar > 0) {
+                    if (cl.proto != null && frame.state != null && frame.baseIndex >= 0) {
+                        int pc = frame.pc >= 0 ? frame.pc : 0;
+                        int count = 0;
+                        if (cl.proto.locVarInfos != null) {
+                            for (org.luava.runtime.bytecode.LuaProto.LocVarInfo lvi : cl.proto.locVarInfos) {
+                                if (lvi.startPc() <= pc && (lvi.endPc() == -1 || pc <= lvi.endPc())) {
+                                    count++;
+                                    if (count == nvar) {
+                                        org.luava.runtime.bytecode.BytecodeVM.setLuaValue(
+                                                target.getPrimitiveStack(),
+                                                target.getTypeStack(),
+                                                target.getObjectStack(),
+                                                frame.baseIndex + lvi.reg(),
+                                                val
+                                        );
+                                        String varName = cl.isStripped() ? "(temporary)" : lvi.name();
+                                        return LuaString.valueOf(varName);
+                                    }
+                                }
+                            }
+                        }
+                        // Lua 5.4 semantics (ldebug.c: luaG_findlocal):
+                        // If nvar is not a named local, check whether it is an active temporary on the stack frame.
+                        int limit;
+                        if (actualLevel > 0) {
+                            org.luava.runtime.eval.CallStack.Frame calleeFrame = state.getFrame(actualLevel - 1);
+                            limit = (calleeFrame != null && calleeFrame.funcIndex >= 0)
+                                    ? calleeFrame.funcIndex
+                                    : frame.baseIndex + cl.proto.maxStackSize;
+                        } else {
+                            limit = frame.baseIndex + cl.proto.maxStackSize;
+                        }
+                        int maxSlot = limit - frame.baseIndex;
+                        if (nvar <= maxSlot) {
+                            int reg = frame.baseIndex + (nvar - 1);
+                            org.luava.runtime.bytecode.BytecodeVM.setLuaValue(
+                                    target.getPrimitiveStack(),
+                                    target.getTypeStack(),
+                                    target.getObjectStack(),
+                                    reg,
+                                    val
+                            );
+                            return LuaString.valueOf("(temporary)");
+                        }
+                    }
+                    return LuaNil.NIL;
+                }
             }
 
             if (nvar < 0) {
@@ -596,6 +745,14 @@ public final class DebugLib {
                         if (globals != null) break;
                     }
                 }
+                if (globals == null) {
+                    for (int i = state.top - 1; i >= 0; i--) {
+                        if (state.stack[i] != null && state.stack[i].state != null) {
+                            globals = state.stack[i].state.getGlobals();
+                            if (globals != null) break;
+                        }
+                    }
+                }
             }
         }
         if (globals == null) return null;
@@ -643,6 +800,18 @@ public final class DebugLib {
         }
         LuaTable activelines = new LuaTable();
         if (fn.isStripped()) {
+            return activelines;
+        }
+        if (fn instanceof org.luava.runtime.bytecode.LuaClosure cl) {
+            if (cl.proto != null && cl.proto.lineInfo != null) {
+                java.util.Set<Integer> lines = new java.util.TreeSet<>();
+                for (int line : cl.proto.lineInfo) {
+                    if (line > 0) lines.add(line);
+                }
+                for (int line : lines) {
+                    activelines.rawset(LuaInteger.valueOf(line), LuaBoolean.TRUE);
+                }
+            }
             return activelines;
         }
         org.luava.frontend.ast.Statements.BlockStmt body = fn.getBody();
