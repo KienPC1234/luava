@@ -84,8 +84,9 @@ public final class OpCode {
     public static final int OP_VARARG = 80;
     public static final int OP_VARARGPREP = 81;
     public static final int OP_EXTRAARG = 82;
+    public static final int OP_CLEANUP = 83;
 
-    public static final int NUM_OPCODES = 83;
+    public static final int NUM_OPCODES = 84;
 
     public static final String[] OP_NAMES = new String[] {
         "MOVE", "LOADI", "LOADF", "LOADK", "LOADKX", "LOADFALSE", "LFALSESKIP", "LOADTRUE",
@@ -97,7 +98,8 @@ public final class OpCode {
         "NOT", "LEN", "CONCAT", "CLOSE", "TBC", "JMP", "EQ", "LT", "LE", "EQK",
         "EQI", "LTI", "LEI", "GTI", "GEI", "TEST", "TESTSET", "CALL", "TAILCALL",
         "RETURN", "RETURN0", "RETURN1", "FORLOOP", "FORPREP", "TFORPREP", "TFORCALL",
-        "TFORLOOP", "SETLIST", "CLOSURE", "VARARG", "VARARGPREP", "EXTRAARG"
+        "TFORLOOP", "SETLIST", "CLOSURE", "VARARG", "VARARGPREP", "EXTRAARG",
+        "CLEANUP"
     };
 
     public static String getOpName(int op) {

@@ -208,6 +208,25 @@ public final class BytecodeCompiler {
             }
         }
 
+        /**
+         * Clear dead slots once at loop entry ([freereg, maxstacksize)).
+         * At statement boundaries no live temps exist above freereg and live
+         * vars are below it, so clearing is safe. This releases stranded heap
+         * references from outer temps that the loop never reuses (otherwise
+         * they pin garbage as false GC roots and starve finalizers, e.g.
+         * db.lua:914). Emitted before loopStart is captured, so back-edges
+         * and later patches are unaffected; line 0 inherits (no hook event).
+         */
+        void clearDeadSlotsAtLoopEntry(int line) {
+            int from = freereg;
+            int to = maxstacksize;
+            while (from < to) {
+                int chunk = Math.min(to - from, Instruction.MASK_B + 1);
+                emit(Instruction.encodeABC(OpCode.OP_CLEANUP, from, chunk - 1, 0), line);
+                from += chunk;
+            }
+        }
+
         int addConst(LuaValue v) {
             Integer idx = constMap.get(v);
             if (idx != null) {
@@ -612,6 +631,7 @@ public final class BytecodeCompiler {
         }
 
         void compileWhile(Statements.WhileStmt ws) {
+            clearDeadSlotsAtLoopEntry(ws.line());
             int loopStart = code.size();
             int condReg = compileExprToAnyReg(ws.condition());
             emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), ws.line());
@@ -638,6 +658,14 @@ public final class BytecodeCompiler {
         }
 
         void compileRepeat(Statements.RepeatStmt rs) {
+            // Repeat body runs before the condition, so the entry cleanup
+            // carries the body's first line (not the condition's) to keep
+            // line-hook event sequencing C-like.
+            int entryLine = rs.condition().line();
+            if (rs.body() != null && !rs.body().statements().isEmpty()) {
+                entryLine = rs.body().statements().get(0).line();
+            }
+            clearDeadSlotsAtLoopEntry(entryLine);
             int loopStart = code.size();
             int baseLocals = locals.size();
             int baseFreereg = freereg;
@@ -698,6 +726,7 @@ public final class BytecodeCompiler {
         }
 
         void compileForNumeric(Statements.ForNumericStmt fns) {
+            clearDeadSlotsAtLoopEntry(fns.line());
             int baseFreereg = freereg;
             int initReg = allocReg();
             int limitReg = allocReg();
@@ -749,6 +778,7 @@ public final class BytecodeCompiler {
         }
 
         void compileForGeneric(Statements.ForGenericStmt fgs) {
+            clearDeadSlotsAtLoopEntry(fgs.line());
             int baseFreereg = freereg;
             int baseLocals = locals.size();
             int fReg = allocReg();

@@ -202,7 +202,12 @@ public final class BytecodeVM {
                 if (co != null) {
                     LuaCoroutine.HookConfig hc = co.getHookConfig();
                     if (!hc.hook.isNil() && !hc.inHook) {
-                        if (hc.count > 0) {
+                        // OP_CLEANUP is compiler-internal (dead-slot clearing):
+                        // it must not fire count hooks (instruction counts stay
+                        // C-like), but it fires line hooks normally (it carries
+                        // the loop's line, so first-event sequencing is intact).
+                        boolean isCleanup = (op == OpCode.OP_CLEANUP);
+                        if (hc.count > 0 && !isCleanup) {
                             co.fireCountHook();
                         }
                         if (hc.hookLine) {
@@ -271,6 +276,17 @@ public final class BytecodeVM {
                     oStack[base + a] = null;
                 }
                 case OpCode.OP_LOADNIL -> {
+                    int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
+                    for (int j = 0; j <= b; j++) {
+                        tStack[base + a + j] = TYPE_NIL;
+                        pStack[base + a + j] = 0;
+                        oStack[base + a + j] = null;
+                    }
+                }
+                case OpCode.OP_CLEANUP -> {
+                    // Compiler-generated dead-slot clearing (loop entries).
+                    // Same effect as LOADNIL but never fires hooks, so
+                    // instruction-counting hooks observe C-like counts.
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     for (int j = 0; j <= b; j++) {
                         tStack[base + a + j] = TYPE_NIL;
@@ -1141,7 +1157,13 @@ public final class BytecodeVM {
         }
         int regA = base + a;
         tStack[regA] = TYPE_OBJECT;
-        oStack[regA] = new LuaClosure(childProto, childUpvals, closure.env, state);
+        LuaClosure child = new LuaClosure(childProto, childUpvals, closure.env, state);
+        // Stripping applies to the whole proto tree (C undump): children
+        // created at runtime inherit the flag so debug info stays masked.
+        if (closure.isStripped()) {
+            child.setStripped(true);
+        }
+        oStack[regA] = child;
     }
 
     private static void executeGetTabUp(long[] pStack, byte[] tStack, LuaValue[] oStack, Upvalue[] upvals, LuaValue[] k, int base, int a, int inst) {
@@ -1404,7 +1426,8 @@ public final class BytecodeVM {
             OpCode.OP_DIV, OpCode.OP_IDIV, OpCode.OP_BAND, OpCode.OP_BOR, OpCode.OP_BXOR,
             OpCode.OP_SHL, OpCode.OP_SHR, OpCode.OP_UNM, OpCode.OP_BNOT, OpCode.OP_NOT,
             OpCode.OP_LEN, OpCode.OP_CONCAT, OpCode.OP_TESTSET, OpCode.OP_CALL, OpCode.OP_TAILCALL,
-            OpCode.OP_FORLOOP, OpCode.OP_FORPREP, OpCode.OP_TFORLOOP, OpCode.OP_CLOSURE, OpCode.OP_VARARG
+            OpCode.OP_FORLOOP, OpCode.OP_FORPREP, OpCode.OP_TFORLOOP, OpCode.OP_CLOSURE, OpCode.OP_VARARG,
+            OpCode.OP_CLEANUP
         };
         for (int op : setsA) {
             OP_SETS_A[op] = true;
