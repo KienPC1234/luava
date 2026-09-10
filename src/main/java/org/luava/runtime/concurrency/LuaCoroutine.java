@@ -379,6 +379,9 @@ public final class LuaCoroutine extends LuaValue {
             handoffArgs = resumeArgs;
             status = Status.RUNNING;
             callStackState.clearSavedErrorStack();
+            callStackState.preserveForDeath = false;
+            callStackState.deathStack = null;
+            callStackState.deathTop = 0;
             error = null;
 
             if (virtualThread == null) {
@@ -398,7 +401,26 @@ public final class LuaCoroutine extends LuaValue {
                         callStackState.clearSavedErrorStack();
                     } catch (Throwable t) {
                         error = t;
-                        callStackState.snapshotErrorStack();
+                        // Transfer death frames saved by reference during fatal
+                        // unwind (no copy). Pops save innermost-first, but stack
+                        // layout is outermost-first, so reverse (pointer swaps).
+                        // Falls back to snapshot if none.
+                        if (callStackState.deathTop > 0 && callStackState.deathStack != null) {
+                            org.luava.runtime.eval.CallStack.Frame[] ds = callStackState.deathStack;
+                            int dn = callStackState.deathTop;
+                            for (int i = 0, j = dn - 1; i < j; i++, j--) {
+                                org.luava.runtime.eval.CallStack.Frame tmp = ds[i];
+                                ds[i] = ds[j];
+                                ds[j] = tmp;
+                            }
+                            callStackState.errorStack = ds;
+                            callStackState.errorTop = dn;
+                            callStackState.deathStack = null;
+                            callStackState.deathTop = 0;
+                        } else {
+                            callStackState.snapshotErrorStack();
+                        }
+                        callStackState.preserveForDeath = false;
                         LuaValue errVal;
                         if (t instanceof LuaException le && le.getErrorObject() != null) {
                             errVal = le.getErrorObject();

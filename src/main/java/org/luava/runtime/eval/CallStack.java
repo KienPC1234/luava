@@ -94,6 +94,15 @@ public final class CallStack {
         public int top = 0;
         public Frame[] errorStack = null;
         public int errorTop = 0;
+        // When true, pop() is skipped to preserve death frames for
+        // debug.traceback on a coroutine killed by an unprotected error.
+        // Set at fatal-error time (cheap flag, no copying); the coroutine
+        // dies so skipped pops never leak (no further pushes on dead state).
+        public boolean preserveForDeath = false;
+        // Death frames saved by reference during fatal unwind (no copy, no wipe).
+        // Transferred to errorStack when the coroutine dies.
+        public Frame[] deathStack = null;
+        public int deathTop = 0;
         public boolean nextMethod = false;
         public String nextName = null;
         public String nextNamewhat = null;
@@ -501,22 +510,36 @@ public final class CallStack {
             state.top--;
             Frame topFrame = state.stack[state.top];
             if (topFrame != null) {
-                topFrame.function = null;
-                topFrame.name = null;
-                topFrame.namewhat = null;
-                topFrame.lastLine = -1;
-                topFrame.env = null;
-                topFrame.temps.clear();
-                topFrame.cArgs = null;
-                topFrame.retValues = null;
-                topFrame.ftransfer = 0;
-                topFrame.ntransfer = 0;
-                topFrame.isTailCall = false;
-                topFrame.baseIndex = -1;
-                topFrame.funcIndex = -1;
-                topFrame.pc = -1;
-                topFrame.state = null;
-                topFrame.varargs = null;
+                if (state.preserveForDeath) {
+                    // Fatal unwind: save reference (no wipe, no copy) for
+                    // dead-coroutine traceback. Top still decrements so
+                    // unwind loops terminate.
+                    if (state.deathStack == null) {
+                        state.deathStack = new Frame[Math.max(state.top + 1, 16)];
+                    } else if (state.deathTop >= state.deathStack.length) {
+                        Frame[] bigger = new Frame[state.deathStack.length * 2];
+                        System.arraycopy(state.deathStack, 0, bigger, 0, state.deathTop);
+                        state.deathStack = bigger;
+                    }
+                    state.deathStack[state.deathTop++] = topFrame;
+                } else {
+                    topFrame.function = null;
+                    topFrame.name = null;
+                    topFrame.namewhat = null;
+                    topFrame.lastLine = -1;
+                    topFrame.env = null;
+                    topFrame.temps.clear();
+                    topFrame.cArgs = null;
+                    topFrame.retValues = null;
+                    topFrame.ftransfer = 0;
+                    topFrame.ntransfer = 0;
+                    topFrame.isTailCall = false;
+                    topFrame.baseIndex = -1;
+                    topFrame.funcIndex = -1;
+                    topFrame.pc = -1;
+                    topFrame.state = null;
+                    topFrame.varargs = null;
+                }
             }
             if (cur != null) {
                 if (state.top > 0) {

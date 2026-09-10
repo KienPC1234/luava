@@ -62,7 +62,9 @@ public final class LuaClosure extends LuaFunction {
             state = new LuaState();
         }
         LuaValue[] res = BytecodeVM.execute(state, this, args);
-        if (res == null || res.length == 0) return LuaNil.NIL;
+        // Lua 5.4: bare 'return' yields zero values (not one nil).
+        // Mirror AST InterpretedLuaFunction which returns Varargs.EMPTY.
+        if (res == null || res.length == 0) return org.luava.runtime.Varargs.EMPTY;
         if (res.length == 1) return res[0];
         return org.luava.runtime.Varargs.of(res);
     }

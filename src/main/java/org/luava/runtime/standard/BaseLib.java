@@ -179,6 +179,7 @@ public final class BaseLib {
                 }
             }
             if (level <= 0) {
+                preserveCoroutineDeathFrames();
                 LuaException le = new LuaException(msg);
                 le.setDecorated(true);
                 throw le;
@@ -193,9 +194,11 @@ public final class BaseLib {
                     String formatted = org.luava.frontend.parser.ParseException.formatChunkName(src) + ":" + line + ": " + msg.toLuaString();
                     LuaException le = new LuaException(LuaString.valueOf(formatted));
                     le.setDecorated(true);
+                    preserveCoroutineDeathFrames();
                     throw le;
                 }
             }
+            preserveCoroutineDeathFrames();
             LuaException le = new LuaException(msg);
             le.setDecorated(true);
             throw le;
@@ -696,5 +699,22 @@ public final class BaseLib {
                 default -> throw new LuaException("bad argument #1 to 'collectgarbage' (invalid option '" + opt + "')");
             };
         }));
+    }
+
+    /**
+     * Preserve current coroutine's frames for dead-coroutine traceback.
+     * Only for non-main coroutines dying from unprotected errors; main-thread
+     * errors propagate out (no need to preserve). Cheap flag (no copying);
+     * CallStack.pop() skips while set. The coroutine dies so no leak.
+     */
+    private static void preserveCoroutineDeathFrames() {
+        org.luava.runtime.concurrency.LuaCoroutine cur =
+                org.luava.runtime.concurrency.LuaCoroutine.running();
+        if (cur != null && !cur.isMainThread()) {
+            org.luava.runtime.eval.CallStack.CallStackState st = cur.getCallStackState();
+            if (st.errorStack == null && st.protectedFrames.isEmpty()) {
+                st.preserveForDeath = true;
+            }
+        }
     }
 }
