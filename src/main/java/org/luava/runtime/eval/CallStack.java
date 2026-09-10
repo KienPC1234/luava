@@ -192,6 +192,21 @@ public final class CallStack {
         setNextCall(name, isMetamethod ? "metamethod" : null, false, isMetamethod);
     }
 
+    /**
+     * Clear a stale next-call name (e.g. set for a call target that pushes no
+     * frame, like a Java generic-for iterator). Only clears when the pending
+     * value still equals {@code expected}, so nested legitimate values survive.
+     */
+    public static void clearNextCallIf(String expected) {
+        CallStackState state = currentState();
+        if (expected != null ? expected.equals(state.nextName) : state.nextName == null) {
+            state.nextName = null;
+            state.nextNamewhat = null;
+            state.nextMetamethod = false;
+            state.nextMethod = false;
+        }
+    }
+
     public static void setNextTransfer(int ftransfer, int ntransfer, org.luava.runtime.LuaValue[] cArgs, Environment env) {
         CallStackState state = currentState();
         state.nextFtransfer = ftransfer;

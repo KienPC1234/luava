@@ -1782,7 +1782,17 @@ public final class BytecodeVM {
         LuaValue f = getLuaValue(pStack, tStack, oStack, base + a);
         LuaValue s = getLuaValue(pStack, tStack, oStack, base + a + 1);
         LuaValue var = getLuaValue(pStack, tStack, oStack, base + a + 2);
-        LuaValue res = f.call(s, var);
+        // C Lua: iterator calls report name/namewhat "for iterator".
+        // Lua closures consume this via the initial push; Java callables push
+        // no frame, so clear afterwards (try-finally: also on throw) to avoid
+        // leaking the name into unrelated later calls.
+        org.luava.runtime.eval.CallStack.setNextCall("for iterator", "for iterator", false, false);
+        LuaValue res;
+        try {
+            res = f.call(s, var);
+        } finally {
+            org.luava.runtime.eval.CallStack.clearNextCallIf("for iterator");
+        }
         int nVars = Math.max(1, c);
         if (res instanceof Varargs va) {
             LuaValue[] vals = va.getValuesUnsafe();
