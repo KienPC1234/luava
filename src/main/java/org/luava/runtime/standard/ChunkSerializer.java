@@ -195,6 +195,34 @@ public final class ChunkSerializer {
             ups.add(new Upvalue(upName, slot));
         }
 
+        if (LuaState.USE_BYTECODE_VM) {
+            String resolvedSource = chunkName != null ? chunkName : (isStripped ? "=?" : source);
+            org.luava.runtime.bytecode.LuaProto proto = org.luava.runtime.bytecode.BytecodeCompiler.compile(body, resolvedSource, params, isVararg, lineDefined, lastLineDefined, upvalueNames);
+            proto.rawSource = code;
+            proto.body = body;
+
+            Upvalue[] upvals = new Upvalue[proto.upvalues.length];
+            for (int i = 0; i < proto.upvalues.length; i++) {
+                String upName = proto.upvalues[i].name;
+                Environment.VariableSlot slot;
+                if ("_ENV".equals(upName)) {
+                    slot = new Environment.VariableSlot(envVal != null ? envVal : globals, false, false);
+                } else {
+                    slot = new Environment.VariableSlot(LuaNil.NIL, false, false);
+                }
+                upvals[i] = new Upvalue(upName, slot);
+            }
+            org.luava.runtime.bytecode.LuaClosure cl = new org.luava.runtime.bytecode.LuaClosure(proto, upvals, envTable);
+            cl.setStripped(isStripped);
+            cl.setSource(resolvedSource);
+            cl.setLineDefined(lineDefined);
+            cl.setLastLineDefined(lastLineDefined);
+            cl.setParams(params);
+            cl.setNparams(params.size());
+            cl.setVararg(isVararg);
+            return cl;
+        }
+
         LuaFunction fn = Interpreter.INSTANCE.createFunctionFromDump(params, isVararg, body, fnParentEnv, ups, code);
         fn.setStripped(isStripped);
         fn.setSource(chunkName != null ? chunkName : (isStripped ? "=?" : source));

@@ -23,7 +23,19 @@ public final class LuaClosure extends LuaFunction {
         this.what = proto.lineDefined == 0 ? "main" : "Lua";
         this.nparams = proto.numParams;
         this.isVararg = proto.isVararg;
-        this.upvalues = Arrays.asList(this.upvals);
+        this.upvalues = new java.util.ArrayList<>(Arrays.asList(this.upvals));
+        this.rawSource = proto.rawSource;
+        this.body = proto.body;
+        if (proto.locVarInfos != null && proto.numParams > 0) {
+            this.params = new java.util.ArrayList<>(proto.numParams);
+            for (int i = 0; i < proto.numParams && i < proto.locVarInfos.length; i++) {
+                this.params.add(proto.locVarInfos[i].name());
+            }
+        }
+        if (proto.name != null) {
+            this.setName(proto.name);
+        }
+        org.luava.runtime.eval.GCManager.onAlloc(64 + this.upvals.length * 16);
     }
 
     public LuaClosure(LuaProto proto, Upvalue[] upvals, LuaTable env) {
@@ -39,12 +51,20 @@ public final class LuaClosure extends LuaFunction {
     }
 
     @Override
+    public void replaceUpvalue(int index, org.luava.runtime.eval.Upvalue uv) {
+        upvals[index] = uv;
+        upvalues.set(index, uv);
+    }
+
+    @Override
     public LuaValue invoke(LuaValue... args) {
         if (state == null) {
             state = new LuaState();
         }
         LuaValue[] res = BytecodeVM.execute(state, this, args);
-        if (res == null || res.length == 0) return LuaNil.NIL;
+        // Lua 5.4: bare 'return' yields zero values (not one nil).
+        // Mirror AST InterpretedLuaFunction which returns Varargs.EMPTY.
+        if (res == null || res.length == 0) return org.luava.runtime.Varargs.EMPTY;
         if (res.length == 1) return res[0];
         return org.luava.runtime.Varargs.of(res);
     }

@@ -22,8 +22,46 @@ public final class Upvalue {
     private LuaValue objectValue;
     private LuaValue closedValue = null;
 
+    // Unique identity for debug.upvalueid
+    private Object id;
+
+    // Join delegate (debug.upvaluejoin): if non-null, this upvalue is an alias
+    // that shares live storage with the target (C: f1.upvals[n1] = f2.upvals[n2]).
+    // The alias keeps its own name (for AST name resolution) and id is synced
+    // to the target's id at join time.
+    private Upvalue joinDelegate;
+
+    /**
+     * Create an alias upvalue for {@code debug.upvaluejoin}: shares live storage
+     * with {@code target} (reads/writes delegate to it) but keeps {@code name}
+     * and syncs identity to target. The caller must REPLACE (not mutate) the
+     * original upvalue in the function's list, as the original may be shared
+     * with other closures (same variable = same upvalue object).
+     */
+    public static Upvalue joinedAlias(String name, Upvalue target) {
+        // Flatten chains (join of join follows C pointer assignment).
+        Upvalue root = target;
+        while (root.joinDelegate != null) {
+            root = root.joinDelegate;
+        }
+        Upvalue alias = new Upvalue(name, LuaNil.NIL);
+        alias.joinDelegate = root;
+        alias.id = root.getId();
+        // Share slot for AST path (AST reads/writes via slot directly).
+        // VM path uses getValue/setValue which delegate above.
+        alias.slot = root.slot;
+        return alias;
+    }
+
     // Intrusive singly-linked list pointer (managed by LuaState in descending order of stackIndex)
     public Upvalue nextOpen;
+
+    public Object getId() {
+        if (id == null) {
+            id = (slot != null) ? slot : new Object();
+        }
+        return id;
+    }
 
     public Upvalue(String name, Environment.VariableSlot slot) {
         this.name = name != null ? name : "?";
@@ -112,6 +150,9 @@ public final class Upvalue {
     }
 
     public LuaValue getValue() {
+        if (joinDelegate != null) {
+            return joinDelegate.getValue();
+        }
         if (isOpenOnStack && thread != null && stackIndex >= 0) {
             return BytecodeVM.getLuaValue(thread.getPrimitiveStack(), thread.getTypeStack(), thread.getObjectStack(), stackIndex);
         }
@@ -132,6 +173,10 @@ public final class Upvalue {
     }
 
     public void setValue(LuaValue val) {
+        if (joinDelegate != null) {
+            joinDelegate.setValue(val);
+            return;
+        }
         LuaValue v = val != null ? val : LuaNil.NIL;
         if (isOpenOnStack && thread != null && stackIndex >= 0) {
             BytecodeVM.setLuaValue(thread.getPrimitiveStack(), thread.getTypeStack(), thread.getObjectStack(), stackIndex, v);
@@ -152,5 +197,61 @@ public final class Upvalue {
         this.closedValue = v;
         this.objectValue = v;
         this.typeTag = BytecodeVM.TYPE_OBJECT;
+    }
+
+    /**
+     * Make this upvalue share the live storage of {@code other} while keeping
+     * its own name. This mirrors Lua C's lua_upvaluejoin, where both upvalues
+     * point to the same UpVal*. The name must be preserved because the AST
+     * interpreter resolves upvalues by name during closure invocation.
+     */
+    public void joinWith(Upvalue other) {
+        if (other == null) return;
+        this.id = other.getId();
+        if (other.slot != null) {
+            this.slot = other.slot;
+            this.stack = null;
+            this.state = null;
+            this.thread = null;
+            this.stackIndex = -1;
+            this.isOpenOnStack = false;
+            this.rawValue = 0;
+            this.typeTag = BytecodeVM.TYPE_NIL;
+            this.objectValue = null;
+            this.closedValue = null;
+        } else if (other.isOpenOnStack) {
+            this.slot = null;
+            this.stack = other.stack;
+            this.state = other.state;
+            this.thread = other.thread;
+            this.stackIndex = other.stackIndex;
+            this.isOpenOnStack = true;
+            this.rawValue = 0;
+            this.typeTag = BytecodeVM.TYPE_NIL;
+            this.objectValue = null;
+            this.closedValue = null;
+        } else if (other.typeTag != BytecodeVM.TYPE_NIL || other.objectValue != null) {
+            this.slot = null;
+            this.stack = null;
+            this.state = null;
+            this.thread = null;
+            this.stackIndex = -1;
+            this.isOpenOnStack = false;
+            this.rawValue = other.rawValue;
+            this.typeTag = other.typeTag;
+            this.objectValue = other.objectValue;
+            this.closedValue = null;
+        } else {
+            this.slot = null;
+            this.stack = null;
+            this.state = null;
+            this.thread = null;
+            this.stackIndex = -1;
+            this.isOpenOnStack = false;
+            this.rawValue = 0;
+            this.typeTag = BytecodeVM.TYPE_NIL;
+            this.objectValue = null;
+            this.closedValue = other.closedValue;
+        }
     }
 }

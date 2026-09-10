@@ -179,6 +179,7 @@ public final class BaseLib {
                 }
             }
             if (level <= 0) {
+                preserveCoroutineDeathFrames();
                 LuaException le = new LuaException(msg);
                 le.setDecorated(true);
                 throw le;
@@ -193,15 +194,17 @@ public final class BaseLib {
                     String formatted = org.luava.frontend.parser.ParseException.formatChunkName(src) + ":" + line + ": " + msg.toLuaString();
                     LuaException le = new LuaException(LuaString.valueOf(formatted));
                     le.setDecorated(true);
+                    preserveCoroutineDeathFrames();
                     throw le;
                 }
             }
+            preserveCoroutineDeathFrames();
             LuaException le = new LuaException(msg);
             le.setDecorated(true);
             throw le;
         }));
 
-        globals.rawset(LuaString.valueOf("pcall"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.valueOf("pcall"), LuaFunction.of("pcall", args -> {
             if (args.length == 0) {
                 return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("bad argument #1 to 'pcall' (value expected)"));
             }
@@ -210,7 +213,7 @@ public final class BaseLib {
             System.arraycopy(args, 1, fnArgs, 0, fnArgs.length);
             org.luava.runtime.eval.CallStack.pushProtectedFrame(null);
             boolean pushedCFrame = false;
-            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction)) {
+            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
                 org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
                 org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
                 pushedCFrame = true;
@@ -242,7 +245,7 @@ public final class BaseLib {
             }
         }));
 
-        globals.rawset(LuaString.valueOf("xpcall"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.valueOf("xpcall"), LuaFunction.of("xpcall", args -> {
             if (args.length < 2) {
                 return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("bad arguments to 'xpcall' (value expected)"));
             }
@@ -253,7 +256,7 @@ public final class BaseLib {
 
             org.luava.runtime.eval.CallStack.pushProtectedFrame(msgh);
             boolean pushedCFrame = false;
-            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction)) {
+            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
                 org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
                 org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
                 pushedCFrame = true;
@@ -696,5 +699,22 @@ public final class BaseLib {
                 default -> throw new LuaException("bad argument #1 to 'collectgarbage' (invalid option '" + opt + "')");
             };
         }));
+    }
+
+    /**
+     * Preserve current coroutine's frames for dead-coroutine traceback.
+     * Only for non-main coroutines dying from unprotected errors; main-thread
+     * errors propagate out (no need to preserve). Cheap flag (no copying);
+     * CallStack.pop() skips while set. The coroutine dies so no leak.
+     */
+    private static void preserveCoroutineDeathFrames() {
+        org.luava.runtime.concurrency.LuaCoroutine cur =
+                org.luava.runtime.concurrency.LuaCoroutine.running();
+        if (cur != null && !cur.isMainThread()) {
+            org.luava.runtime.eval.CallStack.CallStackState st = cur.getCallStackState();
+            if (st.errorStack == null && st.protectedFrames.isEmpty()) {
+                st.preserveForDeath = true;
+            }
+        }
     }
 }
