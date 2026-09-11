@@ -1,3 +1,10 @@
+/*
+ * Copyright 2026 Ha Tri Kien
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 package org.luava.runtime.standard;
 
 import org.luava.runtime.LuaException;
@@ -218,7 +225,8 @@ public final class StringLib {
                         case 'c' -> {
                             checkFormat(form, "-", false);
                             long code = checkFormatInteger(v, argIdx);
-                            String res = String.valueOf((char) (int) code);
+                            // C printf %c: converted to unsigned char.
+                            String res = String.valueOf((char) (code & 0xFF));
                             if (width > 1) {
                                 if (flags.contains("-")) res = res + " ".repeat(width - 1);
                                 else res = " ".repeat(width - 1) + res;

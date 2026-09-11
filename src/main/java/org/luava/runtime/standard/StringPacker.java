@@ -1,3 +1,10 @@
+/*
+ * Copyright 2026 Ha Tri Kien
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 package org.luava.runtime.standard;
 
 import org.luava.runtime.LuaException;
@@ -17,10 +24,6 @@ public final class StringPacker {
     private static final int DEFAULT_MAXALIGN = 8;
 
     private StringPacker() {}
-
-    private static boolean isPowerOf2(int n) {
-        return n > 0 && (n & (n - 1)) == 0;
-    }
 
     private static int getalign(int size, int maxalign) {
         if (size == 0 || (size & (size - 1)) != 0) {
@@ -78,9 +81,8 @@ public final class StringPacker {
                         if (a < 1 || a > 16) {
                             throw new LuaException("integral size (" + a + ") out of limits [1,16]");
                         }
-                        if (!isPowerOf2(a)) {
-                            throw new LuaException("alignment " + a + " is not a power of 2");
-                        }
+                        // C getnumlimit: only the [1,16] range is validated;
+                        // non-power-of-2 alignments (e.g. !3) are accepted.
                         opt.size = a;
                     } else {
                         opt.size = DEFAULT_MAXALIGN;
@@ -278,13 +280,22 @@ public final class StringPacker {
         out.writeBytes(buf);
     }
 
+    // C luaL_checkinteger/checknumber/checklstring: a missing value is a Lua
+    // argument error, never a Java ArrayIndexOutOfBoundsException.
+    private static LuaValue packArg(LuaValue[] args, int argIdx, String what) {
+        if (argIdx >= args.length) {
+            throw new LuaException("bad argument #" + (argIdx + 1)
+                    + " to 'string.pack' (" + what + " expected, got nil)");
+        }
+        return args[argIdx];
+    }
+
     public static byte[] pack(String fmt, LuaValue[] args, int argOffset) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         ByteOrder order = ByteOrder.nativeOrder();
         int maxalign = 1;
         int argIdx = argOffset;
         int[] indexRef = new int[]{0};
-
         while (true) {
             Option opt = nextOption(fmt, indexRef, maxalign);
             if (opt == null) break;
@@ -306,34 +317,34 @@ public final class StringPacker {
 
             switch (opt.code) {
                 case 'b', 'B' -> {
-                    long val = args[argIdx++].toLong();
+                    long val = packArg(args, argIdx++, "number").toLong();
                     packInt(out, val, order, 1, opt.isSigned);
                 }
                 case 'x' -> out.write(0);
                 case 'h', 'H' -> {
-                    long val = args[argIdx++].toLong();
+                    long val = packArg(args, argIdx++, "number").toLong();
                     packInt(out, val, order, 2, opt.isSigned);
                 }
                 case 'l', 'L', 'j', 'J', 'T' -> {
-                    long val = args[argIdx++].toLong();
+                    long val = packArg(args, argIdx++, "number").toLong();
                     packInt(out, val, order, 8, opt.isSigned);
                 }
                 case 'i', 'I' -> {
-                    long val = args[argIdx++].toLong();
+                    long val = packArg(args, argIdx++, "number").toLong();
                     packInt(out, val, order, opt.size, opt.isSigned);
                 }
                 case 'f' -> {
-                    float f = (float) args[argIdx++].toDouble();
+                    float f = (float) packArg(args, argIdx++, "number").toDouble();
                     ByteBuffer bb = ByteBuffer.allocate(4).order(order).putFloat(f);
                     out.writeBytes(bb.array());
                 }
                 case 'd', 'n' -> {
-                    double d = args[argIdx++].toDouble();
+                    double d = packArg(args, argIdx++, "number").toDouble();
                     ByteBuffer bb = ByteBuffer.allocate(8).order(order).putDouble(d);
                     out.writeBytes(bb.array());
                 }
                 case 'c' -> {
-                    String str = args[argIdx++].toLuaString();
+                    String str = packArg(args, argIdx++, "string").toLuaString();
                     byte[] bytes = str.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
                     if (bytes.length > opt.size) {
                         throw new LuaException("bad argument to 'string.pack' (string longer than given size)");
@@ -344,7 +355,7 @@ public final class StringPacker {
                     }
                 }
                 case 's' -> {
-                    String str = args[argIdx++].toLuaString();
+                    String str = packArg(args, argIdx++, "string").toLuaString();
                     byte[] bytes = str.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
                     if (opt.size < 8 && bytes.length >= (1L << (opt.size * 8))) {
                         throw new LuaException("bad argument to 'string.pack' (string length does not fit in given size)");
@@ -353,7 +364,7 @@ public final class StringPacker {
                     out.writeBytes(bytes);
                 }
                 case 'z' -> {
-                    String str = args[argIdx++].toLuaString();
+                    String str = packArg(args, argIdx++, "string").toLuaString();
                     if (str.indexOf('\0') >= 0) {
                         throw new LuaException("bad argument to 'string.pack' (string contains zeros)");
                     }
@@ -402,10 +413,15 @@ public final class StringPacker {
     }
 
     public static LuaValue unpack(String fmt, byte[] data, int startPos1Based) {
+        // C posrelatI: 0 and overly-negative positions clamp to 1; only
+        // positions past the end are an error.
         if (startPos1Based < 0) {
             startPos1Based = data.length + startPos1Based + 1;
         }
-        if (startPos1Based < 1 || startPos1Based > data.length + 1) {
+        if (startPos1Based < 1) {
+            startPos1Based = 1;
+        }
+        if (startPos1Based > data.length + 1) {
             throw new LuaException("bad argument #3 to 'string.unpack' (initial position out of string)");
         }
         ByteOrder order = ByteOrder.nativeOrder();

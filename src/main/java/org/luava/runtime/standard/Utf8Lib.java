@@ -1,3 +1,10 @@
+/*
+ * Copyright 2026 Ha Tri Kien
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 package org.luava.runtime.standard;
 
 import org.luava.runtime.LuaException;
@@ -196,6 +203,7 @@ public final class Utf8Lib {
         }));
 
         LuaFunction iterAuxStrict = LuaFunction.of(args -> {
+            if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'utf8.codes' iterator (string expected)");
             byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
             long n = args.length > 1 ? args[1].toLong() : 0;
@@ -214,6 +222,7 @@ public final class Utf8Lib {
         });
 
         LuaFunction iterAuxLax = LuaFunction.of(args -> {
+            if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'utf8.codes' iterator (string expected)");
             byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
             long n = args.length > 1 ? args[1].toLong() : 0;

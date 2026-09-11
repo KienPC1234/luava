@@ -1,3 +1,10 @@
+/*
+ * Copyright 2026 Ha Tri Kien
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 package org.luava.binding;
 
 import org.luava.runtime.LuaBoolean;
@@ -37,7 +44,10 @@ public final class LuaDataConverter {
         if (obj instanceof Float f) return LuaFloat.valueOf(f.doubleValue());
         if (obj instanceof Double d) return LuaFloat.valueOf(d);
         if (obj instanceof Character c) return LuaString.valueOf(String.valueOf(c));
-        if (obj instanceof CharSequence s) return LuaString.valueOf(s.toString());
+        // Only immutable String converts to a Lua string. Mutable
+        // CharSequences (StringBuilder, buffers, ...) stay live userdata so
+        // object identity and chaining survive the bridge.
+        if (obj instanceof String s) return LuaString.valueOf(s);
 
         if (obj instanceof Enum<?> e) {
             return LuaString.valueOf(e.name());
@@ -59,6 +69,15 @@ public final class LuaDataConverter {
             LuaTable table = new LuaTable();
             for (Map.Entry<?, ?> entry : map.entrySet()) {
                 table.rawset(toLua(entry.getKey()), toLua(entry.getValue()));
+            }
+            return table;
+        }
+
+        if (obj instanceof Set<?> set) {
+            LuaTable table = new LuaTable();
+            int i = 1;
+            for (Object e : set) {
+                table.rawset(LuaInteger.valueOf(i++), toLua(e));
             }
             return table;
         }
@@ -86,11 +105,57 @@ public final class LuaDataConverter {
         if (obj instanceof Float f) return LuaFloat.valueOf(f.doubleValue());
         if (obj instanceof Double d) return LuaFloat.valueOf(d);
         if (obj instanceof Character c) return LuaString.valueOf(String.valueOf(c));
-        if (obj instanceof CharSequence s) return LuaString.valueOf(s.toString());
+        if (obj instanceof String s) return LuaString.valueOf(s);
         if (obj instanceof Enum<?> e) return LuaString.valueOf(e.name());
 
         // Collections, Arrays, and arbitrary Java objects wrapped as live LuaUserdata
-        return new LuaUserdata(obj);
+        return wrapLive(obj);
+    }
+
+    /**
+     * Wraps a fresh Java object as live userdata, attaching the shared
+     * length metatable for sized types. Use at construction/call sites that
+     * produce live objects (as opposed to {@link #toLua}, which snapshots
+     * collections into tables).
+     */
+    public static LuaUserdata wrapLive(Object obj) {
+        LuaUserdata ud = new LuaUserdata(obj);
+        if (obj instanceof List<?> || obj instanceof Map<?, ?> || obj instanceof Set<?> || obj.getClass().isArray()) {
+            ud.setMetatable(liveCollectionMetatable());
+        }
+        return ud;
+    }
+
+    private static volatile LuaTable liveCollectionMetatable;
+
+    /**
+     * Shared metatable giving live Java collections/arrays the Lua length
+     * operator ({@code #}). Host code may replace it per-object via
+     * {@code setmetatable}; this default only applies at wrap time.
+     */
+    private static LuaTable liveCollectionMetatable() {
+        LuaTable mt = liveCollectionMetatable;
+        if (mt == null) {
+            synchronized (LuaDataConverter.class) {
+                mt = liveCollectionMetatable;
+                if (mt == null) {
+                    mt = new LuaTable();
+                    mt.rawset(LuaString.valueOf("__len"), LuaFunction.of(args -> {
+                        Object inst = (args.length > 0 && args[0].isUserdata())
+                                ? ((LuaUserdata) args[0]).getJavaInstance() : null;
+                        if (inst instanceof List<?> l) return LuaInteger.valueOf(l.size());
+                        if (inst instanceof Map<?, ?> m) return LuaInteger.valueOf(m.size());
+                        if (inst instanceof Set<?> s) return LuaInteger.valueOf(s.size());
+                        if (inst != null && inst.getClass().isArray()) {
+                            return LuaInteger.valueOf(Array.getLength(inst));
+                        }
+                        throw new LuaException("attempt to get length of a non-sized userdata value");
+                    }));
+                    liveCollectionMetatable = mt;
+                }
+            }
+        }
+        return mt;
     }
 
     @SuppressWarnings("unchecked")
