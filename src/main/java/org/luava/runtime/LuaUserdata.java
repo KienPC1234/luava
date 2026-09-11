@@ -1,3 +1,10 @@
+/*
+ * Copyright 2026 Ha Tri Kien
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 package org.luava.runtime;
 
 import org.luava.binding.LuaDataConverter;
@@ -380,7 +387,7 @@ public final class LuaUserdata extends LuaValue {
             try {
                 Object[] javaArgs = convertArgs(bestMatch.getParameterTypes(), bestMatch.isVarArgs(), args);
                 Object obj = bestMatch.newInstance(javaArgs);
-                return new LuaUserdata(obj);
+                return LuaDataConverter.wrapLive(obj);
             } catch (Throwable t) {
                 throw new LuaException("Error invoking constructor for " + clazz.getName() + ": " + t.getMessage());
             }

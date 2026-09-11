@@ -1,3 +1,10 @@
+/*
+ * Copyright 2026 Ha Tri Kien
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 package org.luava.runtime.standard;
 
 import org.luava.runtime.LuaException;
@@ -178,7 +185,11 @@ public final class TableLib {
                 throw new LuaException("bad argument #1 to 'table.sort' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }
             LuaTable t = (LuaTable) args[0];
-            LuaFunction comp = (args.length > 1 && !args[1].isNil() && args[1].isFunction()) ? (LuaFunction) args[1] : null;
+            if (args.length > 1 && !args[1].isNil() && !args[1].isFunction()) {
+                throw new LuaException("bad argument #2 to 'table.sort' (function expected, got "
+                        + args[1].typeName() + ")");
+            }
+            LuaFunction comp = (args.length > 1 && !args[1].isNil()) ? (LuaFunction) args[1] : null;
             long lenLong = luaLen(t);
             if (lenLong <= 1) {
                 return LuaNil.NIL;
@@ -195,25 +206,9 @@ public final class TableLib {
             org.luava.runtime.concurrency.LuaCoroutine curCoro = org.luava.runtime.concurrency.LuaCoroutine.running();
             if (curCoro != null) curCoro.enterNonYieldable();
             try {
-                items.sort((a, b) -> {
-                    if (comp != null) {
-                        boolean ab = comp.call(a, b).toBoolean();
-                        boolean ba = comp.call(b, a).toBoolean();
-                        if (ab && ba) {
-                            throw new LuaException("invalid order function for sorting");
-                        }
-                        if (ab) return -1;
-                        if (ba) return 1;
-                        return 0;
-                    }
-                    boolean ab = a.luaLessThan(b);
-                    if (ab) return -1;
-                    boolean ba = b.luaLessThan(a);
-                    if (ba) return 1;
-                    return 0;
-                });
-            } catch (IllegalArgumentException ex) {
-                throw new LuaException("invalid order function for sorting");
+                // Faithful port of C ltablib.c auxsort/partition: one comparator
+                // call per test, same invalid-order detection, same pivot logic.
+                auxsort(items, 1, len, comp, new int[]{0});
             } finally {
                 if (curCoro != null) curCoro.exitNonYieldable();
             }
@@ -225,5 +220,92 @@ public final class TableLib {
         }));
 
         globals.rawset(LuaString.valueOf("table"), tableMod);
+    }
+
+    // ---- Quicksort ported from PUC-Rio ltablib.c (1-based indices) ----
+
+    private static final int SORT_RANLIMIT = 100;
+
+    private static boolean sortComp(LuaValue a, LuaValue b, LuaFunction comp) {
+        if (comp == null) return a.luaLessThan(b);
+        return comp.call(a, b).toBoolean();
+    }
+
+    private static void swapItems(java.util.List<LuaValue> a, int i, int j) {
+        LuaValue tmp = a.get(i - 1);
+        a.set(i - 1, a.get(j - 1));
+        a.set(j - 1, tmp);
+    }
+
+    private static int partition(java.util.List<LuaValue> a, int lo, int up, LuaFunction comp) {
+        LuaValue pivot = a.get(up - 2); // a[up-1] after the pivot swap
+        int i = lo;
+        int j = up - 1;
+        for (;;) {
+            while (sortComp(a.get(++i - 1), pivot, comp)) {
+                if (i == up - 1) {
+                    throw new LuaException("invalid order function for sorting");
+                }
+            }
+            while (sortComp(pivot, a.get(--j - 1), comp)) {
+                if (j < i) {
+                    throw new LuaException("invalid order function for sorting");
+                }
+            }
+            if (j < i) {
+                a.set(up - 2, a.get(i - 1));
+                a.set(i - 1, pivot);
+                return i;
+            }
+            swapItems(a, i, j);
+        }
+    }
+
+    private static int choosePivot(int lo, int up, int rnd) {
+        int r4 = (up - lo) / 4;
+        return (int) (Integer.toUnsignedLong(rnd) % (r4 * 2) + (lo + r4));
+    }
+
+    private static int randomizePivot() {
+        long n = System.nanoTime() + 0x9E3779B97F4A7C15L * System.currentTimeMillis();
+        return (int) (n ^ (n >>> 32));
+    }
+
+    private static void auxsort(java.util.List<LuaValue> a, int lo, int up, LuaFunction comp, int[] rnd) {
+        while (lo < up) {
+            if (sortComp(a.get(up - 1), a.get(lo - 1), comp)) {
+                swapItems(a, lo, up);
+            }
+            if (up - lo == 1) return;
+            int p;
+            if (up - lo < SORT_RANLIMIT || rnd[0] == 0) {
+                p = (lo + up) / 2;
+            } else {
+                p = choosePivot(lo, up, rnd[0]);
+            }
+            if (sortComp(a.get(p - 1), a.get(lo - 1), comp)) {
+                swapItems(a, p, lo);
+            } else if (sortComp(a.get(up - 1), a.get(p - 1), comp)) {
+                swapItems(a, p, up);
+            }
+            if (up - lo == 2) return;
+            LuaValue pivot = a.get(p - 1);
+            a.set(p - 1, a.get(up - 2));
+            a.set(up - 2, pivot);
+            p = partition(a, lo, up, comp);
+            int n;
+            if (p - lo < up - p) {
+                auxsort(a, lo, p - 1, comp, rnd);
+                n = p - lo;
+                lo = p + 1;
+            } else {
+                auxsort(a, p + 1, up, comp, rnd);
+                n = up - p;
+                up = p - 1;
+            }
+            if ((up - lo) / 128 > n) {
+                rnd[0] = randomizePivot();
+            }
+        }
     }
 }

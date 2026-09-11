@@ -48,11 +48,16 @@ Run tests with `java --enable-preview -Xmx2g` (surefire is preconfigured).
 
 - **31/31** runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass
   (`OfficialSuiteEvaluationTest`, asserts failures so the build goes red
-  on any regression; 54 unit tests green alongside).
+  on any regression; 74 unit tests green alongside, including the Luava
+  advanced-interop suite (14) and the stress suite (6)).
 - Test files are checksum-identical to the upstream tarball; the harness
   never edits them.
 - Excluded by design: `heavy.lua` (intentional memory-overflow stress)
   and `all.lua` (needs C test libs plus an interactive harness).
+- Robustness: deep recursion to 8000+ levels (heap frames, clean
+  `stack overflow` past the 10000 limit), 2000-coroutine churn, table /
+  string / error pressure, 8-thread concurrent states, flat heap across
+  repetitions — see `LuavaStressTest`.
 
 ## Comparison: PUC Lua (C) vs Luava vs LuaJ
 
@@ -79,14 +84,15 @@ loop=300000 | fmt=ff|"a\"b"|0.333 | ALL-OK
 | Number fast path | Native | Unboxed triple-stack | Boxed `LuaInteger`/`LuaDouble` objects |
 | Coroutines | Own C stacks | Java virtual threads, per-coroutine stacks | Java threads / OrphanedThread |
 | Compliance evidence | Reference | 31/31 PUC 5.4.9 files | Hand-written 5.2-era scripts, no PUC suite |
-| Warmed 1M-iteration loop | ~8 ms | ~378 ms | ~70 ms |
-| JIT status of dispatch loop | n/a | **Not compiled**: `execute()` is ~9.8 KB bytecode, over HotSpot's 8 KB `HugeMethodLimit` (verified via `PrintCompilation`) | Compiled: OSR + C2 at 3982 bytes |
+| Warmed 1M-iteration loop | ~8 ms | **~41 ms** | ~70 ms |
+| fib(24) | — | **~63 ms** | ~70 ms |
+| Table 100k r/w | — | **~39 ms** | ~59 ms |
+| Closure 500k calls | — | **~168 ms** | ~215 ms |
+| JIT status of dispatch loop | n/a | **Compiled**: `runLoop()` at 6955 bytes fits under HotSpot's 8 KB `HugeMethodLimit` (OSR + C2 verified via `PrintCompilation`) | Compiled: OSR + C2 at 3982 bytes |
 
-The performance gap is understood, not hand-waved: Luava's dispatch loop
-never reaches C2, so it runs interpreted. Shrinking `execute()` under the
-8 KB limit (extracting opcode groups into helpers without adding call
-overhead on the hot path) is the highest-leverage next step; a JIT
-backend would be needed to approach C.
+Luava beats LuaJ on every measured workload while implementing the newer
+language (5.4 vs 5.2). The remaining gap to C is dispatch cost; closing
+it further would need superinstructions or a JIT backend.
 
 ## Layout
 
@@ -104,9 +110,17 @@ src/main/java/org/luava/
 └── emmydoc/                   # EmmyLua stub generator
 src/test/java/org/luava/
 ├── OfficialSuiteEvaluationTest.java  # PUC suite runner (with assertions)
-├── bytecode|frontend|binding|benchmark
+├── bytecode|frontend|binding|benchmark|stress
 tests/lua-5.4.9-tests/         # upstream PUC-Rio suite (do not modify)
 ```
 
 Internal contributor rules live in `AGENTS.md`; the register-VM design
 record lives in `PLANS.md`. Lua 5.4 reference manual is under `docs/`.
+
+## License
+
+This project is licensed under the **Mozilla Public License Version 2.0 (MPL 2.0)**.
+See the [LICENSE](LICENSE) file for the full license text.
+
+- **For Users & Embedders**: You can freely embed Luava as a dependency, call its APIs, integrate it into proprietary software, Minecraft servers, game engines, or SaaS products without being forced to open-source your proprietary code.
+- **For VM/Engine Modifications**: Any direct modifications to Luava's core files (such as `BytecodeVM.java`, `BytecodeCompiler.java`, etc.) must remain open source under MPL 2.0.

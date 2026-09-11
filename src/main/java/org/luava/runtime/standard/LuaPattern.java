@@ -1,3 +1,10 @@
+/*
+ * Copyright 2026 Ha Tri Kien
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 package org.luava.runtime.standard;
 
 import org.luava.runtime.LuaException;
@@ -376,10 +383,12 @@ public final class LuaPattern {
         }
     }
 
-    private static int posrelat(int pos, int len) {
-        if (pos > 0) return pos - 1;
+    // C posrelatI uses lua_Integer: huge positions must saturate past the
+    // end (find nothing), never wrap around via (int) cast.
+    private static int posrelat(long pos, int len) {
+        if (pos > 0) return (int) Math.min(pos - 1, (long) len + 1);
         else if (pos == 0) return 0;
-        else if (pos + len >= 0) return pos + len;
+        else if (pos + len >= 0) return (int) (pos + len);
         else return 0;
     }
 
@@ -413,7 +422,7 @@ public final class LuaPattern {
     public static Varargs find(LuaValue sVal, LuaValue pVal, LuaValue initVal, boolean plain) {
         byte[] src = sVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
         byte[] p = pVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
-        int initArg = (initVal != null && !initVal.isNil()) ? (int) initVal.toLong() : 1;
+        long initArg = (initVal != null && !initVal.isNil()) ? initVal.toLong() : 1;
         int init = posrelat(initArg, src.length);
 
         if (plain || nospecials(p)) {
@@ -448,7 +457,7 @@ public final class LuaPattern {
     public static Varargs match(LuaValue sVal, LuaValue pVal, LuaValue initVal) {
         byte[] src = sVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
         byte[] p = pVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
-        int initArg = (initVal != null && !initVal.isNil()) ? (int) initVal.toLong() : 1;
+        long initArg = (initVal != null && !initVal.isNil()) ? initVal.toLong() : 1;
         int init = posrelat(initArg, src.length);
 
         boolean anchor = p.length > 0 && p[0] == '^';
@@ -471,7 +480,7 @@ public final class LuaPattern {
     public static Varargs gsub(LuaValue sVal, LuaValue pVal, LuaValue replVal, LuaValue maxVal) {
         byte[] src = sVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
         byte[] p = pVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
-        int max_s = (maxVal != null && !maxVal.isNil()) ? (int) maxVal.toLong() : Integer.MAX_VALUE;
+        long max_s = (maxVal != null && !maxVal.isNil()) ? maxVal.toLong() : Long.MAX_VALUE;
 
         boolean anchor = p.length > 0 && p[0] == '^';
         byte[] actP = anchor ? Arrays.copyOfRange(p, 1, p.length) : p;
@@ -591,7 +600,7 @@ public final class LuaPattern {
     public static LuaFunction gmatch(LuaValue sVal, LuaValue pVal, LuaValue initVal) {
         byte[] src = sVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
         byte[] p = pVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
-        int initArg = (initVal != null && !initVal.isNil()) ? (int) initVal.toLong() : 1;
+        long initArg = (initVal != null && !initVal.isNil()) ? initVal.toLong() : 1;
         int init = posrelat(initArg, src.length);
 
         MatchState ms = new MatchState(src, p);

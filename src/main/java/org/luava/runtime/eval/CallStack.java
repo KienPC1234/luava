@@ -1,3 +1,10 @@
+/*
+ * Copyright 2026 Ha Tri Kien
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 package org.luava.runtime.eval;
 
 import org.luava.runtime.LuaFunction;
@@ -74,7 +81,15 @@ public final class CallStack {
         }
     }
 
-    public static final int MAX_CALL_DEPTH = 200;
+    /**
+     * Maximum Lua call depth. Frames live on the heap (pooled CallInfo +
+     * reused Frame objects), not the Java call stack, so thousands of
+     * levels are cheap and match C behavior for legitimate deep recursion
+     * (PUC Lua handles 8000+). Unbounded recursion still fails cleanly
+     * with "stack overflow" instead of OOMing the heap. Coroutine nesting
+     * has its own separate limit (MAX_NESTED_COROUTINES).
+     */
+    public static final int MAX_CALL_DEPTH = 10000;
     public static final int EXTRA_STACK_SLOTS = 50;
 
     public static final class ProtectedFrame {
