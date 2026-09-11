@@ -699,7 +699,8 @@ public final class BytecodeVM {
                 case OpCode.OP_FORLOOP -> {
                     int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
                     int regInit = ctx.base + a;
-                    if (ctx.tStack[regInit + 1] == TYPE_INT && ctx.pStack[regInit + 1] > 0) {
+                    if (ctx.tStack[regInit + 1] == TYPE_INT
+                            && Long.compareUnsigned(ctx.pStack[regInit + 1], 0) > 0) {
                         ctx.pStack[regInit + 1]--;
                         long next = ctx.pStack[regInit] + ctx.pStack[regInit + 2];
                         ctx.pStack[regInit] = next;
@@ -1886,9 +1887,12 @@ public final class BytecodeVM {
                 }
                 double d = dLimit;
                 if (Double.isNaN(d)) {
-                    throw new LuaException("bad 'for' limit (number expected, got NaN)");
-                }
-                if (d >= 9223372036854775808.0) {
+                    // C lvm.c forlimit: NaN converts via tonumber, 0 < NaN is
+                    // false so it takes the negative branch: skip for step > 0,
+                    // MININTEGER bound for step < 0 (loop then runs).
+                    if (stepVal > 0) return pc + bx;
+                    limitVal = Long.MIN_VALUE;
+                } else if (d >= 9223372036854775808.0) {
                     if (stepVal < 0) return pc + bx; // skip loop
                     limitVal = Long.MAX_VALUE;
                 } else if (d < -9223372036854775808.0) {
@@ -1946,11 +1950,9 @@ public final class BytecodeVM {
     }
 
     private static Long toForInteger(LuaValue v) {
+        // C lvm.c forprep: integer loop only when init AND step are strictly
+        // integers; strings (even "1") force the float path.
         if (v instanceof LuaInteger li) return li.toLong();
-        if (v instanceof LuaString ls) {
-            LuaValue num = ls.toLuaNumber();
-            if (num instanceof LuaInteger li) return li.toLong();
-        }
         return null;
     }
 

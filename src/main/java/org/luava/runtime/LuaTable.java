@@ -455,20 +455,36 @@ public final class LuaTable extends LuaValue {
     }
 
     public int rawlen() {
-        // Find boundary according to Lua 5.4 definition
+        // Mirror C luaH_getn/unbound_search: trim trailing nils, then if
+        // t[n+1] is present (possibly in hashPart) search upward for a border.
         int n = arrayPart.size();
         while (n > 0 && arrayPart.get(n - 1).isNil()) {
             n--;
         }
-        if (n > 0) {
+        if (n > 0 && rawget(LuaInteger.valueOf((long) n + 1)).isNil()) {
             return n;
         }
-        // If array part is empty, check consecutive integer keys in hash part
-        int i = 1;
-        while (!rawget(LuaInteger.valueOf(i)).isNil()) {
-            i++;
+        return unboundSearch(n);
+    }
+
+    private int unboundSearch(long j) {
+        long i = j; // i is zero or a present index
+        j++;
+        while (!rawget(LuaInteger.valueOf(j)).isNil()) {
+            i = j;
+            if (j > 0x7FFFFFFFL / 2) { // overflow guard: linear fallback
+                i = 1;
+                while (!rawget(LuaInteger.valueOf(i)).isNil()) i++;
+                return (int) Math.min(i - 1, Integer.MAX_VALUE);
+            }
+            j *= 2;
         }
-        return i - 1;
+        while (j - i > 1) {
+            long m = (i + j) / 2;
+            if (rawget(LuaInteger.valueOf(m)).isNil()) j = m;
+            else i = m;
+        }
+        return (int) Math.min(i, Integer.MAX_VALUE);
     }
 
     public Varargs next(LuaValue currentKey) {

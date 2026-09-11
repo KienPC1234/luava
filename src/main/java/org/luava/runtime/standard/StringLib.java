@@ -225,7 +225,8 @@ public final class StringLib {
                         case 'c' -> {
                             checkFormat(form, "-", false);
                             long code = checkFormatInteger(v, argIdx);
-                            String res = String.valueOf((char) (int) code);
+                            // C printf %c: converted to unsigned char.
+                            String res = String.valueOf((char) (code & 0xFF));
                             if (width > 1) {
                                 if (flags.contains("-")) res = res + " ".repeat(width - 1);
                                 else res = " ".repeat(width - 1) + res;

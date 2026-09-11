@@ -51,7 +51,7 @@ public final class DebugLib {
             { LuaCoroutine sc = targetCoro != null ? targetCoro : LuaCoroutine.running(); if (sc != null) sc.syncTopFrameFromMirror(); }
             if (argIdx >= args.length) return LuaNil.NIL;
             LuaValue fnOrLevel = args[argIdx];
-            String what = (argIdx + 1 < args.length && !args[argIdx + 1].isNil()) ? args[argIdx + 1].toLuaString() : "flnStu";
+            String what = (argIdx + 1 < args.length && !args[argIdx + 1].isNil()) ? args[argIdx + 1].toLuaString() : "flnSrtu";
 
             if (what.startsWith(">")) {
                 throw new LuaException("bad argument #" + (argIdx + 2) + " to 'getinfo' (invalid option '>')");
