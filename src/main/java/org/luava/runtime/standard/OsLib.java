@@ -11,17 +11,11 @@ import org.luava.runtime.*;
 
 import java.io.File;
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.MemorySegment;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.time.Instant;
-import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.Set;
 
 public final class OsLib {
@@ -31,7 +25,6 @@ public final class OsLib {
         "Ec", "EC", "Ex", "EX", "Ey", "EY",
         "Od", "Oe", "OH", "OI", "Om", "OM", "OS", "Ou", "OU", "OV", "Ow", "OW", "Oy"
     );
-    private static final int[] LC_CATS = {6, 3, 0, 4, 1, 2}; // ALL, COLLATE, CTYPE, MONETARY, NUMERIC, TIME
     private static final String[] CAT_NAMES = {"all", "collate", "ctype", "monetary", "numeric", "time"};
 
     private OsLib() {}
@@ -116,46 +109,19 @@ public final class OsLib {
             int sec = getField(t, "sec", 0, 0);
             int isdst = getBoolField(t, "isdst");
 
-            if (NativeProcess.isAvailable() && NativeProcess.mktime != null) {
-                try (Arena arena = Arena.ofConfined()) {
-                    MemorySegment tm = arena.allocate(NativeProcess.TM_SIZE);
-                    NativeProcess.setTmYear(tm, year);
-                    NativeProcess.setTmMon(tm, month);
-                    NativeProcess.setTmMday(tm, day);
-                    NativeProcess.setTmHour(tm, hour);
-                    NativeProcess.setTmMin(tm, min);
-                    NativeProcess.setTmSec(tm, sec);
-                    NativeProcess.setTmIsdst(tm, isdst);
-
-                    long res = NativeProcess.mktime(tm);
-                    if (res == -1) {
-                        throw new LuaException("time result cannot be represented in this installation");
-                    }
-
-                    t.rawset(LuaString.valueOf("year"), LuaInteger.valueOf(NativeProcess.getTmYear(tm) + 1900L));
-                    t.rawset(LuaString.valueOf("month"), LuaInteger.valueOf(NativeProcess.getTmMon(tm) + 1L));
-                    t.rawset(LuaString.valueOf("day"), LuaInteger.valueOf(NativeProcess.getTmMday(tm)));
-                    t.rawset(LuaString.valueOf("hour"), LuaInteger.valueOf(NativeProcess.getTmHour(tm)));
-                    t.rawset(LuaString.valueOf("min"), LuaInteger.valueOf(NativeProcess.getTmMin(tm)));
-                    t.rawset(LuaString.valueOf("sec"), LuaInteger.valueOf(NativeProcess.getTmSec(tm)));
-                    t.rawset(LuaString.valueOf("yday"), LuaInteger.valueOf(NativeProcess.getTmYday(tm) + 1L));
-                    t.rawset(LuaString.valueOf("wday"), LuaInteger.valueOf(NativeProcess.getTmWday(tm) + 1L));
-                    int normIsdst = NativeProcess.getTmIsdst(tm);
-                    if (normIsdst >= 0) {
-                        t.rawset(LuaString.valueOf("isdst"), LuaBoolean.valueOf(normIsdst > 0));
-                    }
-
-                    return LuaInteger.valueOf(res);
-                } catch (LuaException le) {
-                    throw le;
-                } catch (Throwable th) {
-                    throw new LuaException("time error: " + th.getMessage());
-                }
-            }
-
-            LocalDateTime ldt = LocalDateTime.of(year + 1900, month + 1, day, hour, min, sec);
-            long epochSec = ldt.atZone(ZoneId.systemDefault()).toEpochSecond();
-            return LuaInteger.valueOf(epochSec);
+            long[] r = OsTime.mktime(ZoneId.systemDefault(), year + 1900L, month,
+                    day, hour, min, sec, isdst);
+            t.rawset(LuaString.valueOf("year"), LuaInteger.valueOf(r[1]));
+            t.rawset(LuaString.valueOf("month"), LuaInteger.valueOf(r[2] + 1));
+            t.rawset(LuaString.valueOf("day"), LuaInteger.valueOf(r[3]));
+            t.rawset(LuaString.valueOf("hour"), LuaInteger.valueOf(r[4]));
+            t.rawset(LuaString.valueOf("min"), LuaInteger.valueOf(r[5]));
+            t.rawset(LuaString.valueOf("sec"), LuaInteger.valueOf(r[6]));
+            long rdays = OsTime.daysFromCivil(r[1], r[2] + 1, r[3]);
+            t.rawset(LuaString.valueOf("yday"), LuaInteger.valueOf(OsTime.dayOfYear(r[1], r[2] + 1, r[3])));
+            t.rawset(LuaString.valueOf("wday"), LuaInteger.valueOf(OsTime.dayOfWeek(rdays) % 7 + 1));
+            t.rawset(LuaString.valueOf("isdst"), LuaBoolean.valueOf(r[7] > 0));
+            return LuaInteger.valueOf(r[0]);
         }));
 
         os.rawset(LuaString.valueOf("difftime"), LuaFunction.of(args -> {
@@ -192,107 +158,67 @@ public final class OsLib {
                 sIdx++;
             }
 
-            if (NativeProcess.isAvailable() && NativeProcess.localtime_r != null) {
-                try (Arena arena = Arena.ofConfined()) {
-                    MemorySegment tm = arena.allocate(NativeProcess.TM_SIZE);
-                    boolean ok = isUtc ? NativeProcess.gmtime(epochSec, tm) : NativeProcess.localtime(epochSec, tm);
-                    if (!ok) {
-                        throw new LuaException("date result cannot be represented in this installation");
-                    }
-
-                    if (fmt.startsWith("*t", sIdx) && fmt.length() == sIdx + 2) {
-                        LuaTable t = new LuaTable();
-                        t.rawset(LuaString.valueOf("year"), LuaInteger.valueOf(NativeProcess.getTmYear(tm) + 1900L));
-                        t.rawset(LuaString.valueOf("month"), LuaInteger.valueOf(NativeProcess.getTmMon(tm) + 1L));
-                        t.rawset(LuaString.valueOf("day"), LuaInteger.valueOf(NativeProcess.getTmMday(tm)));
-                        t.rawset(LuaString.valueOf("hour"), LuaInteger.valueOf(NativeProcess.getTmHour(tm)));
-                        t.rawset(LuaString.valueOf("min"), LuaInteger.valueOf(NativeProcess.getTmMin(tm)));
-                        t.rawset(LuaString.valueOf("sec"), LuaInteger.valueOf(NativeProcess.getTmSec(tm)));
-                        t.rawset(LuaString.valueOf("yday"), LuaInteger.valueOf(NativeProcess.getTmYday(tm) + 1L));
-                        t.rawset(LuaString.valueOf("wday"), LuaInteger.valueOf(NativeProcess.getTmWday(tm) + 1L));
-                        int isdst = NativeProcess.getTmIsdst(tm);
-                        if (isdst >= 0) {
-                            t.rawset(LuaString.valueOf("isdst"), LuaBoolean.valueOf(isdst > 0));
-                        }
-                        return t;
-                    }
-
-                    StringBuilder b = new StringBuilder();
-                    while (sIdx < slen) {
-                        char ch = fmt.charAt(sIdx);
-                        if (ch != '%') {
-                            b.append(ch);
-                            sIdx++;
-                        } else {
-                            sIdx++; // skip '%'
-                            int convStart = sIdx;
-                            int convLen = slen - convStart;
-                            String spec = null;
-                            int opLen = 0;
-                            if (convLen >= 1) {
-                                char c = fmt.charAt(convStart);
-                                if (STRFTIME_OP1.indexOf(c) >= 0) {
-                                    spec = "%" + c;
-                                    opLen = 1;
-                                }
-                            }
-                            if (spec == null && convLen >= 2) {
-                                String sub = fmt.substring(convStart, convStart + 2);
-                                if (STRFTIME_OP2.contains(sub)) {
-                                    spec = "%" + sub;
-                                    opLen = 2;
-                                }
-                            }
-                            if (spec == null) {
-                                throw new LuaException("bad argument #1 to 'os.date' (invalid conversion specifier '%" + fmt.substring(convStart) + "')");
-                            }
-                            sIdx += opLen;
-                            String formatted = NativeProcess.strftime(spec, tm);
-                            b.append(formatted);
-                        }
-                    }
-                    return LuaString.valueOf(b.toString());
-                } catch (LuaException le) {
-                    throw le;
-                } catch (Throwable th) {
-                    throw new LuaException("date error: " + th.getMessage());
-                }
-            }
-
             ZoneId zone = isUtc ? ZoneOffset.UTC : ZoneId.systemDefault();
-            Instant instant;
-            try {
-                instant = Instant.ofEpochSecond(epochSec);
-            } catch (Exception e) {
+            long[] f = OsTime.localFields(zone, epochSec);
+            // glibc localtime fails when tm_year leaves int32 range; when it
+            // fits, huge years render int-wrapped like glibc's int fields.
+            if (f[0] - 1900 > Integer.MAX_VALUE || f[0] - 1900 < Integer.MIN_VALUE) {
                 throw new LuaException("date result cannot be represented in this installation");
             }
-            LocalDateTime ldt = LocalDateTime.ofInstant(instant, zone);
+            int tmYear = (int) (f[0] - 1900);
+            // glibc renders huge years int-wrapped (full-year 32-bit wrap).
+            long dispYear = (int) f[0];
+            int offSecs = OsTime.zoneOffsetSecs(zone, epochSec);
+            boolean dst = OsTime.isDst(zone, epochSec);
 
             if (fmt.startsWith("*t", sIdx) && fmt.length() == sIdx + 2) {
                 LuaTable t = new LuaTable();
-                t.rawset(LuaString.valueOf("year"), LuaInteger.valueOf(ldt.getYear()));
-                t.rawset(LuaString.valueOf("month"), LuaInteger.valueOf(ldt.getMonthValue()));
-                t.rawset(LuaString.valueOf("day"), LuaInteger.valueOf(ldt.getDayOfMonth()));
-                t.rawset(LuaString.valueOf("hour"), LuaInteger.valueOf(ldt.getHour()));
-                t.rawset(LuaString.valueOf("min"), LuaInteger.valueOf(ldt.getMinute()));
-                t.rawset(LuaString.valueOf("sec"), LuaInteger.valueOf(ldt.getSecond()));
-                int wday = ldt.getDayOfWeek().getValue() % 7 + 1; // Lua: Sunday = 1
-                t.rawset(LuaString.valueOf("wday"), LuaInteger.valueOf(wday));
-                t.rawset(LuaString.valueOf("yday"), LuaInteger.valueOf(ldt.getDayOfYear()));
-                t.rawset(LuaString.valueOf("isdst"), LuaBoolean.FALSE);
+                t.rawset(LuaString.valueOf("year"), LuaInteger.valueOf(dispYear));
+                t.rawset(LuaString.valueOf("month"), LuaInteger.valueOf(f[1]));
+                t.rawset(LuaString.valueOf("day"), LuaInteger.valueOf(f[2]));
+                t.rawset(LuaString.valueOf("hour"), LuaInteger.valueOf(f[3]));
+                t.rawset(LuaString.valueOf("min"), LuaInteger.valueOf(f[4]));
+                t.rawset(LuaString.valueOf("sec"), LuaInteger.valueOf(f[5]));
+                t.rawset(LuaString.valueOf("wday"), LuaInteger.valueOf(OsTime.dayOfWeek(f[6]) % 7 + 1));
+                t.rawset(LuaString.valueOf("yday"), LuaInteger.valueOf(OsTime.dayOfYear(f[0], f[1], f[2])));
+                t.rawset(LuaString.valueOf("isdst"), LuaBoolean.valueOf(dst));
                 return t;
             }
 
-            String formatted = fmt
-                    .replace("%Y", String.format("%04d", ldt.getYear()))
-                    .replace("%y", String.format("%02d", ldt.getYear() % 100))
-                    .replace("%m", String.format("%02d", ldt.getMonthValue()))
-                    .replace("%d", String.format("%02d", ldt.getDayOfMonth()))
-                    .replace("%H", String.format("%02d", ldt.getHour()))
-                    .replace("%M", String.format("%02d", ldt.getMinute()))
-                    .replace("%S", String.format("%02d", ldt.getSecond()))
-                    .replace("%c", ldt.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME));
-            return LuaString.valueOf(formatted);
+            StringBuilder b = new StringBuilder();
+            while (sIdx < slen) {
+                char ch = fmt.charAt(sIdx);
+                if (ch != '%') {
+                    b.append(ch);
+                    sIdx++;
+                } else {
+                    sIdx++; // skip '%'
+                    int convStart = sIdx;
+                    int convLen = slen - convStart;
+                    String spec = null;
+                    int opLen = 0;
+                    if (convLen >= 1) {
+                        char c = fmt.charAt(convStart);
+                        if (STRFTIME_OP1.indexOf(c) >= 0) {
+                            spec = "%" + c;
+                            opLen = 1;
+                        }
+                    }
+                    if (spec == null && convLen >= 2) {
+                        String sub = fmt.substring(convStart, convStart + 2);
+                        if (STRFTIME_OP2.contains(sub)) {
+                            spec = "%" + sub;
+                            opLen = 2;
+                        }
+                    }
+                    if (spec == null) {
+                        throw new LuaException("bad argument #1 to 'os.date' (invalid conversion specifier '%" + fmt.substring(convStart) + "')");
+                    }
+                    sIdx += opLen;
+                    b.append(OsTime.formatSpec(spec, f, tmYear, dispYear, offSecs, zone));
+                }
+            }
+            return LuaString.valueOf(b.toString());
         }));
 
         os.rawset(LuaString.valueOf("getenv"), LuaFunction.of(args -> {
@@ -306,21 +232,13 @@ public final class OsLib {
                 return LuaBoolean.TRUE;
             }
             String cmd = args[0].toLuaString();
-            if (NativeProcess.isAvailable()) {
-                try {
-                    int stat = NativeProcess.system(cmd);
-                    return NativeProcess.execResult(stat);
-                } catch (Throwable t) {
-                    return Varargs.of(LuaNil.NIL, LuaString.valueOf(t.getMessage()));
-                }
-            }
             try {
-                Process proc = new ProcessBuilder("/bin/sh", "-c", cmd).inheritIO().start();
-                int exitCode = proc.waitFor();
-                if (exitCode == 0) {
-                    return Varargs.of(LuaBoolean.TRUE, LuaString.valueOf("exit"), LuaInteger.valueOf(0));
-                } else {
-                    return Varargs.of(LuaNil.NIL, LuaString.valueOf("exit"), LuaInteger.valueOf(exitCode));
+                OsTime.ShellRun run = OsTime.startShell(cmd, true);
+                try {
+                    return OsTime.finishShell(run);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return Varargs.of(LuaNil.NIL, LuaString.valueOf("interrupted"));
                 }
             } catch (Exception e) {
                 return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()));
@@ -371,22 +289,15 @@ public final class OsLib {
         os.rawset(LuaString.valueOf("setlocale"), LuaFunction.of(args -> {
             String loc = (args.length > 0 && !args[0].isNil()) ? args[0].toLuaString() : null;
             String catStr = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "all";
-            int op = -1;
-            for (int i = 0; i < CAT_NAMES.length; i++) {
-                if (CAT_NAMES[i].equals(catStr)) {
-                    op = i;
+            boolean knownCat = false;
+            for (String name : CAT_NAMES) {
+                if (name.equals(catStr)) {
+                    knownCat = true;
                     break;
                 }
             }
-            if (op < 0) {
+            if (!knownCat) {
                 throw new LuaException("bad argument #2 to 'os.setlocale' (invalid option '" + catStr + "')");
-            }
-            if (NativeProcess.isAvailable() && NativeProcess.setlocale != null) {
-                try {
-                    String res = NativeProcess.setlocale(LC_CATS[op], loc);
-                    return (res != null) ? LuaString.valueOf(res) : LuaNil.NIL;
-                } catch (Throwable ignored) {
-                }
             }
             if (loc == null || "C".equals(loc) || "".equals(loc) || "POSIX".equalsIgnoreCase(loc)) {
                 return LuaString.valueOf("C");
