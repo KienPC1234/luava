@@ -89,6 +89,11 @@ public final class OsLib {
 
     public static void open(LuaTable globals) {
         LuaTable os = new LuaTable();
+        fillInto(os, globals);
+        globals.rawset(LuaString.valueOf("os"), os);
+    }
+
+    public static void fillInto(LuaTable os, LuaTable globals) {
 
         os.rawset(LuaString.valueOf("clock"), LuaFunction.of(args -> {
             double secs = (System.nanoTime() - START_NANO) / 1_000_000_000.0;
@@ -388,7 +393,5 @@ public final class OsLib {
             }
             return LuaNil.NIL;
         }));
-
-        globals.rawset(LuaString.valueOf("os"), os);
     }
 }

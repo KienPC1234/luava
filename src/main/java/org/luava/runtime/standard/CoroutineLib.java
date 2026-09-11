@@ -26,6 +26,11 @@ public final class CoroutineLib {
 
     public static void open(LuaTable globals, LuaCoroutine mainThread) {
         LuaTable coro = new LuaTable();
+        fillInto(coro, globals, mainThread);
+        globals.rawset(LuaString.valueOf("coroutine"), coro);
+    }
+
+    public static void fillInto(LuaTable coro, LuaTable globals, LuaCoroutine mainThread) {
 
         coro.rawset(LuaString.valueOf("create"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isFunction()) {
@@ -124,7 +129,5 @@ public final class CoroutineLib {
                 return Varargs.of(out);
             });
         }));
-
-        globals.rawset(LuaString.valueOf("coroutine"), coro);
     }
 }

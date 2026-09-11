@@ -627,6 +627,11 @@ public final class IoLib {
 
     public static void open(LuaTable globals) {
         LuaTable io = new LuaTable();
+        fillInto(io, globals);
+        globals.rawset(LuaString.valueOf("io"), io);
+    }
+
+    public static void fillInto(LuaTable io, LuaTable globals) {
         LuaTable fileMt = new LuaTable();
         LuaTable fileMethods = new LuaTable();
 
@@ -1045,7 +1050,5 @@ public final class IoLib {
                 return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()));
             }
         }));
-
-        globals.rawset(LuaString.valueOf("io"), io);
     }
 }

@@ -70,6 +70,11 @@ public final class Utf8Lib {
 
     public static void open(LuaTable globals) {
         LuaTable utf8 = new LuaTable();
+        fillInto(utf8, globals);
+        globals.rawset(LuaString.valueOf("utf8"), utf8);
+    }
+
+    public static void fillInto(LuaTable utf8, LuaTable globals) {
 
         utf8.rawset(LuaString.valueOf("charpattern"), LuaString.valueOf("[\0-\u007F\u00C2-\u00FD][\u0080-\u00BF]*"));
 
@@ -249,7 +254,5 @@ public final class Utf8Lib {
             }
             return Varargs.of(lax ? iterAuxLax : iterAuxStrict, args[0], LuaInteger.valueOf(0));
         }));
-
-        globals.rawset(LuaString.valueOf("utf8"), utf8);
     }
 }
