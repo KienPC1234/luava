@@ -66,7 +66,10 @@ public final class ChunkSerializer {
 
         String code = fn.getRawSource();
         if (code == null) {
-            code = "";
+            // Compile no longer pretty-prints every function (cold-start
+            // cost); render source lazily here — string.dump is rare.
+            org.luava.frontend.ast.Statements.BlockStmt body = fn.getBody();
+            code = (body != null) ? AstPrinter.print(body) : "";
         }
         byte[] codeBytes = code.getBytes(StandardCharsets.UTF_8);
         out.writeInt(codeBytes.length);
@@ -115,6 +118,12 @@ public final class ChunkSerializer {
             byte[] payload = dumpPayload(fn, effectiveStrip);
             byte[] luacBytecode = null;
             String rawCode = fn.getRawSource();
+            if (rawCode == null) {
+                // Compile no longer pretty-prints every function; render
+                // lazily — only string.dump pays this cost.
+                org.luava.frontend.ast.Statements.BlockStmt body = fn.getBody();
+                rawCode = (body != null) ? AstPrinter.print(body) : null;
+            }
             if (rawCode != null) {
                 luacBytecode = tryCompileWithLuac(rawCode, effectiveStrip);
             }

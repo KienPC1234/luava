@@ -24,6 +24,11 @@ public final class StringLib {
 
     public static void open(LuaTable globals) {
         LuaTable stringTable = new LuaTable();
+        fillInto(stringTable, globals);
+        globals.rawset(LuaString.valueOf("string"), stringTable);
+    }
+
+    public static void fillInto(LuaTable stringTable, LuaTable globals) {
 
         stringTable.rawset(LuaString.valueOf("len"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'string.len'");
@@ -384,9 +389,12 @@ public final class StringLib {
             byte[] dumped = ChunkSerializer.dump(fn, strip);
             return LuaString.valueOf(new String(dumped, java.nio.charset.StandardCharsets.ISO_8859_1));
         }));
+    }
 
-        globals.rawset(LuaString.valueOf("string"), stringTable);
-
+    // Installs the string metatable eagerly (cheap: two small tables). The
+    // __index target is the (possibly still lazy) string library table, so
+    // ("x"):upper() works and fills the library on first use.
+    public static void installMetatable(LuaTable stringTable) {
         LuaTable stringMt = new LuaTable();
         stringMt.rawset(LuaString.valueOf("__index"), stringTable);
         LuaString.setStringMetatable(stringMt);

@@ -25,6 +25,11 @@ public final class PackageLib {
 
     public static void open(LuaState state, LuaTable globals) {
         LuaTable pkg = new LuaTable();
+        fillInto(pkg, state, globals);
+        globals.rawset(LuaString.valueOf("package"), pkg);
+    }
+
+    public static void fillInto(LuaTable pkg, LuaState state, LuaTable globals) {
         LuaTable loaded = new LuaTable();
         LuaTable preload = new LuaTable();
 
@@ -161,8 +166,6 @@ public final class PackageLib {
         pkg.rawset(LuaString.valueOf("loadlib"), LuaFunction.of(args -> {
             return Varargs.of(LuaNil.NIL, LuaString.valueOf("dynamic libraries not supported"), LuaString.valueOf("absent"));
         }));
-
-        globals.rawset(LuaString.valueOf("package"), pkg);
 
         // require(modname)
         globals.rawset(LuaString.valueOf("require"), LuaFunction.of(args -> {

@@ -354,12 +354,35 @@ public final class IoLib {
         private final Process process;
         private final PushbackInputStream in;
         private final OutputStream out;
+        private final java.nio.file.Path sentinel;
+        private final java.nio.file.Path fifo;
 
         public ProcessFileHandle(Process process, String mode, String name) {
+            this(process, mode, name, null, null, null);
+        }
+
+        public ProcessFileHandle(Process process, String mode, String name,
+                                 java.nio.file.Path sentinel) {
+            this(process, mode, name, sentinel, null, null);
+        }
+
+        /**
+         * {@code explicitIn} (when non-null) replaces the process pipe for
+         * mode "r"; used with a FIFO so EOF follows POSIX popen semantics
+         * (all writers closed) rather than the JDK pipe's early process-exit
+         * EOF. {@code fifo} is deleted on close.
+         */
+        public ProcessFileHandle(Process process, String mode, String name,
+                                 java.nio.file.Path sentinel,
+                                 java.io.InputStream explicitIn,
+                                 java.nio.file.Path fifo) {
             super(name);
             this.process = process;
-            this.in = mode.contains("r") ? new PushbackInputStream(new BufferedInputStream(process.getInputStream()), 1024) : null;
+            this.fifo = fifo;
+            java.io.InputStream src = explicitIn != null ? explicitIn : process.getInputStream();
+            this.in = mode.contains("r") ? new PushbackInputStream(new BufferedInputStream(src), 1024) : null;
             this.out = mode.contains("w") ? new BufferedOutputStream(process.getOutputStream()) : null;
+            this.sentinel = sentinel;
         }
 
         @Override
@@ -392,15 +415,17 @@ public final class IoLib {
                 if (in != null) in.close();
                 if (out != null) out.close();
                 try {
-                    int exitCode = process.waitFor();
-                    if (exitCode == 0) {
-                        return Varargs.of(LuaBoolean.TRUE, LuaString.valueOf("exit"), LuaInteger.valueOf(0));
-                    } else {
-                        return Varargs.of(LuaNil.NIL, LuaString.valueOf("exit"), LuaInteger.valueOf(exitCode));
-                    }
+                    return OsTime.finishShell(new OsTime.ShellRun(process, sentinel));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return Varargs.of(LuaNil.NIL, LuaString.valueOf("interrupted"), LuaInteger.valueOf(-1));
+                } finally {
+                    if (fifo != null) {
+                        try {
+                            java.nio.file.Files.deleteIfExists(fifo);
+                        } catch (Exception ignored) {
+                        }
+                    }
                 }
             }
             throw new LuaException("attempt to use a closed file");
@@ -423,106 +448,6 @@ public final class IoLib {
             checkOpen();
             if (out == null) throw new IOException("Bad file descriptor");
             out.write(data.getBytes(StandardCharsets.ISO_8859_1));
-        }
-    }
-
-    public static class NativeProcessFileHandle extends FileHandle {
-        private final java.lang.foreign.MemorySegment fp;
-        private int pushedBack = -1;
-
-        public NativeProcessFileHandle(java.lang.foreign.MemorySegment fp, String name) {
-            super(name);
-            this.fp = fp;
-        }
-
-        @Override
-        protected int readByte() throws IOException {
-            checkOpen();
-            if (pushedBack != -1) {
-                int b = pushedBack;
-                pushedBack = -1;
-                return b;
-            }
-            try {
-                int c = (int) NativeProcess.fgetc.invokeExact(fp);
-                return c == -1 ? -1 : (c & 0xFF);
-            } catch (Throwable t) {
-                throw new IOException(t);
-            }
-        }
-
-        @Override
-        protected void unreadByte(int b) throws IOException {
-            checkOpen();
-            pushedBack = b;
-        }
-
-        @Override
-        protected int readBytes(byte[] buf, int off, int len) throws IOException {
-            checkOpen();
-            if (len == 0) return 0;
-            int copied = 0;
-            if (pushedBack != -1) {
-                buf[off] = (byte) pushedBack;
-                pushedBack = -1;
-                copied = 1;
-                if (len == 1) return 1;
-            }
-            try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
-                int toRead = len - copied;
-                java.lang.foreign.MemorySegment seg = arena.allocate(toRead);
-                long read = (long) NativeProcess.fread.invokeExact(seg, 1L, (long) toRead, fp);
-                if (read > 0) {
-                    java.lang.foreign.MemorySegment.copy(seg, java.lang.foreign.ValueLayout.JAVA_BYTE, 0, buf, off + copied, (int) read);
-                    return copied + (int) read;
-                }
-                return copied > 0 ? copied : -1;
-            } catch (Throwable t) {
-                throw new IOException(t);
-            }
-        }
-
-        @Override
-        public void write(String data) throws IOException {
-            checkOpen();
-            byte[] bytes = data.getBytes(StandardCharsets.ISO_8859_1);
-            try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
-                java.lang.foreign.MemorySegment seg = arena.allocate(bytes.length);
-                java.lang.foreign.MemorySegment.copy(bytes, 0, seg, java.lang.foreign.ValueLayout.JAVA_BYTE, 0, bytes.length);
-                long written = (long) NativeProcess.fwrite.invokeExact(seg, 1L, (long) bytes.length, fp);
-                int fl = (int) NativeProcess.fflush.invokeExact(fp);
-            } catch (Throwable t) {
-                throw new IOException(t);
-            }
-        }
-
-        @Override
-        public void flush() throws IOException {
-            checkOpen();
-            try {
-                int fl = (int) NativeProcess.fflush.invokeExact(fp);
-            } catch (Throwable t) {
-                throw new IOException(t);
-            }
-        }
-
-        @Override
-        public long seek(String whence, long offset) throws IOException {
-            throw new IOException("cannot seek on popen stream");
-        }
-
-        @Override
-        public LuaValue close() throws IOException {
-            if (!closed) {
-                closed = true;
-                try {
-                    int stat = (int) NativeProcess.pclose.invokeExact(fp);
-                    return NativeProcess.execResult(stat);
-                } catch (Throwable t) {
-                    throw new IOException(t);
-                }
-            }
-            throw new LuaException("attempt to use a closed file");
         }
     }
 
@@ -627,6 +552,11 @@ public final class IoLib {
 
     public static void open(LuaTable globals) {
         LuaTable io = new LuaTable();
+        fillInto(io, globals);
+        globals.rawset(LuaString.valueOf("io"), io);
+    }
+
+    public static void fillInto(LuaTable io, LuaTable globals) {
         LuaTable fileMt = new LuaTable();
         LuaTable fileMethods = new LuaTable();
 
@@ -839,34 +769,52 @@ public final class IoLib {
             if (!"r".equals(mode) && !"w".equals(mode)) {
                 throw new LuaException("bad argument #2 to 'popen' (invalid mode)");
             }
-            if (NativeProcess.isAvailable()) {
-                try {
-                    java.lang.foreign.MemorySegment fp = NativeProcess.popen(cmd, mode);
-                    if (fp == null || fp.equals(java.lang.foreign.MemorySegment.NULL)) {
-                        return Varargs.of(LuaNil.NIL, LuaString.valueOf("cannot open popen process"), LuaInteger.valueOf(2));
-                    }
-                    NativeProcessFileHandle pfh = new NativeProcessFileHandle(fp, cmd);
-                    LuaUserdata ud = new LuaUserdata(pfh, 0);
-                    ud.setMetatable(fileMt);
-                    org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.valueOf("__gc")));
-                    return ud;
-                } catch (Throwable t) {
-                    return Varargs.of(LuaNil.NIL, LuaString.valueOf(t.getMessage()), LuaInteger.valueOf(2));
-                }
-            }
             try {
-                boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
-                ProcessBuilder pb = isWindows
-                        ? new ProcessBuilder("cmd.exe", "/c", cmd)
-                        : new ProcessBuilder("/bin/sh", "-c", cmd);
-                Process p = pb.start();
-                ProcessFileHandle pfh = new ProcessFileHandle(p, mode, cmd);
+                if ("r".equals(mode) && !OsTime.isWindows()) {
+                    // FIFO so read EOF follows POSIX popen semantics (all
+                    // writers closed). The JDK pipe would signal EOF as soon
+                    // as the direct shell child exits, dropping output still
+                    // produced by background jobs.
+                    java.nio.file.Path fifo = java.nio.file.Files.createTempFile("luava-popen", ".fifo");
+                    java.nio.file.Files.deleteIfExists(fifo);
+                    int mk = new ProcessBuilder("mkfifo", fifo.toString()).start().waitFor();
+                    if (mk == 0) {
+                        final java.io.InputStream[] holder = new java.io.InputStream[1];
+                        final java.io.IOException[] err = new java.io.IOException[1];
+                        Thread reader = Thread.ofVirtual().start(() -> {
+                            try {
+                                holder[0] = new java.io.FileInputStream(fifo.toFile());
+                            } catch (java.io.IOException e) {
+                                err[0] = e;
+                            }
+                        });
+                        OsTime.ShellRun run = OsTime.startShellRedirect(cmd, fifo.toFile());
+                        reader.join(10000);
+                        if (err[0] != null || holder[0] == null) {
+                            run.process().destroy();
+                            java.nio.file.Files.deleteIfExists(fifo);
+                            throw new java.io.IOException("cannot open popen stream");
+                        }
+                        ProcessFileHandle pfh = new ProcessFileHandle(
+                            run.process(), mode, cmd, run.sentinel(), holder[0], fifo);
+                        LuaUserdata ud = new LuaUserdata(pfh, 0);
+                        ud.setMetatable(fileMt);
+                        org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.valueOf("__gc")));
+                        return ud;
+                    }
+                    java.nio.file.Files.deleteIfExists(fifo);
+                }
+                OsTime.ShellRun run = OsTime.startShell(cmd, false);
+                ProcessFileHandle pfh = new ProcessFileHandle(run.process(), mode, cmd, run.sentinel());
                 LuaUserdata ud = new LuaUserdata(pfh, 0);
                 ud.setMetatable(fileMt);
                 org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.valueOf("__gc")));
                 return ud;
-            } catch (IOException e) {
+            } catch (java.io.IOException e) {
                 return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()), LuaInteger.valueOf(2));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return Varargs.of(LuaNil.NIL, LuaString.valueOf("interrupted"), LuaInteger.valueOf(2));
             }
         }));
 
@@ -1045,7 +993,5 @@ public final class IoLib {
                 return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()));
             }
         }));
-
-        globals.rawset(LuaString.valueOf("io"), io);
     }
 }

@@ -62,16 +62,25 @@ public final class LuaState {
 
     private void openStandardLibraries() {
         BaseLib.open(this, globals);
-        MathLib.open(globals);
-        StringLib.open(globals);
-        TableLib.open(globals);
-        CoroutineLib.open(globals, mainThread);
-        Utf8Lib.open(globals);
-        OsLib.open(globals);
-        IoLib.open(globals);
-        DebugLib.open(this, globals);
-        PackageLib.open(this, globals);
-        org.luava.binding.JavaInteropLib.open(globals);
+        lazyLib("math", t -> MathLib.fillInto(t, globals));
+        LuaTable stringLib = lazyLib("string", t -> StringLib.fillInto(t, globals));
+        StringLib.installMetatable(stringLib);
+        lazyLib("table", t -> TableLib.fillInto(t, globals));
+        lazyLib("coroutine", t -> CoroutineLib.fillInto(t, globals, mainThread));
+        lazyLib("utf8", t -> Utf8Lib.fillInto(t, globals));
+        lazyLib("os", t -> OsLib.fillInto(t, globals));
+        lazyLib("io", t -> IoLib.fillInto(t, globals));
+        lazyLib("debug", t -> DebugLib.fillInto(t, this, globals));
+        LuaTable pkgLib = lazyLib("package", t -> PackageLib.fillInto(t, this, globals));
+        LuaTable javaLib = lazyLib("java", t -> org.luava.binding.JavaInteropLib.fillInto(t, globals));
+        globals.rawset(LuaString.valueOf("luajava"), javaLib);
+        // Bare-global require: stub fills package lib on first call, then
+        // delegates to the real implementation (which overwrites this stub).
+        globals.rawset(LuaString.valueOf("require"), LuaFunction.of(args -> {
+            pkgLib.ensureFilled();
+            LuaValue real = globals.rawget(LuaString.valueOf("require"));
+            return ((LuaFunction) real).call(args);
+        }));
         LuaTable argTable = new LuaTable();
         String progName = System.getProperty("lua.prog");
         if (progName == null || progName.isEmpty()) {
@@ -80,6 +89,15 @@ public final class LuaState {
         }
         argTable.rawset(LuaInteger.valueOf(0), LuaString.valueOf(progName));
         globals.rawset(LuaString.valueOf("arg"), argTable);
+    }
+
+    private LuaTable lazyLib(String name, java.util.function.Consumer<LuaTable> filler) {
+        LuaTable[] holder = new LuaTable[1];
+        LuaTable table = new LuaTable();
+        table.setLazyFiller(() -> filler.accept(holder[0]));
+        holder[0] = table;
+        globals.rawset(LuaString.valueOf(name), table);
+        return table;
     }
 
     public LuaTable getRegistry() {

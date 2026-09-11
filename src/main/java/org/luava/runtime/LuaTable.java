@@ -18,6 +18,27 @@ public final class LuaTable extends LuaValue {
     private final Map<LuaValue, LuaValue> hashPart = new LinkedHashMap<>();
     private final ArrayList<LuaValue> arrayPart = new ArrayList<>();
     private LuaTable metatable;
+    // Cold-start hook: installed only on standard-library placeholder tables
+    // (null for every ordinary table). Plain tables pay one predictable
+    // null-check; the class stays final so JIT devirtualization is intact.
+    private volatile Runnable lazyFiller;
+
+    public void setLazyFiller(Runnable filler) {
+        this.lazyFiller = filler;
+    }
+
+    void ensureFilled() {
+        Runnable f = lazyFiller;
+        if (f != null) {
+            synchronized (this) {
+                f = lazyFiller;
+                if (f != null) {
+                    lazyFiller = null;
+                    f.run();
+                }
+            }
+        }
+    }
 
     public LuaTable() {
         org.luava.runtime.eval.GCManager.onAlloc();
@@ -269,6 +290,7 @@ public final class LuaTable extends LuaValue {
      * these when the table has no metatable (weak modes always imply one).
      */
     public LuaValue rawgetInt(long idx) {
+        ensureFilled();
         if (idx >= 1 && idx <= arrayPart.size()) {
             LuaValue val = arrayPart.get((int) (idx - 1));
             if (val instanceof WeakVal wv) {
@@ -287,6 +309,7 @@ public final class LuaTable extends LuaValue {
     }
 
     public void rawsetInt(long idx, LuaValue value) {
+        ensureFilled();
         LuaValue toSet = (value == null || value.isNil()) ? LuaNil.NIL : value;
         if (idx == arrayPart.size() + 1 && !toSet.isNil()) {
             arrayPart.add(toSet);
@@ -301,6 +324,7 @@ public final class LuaTable extends LuaValue {
     }
 
     public LuaValue rawget(LuaValue key) {
+        ensureFilled();
         key = normalizeKey(key);
         if (key == null || key.isNil()) {
             return LuaNil.NIL;
@@ -335,6 +359,7 @@ public final class LuaTable extends LuaValue {
     }
 
     public void rawset(LuaValue key, LuaValue value) {
+        ensureFilled();
         lastReturnedKey = null;
         nextIterator = null;
         key = normalizeKey(key);
@@ -389,6 +414,7 @@ public final class LuaTable extends LuaValue {
 
     @Override
     public LuaValue get(LuaValue key) {
+        ensureFilled();
         LuaValue t = this;
         for (int loop = 0; loop < 2000; loop++) {
             if (t instanceof LuaTable tbl) {
@@ -414,6 +440,7 @@ public final class LuaTable extends LuaValue {
 
     @Override
     public void set(LuaValue key, LuaValue value) {
+        ensureFilled();
         LuaValue t = this;
         for (int loop = 0; loop < 2000; loop++) {
             if (t instanceof LuaTable tbl) {
@@ -444,6 +471,7 @@ public final class LuaTable extends LuaValue {
 
     @Override
     public LuaValue len() {
+        ensureFilled();
         if (metatable != null) {
             LuaValue handler = metatable.rawget(LuaString.valueOf("__len"));
             if (!handler.isNil()) {
@@ -455,6 +483,7 @@ public final class LuaTable extends LuaValue {
     }
 
     public int rawlen() {
+        ensureFilled();
         // Mirror C luaH_getn/unbound_search: trim trailing nils, then if
         // t[n+1] is present (possibly in hashPart) search upward for a border.
         int n = arrayPart.size();
@@ -488,6 +517,7 @@ public final class LuaTable extends LuaValue {
     }
 
     public Varargs next(LuaValue currentKey) {
+        ensureFilled();
         currentKey = normalizeKey(currentKey);
 
         // 1. Starting traversal (currentKey is nil)
