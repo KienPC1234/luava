@@ -169,8 +169,16 @@ public final class MathLib {
                 return Varargs.of(LuaFloat.valueOf(d), LuaFloat.valueOf(d));
             }
             double intPart = (d >= 0) ? Math.floor(d) : Math.ceil(d);
+            // Lua's pushnumint: the integer part is pushed as a Lua integer
+            // when it fits, otherwise as a float (e.g. huge magnitudes).
+            LuaValue ip;
+            if (intPart >= -9223372036854775808.0 && intPart < 9223372036854775808.0) {
+                ip = LuaInteger.valueOf((long) intPart);
+            } else {
+                ip = LuaFloat.valueOf(intPart);
+            }
             double fracPart = d - intPart;
-            return Varargs.of(LuaFloat.valueOf(intPart), LuaFloat.valueOf(fracPart));
+            return Varargs.of(ip, LuaFloat.valueOf(fracPart));
         }));
 
         long[] rngState = new long[4];

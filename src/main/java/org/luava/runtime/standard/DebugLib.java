@@ -690,6 +690,26 @@ public final class DebugLib {
             if (hkT != null) hkT.rawset(target, hook);
             return LuaNil.NIL;
         }));
+
+        // debug.debug: an interactive prompt reading from stdin. An embedded
+        // server has no terminal to drive, so this is a no-op that returns
+        // immediately (matching a non-interactive stdin).
+        debug.rawset(LuaString.valueOf("debug"), LuaFunction.of(args -> LuaNil.NIL));
+
+        // debug.setcstacklimit: Lua 5.4 lets the host cap C-stack recursion.
+        // Java frames live on the heap, so the limit is accepted and ignored;
+        // the previous limit is returned per the 5.4 API (Lua's default is
+        // 200). A non-number argument raises the usual Lua error.
+        int[] cstackLimit = {200};
+        debug.rawset(LuaString.valueOf("setcstacklimit"), LuaFunction.of(args -> {
+            if (args.length == 0 || !args[0].isNumber()) {
+                throw new LuaException("bad argument #1 to 'setcstacklimit' (number expected, got "
+                        + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
+            }
+            int prev = cstackLimit[0];
+            cstackLimit[0] = (int) args[0].toLong();
+            return LuaInteger.valueOf(prev);
+        }));
     }
 
     private static void formatTracebackFrame(StringBuilder sb, org.luava.runtime.eval.CallStack.Frame frame) {

@@ -140,7 +140,7 @@ public final class LuaDataConverter {
                 mt = liveCollectionMetatable;
                 if (mt == null) {
                     mt = new LuaTable();
-                    mt.rawset(LuaString.valueOf("__len"), LuaFunction.of(args -> {
+                    mt.rawset(LuaString.valueOf("__len"), LuaFunction.ofGuarded(args -> {
                         Object inst = (args.length > 0 && args[0].isUserdata())
                                 ? ((LuaUserdata) args[0]).getJavaInstance() : null;
                         if (inst instanceof List<?> l) return LuaInteger.valueOf(l.size());
@@ -206,36 +206,32 @@ public final class LuaDataConverter {
             }
         }
 
-        // Integers and primitive number coercion
+        // Integers and primitive number coercion. Lua semantics: numbers and
+        // numeric strings convert, everything else is an error (never a
+        // silent 0).
         if (targetType == byte.class || targetType == Byte.class) {
-            long l = val.isInteger() ? val.toLong() : (val.isFloat() ? (long) val.toDouble() : 0);
-            return (T) Byte.valueOf((byte) l);
+            return (T) Byte.valueOf((byte) toLongChecked(val));
         }
 
         if (targetType == short.class || targetType == Short.class) {
-            long l = val.isInteger() ? val.toLong() : (val.isFloat() ? (long) val.toDouble() : 0);
-            return (T) Short.valueOf((short) l);
+            return (T) Short.valueOf((short) toLongChecked(val));
         }
 
         if (targetType == int.class || targetType == Integer.class) {
-            long l = val.isInteger() ? val.toLong() : (val.isFloat() ? (long) val.toDouble() : 0);
-            return (T) Integer.valueOf((int) l);
+            return (T) Integer.valueOf((int) toLongChecked(val));
         }
 
         if (targetType == long.class || targetType == Long.class) {
-            long l = val.isInteger() ? val.toLong() : (val.isFloat() ? (long) val.toDouble() : 0);
-            return (T) Long.valueOf(l);
+            return (T) Long.valueOf(toLongChecked(val));
         }
 
         // Floating point numbers
         if (targetType == float.class || targetType == Float.class) {
-            double d = val.isFloat() ? val.toDouble() : (val.isInteger() ? (double) val.toLong() : 0.0);
-            return (T) Float.valueOf((float) d);
+            return (T) Float.valueOf((float) toDoubleChecked(val));
         }
 
         if (targetType == double.class || targetType == Double.class) {
-            double d = val.isFloat() ? val.toDouble() : (val.isInteger() ? (double) val.toLong() : 0.0);
-            return (T) Double.valueOf(d);
+            return (T) Double.valueOf(toDoubleChecked(val));
         }
 
         // Enums
@@ -350,6 +346,29 @@ public final class LuaDataConverter {
         }
 
         throw new LuaException("Cannot convert Lua value of type " + val.typeName() + " to Java type " + targetType.getName());
+    }
+
+    /**
+     * Coerces a Lua value to a Java integer, following Lua's rules: integer
+     * and float values convert (floats truncate toward zero), numeric strings
+     * convert, anything else raises a Lua error rather than becoming 0.
+     */
+    static long toLongChecked(LuaValue val) {
+        if (val.isInteger()) return val.toLong();
+        if (val.isFloat()) return (long) val.toDouble();
+        if (val.isString()) return val.toLong(); // throws on non-numeric strings
+        throw new LuaException("number expected, got " + val.typeName());
+    }
+
+    /**
+     * Coerces a Lua value to a Java double following Lua's rules; non-numeric
+     * values raise a Lua error instead of silently becoming 0.
+     */
+    static double toDoubleChecked(LuaValue val) {
+        if (val.isFloat()) return val.toDouble();
+        if (val.isInteger()) return (double) val.toLong();
+        if (val.isString()) return val.toDouble(); // throws on non-numeric strings
+        throw new LuaException("number expected, got " + val.typeName());
     }
 
     public static Method findSingleAbstractMethod(Class<?> iface) {

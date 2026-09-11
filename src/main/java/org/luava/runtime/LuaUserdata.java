@@ -272,8 +272,7 @@ public final class LuaUserdata extends LuaValue {
                     }
                     return LuaDataConverter.toLua(res);
                 } catch (Throwable t) {
-                    Throwable cause = t.getCause() != null ? t.getCause() : t;
-                    throw new LuaException("Error invoking Java functional interface: " + cause.getMessage());
+                    throw LuaFunction.hostError("Error invoking Java functional interface", t);
                 }
             }
         }
@@ -389,7 +388,7 @@ public final class LuaUserdata extends LuaValue {
                 Object obj = bestMatch.newInstance(javaArgs);
                 return LuaDataConverter.wrapLive(obj);
             } catch (Throwable t) {
-                throw new LuaException("Error invoking constructor for " + clazz.getName() + ": " + t.getMessage());
+                throw LuaFunction.hostError("Error invoking constructor for " + clazz.getName(), t);
             }
         });
     }
@@ -420,8 +419,7 @@ public final class LuaUserdata extends LuaValue {
                 }
                 return LuaDataConverter.toLua(result);
             } catch (Throwable t) {
-                Throwable cause = t.getCause() != null ? t.getCause() : t;
-                throw new LuaException("Error invoking Java method " + methodName + ": " + cause.getMessage());
+                throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }
         });
     }
@@ -541,7 +539,9 @@ public final class LuaUserdata extends LuaValue {
             return list;
         });
         for (Field f : fields) {
-            if (f.getName().equals(name) && Modifier.isStatic(f.getModifiers()) == isStatic) {
+            if (f.getName().equals(name)
+                    && Modifier.isStatic(f.getModifiers()) == isStatic
+                    && !org.luava.binding.JavaAccessPolicy.active().isDenied(f.getDeclaringClass().getName())) {
                 return f;
             }
         }
@@ -561,7 +561,9 @@ public final class LuaUserdata extends LuaValue {
         });
         List<Method> result = new ArrayList<>();
         for (Method m : methods) {
-            if (m.getName().equals(name) && Modifier.isStatic(m.getModifiers()) == isStatic) {
+            if (m.getName().equals(name)
+                    && Modifier.isStatic(m.getModifiers()) == isStatic
+                    && !org.luava.binding.JavaAccessPolicy.active().isDenied(m.getDeclaringClass().getName())) {
                 result.add(m);
             }
         }

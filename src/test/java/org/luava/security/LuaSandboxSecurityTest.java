@@ -173,6 +173,19 @@ public class LuaSandboxSecurityTest {
     }
 
     @Test
+    void stringDumpDoesNotSpawnAProcess() {
+        // string.dump used to shell out to the C `luac`; in a sandbox that is
+        // both a process-execution escape and a hidden C dependency. The
+        // pure-Java dump must round-trip inside Luava without any subprocess.
+        LuaState s = new LuaState().sandbox();
+        LuaValue r = s.eval(
+                "local d = string.dump(function(x) return x * 2 end)\n"
+                        + "local g = load(d)\n"
+                        + "return g(21)");
+        assertEquals(42L, r.toLong());
+    }
+
+    @Test
     void clearGuardRestoresUnguardedExecution() {
         LuaState s = new LuaState().sandbox().instructionLimit(1000);
         s.clearGuard();
