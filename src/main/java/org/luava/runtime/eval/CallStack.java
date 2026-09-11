@@ -292,6 +292,15 @@ public final class CallStack {
         return false;
     }
 
+    /** ThreadLocal-free {@link #isHandlingError()} for a known state. */
+    public static boolean isHandlingError(CallStackState state) {
+        java.util.List<ProtectedFrame> list = state.protectedFrames;
+        for (int i = list.size() - 1; i >= 0; i--) {
+            if (list.get(i).handling) return true;
+        }
+        return false;
+    }
+
     public static boolean canHandleError() {
         java.util.List<ProtectedFrame> list = currentState().protectedFrames;
         for (int i = list.size() - 1; i >= 0; i--) {
@@ -355,7 +364,7 @@ public final class CallStack {
     public static void push(LuaFunction fn, String name, String namewhat, int line, boolean isMethod, boolean isMetamethod, boolean isTailCall,
                             CallStackState state, LuaCoroutine cur) {
         int top = state.top;
-        if (isHandlingError()) {
+        if (isHandlingError(state)) {
             if (top >= MAX_CALL_DEPTH + EXTRA_STACK_SLOTS) {
                 org.luava.runtime.LuaException le = new org.luava.runtime.LuaException("error in error handling");
                 le.setDecorated(true);
