@@ -136,76 +136,84 @@ public final class BytecodeVM {
     }
 
     public static LuaValue[] execute(LuaState state, LuaClosure initialClosure, LuaValue[] initialArgs) {
+        VmContext ctx = new VmContext();
+        LuaCoroutine coInit = LuaCoroutine.running();
+        ctx.co = coInit;
+        ctx.callState = coInit != null ? coInit.getCallStackState() : CallStack.currentState();
         state.ensureStackCapacity(256);
-        long[] pStack = state.getPrimitiveStack();
-        byte[] tStack = state.getTypeStack();
-        LuaValue[] oStack = state.getObjectStack();
+        ctx.pStack = state.getPrimitiveStack();
+        ctx.tStack = state.getTypeStack();
+        ctx.oStack = state.getObjectStack();
 
-        CallInfo[] callStack = new CallInfo[256];
-        for (int i = 0; i < callStack.length; i++) callStack[i] = new CallInfo();
-        int callDepth = 0;
+        ctx.callStack = new CallInfo[256];
+        for (int i = 0; i < ctx.callStack.length; i++) ctx.callStack[i] = new CallInfo();
+        ctx.callDepth = 0;
 
-        int savedStackTop = state.getStackTop();
-        int base = savedStackTop;
-        int top = base;
-        int pc = 0;
+        ctx.savedStackTop = state.getStackTop();
+        ctx.base = ctx.savedStackTop;
+        ctx.top = ctx.base;
+        ctx.pc = 0;
 
-        LuaClosure closure = initialClosure;
-        LuaProto proto = closure.proto;
-        int[] code = proto.code;
-        LuaValue[] k = proto.constants;
-        Upvalue[] upvals = closure.upvals;
+        ctx.closure = initialClosure;
+        ctx.proto = ctx.closure.proto;
+        ctx.code = ctx.proto.code;
+        ctx.k = ctx.proto.constants;
+        ctx.upvals = ctx.closure.upvals;
 
-        state.ensureStackCapacity(base + proto.maxStackSize + 64);
-        state.setStackTop(base + proto.maxStackSize + 64);
-        pStack = state.getPrimitiveStack();
-        tStack = state.getTypeStack();
-        oStack = state.getObjectStack();
+        state.ensureStackCapacity(ctx.base + ctx.proto.maxStackSize + 64);
+        state.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
+        ctx.pStack = state.getPrimitiveStack();
+        ctx.tStack = state.getTypeStack();
+        ctx.oStack = state.getObjectStack();
 
         int nArgs = initialArgs != null ? initialArgs.length : 0;
-        for (int i = 0; i < proto.numParams; i++) {
-            setLuaValue(pStack, tStack, oStack, base + i, (i < nArgs) ? initialArgs[i] : LuaNil.NIL);
+        for (int i = 0; i < ctx.proto.numParams; i++) {
+            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, (i < nArgs) ? initialArgs[i] : LuaNil.NIL);
         }
-        top = base + proto.numParams;
+        ctx.top = ctx.base + ctx.proto.numParams;
 
-        LuaValue[] varargs = null;
-        if (proto.isVararg && nArgs > proto.numParams) {
-            int nv = nArgs - proto.numParams;
-            varargs = new LuaValue[nv];
+        ctx.varargs = null;
+        if (ctx.proto.isVararg && nArgs > ctx.proto.numParams) {
+            int nv = nArgs - ctx.proto.numParams;
+            ctx.varargs = new LuaValue[nv];
             for (int i = 0; i < nv; i++) {
-                varargs[i] = initialArgs[proto.numParams + i];
+                ctx.varargs[i] = initialArgs[ctx.proto.numParams + i];
             }
         }
 
-        int initialDepth = CallStack.depth();
-        CallStack.setNextVmFrame(state, base, base - 1, varargs, pc);
+        ctx.initialDepth = CallStack.depth();
+        CallStack.setNextVmFrame(ctx.callState, state, ctx.base, ctx.base - 1, ctx.varargs, ctx.pc);
         CallStack.push(initialClosure, initialClosure.getName(), initialClosure.getLineDefined());
-        int oldpc = -1;
-        boolean varargPrepRan = false;
-        Throwable caughtException = null;
+        ctx.oldpc = -1;
+        ctx.varargPrepRan = false;
+        ctx.thrown = null;
         // Hoisted: coroutine is constant for the whole execute() invocation
         // (resume continues the same thread/CURRENT; nested coroutines get
         // their own execute()). Saves a ThreadLocal lookup per instruction.
-        LuaCoroutine co0 = LuaCoroutine.running();
+        return runLoop(state, ctx);
+    }
+
+    /**
+     * The HotSpot-critical dispatch loop. Kept small enough for C2/OSR
+     * (well under the 8 KB HugeMethodLimit); big opcode handlers live in
+     * helpers that mutate {@code ctx} directly.
+     */
+    private static LuaValue[] runLoop(LuaState state, VmContext ctx) {
+        LuaCoroutine co0 = ctx.co;
 
         try {
             while (true) {
-                int instPc = pc;
+                int instPc = ctx.pc;
                 // Lazy frame sync: mirror pc for on-demand debug readers
                 // (getinfo/traceback/getlocal sync the top frame from this).
                 // Replaces per-instruction topFrame() + lineInfo lookup.
                 if (co0 != null) {
                     co0.vmPcMirror = instPc;
                 } else {
-                    int curLineSlow = (proto.lineInfo != null && instPc < proto.lineInfo.length) ? proto.lineInfo[instPc] : -1;
-                    CallStack.Frame curFrameSlow = CallStack.topFrame();
-                    if (curFrameSlow != null) {
-                        curFrameSlow.pc = instPc;
-                        curFrameSlow.line = curLineSlow;
-                    }
+                    mirrorSlow(ctx, instPc);
                 }
 
-                int inst = code[pc++];
+                int inst = ctx.code[ctx.pc++];
                 int op = (inst >>> Instruction.POS_OP) & Instruction.MASK_OP;
                 int a = (inst >>> Instruction.POS_A) & Instruction.MASK_A;
 
@@ -213,103 +221,59 @@ public final class BytecodeVM {
                 // ThreadLocal + config lookups per instruction. HOOKS_ARMED is
                 // biased to stay true (perf-only cost); hooks still verified
                 // per-coroutine inside.
-                LuaCoroutine co = LuaCoroutine.HOOKS_ARMED ? co0 : null;
-                if (co != null) {
-                    // Hooks armed: compute line/frame lazily (once per
-                    // instruction only while a hook is actually installed).
-                    int curLine = (proto.lineInfo != null && instPc < proto.lineInfo.length) ? proto.lineInfo[instPc] : -1;
-                    CallStack.Frame curFrame = CallStack.topFrame();
-                    LuaCoroutine.HookConfig hc = co.getHookConfig();
-                    if (!hc.hook.isNil() && !hc.inHook) {
-                        // OP_CLEANUP is compiler-internal (dead-slot clearing):
-                        // it must not fire count hooks (instruction counts stay
-                        // C-like), but it fires line hooks normally (it carries
-                        // the loop's line, so first-event sequencing is intact).
-                        boolean isCleanup = (op == OpCode.OP_CLEANUP);
-                        if (hc.count > 0 && !isCleanup) {
-                            // Stamp the frame: hook observers (getlocal/traceback) read it.
-                            if (curFrame != null) {
-                                curFrame.pc = instPc;
-                                curFrame.line = curLine;
-                            }
-                            co.fireCountHook();
-                        }
-                        if (hc.hookLine) {
-                            // Lua 5.4 semantics (lvm.c: OP_VARARGPREP & ldebug.c: luaG_traceexec):
-                            // 1. OP_VARARGPREP is internal setup and never triggers the line hook.
-                            // 2. Setting oldpc to 1 in Lua's OP_VARARGPREP guarantees next opcode triggers line hook.
-                            // 3. Subsequent instructions trigger the hook on backward jumps (loops: instPc <= oldpc)
-                            //    or on entering a new line (curLine != oldLine).
-                            if (op != OpCode.OP_VARARGPREP) {
-                                int oldLine = (proto.lineInfo != null && oldpc >= 0 && oldpc < proto.lineInfo.length)
-                                        ? proto.lineInfo[oldpc] : -1;
-                                if (varargPrepRan || oldpc < 0 || instPc <= oldpc || curLine != oldLine) {
-                                    if (curLine > 0) {
-                                        // Stamp the frame: hook observers (getlocal/traceback) read it.
-                                        if (curFrame != null) {
-                                            curFrame.pc = instPc;
-                                            curFrame.line = curLine;
-                                        }
-                                        co.fireLineHookDirect(curLine, curFrame);
-                                    }
-                                    varargPrepRan = false;
-                                }
-                            } else {
-                                varargPrepRan = true;
-                            }
-                        }
-                    }
+                if (LuaCoroutine.HOOKS_ARMED && co0 != null) {
+                    pollHooks(co0, ctx, instPc, op);
                 }
-                oldpc = instPc;
+                ctx.oldpc = instPc;
 
             switch (op) {
                 case OpCode.OP_MOVE -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    copyReg(pStack, tStack, oStack, base + a, base + b);
+                    copyReg(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.base + b);
                 }
                 case OpCode.OP_LOADI -> {
                     int sbx = ((inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx) - Instruction.OFFSET_sBx;
-                    pStack[base + a] = sbx;
-                    tStack[base + a] = TYPE_INT;
-                    oStack[base + a] = null;
+                    ctx.pStack[ctx.base + a] = sbx;
+                    ctx.tStack[ctx.base + a] = TYPE_INT;
+                    ctx.oStack[ctx.base + a] = null;
                 }
                 case OpCode.OP_LOADF -> {
                     int sbx = ((inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx) - Instruction.OFFSET_sBx;
-                    pStack[base + a] = Double.doubleToRawLongBits(sbx);
-                    tStack[base + a] = TYPE_FLOAT;
-                    oStack[base + a] = null;
+                    ctx.pStack[ctx.base + a] = Double.doubleToRawLongBits(sbx);
+                    ctx.tStack[ctx.base + a] = TYPE_FLOAT;
+                    ctx.oStack[ctx.base + a] = null;
                 }
                 case OpCode.OP_LOADK -> {
                     int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
-                    setLuaValue(pStack, tStack, oStack, base + a, k[bx]);
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.k[bx]);
                 }
                 case OpCode.OP_LOADKX -> {
-                    int nextInst = code[pc++];
+                    int nextInst = ctx.code[ctx.pc++];
                     int ax = (nextInst >>> Instruction.POS_Ax) & Instruction.MASK_Ax;
-                    setLuaValue(pStack, tStack, oStack, base + a, k[ax]);
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.k[ax]);
                 }
                 case OpCode.OP_LOADFALSE -> {
-                    pStack[base + a] = 0;
-                    tStack[base + a] = TYPE_BOOLEAN;
-                    oStack[base + a] = null;
+                    ctx.pStack[ctx.base + a] = 0;
+                    ctx.tStack[ctx.base + a] = TYPE_BOOLEAN;
+                    ctx.oStack[ctx.base + a] = null;
                 }
                 case OpCode.OP_LFALSESKIP -> {
-                    pStack[base + a] = 0;
-                    tStack[base + a] = TYPE_BOOLEAN;
-                    oStack[base + a] = null;
-                    pc++;
+                    ctx.pStack[ctx.base + a] = 0;
+                    ctx.tStack[ctx.base + a] = TYPE_BOOLEAN;
+                    ctx.oStack[ctx.base + a] = null;
+                    ctx.pc++;
                 }
                 case OpCode.OP_LOADTRUE -> {
-                    pStack[base + a] = 1;
-                    tStack[base + a] = TYPE_BOOLEAN;
-                    oStack[base + a] = null;
+                    ctx.pStack[ctx.base + a] = 1;
+                    ctx.tStack[ctx.base + a] = TYPE_BOOLEAN;
+                    ctx.oStack[ctx.base + a] = null;
                 }
                 case OpCode.OP_LOADNIL -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     for (int j = 0; j <= b; j++) {
-                        tStack[base + a + j] = TYPE_NIL;
-                        pStack[base + a + j] = 0;
-                        oStack[base + a + j] = null;
+                        ctx.tStack[ctx.base + a + j] = TYPE_NIL;
+                        ctx.pStack[ctx.base + a + j] = 0;
+                        ctx.oStack[ctx.base + a + j] = null;
                     }
                 }
                 case OpCode.OP_CLEANUP -> {
@@ -318,336 +282,304 @@ public final class BytecodeVM {
                     // instruction-counting hooks observe C-like counts.
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     for (int j = 0; j <= b; j++) {
-                        tStack[base + a + j] = TYPE_NIL;
-                        pStack[base + a + j] = 0;
-                        oStack[base + a + j] = null;
+                        ctx.tStack[ctx.base + a + j] = TYPE_NIL;
+                        ctx.pStack[ctx.base + a + j] = 0;
+                        ctx.oStack[ctx.base + a + j] = null;
                     }
                 }
                 case OpCode.OP_GETUPVAL -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    setLuaValue(pStack, tStack, oStack, base + a, upvals[b].getValue());
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.upvals[b].getValue());
                 }
                 case OpCode.OP_SETUPVAL -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    upvals[b].setValue(getLuaValue(pStack, tStack, oStack, base + a));
+                    ctx.upvals[b].setValue(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a));
                 }
-                case OpCode.OP_GETTABUP -> executeGetTabUp(pStack, tStack, oStack, upvals, k, base, a, inst);
-                case OpCode.OP_GETTABLE -> executeGetTable(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_GETI -> executeGetI(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_GETFIELD -> executeGetField(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_SETTABUP -> executeSetTabUp(pStack, tStack, oStack, upvals, k, base, a, inst);
-                case OpCode.OP_SETTABLE -> executeSetTable(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_SETI -> executeSetI(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_SETFIELD -> executeSetField(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_NEWTABLE -> pc = executeNewTable(code, pc, tStack, oStack, base, a);
-                case OpCode.OP_SELF -> executeSelf(pStack, tStack, oStack, k, base, a, inst);
+                case OpCode.OP_GETTABUP -> executeGetTabUp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.upvals, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_GETTABLE -> executeGetTable(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_GETI -> executeGetI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_GETFIELD -> executeGetField(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_SETTABUP -> executeSetTabUp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.upvals, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_SETTABLE -> executeSetTable(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_SETI -> executeSetI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_SETFIELD -> executeSetField(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_NEWTABLE -> ctx.pc = executeNewTable(ctx.code, ctx.pc, ctx.tStack, ctx.oStack, ctx.base, a);
+                case OpCode.OP_SELF -> executeSelf(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
                 case OpCode.OP_ADD -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-                    int regB = base + b;
-                    int regC = base + c;
-                    int regA = base + a;
-                    if (tStack[regB] == TYPE_INT && tStack[regC] == TYPE_INT) {
-                        pStack[regA] = pStack[regB] + pStack[regC];
-                        tStack[regA] = TYPE_INT;
-                        oStack[regA] = null;
-                        if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) pc++;
-                    } else if (isNumber(tStack[regB]) && isNumber(tStack[regC])) {
-                        double db = tStack[regB] == TYPE_INT ? pStack[regB] : Double.longBitsToDouble(pStack[regB]);
-                        double dc = tStack[regC] == TYPE_INT ? pStack[regC] : Double.longBitsToDouble(pStack[regC]);
-                        pStack[regA] = Double.doubleToRawLongBits(db + dc);
-                        tStack[regA] = TYPE_FLOAT;
-                        oStack[regA] = null;
-                        if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) pc++;
+                    int regB = ctx.base + b;
+                    int regC = ctx.base + c;
+                    int regA = ctx.base + a;
+                    if (ctx.tStack[regB] == TYPE_INT && ctx.tStack[regC] == TYPE_INT) {
+                        ctx.pStack[regA] = ctx.pStack[regB] + ctx.pStack[regC];
+                        ctx.tStack[regA] = TYPE_INT;
+                        ctx.oStack[regA] = null;
+                        if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) ctx.pc++;
+                    } else if (isNumber(ctx.tStack[regB]) && isNumber(ctx.tStack[regC])) {
+                        double db = ctx.tStack[regB] == TYPE_INT ? ctx.pStack[regB] : Double.longBitsToDouble(ctx.pStack[regB]);
+                        double dc = ctx.tStack[regC] == TYPE_INT ? ctx.pStack[regC] : Double.longBitsToDouble(ctx.pStack[regC]);
+                        ctx.pStack[regA] = Double.doubleToRawLongBits(db + dc);
+                        ctx.tStack[regA] = TYPE_FLOAT;
+                        ctx.oStack[regA] = null;
+                        if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) ctx.pc++;
                     } else {
-                        executeSlowAdd(pStack, tStack, oStack, regA, regB, regC);
+                        executeSlowAdd(ctx.pStack, ctx.tStack, ctx.oStack, regA, regB, regC);
                     }
                 }
                 case OpCode.OP_ADDI -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int sc = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-                    int regB = base + b;
-                    int regA = base + a;
-                    if (tStack[regB] == TYPE_INT) {
-                        pStack[regA] = pStack[regB] + sc;
-                        tStack[regA] = TYPE_INT;
-                        oStack[regA] = null;
-                        if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBINI) pc++;
-                    } else if (tStack[regB] == TYPE_FLOAT) {
-                        double db = Double.longBitsToDouble(pStack[regB]);
-                        pStack[regA] = Double.doubleToRawLongBits(db + sc);
-                        tStack[regA] = TYPE_FLOAT;
-                        oStack[regA] = null;
-                        if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBINI) pc++;
+                    int regB = ctx.base + b;
+                    int regA = ctx.base + a;
+                    if (ctx.tStack[regB] == TYPE_INT) {
+                        ctx.pStack[regA] = ctx.pStack[regB] + sc;
+                        ctx.tStack[regA] = TYPE_INT;
+                        ctx.oStack[regA] = null;
+                        if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBINI) ctx.pc++;
+                    } else if (ctx.tStack[regB] == TYPE_FLOAT) {
+                        double db = Double.longBitsToDouble(ctx.pStack[regB]);
+                        ctx.pStack[regA] = Double.doubleToRawLongBits(db + sc);
+                        ctx.tStack[regA] = TYPE_FLOAT;
+                        ctx.oStack[regA] = null;
+                        if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBINI) ctx.pc++;
                     } else {
-                        executeSlowAddI(pStack, tStack, oStack, regA, regB, sc);
+                        executeSlowAddI(ctx.pStack, ctx.tStack, ctx.oStack, regA, regB, sc);
                     }
                 }
-                case OpCode.OP_ADDK -> executeSlowAddK(pStack, tStack, oStack, k, base, a, inst);
+                case OpCode.OP_ADDK -> executeSlowAddK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
                 case OpCode.OP_SUB -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-                    int regB = base + b;
-                    int regC = base + c;
-                    int regA = base + a;
-                    if (tStack[regB] == TYPE_INT && tStack[regC] == TYPE_INT) {
-                        pStack[regA] = pStack[regB] - pStack[regC];
-                        tStack[regA] = TYPE_INT;
-                        oStack[regA] = null;
-                        if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) pc++;
-                    } else if (isNumber(tStack[regB]) && isNumber(tStack[regC])) {
-                        double db = tStack[regB] == TYPE_INT ? pStack[regB] : Double.longBitsToDouble(pStack[regB]);
-                        double dc = tStack[regC] == TYPE_INT ? pStack[regC] : Double.longBitsToDouble(pStack[regC]);
-                        pStack[regA] = Double.doubleToRawLongBits(db - dc);
-                        tStack[regA] = TYPE_FLOAT;
-                        oStack[regA] = null;
-                        if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) pc++;
+                    int regB = ctx.base + b;
+                    int regC = ctx.base + c;
+                    int regA = ctx.base + a;
+                    if (ctx.tStack[regB] == TYPE_INT && ctx.tStack[regC] == TYPE_INT) {
+                        ctx.pStack[regA] = ctx.pStack[regB] - ctx.pStack[regC];
+                        ctx.tStack[regA] = TYPE_INT;
+                        ctx.oStack[regA] = null;
+                        if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) ctx.pc++;
+                    } else if (isNumber(ctx.tStack[regB]) && isNumber(ctx.tStack[regC])) {
+                        double db = ctx.tStack[regB] == TYPE_INT ? ctx.pStack[regB] : Double.longBitsToDouble(ctx.pStack[regB]);
+                        double dc = ctx.tStack[regC] == TYPE_INT ? ctx.pStack[regC] : Double.longBitsToDouble(ctx.pStack[regC]);
+                        ctx.pStack[regA] = Double.doubleToRawLongBits(db - dc);
+                        ctx.tStack[regA] = TYPE_FLOAT;
+                        ctx.oStack[regA] = null;
+                        if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) ctx.pc++;
                     } else {
-                        executeSlowSub(pStack, tStack, oStack, regA, regB, regC);
+                        executeSlowSub(ctx.pStack, ctx.tStack, ctx.oStack, regA, regB, regC);
                     }
                 }
-                case OpCode.OP_SUBK -> executeSlowSubK(pStack, tStack, oStack, k, base, a, inst);
+                case OpCode.OP_SUBK -> executeSlowSubK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
                 case OpCode.OP_MUL -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-                    int regB = base + b;
-                    int regC = base + c;
-                    int regA = base + a;
-                    if (tStack[regB] == TYPE_INT && tStack[regC] == TYPE_INT) {
-                        pStack[regA] = pStack[regB] * pStack[regC];
-                        tStack[regA] = TYPE_INT;
-                        oStack[regA] = null;
-                        if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) pc++;
-                    } else if (isNumber(tStack[regB]) && isNumber(tStack[regC])) {
-                        double db = tStack[regB] == TYPE_INT ? pStack[regB] : Double.longBitsToDouble(pStack[regB]);
-                        double dc = tStack[regC] == TYPE_INT ? pStack[regC] : Double.longBitsToDouble(pStack[regC]);
-                        pStack[regA] = Double.doubleToRawLongBits(db * dc);
-                        tStack[regA] = TYPE_FLOAT;
-                        oStack[regA] = null;
-                        if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) pc++;
+                    int regB = ctx.base + b;
+                    int regC = ctx.base + c;
+                    int regA = ctx.base + a;
+                    if (ctx.tStack[regB] == TYPE_INT && ctx.tStack[regC] == TYPE_INT) {
+                        ctx.pStack[regA] = ctx.pStack[regB] * ctx.pStack[regC];
+                        ctx.tStack[regA] = TYPE_INT;
+                        ctx.oStack[regA] = null;
+                        if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) ctx.pc++;
+                    } else if (isNumber(ctx.tStack[regB]) && isNumber(ctx.tStack[regC])) {
+                        double db = ctx.tStack[regB] == TYPE_INT ? ctx.pStack[regB] : Double.longBitsToDouble(ctx.pStack[regB]);
+                        double dc = ctx.tStack[regC] == TYPE_INT ? ctx.pStack[regC] : Double.longBitsToDouble(ctx.pStack[regC]);
+                        ctx.pStack[regA] = Double.doubleToRawLongBits(db * dc);
+                        ctx.tStack[regA] = TYPE_FLOAT;
+                        ctx.oStack[regA] = null;
+                        if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) ctx.pc++;
                     } else {
-                        executeSlowMul(pStack, tStack, oStack, regA, regB, regC);
+                        executeSlowMul(ctx.pStack, ctx.tStack, ctx.oStack, regA, regB, regC);
                     }
                 }
-                case OpCode.OP_MULK -> executeSlowMulK(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_DIV -> executeSlowDiv(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_DIVK -> executeSlowDivK(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_IDIV -> executeSlowIDiv(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_IDIVK -> executeSlowIDivK(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_MOD -> executeSlowMod(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_MODK -> executeSlowModK(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_POW -> executeSlowPow(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_POWK -> executeSlowPowK(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_BAND -> executeSlowBand(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_BANDK -> executeSlowBandK(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_BOR -> executeSlowBor(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_BORK -> executeSlowBorK(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_BXOR -> executeSlowBxor(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_BXORK -> executeSlowBxorK(pStack, tStack, oStack, k, base, a, inst);
-                case OpCode.OP_SHL -> executeSlowShl(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_SHLI -> executeSlowShlI(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_SHR -> executeSlowShr(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_SHRI -> executeSlowShrI(pStack, tStack, oStack, base, a, inst);
+                case OpCode.OP_MULK -> executeSlowMulK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_DIV -> executeSlowDiv(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_DIVK -> executeSlowDivK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_IDIV -> executeSlowIDiv(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_IDIVK -> executeSlowIDivK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_MOD -> executeSlowMod(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_MODK -> executeSlowModK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_POW -> executeSlowPow(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_POWK -> executeSlowPowK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_BAND -> executeSlowBand(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_BANDK -> executeSlowBandK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_BOR -> executeSlowBor(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_BORK -> executeSlowBorK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_BXOR -> executeSlowBxor(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_BXORK -> executeSlowBxorK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_SHL -> executeSlowShl(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_SHLI -> executeSlowShlI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_SHR -> executeSlowShr(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_SHRI -> executeSlowShrI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
                 case OpCode.OP_UNM -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    int regB = base + b;
-                    int regA = base + a;
-                    if (tStack[regB] == TYPE_INT) {
-                        pStack[regA] = -pStack[regB];
-                        tStack[regA] = TYPE_INT;
-                        oStack[regA] = null;
-                    } else if (tStack[regB] == TYPE_FLOAT) {
-                        pStack[regA] = Double.doubleToRawLongBits(-Double.longBitsToDouble(pStack[regB]));
-                        tStack[regA] = TYPE_FLOAT;
-                        oStack[regA] = null;
+                    int regB = ctx.base + b;
+                    int regA = ctx.base + a;
+                    if (ctx.tStack[regB] == TYPE_INT) {
+                        ctx.pStack[regA] = -ctx.pStack[regB];
+                        ctx.tStack[regA] = TYPE_INT;
+                        ctx.oStack[regA] = null;
+                    } else if (ctx.tStack[regB] == TYPE_FLOAT) {
+                        ctx.pStack[regA] = Double.doubleToRawLongBits(-Double.longBitsToDouble(ctx.pStack[regB]));
+                        ctx.tStack[regA] = TYPE_FLOAT;
+                        ctx.oStack[regA] = null;
                     } else {
-                        setLuaValue(pStack, tStack, oStack, regA, getLuaValue(pStack, tStack, oStack, regB).unm());
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).unm());
                     }
                 }
                 case OpCode.OP_BNOT -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    int regB = base + b;
-                    int regA = base + a;
-                    if (tStack[regB] == TYPE_INT) {
-                        pStack[regA] = ~pStack[regB];
-                        tStack[regA] = TYPE_INT;
-                        oStack[regA] = null;
+                    int regB = ctx.base + b;
+                    int regA = ctx.base + a;
+                    if (ctx.tStack[regB] == TYPE_INT) {
+                        ctx.pStack[regA] = ~ctx.pStack[regB];
+                        ctx.tStack[regA] = TYPE_INT;
+                        ctx.oStack[regA] = null;
                     } else {
-                        setLuaValue(pStack, tStack, oStack, regA, getLuaValue(pStack, tStack, oStack, regB).bnot());
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).bnot());
                     }
                 }
                 case OpCode.OP_NOT -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    boolean truthy = isTruthy(pStack, tStack, base + b);
-                    pStack[base + a] = truthy ? 0L : 1L;
-                    tStack[base + a] = TYPE_BOOLEAN;
-                    oStack[base + a] = null;
+                    boolean truthy = isTruthy(ctx.pStack, ctx.tStack, ctx.base + b);
+                    ctx.pStack[ctx.base + a] = truthy ? 0L : 1L;
+                    ctx.tStack[ctx.base + a] = TYPE_BOOLEAN;
+                    ctx.oStack[ctx.base + a] = null;
                 }
                 case OpCode.OP_LEN -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).len());
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).len());
                 }
-                case OpCode.OP_CONCAT -> executeConcat(pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_CLOSE -> {
-                    state.closeUpvalues(base + a);
-                    state.closeTbc(base + a, null);
-                }
-                case OpCode.OP_TBC -> {
-                    LuaValue val = getLuaValue(pStack, tStack, oStack, base + a);
-                    String varName = proto.findLocalVarName(a, pc - 1);
-                    state.pushTbc(base + a, val, varName);
-                }
+                case OpCode.OP_CONCAT -> executeConcat(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_CLOSE -> doClose(state, ctx, a, false);
+                case OpCode.OP_TBC -> doClose(state, ctx, a, true);
                 case OpCode.OP_JMP -> {
                     int sj = ((inst >>> Instruction.POS_sJ) & Instruction.MASK_sJ) - Instruction.OFFSET_sJ;
-                    pc += sj;
+                    ctx.pc += sj;
                 }
                 case OpCode.OP_EQ -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-                    int regA = base + a;
-                    int regB = base + b;
-                    byte ta = tStack[regA];
-                    byte tb = tStack[regB];
+                    int regA = ctx.base + a;
+                    int regB = ctx.base + b;
+                    byte ta = ctx.tStack[regA];
+                    byte tb = ctx.tStack[regB];
                     boolean cond;
                     if (ta == tb && ta == TYPE_INT) {
-                        cond = (pStack[regA] == pStack[regB]);
+                        cond = (ctx.pStack[regA] == ctx.pStack[regB]);
                     } else if (ta == tb && ta == TYPE_BOOLEAN) {
-                        cond = (pStack[regA] == pStack[regB]);
+                        cond = (ctx.pStack[regA] == ctx.pStack[regB]);
                     } else if (ta == TYPE_NIL && tb == TYPE_NIL) {
                         cond = true;
                     } else {
-                        cond = getLuaValue(pStack, tStack, oStack, regA).luaEquals(getLuaValue(pStack, tStack, oStack, regB));
+                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaEquals(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB));
                     }
-                    if (cond != (flagK == 1)) pc++;
+                    if (cond != (flagK == 1)) ctx.pc++;
                 }
                 case OpCode.OP_EQK -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-                    boolean cond = getLuaValue(pStack, tStack, oStack, base + a).luaEquals(k[b]);
-                    if (cond != (flagK == 1)) pc++;
+                    boolean cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a).luaEquals(ctx.k[b]);
+                    if (cond != (flagK == 1)) ctx.pc++;
                 }
                 case OpCode.OP_EQI -> {
                     int sb = ((inst >>> Instruction.POS_B) & Instruction.MASK_B) - 128;
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-                    int regA = base + a;
-                    boolean cond = (tStack[regA] == TYPE_INT && pStack[regA] == sb);
-                    if (!cond && tStack[regA] != TYPE_INT) {
-                        cond = getLuaValue(pStack, tStack, oStack, regA).luaEquals(LuaInteger.valueOf(sb));
+                    int regA = ctx.base + a;
+                    boolean cond = (ctx.tStack[regA] == TYPE_INT && ctx.pStack[regA] == sb);
+                    if (!cond && ctx.tStack[regA] != TYPE_INT) {
+                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaEquals(LuaInteger.valueOf(sb));
                     }
-                    if (cond != (flagK == 1)) pc++;
+                    if (cond != (flagK == 1)) ctx.pc++;
                 }
                 case OpCode.OP_LT -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-                    int regA = base + a;
-                    int regB = base + b;
-                    byte ta = tStack[regA];
-                    byte tb = tStack[regB];
+                    int regA = ctx.base + a;
+                    int regB = ctx.base + b;
+                    byte ta = ctx.tStack[regA];
+                    byte tb = ctx.tStack[regB];
                     boolean cond;
                     if (ta == TYPE_INT && tb == TYPE_INT) {
-                        cond = pStack[regA] < pStack[regB];
+                        cond = ctx.pStack[regA] < ctx.pStack[regB];
                     } else if (ta == TYPE_INT && tb == TYPE_FLOAT) {
-                        cond = ltIntFloat(pStack[regA], Double.longBitsToDouble(pStack[regB]));
+                        cond = ltIntFloat(ctx.pStack[regA], Double.longBitsToDouble(ctx.pStack[regB]));
                     } else if (ta == TYPE_FLOAT && tb == TYPE_INT) {
-                        cond = ltFloatInt(Double.longBitsToDouble(pStack[regA]), pStack[regB]);
+                        cond = ltFloatInt(Double.longBitsToDouble(ctx.pStack[regA]), ctx.pStack[regB]);
                     } else if (ta == TYPE_FLOAT && tb == TYPE_FLOAT) {
-                        cond = Double.longBitsToDouble(pStack[regA]) < Double.longBitsToDouble(pStack[regB]);
+                        cond = Double.longBitsToDouble(ctx.pStack[regA]) < Double.longBitsToDouble(ctx.pStack[regB]);
                     } else {
-                        cond = getLuaValue(pStack, tStack, oStack, regA).luaLessThan(getLuaValue(pStack, tStack, oStack, regB));
+                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessThan(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB));
                     }
-                    if (cond != (flagK == 1)) pc++;
+                    if (cond != (flagK == 1)) ctx.pc++;
                 }
                 case OpCode.OP_LE -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-                    int regA = base + a;
-                    int regB = base + b;
-                    byte ta = tStack[regA];
-                    byte tb = tStack[regB];
+                    int regA = ctx.base + a;
+                    int regB = ctx.base + b;
+                    byte ta = ctx.tStack[regA];
+                    byte tb = ctx.tStack[regB];
                     boolean cond;
                     if (ta == TYPE_INT && tb == TYPE_INT) {
-                        cond = pStack[regA] <= pStack[regB];
+                        cond = ctx.pStack[regA] <= ctx.pStack[regB];
                     } else if (ta == TYPE_INT && tb == TYPE_FLOAT) {
-                        cond = leIntFloat(pStack[regA], Double.longBitsToDouble(pStack[regB]));
+                        cond = leIntFloat(ctx.pStack[regA], Double.longBitsToDouble(ctx.pStack[regB]));
                     } else if (ta == TYPE_FLOAT && tb == TYPE_INT) {
-                        cond = leFloatInt(Double.longBitsToDouble(pStack[regA]), pStack[regB]);
+                        cond = leFloatInt(Double.longBitsToDouble(ctx.pStack[regA]), ctx.pStack[regB]);
                     } else if (ta == TYPE_FLOAT && tb == TYPE_FLOAT) {
-                        cond = Double.longBitsToDouble(pStack[regA]) <= Double.longBitsToDouble(pStack[regB]);
+                        cond = Double.longBitsToDouble(ctx.pStack[regA]) <= Double.longBitsToDouble(ctx.pStack[regB]);
                     } else {
-                        cond = getLuaValue(pStack, tStack, oStack, regA).luaLessOrEqual(getLuaValue(pStack, tStack, oStack, regB));
+                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessOrEqual(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB));
                     }
-                    if (cond != (flagK == 1)) pc++;
+                    if (cond != (flagK == 1)) ctx.pc++;
                 }
                 case OpCode.OP_TEST -> {
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-                    boolean truthy = isTruthy(pStack, tStack, base + a);
-                    if (truthy != (flagK == 1)) pc++;
-                    clearDeadTemp(pStack, tStack, oStack, proto, base, a, pc - 1);
+                    boolean truthy = isTruthy(ctx.pStack, ctx.tStack, ctx.base + a);
+                    if (truthy != (flagK == 1)) ctx.pc++;
+                    clearDeadTemp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.proto, ctx.base, a, ctx.pc - 1);
                 }
                 case OpCode.OP_TESTSET -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-                    boolean truthy = isTruthy(pStack, tStack, base + b);
+                    boolean truthy = isTruthy(ctx.pStack, ctx.tStack, ctx.base + b);
                     if (truthy != (flagK == 1)) {
-                        pc++;
+                        ctx.pc++;
                     } else {
-                        copyReg(pStack, tStack, oStack, base + a, base + b);
+                        copyReg(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.base + b);
                     }
-                    clearDeadTemp(pStack, tStack, oStack, proto, base, b, pc - 1);
+                    clearDeadTemp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.proto, ctx.base, b, ctx.pc - 1);
                 }
                 case OpCode.OP_CALL -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
 
-                    int funcIdx = base + a;
-                    LuaValue func = getLuaValue(pStack, tStack, oStack, funcIdx);
-                    int nActualArgs = b > 0 ? b - 1 : (top - (funcIdx + 1));
+                    int funcIdx = ctx.base + a;
                     int nResults = c - 1;
-
-                    while (!(func instanceof LuaFunction)) {
-                        LuaTable mt = func.getMetatable();
-                        LuaValue tm = mt != null ? mt.rawget(LuaString.valueOf("__call")) : null;
-                        if (tm != null && !tm.isNil()) {
-                            state.ensureStackCapacity(funcIdx + nActualArgs + 3);
-                            pStack = state.getPrimitiveStack();
-                            tStack = state.getTypeStack();
-                            oStack = state.getObjectStack();
-                            System.arraycopy(pStack, funcIdx, pStack, funcIdx + 1, nActualArgs + 1);
-                            System.arraycopy(tStack, funcIdx, tStack, funcIdx + 1, nActualArgs + 1);
-                            System.arraycopy(oStack, funcIdx, oStack, funcIdx + 1, nActualArgs + 1);
-                            setLuaValue(pStack, tStack, oStack, funcIdx, tm);
-                            nActualArgs++;
-                            func = tm;
-                        } else if (func instanceof LuaUserdata) {
-                            // Java userdata (incl. SAM functional interfaces):
-                            // adapt to the external-call path instead of throwing.
-                            func = new UserdataCallFunction((LuaUserdata) func);
-                        } else {
-                            String[] info = getobjname(proto, pc - 1, a);
-                            String extra = (info != null && info[0] != null) ? " (" + info[1] + " '" + info[0] + "')" : "";
-                            throw new LuaException("attempt to call a " + func.typeName() + " value" + extra);
-                        }
-                    }
+                    LuaFunction func = resolveCallable(state, ctx, funcIdx, b > 0 ? b - 1 : (ctx.top - (funcIdx + 1)), a);
+                    int nActualArgs = ctx.scratch0;
 
                     if (func instanceof LuaClosure childClosure) {
-                        CallStack.Frame callerFrame = CallStack.topFrame();
+                        CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
                         if (callerFrame != null) {
-                            callerFrame.pc = pc - 1;
-                            if (proto.lineInfo != null && pc - 1 >= 0 && pc - 1 < proto.lineInfo.length) {
-                                callerFrame.line = proto.lineInfo[pc - 1];
+                            callerFrame.pc = ctx.pc - 1;
+                            if (ctx.proto.lineInfo != null && ctx.pc - 1 >= 0 && ctx.pc - 1 < ctx.proto.lineInfo.length) {
+                                callerFrame.line = ctx.proto.lineInfo[ctx.pc - 1];
                             }
                         }
-                        if (callDepth >= callStack.length) {
-                            callStack = expandCallStack(callStack);
+                        if (ctx.callDepth >= ctx.callStack.length) {
+                            ctx.callStack = expandCallStack(ctx.callStack);
                         }
-                        CallInfo ci = callStack[callDepth++];
-                        ci.init(closure, funcIdx, base, top, pc, nResults);
-                        ci.varargs = varargs;
-                        ci.oldpc = oldpc;
-                        ci.varargPrepRan = varargPrepRan;
-                        oldpc = -1;
-                        varargPrepRan = false;
-                        CallStack.CallStackState csState = CallStack.currentState();
+                        CallInfo ci = ctx.callStack[ctx.callDepth++];
+                        ci.init(ctx.closure, funcIdx, ctx.base, ctx.top, ctx.pc, nResults);
+                        ci.varargs = ctx.varargs;
+                        ci.oldpc = ctx.oldpc;
+                        ci.varargPrepRan = ctx.varargPrepRan;
+                        ctx.oldpc = -1;
+                        ctx.varargPrepRan = false;
+                        CallStack.CallStackState csState = ctx.callState;
                         String callName = csState.nextName;
                         String callNamewhat = csState.nextNamewhat;
                         boolean isMeta = csState.nextMetamethod;
@@ -657,7 +589,7 @@ public final class BytecodeVM {
                         csState.nextMetamethod = false;
                         csState.nextMethod = false;
                         if (callName == null) {
-                            String[] info = getobjname(proto, pc - 1, a);
+                            String[] info = callName(ctx, ctx.proto, ctx.pc - 1, a);
                             if (info != null) {
                                 callName = info[0];
                                 callNamewhat = info[1];
@@ -668,445 +600,144 @@ public final class BytecodeVM {
                             }
                         }
 
-                        base = funcIdx + 1;
-                        closure = childClosure;
-                        proto = closure.proto;
-                        code = proto.code;
-                        k = proto.constants;
-                        upvals = closure.upvals;
-                        pc = 0;
+                        ctx.base = funcIdx + 1;
+                        ctx.closure = childClosure;
+                        ctx.proto = ctx.closure.proto;
+                        ctx.code = ctx.proto.code;
+                        ctx.k = ctx.proto.constants;
+                        ctx.upvals = ctx.closure.upvals;
+                        ctx.pc = 0;
 
-                        state.ensureStackCapacity(base + proto.maxStackSize + 64);
-                        state.setStackTop(base + proto.maxStackSize + 64);
-                        pStack = state.getPrimitiveStack();
-                        tStack = state.getTypeStack();
-                        oStack = state.getObjectStack();
+                        state.ensureStackCapacity(ctx.base + ctx.proto.maxStackSize + 64);
+                        state.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
+                        ctx.pStack = state.getPrimitiveStack();
+                        ctx.tStack = state.getTypeStack();
+                        ctx.oStack = state.getObjectStack();
 
-                        if (proto.isVararg && nActualArgs > proto.numParams) {
-                            int nv = nActualArgs - proto.numParams;
-                            varargs = new LuaValue[nv];
+                        if (ctx.proto.isVararg && nActualArgs > ctx.proto.numParams) {
+                            int nv = nActualArgs - ctx.proto.numParams;
+                            ctx.varargs = new LuaValue[nv];
                             for (int i = 0; i < nv; i++) {
-                                varargs[i] = getLuaValue(pStack, tStack, oStack, base + proto.numParams + i);
+                                ctx.varargs[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + ctx.proto.numParams + i);
                             }
                         } else {
-                            varargs = null;
+                            ctx.varargs = null;
                         }
 
-                        for (int i = nActualArgs; i < proto.numParams; i++) {
-                            setLuaValue(pStack, tStack, oStack, base + i, LuaNil.NIL);
+                        for (int i = nActualArgs; i < ctx.proto.numParams; i++) {
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, LuaNil.NIL);
                         }
-                        top = base + proto.numParams;
+                        ctx.top = ctx.base + ctx.proto.numParams;
 
                         // Lua 5.4 semantics: call hook runs after stack frame and arguments are established
-                        CallStack.setNextTransfer(1, childClosure.proto.numParams, null);
-                        CallStack.setNextVmFrame(state, base, funcIdx, varargs, 0);
-                        CallStack.push(childClosure, callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(), isMethod, isMeta);
+                        CallStack.setNextTransfer(ctx.callState, 1, childClosure.proto.numParams, null);
+                        CallStack.setNextVmFrame(ctx.callState, state, ctx.base, funcIdx, ctx.varargs, 0);
+                        CallStack.push(childClosure, callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(), isMethod, isMeta, ctx.callState, ctx.co);
                     } else if (func instanceof LuaFunction fn) {
-                        int callLine = (proto.lineInfo != null && pc - 1 < proto.lineInfo.length) ? proto.lineInfo[pc - 1] : -1;
-                        int newTop = executeExternalCall(state, proto, pc, base, fn, funcIdx, nActualArgs, nResults, callLine);
+                        int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
+                        int newTop = executeExternalCall(state, ctx, ctx.proto, ctx.pc, ctx.base, fn, funcIdx, nActualArgs, nResults, callLine);
                         if (nResults < 0) {
-                            top = newTop;
+                            ctx.top = newTop;
                         }
-                        pStack = state.getPrimitiveStack();
-                        tStack = state.getTypeStack();
-                        oStack = state.getObjectStack();
+                        ctx.pStack = state.getPrimitiveStack();
+                        ctx.tStack = state.getTypeStack();
+                        ctx.oStack = state.getObjectStack();
                     }
                 }
                 case OpCode.OP_TAILCALL -> {
-                    int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    int funcIdx = base + a;
-                    LuaValue func = getLuaValue(pStack, tStack, oStack, funcIdx);
-                    int nActualArgs = b > 0 ? b - 1 : (top - (funcIdx + 1));
-
-                    while (!(func instanceof LuaFunction)) {
-                        LuaTable mt = func.getMetatable();
-                        LuaValue tm = mt != null ? mt.rawget(LuaString.valueOf("__call")) : null;
-                        if (tm != null && !tm.isNil()) {
-                            state.ensureStackCapacity(funcIdx + nActualArgs + 3);
-                            pStack = state.getPrimitiveStack();
-                            tStack = state.getTypeStack();
-                            oStack = state.getObjectStack();
-                            System.arraycopy(pStack, funcIdx, pStack, funcIdx + 1, nActualArgs + 1);
-                            System.arraycopy(tStack, funcIdx, tStack, funcIdx + 1, nActualArgs + 1);
-                            System.arraycopy(oStack, funcIdx, oStack, funcIdx + 1, nActualArgs + 1);
-                            setLuaValue(pStack, tStack, oStack, funcIdx, tm);
-                            nActualArgs++;
-                            func = tm;
-                        } else if (func instanceof LuaUserdata) {
-                            // Java userdata (incl. SAM functional interfaces):
-                            // adapt to the external-call path instead of throwing.
-                            func = new UserdataCallFunction((LuaUserdata) func);
-                        } else {
-                            String[] info = getobjname(proto, pc - 1, a);
-                            String extra = (info != null && info[0] != null) ? " (" + info[1] + " '" + info[0] + "')" : "";
-                            throw new LuaException("attempt to call a " + func.typeName() + " value" + extra);
-                        }
-                    }
-
-                    if (func instanceof LuaClosure childClosure) {
-                        state.closeUpvalues(base);
-                        CallStack.CallStackState csState = CallStack.currentState();
-                        String callName = csState.nextName;
-                        String callNamewhat = csState.nextNamewhat;
-                        boolean isMeta = csState.nextMetamethod;
-                        boolean isMethod = csState.nextMethod;
-                        csState.nextName = null;
-                        csState.nextNamewhat = null;
-                        csState.nextMetamethod = false;
-                        csState.nextMethod = false;
-                        if (callName == null) {
-                            String[] info = getobjname(proto, pc - 1, a);
-                            if (info != null) {
-                                callName = info[0];
-                                callNamewhat = info[1];
-                                if ("method".equals(callNamewhat)) isMethod = true;
-                            } else {
-                                callName = childClosure.getName();
-                                callNamewhat = "";
-                            }
-                        }
-                        int oldTop = top;
-                        System.arraycopy(pStack, funcIdx + 1, pStack, base, nActualArgs);
-                        System.arraycopy(tStack, funcIdx + 1, tStack, base, nActualArgs);
-                        System.arraycopy(oStack, funcIdx + 1, oStack, base, nActualArgs);
-                        if (oldTop > base + nActualArgs) {
-                            java.util.Arrays.fill(oStack, base + nActualArgs, oldTop, null);
-                        }
-                        closure = childClosure;
-                        proto = closure.proto;
-                        code = proto.code;
-                        k = proto.constants;
-                        upvals = closure.upvals;
-                        pc = 0;
-                        oldpc = -1;
-                        varargPrepRan = false;
-
-                        if (proto.isVararg && nActualArgs > proto.numParams) {
-                            int nv = nActualArgs - proto.numParams;
-                            varargs = new LuaValue[nv];
-                            for (int i = 0; i < nv; i++) {
-                                varargs[i] = getLuaValue(pStack, tStack, oStack, base + proto.numParams + i);
-                            }
-                        } else {
-                            varargs = null;
-                        }
-
-                        for (int i = nActualArgs; i < proto.numParams; i++) {
-                            setLuaValue(pStack, tStack, oStack, base + i, LuaNil.NIL);
-                        }
-                        top = base + proto.numParams;
-
-                        // Lua 5.4 semantics: tail call replaces frame without firing return hook, fires tailcall hook
-                        CallStack.setNextTransfer(1, childClosure.proto.numParams, null);
-                        CallStack.setNextVmFrame(state, base, base - 1, varargs, 0);
-                        CallStack.replaceTailCall(childClosure, callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(), isMethod, isMeta);
-                    } else if (func instanceof LuaFunction fn) {
-                        state.closeUpvalues(base);
-                        state.closeTbc(base, null);
-
-                        int callLine = (proto.lineInfo != null && pc - 1 < proto.lineInfo.length) ? proto.lineInfo[pc - 1] : -1;
-                        if (callLine > 0) CallStack.setLine(callLine);
-                        CallStack.Frame callerFrameExt = CallStack.topFrame();
-                        if (callerFrameExt != null) {
-                            callerFrameExt.pc = pc - 1;
-                            if (callLine > 0) callerFrameExt.line = callLine;
-                        }
-                        CallStack.CallStackState csState = CallStack.currentState();
-                        String resolvedName = csState.nextName;
-                        String namewhat = csState.nextNamewhat;
-                        boolean isMeta = csState.nextMetamethod;
-                        boolean isMethod = csState.nextMethod;
-                        csState.nextName = null;
-                        csState.nextNamewhat = null;
-                        csState.nextMetamethod = false;
-                        csState.nextMethod = false;
-                        if (resolvedName == null) {
-                            String[] info = getobjname(proto, pc - 1, a);
-                            if (info != null) {
-                                resolvedName = info[0];
-                                namewhat = info[1];
-                                if ("method".equals(namewhat)) isMethod = true;
-                            } else {
-                                resolvedName = fn.getName();
-                                namewhat = "";
-                            }
-                        }
-                        LuaValue[] tailCArgs = getArgsForCall(pStack, tStack, oStack, funcIdx + 1, nActualArgs);
-                        CallStack.setNextTransfer(1, nActualArgs, tailCArgs);
-                        CallStack.setNextVmFrame(state, base, base - 1, null, -1);
-                        CallStack.replaceTailCall(fn, resolvedName, namewhat != null ? namewhat : "", callLine, isMethod, isMeta);
-                        int origTop = state.getStackTop();
-                        state.setStackTop(funcIdx + nActualArgs + 1);
-                        LuaValue res = null;
-                        try {
-                            res = fn.invoke(tailCArgs);
-                        } finally {
-                            state.setStackTop(origTop);
-                            CallStack.Frame f = CallStack.topFrame();
-                            if (f != null && res != null) {
-                                LuaValue[] retVals = (res instanceof Varargs va) ? va.getValuesUnsafe() : new LuaValue[]{res};
-                                f.retValues = retVals;
-                                f.ftransfer = 1;
-                                f.ntransfer = retVals.length;
-                            }
-                            CallStack.pop();
-                        }
-                        LuaValue[] retVals = (res instanceof Varargs va) ? va.getValuesUnsafe() : (res != null ? new LuaValue[]{res} : new LuaValue[0]);
-                        int nReturns = retVals.length;
-                        if (callDepth > 0) {
-                            CallInfo ci = callStack[--callDepth];
-                            int callerFunc = ci.funcIndex;
-                            base = ci.baseIndex;
-                            closure = ci.closure;
-                            proto = closure.proto;
-                            code = proto.code;
-                            k = proto.constants;
-                            upvals = closure.upvals;
-                            pc = ci.savedPc;
-                            varargs = ci.varargs;
-                            oldpc = ci.oldpc;
-                            varargPrepRan = ci.varargPrepRan;
-                            state.ensureStackCapacity(callerFunc + (ci.expectedResults > 0 ? ci.expectedResults : nReturns) + 32);
-                            pStack = state.getPrimitiveStack();
-                            tStack = state.getTypeStack();
-                            oStack = state.getObjectStack();
-                            if (ci.expectedResults > 0) {
-                                for (int i = 0; i < ci.expectedResults; i++) {
-                                    setLuaValue(pStack, tStack, oStack, callerFunc + i, (i < nReturns) ? retVals[i] : LuaNil.NIL);
-                                }
-                            } else if (ci.expectedResults < 0) {
-                                for (int i = 0; i < nReturns; i++) {
-                                    setLuaValue(pStack, tStack, oStack, callerFunc + i, retVals[i]);
-                                }
-                                top = callerFunc + nReturns;
-                            }
-                        } else {
-                            return retVals;
-                        }
+                    LuaValue[] tailResult = doTailCall(state, ctx, a, inst);
+                    if (tailResult != null) {
+                        return tailResult;
                     }
                 }
                 case OpCode.OP_RETURN0 -> {
-                    state.closeUpvalues(base);
-                    state.closeTbc(base, null);
-                    CallStack.Frame retFrame = CallStack.topFrame();
-                    if (retFrame != null) {
-                        // Lazy-sync: stamp return site (locals scope + hooks observe this frame).
-                        retFrame.pc = instPc;
-                        if (proto.lineInfo != null && instPc < proto.lineInfo.length) {
-                            retFrame.line = proto.lineInfo[instPc];
-                        }
-                        retFrame.retValues = new LuaValue[0];
-                        retFrame.ftransfer = 1;
-                        retFrame.ntransfer = 0;
-                    }
-                    if (callDepth > 0) {
-                        CallStack.pop();
-                        CallInfo ci = callStack[--callDepth];
-                        int callerFunc = ci.funcIndex;
-                        base = ci.baseIndex;
-                        closure = ci.closure;
-                        proto = closure.proto;
-                        code = proto.code;
-                        k = proto.constants;
-                        upvals = closure.upvals;
-                        pc = ci.savedPc;
-                        varargs = ci.varargs;
-                        oldpc = ci.oldpc;
-                        varargPrepRan = ci.varargPrepRan;
-                        if (ci.expectedResults > 0) {
-                            for (int i = 0; i < ci.expectedResults; i++) {
-                                setLuaValue(pStack, tStack, oStack, callerFunc + i, LuaNil.NIL);
-                            }
-                        } else if (ci.expectedResults < 0) {
-                            top = callerFunc;
-                        }
-                        state.setStackTop(base + proto.maxStackSize + 64);
-                    } else {
-                        state.setStackTop(savedStackTop);
-                        return new LuaValue[0];
+                    state.closeUpvalues(ctx.base);
+                    state.closeTbc(ctx.base, null);
+                    LuaValue[] retVals0 = new LuaValue[0];
+                    stampReturnFrame(ctx, instPc, retVals0, 1, 0);
+                    LuaValue[] r0 = returnToCaller(state, ctx, retVals0);
+                    if (r0 != null) {
+                        return r0;
                     }
                 }
                 case OpCode.OP_RETURN1 -> {
-                    state.closeUpvalues(base);
-                    state.closeTbc(base, null);
-                    LuaValue ret = getLuaValue(pStack, tStack, oStack, base + a);
-                    CallStack.Frame retFrame = CallStack.topFrame();
-                    if (retFrame != null) {
-                        // Lazy-sync: stamp return site (locals scope + hooks observe this frame).
-                        retFrame.pc = instPc;
-                        if (proto.lineInfo != null && instPc < proto.lineInfo.length) {
-                            retFrame.line = proto.lineInfo[instPc];
-                        }
-                        retFrame.retValues = new LuaValue[]{ret};
-                        // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
-                        retFrame.ftransfer = a + 1;
-                        retFrame.ntransfer = 1;
-                    }
-                    if (callDepth > 0) {
-                        CallStack.pop();
-                        CallInfo ci = callStack[--callDepth];
-                        int callerFunc = ci.funcIndex;
-                        base = ci.baseIndex;
-                        closure = ci.closure;
-                        proto = closure.proto;
-                        code = proto.code;
-                        k = proto.constants;
-                        upvals = closure.upvals;
-                        pc = ci.savedPc;
-                        varargs = ci.varargs;
-                        oldpc = ci.oldpc;
-                        varargPrepRan = ci.varargPrepRan;
-                        if (ci.expectedResults > 0) {
-                            setLuaValue(pStack, tStack, oStack, callerFunc, ret);
-                            for (int i = 1; i < ci.expectedResults; i++) {
-                                setLuaValue(pStack, tStack, oStack, callerFunc + i, LuaNil.NIL);
-                            }
-                        } else if (ci.expectedResults < 0) {
-                            setLuaValue(pStack, tStack, oStack, callerFunc, ret);
-                            top = callerFunc + 1;
-                        }
-                        state.setStackTop(base + proto.maxStackSize + 64);
-                    } else {
-                        state.setStackTop(savedStackTop);
-                        return new LuaValue[]{ret};
+                    state.closeUpvalues(ctx.base);
+                    state.closeTbc(ctx.base, null);
+                    LuaValue ret = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
+                    LuaValue[] retVals1 = new LuaValue[]{ret};
+                    // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
+                    stampReturnFrame(ctx, instPc, retVals1, a + 1, 1);
+                    LuaValue[] r1 = returnToCaller(state, ctx, retVals1);
+                    if (r1 != null) {
+                        return r1;
                     }
                 }
                 case OpCode.OP_RETURN -> {
-                    state.closeUpvalues(base);
-                    state.closeTbc(base, null);
+                    state.closeUpvalues(ctx.base);
+                    state.closeTbc(ctx.base, null);
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    int nReturns = b > 0 ? b - 1 : (top - (base + a));
+                    int nReturns = b > 0 ? b - 1 : (ctx.top - (ctx.base + a));
                     LuaValue[] retVals = new LuaValue[nReturns];
                     for (int i = 0; i < nReturns; i++) {
-                        retVals[i] = getLuaValue(pStack, tStack, oStack, base + a + i);
+                        retVals[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + i);
                     }
-                    CallStack.Frame retFrame = CallStack.topFrame();
-                    if (retFrame != null) {
-                        // Lazy-sync: stamp return site (locals scope + hooks observe this frame).
-                        retFrame.pc = instPc;
-                        if (proto.lineInfo != null && instPc < proto.lineInfo.length) {
-                            retFrame.line = proto.lineInfo[instPc];
-                        }
-                        retFrame.retValues = retVals;
-                        // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
-                        retFrame.ftransfer = a + 1;
-                        retFrame.ntransfer = nReturns;
-                    }
-                    if (callDepth > 0) {
-                        CallStack.pop();
-                        CallInfo ci = callStack[--callDepth];
-                        int callerFunc = ci.funcIndex;
-                        base = ci.baseIndex;
-                        closure = ci.closure;
-                        proto = closure.proto;
-                        code = proto.code;
-                        k = proto.constants;
-                        upvals = closure.upvals;
-                        pc = ci.savedPc;
-                        varargs = ci.varargs;
-                        oldpc = ci.oldpc;
-                        varargPrepRan = ci.varargPrepRan;
-                        if (ci.expectedResults > 0) {
-                            for (int i = 0; i < ci.expectedResults; i++) {
-                                setLuaValue(pStack, tStack, oStack, callerFunc + i, (i < nReturns) ? retVals[i] : LuaNil.NIL);
-                            }
-                        } else if (ci.expectedResults < 0) {
-                            for (int i = 0; i < nReturns; i++) {
-                                setLuaValue(pStack, tStack, oStack, callerFunc + i, retVals[i]);
-                            }
-                            top = callerFunc + nReturns;
-                        }
-                        state.setStackTop(base + proto.maxStackSize + 64);
-                    } else {
-                        state.setStackTop(savedStackTop);
-                        return retVals;
+                    // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
+                    stampReturnFrame(ctx, instPc, retVals, a + 1, nReturns);
+                    LuaValue[] rN = returnToCaller(state, ctx, retVals);
+                    if (rN != null) {
+                        return rN;
                     }
                 }
-                case OpCode.OP_FORPREP -> {
-                    int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
-                    int regInit = base + a;
-                    if (tStack[regInit] == TYPE_INT && tStack[regInit + 1] == TYPE_INT && tStack[regInit + 2] == TYPE_INT) {
-                        long init = pStack[regInit];
-                        long limit = pStack[regInit + 1];
-                        long step = pStack[regInit + 2];
-                        if (step == 0) throw new LuaException("'for' step is zero");
-                        pStack[regInit + 3] = init;
-                        tStack[regInit + 3] = TYPE_INT;
-                        oStack[regInit + 3] = null;
-                        boolean skip = step > 0 ? init > limit : init < limit;
-                        if (skip) {
-                            pc += bx;
-                        } else {
-                            long count = step > 0 ? Long.divideUnsigned(limit - init, step)
-                                    : Long.divideUnsigned(init - limit, -step);
-                            pStack[regInit + 1] = count;
-                        }
-                    } else {
-                        pc = executeForPrepSlow(pStack, tStack, oStack, base, a, bx, pc);
-                    }
-                }
+                case OpCode.OP_FORPREP -> doForPrep(ctx, a, inst);
                 case OpCode.OP_FORLOOP -> {
                     int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
-                    int regInit = base + a;
-                    if (tStack[regInit + 1] == TYPE_INT && pStack[regInit + 1] > 0) {
-                        pStack[regInit + 1]--;
-                        long next = pStack[regInit] + pStack[regInit + 2];
-                        pStack[regInit] = next;
-                        pStack[regInit + 3] = next;
-                        pc -= bx;
-                    } else if (tStack[regInit + 1] == TYPE_FLOAT) {
-                        double step = Double.longBitsToDouble(pStack[regInit + 2]);
-                        double limit = Double.longBitsToDouble(pStack[regInit + 1]);
-                        double idx = Double.longBitsToDouble(pStack[regInit]);
+                    int regInit = ctx.base + a;
+                    if (ctx.tStack[regInit + 1] == TYPE_INT && ctx.pStack[regInit + 1] > 0) {
+                        ctx.pStack[regInit + 1]--;
+                        long next = ctx.pStack[regInit] + ctx.pStack[regInit + 2];
+                        ctx.pStack[regInit] = next;
+                        ctx.pStack[regInit + 3] = next;
+                        ctx.pc -= bx;
+                    } else if (ctx.tStack[regInit + 1] == TYPE_FLOAT) {
+                        double step = Double.longBitsToDouble(ctx.pStack[regInit + 2]);
+                        double limit = Double.longBitsToDouble(ctx.pStack[regInit + 1]);
+                        double idx = Double.longBitsToDouble(ctx.pStack[regInit]);
                         idx += step;
                         if (step > 0 ? idx <= limit : limit <= idx) {
-                            pStack[regInit] = Double.doubleToRawLongBits(idx);
-                            pStack[regInit + 3] = Double.doubleToRawLongBits(idx);
-                            pc -= bx;
+                            ctx.pStack[regInit] = Double.doubleToRawLongBits(idx);
+                            ctx.pStack[regInit + 3] = Double.doubleToRawLongBits(idx);
+                            ctx.pc -= bx;
                         }
                     }
                 }
                 case OpCode.OP_TFORPREP -> {
                     int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
-                    LuaValue val = getLuaValue(pStack, tStack, oStack, base + a + 3);
-                    state.pushTbc(base + a + 3, val, "(for state)");
-                    pc += bx;
+                    LuaValue val = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 3);
+                    state.pushTbc(ctx.base + a + 3, val, "(for state)");
+                    ctx.pc += bx;
                 }
                 case OpCode.OP_TFORCALL -> {
                     // Stamp the generic-for frame (iterator runs arbitrary
                     // code that may read this frame via traceback/getinfo).
-                    CallStack.Frame tforCaller = CallStack.topFrame();
+                    CallStack.Frame tforCaller = CallStack.topFrame(ctx.callState);
                     if (tforCaller != null) {
                         tforCaller.pc = instPc;
-                        if (proto.lineInfo != null && instPc < proto.lineInfo.length) {
-                            tforCaller.line = proto.lineInfo[instPc];
+                        if (ctx.proto.lineInfo != null && instPc < ctx.proto.lineInfo.length) {
+                            tforCaller.line = ctx.proto.lineInfo[instPc];
                         }
                     }
-                    executeTForCall(pStack, tStack, oStack, base, a, inst);
+                    executeTForCall(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
                 }
                 case OpCode.OP_TFORLOOP -> {
                     int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
-                    if (tStack[base + a + 4] != TYPE_NIL) {
-                        copyReg(pStack, tStack, oStack, base + a + 2, base + a + 4);
-                        pc -= bx;
+                    if (ctx.tStack[ctx.base + a + 4] != TYPE_NIL) {
+                        copyReg(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 2, ctx.base + a + 4);
+                        ctx.pc -= bx;
                     }
                 }
-                case OpCode.OP_SETLIST -> pc = executeSetList(code, pc, inst, pStack, tStack, oStack, base, a, top);
-                case OpCode.OP_CLOSURE -> executeClosure(state, proto, closure, upvals, pStack, tStack, oStack, base, a, inst);
-                case OpCode.OP_VARARG -> {
-                    int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-                    int vLen = varargs != null ? varargs.length : 0;
-                    if (c > 1) {
-                        for (int i = 0; i < c - 1; i++) {
-                            setLuaValue(pStack, tStack, oStack, base + a + i, i < vLen ? varargs[i] : LuaNil.NIL);
-                        }
-                    } else if (c == 0) {
-                        for (int i = 0; i < vLen; i++) {
-                            setLuaValue(pStack, tStack, oStack, base + a + i, varargs[i]);
-                        }
-                        top = base + a + vLen;
-                    }
-                }
+                case OpCode.OP_SETLIST -> ctx.pc = executeSetList(ctx.code, ctx.pc, inst, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, ctx.top);
+                case OpCode.OP_CLOSURE -> executeClosure(state, ctx.proto, ctx.closure, ctx.upvals, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_VARARG -> doVararg(ctx, a, inst);
                 case OpCode.OP_VARARGPREP -> {
                     // Pre-aligned in call setup
                 }
@@ -1115,64 +746,482 @@ public final class BytecodeVM {
             }
         }
         } catch (org.luava.runtime.eval.LuaUnwindException ue) {
-            caughtException = ue;
+            ctx.thrown = ue;
             throw ue;
         } catch (LuaException le) {
-            int faultPc = (pc > 0) ? pc - 1 : 0;
+            int faultPc = (ctx.pc > 0) ? ctx.pc - 1 : 0;
             // Lazy-sync top frame so tracebacks/getinfo see the fault site.
-            CallStack.Frame faultFrame = CallStack.topFrame();
+            CallStack.Frame faultFrame = CallStack.topFrame(ctx.callState);
             if (faultFrame != null) {
                 faultFrame.pc = faultPc;
-                if (proto.lineInfo != null && faultPc < proto.lineInfo.length) {
-                    faultFrame.line = proto.lineInfo[faultPc];
+                if (ctx.proto.lineInfo != null && faultPc < ctx.proto.lineInfo.length) {
+                    faultFrame.line = ctx.proto.lineInfo[faultPc];
                 }
             }
             if (!le.isDecorated()) {
-                attachBytecodeDesc(le, proto, faultPc, pStack, tStack, oStack, base);
-                int curLine = (proto.lineInfo != null && proto.lineInfo.length > 0 && faultPc < proto.lineInfo.length) ? proto.lineInfo[faultPc] : -1;
-                String msg = le.getMessage();
-                if (msg != null) {
-                    String source = proto.source;
-                    if (source == null || source.isEmpty() || "=?".equals(source) || curLine <= 0) {
-                        source = (source == null || "=?".equals(source)) ? "=?" : source;
-                        if ("=?".equals(source)) curLine = -1;
-                    }
-                    String formattedSource = org.luava.frontend.parser.ParseException.formatChunkName(source);
-                    le.setMessage(formattedSource + ":" + curLine + ": " + msg);
-                }
-                le.setDecorated(true);
+                decorateFault(le, ctx, faultPc);
             }
             if (CallStack.canHandleError()) {
                 LuaValue res = CallStack.runErrorHandler(le.getErrorObject());
-                caughtException = le;
+                ctx.thrown = le;
                 throw new org.luava.runtime.eval.LuaUnwindException(res, le.getErrorObject());
             }
-            caughtException = le;
+            ctx.thrown = le;
             throw le;
         } catch (Throwable t) {
-            caughtException = t;
+            ctx.thrown = t;
             throw t;
         } finally {
-            while (CallStack.depth() > initialDepth) {
-                CallStack.pop();
+            finishFrame(state, ctx);
+        }
+    }
+
+    /**
+     * Loop-exit teardown (cold paths + normal returns share it): pop stray
+     * frames, close upvalues, map the in-flight error for {@code closeTbc},
+     * and restore the stack top.
+     */
+    private static void finishFrame(LuaState state, VmContext ctx) {
+        while (CallStack.depth() > ctx.initialDepth) {
+            CallStack.pop(ctx.callState, ctx.co);
+        }
+        state.closeUpvalues(ctx.savedStackTop);
+        LuaValue errVal = null;
+        if (ctx.thrown != null) {
+            if (ctx.thrown instanceof org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal) {
+                errVal = null;
+            } else if (ctx.thrown instanceof org.luava.runtime.eval.LuaUnwindException ue) {
+                errVal = ue.getOriginalError();
+            } else if (ctx.thrown instanceof LuaException le && le.getErrorObject() != null) {
+                errVal = le.getErrorObject();
+            } else {
+                String msg = ctx.thrown.getMessage() != null ? ctx.thrown.getMessage() : ctx.thrown.toString();
+                errVal = LuaString.valueOf(msg);
             }
-            state.closeUpvalues(savedStackTop);
-            LuaValue errVal = null;
-            if (caughtException != null) {
-                if (caughtException instanceof org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal) {
-                    errVal = null;
-                } else if (caughtException instanceof org.luava.runtime.eval.LuaUnwindException ue) {
-                    errVal = ue.getOriginalError();
-                } else if (caughtException instanceof LuaException le && le.getErrorObject() != null) {
-                    errVal = le.getErrorObject();
+        }
+        state.closeTbc(ctx.savedStackTop, errVal);
+        state.setStackTop(ctx.savedStackTop);
+    }
+
+    /**
+     * Hook polling, extracted from the dispatch loop (runs only while a hook
+     * is armed, so zero cost otherwise). Mutates {@code ctx.oldpc} /
+     * {@code ctx.varargPrepRan} and stamps the top frame before firing, so
+     * hook observers ({@code getlocal}, traceback) see the firing site.
+     */
+    private static void pollHooks(LuaCoroutine co, VmContext ctx, int instPc, int op) {
+        // Hooks armed: compute line/frame lazily (once per
+        // instruction only while a hook is actually installed).
+        int curLine = (ctx.proto.lineInfo != null && instPc < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[instPc] : -1;
+        CallStack.Frame curFrame = CallStack.topFrame(ctx.callState);
+        LuaCoroutine.HookConfig hc = co.getHookConfig();
+        if (!hc.hook.isNil() && !hc.inHook) {
+            // OP_CLEANUP is compiler-internal (dead-slot clearing):
+            // it must not fire count hooks (instruction counts stay
+            // C-like), but it fires line hooks normally (it carries
+            // the loop's line, so first-event sequencing is intact).
+            boolean isCleanup = (op == OpCode.OP_CLEANUP);
+            if (hc.count > 0 && !isCleanup) {
+                // Stamp the frame: hook observers (getlocal/traceback) read it.
+                if (curFrame != null) {
+                    curFrame.pc = instPc;
+                    curFrame.line = curLine;
+                }
+                co.fireCountHook();
+            }
+            if (hc.hookLine) {
+                // Lua 5.4 semantics (lvm.c: OP_VARARGPREP & ldebug.c: luaG_traceexec):
+                // 1. OP_VARARGPREP is internal setup and never triggers the line hook.
+                // 2. Setting oldpc to 1 in Lua's OP_VARARGPREP guarantees next opcode triggers line hook.
+                // 3. Subsequent instructions trigger the hook on backward jumps (loops: instPc <= oldpc)
+                //    or on entering a new line (curLine != oldLine).
+                if (op != OpCode.OP_VARARGPREP) {
+                    int oldLine = (ctx.proto.lineInfo != null && ctx.oldpc >= 0 && ctx.oldpc < ctx.proto.lineInfo.length)
+                            ? ctx.proto.lineInfo[ctx.oldpc] : -1;
+                    if (ctx.varargPrepRan || ctx.oldpc < 0 || instPc <= ctx.oldpc || curLine != oldLine) {
+                        if (curLine > 0) {
+                            // Stamp the frame: hook observers (getlocal/traceback) read it.
+                            if (curFrame != null) {
+                                curFrame.pc = instPc;
+                                curFrame.line = curLine;
+                            }
+                            co.fireLineHookDirect(curLine, curFrame);
+                        }
+                        ctx.varargPrepRan = false;
+                    }
                 } else {
-                    String msg = caughtException.getMessage() != null ? caughtException.getMessage() : caughtException.toString();
-                    errVal = LuaString.valueOf(msg);
+                    ctx.varargPrepRan = true;
                 }
             }
-            state.closeTbc(savedStackTop, errVal);
-            state.setStackTop(savedStackTop);
         }
+    }
+
+    /**
+     * Error-message decoration for the {@code catch} path (cold).
+     * Attaches the bytecode descriptor and rewrites the message to the
+     * {@code source:line: msg} form.
+     */
+    private static void decorateFault(LuaException le, VmContext ctx, int faultPc) {
+        attachBytecodeDesc(le, ctx.proto, faultPc, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
+        int curLine = (ctx.proto.lineInfo != null && ctx.proto.lineInfo.length > 0 && faultPc < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[faultPc] : -1;
+        String msg = le.getMessage();
+        if (msg != null) {
+            String source = ctx.proto.source;
+            if (source == null || source.isEmpty() || "=?".equals(source) || curLine <= 0) {
+                source = (source == null || "=?".equals(source)) ? "=?" : source;
+                if ("=?".equals(source)) curLine = -1;
+            }
+            String formattedSource = org.luava.frontend.parser.ParseException.formatChunkName(source);
+            le.setMessage(formattedSource + ":" + curLine + ": " + msg);
+        }
+        le.setDecorated(true);
+    }
+
+    /**
+     * Shared {@code __call} / userdata resolution for {@code OP_CALL} and
+     * {@code OP_TAILCALL} (cold unwrap path). Returns the callable and
+     * publishes the adjusted argument count via {@code ctx.scratch0}.
+     */
+    private static LuaFunction resolveCallable(LuaState state, VmContext ctx, int funcIdx, int nArgs, int a) {
+        LuaValue func = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx);
+        while (!(func instanceof LuaFunction)) {
+            LuaTable mt = func.getMetatable();
+            LuaValue tm = mt != null ? mt.rawget(LuaString.valueOf("__call")) : null;
+            if (tm != null && !tm.isNil()) {
+                state.ensureStackCapacity(funcIdx + nArgs + 3);
+                ctx.pStack = state.getPrimitiveStack();
+                ctx.tStack = state.getTypeStack();
+                ctx.oStack = state.getObjectStack();
+                System.arraycopy(ctx.pStack, funcIdx, ctx.pStack, funcIdx + 1, nArgs + 1);
+                System.arraycopy(ctx.tStack, funcIdx, ctx.tStack, funcIdx + 1, nArgs + 1);
+                System.arraycopy(ctx.oStack, funcIdx, ctx.oStack, funcIdx + 1, nArgs + 1);
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, tm);
+                nArgs++;
+                func = tm;
+            } else if (func instanceof LuaUserdata) {
+                // Java userdata (incl. SAM functional interfaces):
+                // adapt to the external-call path instead of throwing.
+                func = new UserdataCallFunction((LuaUserdata) func);
+            } else {
+                String[] info = getobjname(ctx.proto, ctx.pc - 1, a);
+                String extra = (info != null && info[0] != null) ? " (" + info[1] + " '" + info[0] + "')" : "";
+                throw new LuaException("attempt to call a " + func.typeName() + " value" + extra);
+            }
+        }
+        ctx.scratch0 = nArgs;
+        return (LuaFunction) func;
+    }
+
+    /**
+     * {@code OP_TAILCALL} handler (largest single case, ~1.5 KB).
+     * Mutates {@code ctx} directly; a non-null return value must be
+     * returned from the dispatch loop immediately.
+     */
+    private static LuaValue[] doTailCall(LuaState state, VmContext ctx, int a, int inst) {
+        int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
+        int funcIdx = ctx.base + a;
+        LuaFunction func = resolveCallable(state, ctx, funcIdx, b > 0 ? b - 1 : (ctx.top - (funcIdx + 1)), a);
+        int nActualArgs = ctx.scratch0;
+
+        if (func instanceof LuaClosure childClosure) {
+            state.closeUpvalues(ctx.base);
+            CallStack.CallStackState csState = ctx.callState;
+            String callName = csState.nextName;
+            String callNamewhat = csState.nextNamewhat;
+            boolean isMeta = csState.nextMetamethod;
+            boolean isMethod = csState.nextMethod;
+            csState.nextName = null;
+            csState.nextNamewhat = null;
+            csState.nextMetamethod = false;
+            csState.nextMethod = false;
+            if (callName == null) {
+                String[] info = callName(ctx, ctx.proto, ctx.pc - 1, a);
+                if (info != null) {
+                    callName = info[0];
+                    callNamewhat = info[1];
+                    if ("method".equals(callNamewhat)) isMethod = true;
+                } else {
+                    callName = childClosure.getName();
+                    callNamewhat = "";
+                }
+            }
+            int oldTop = ctx.top;
+            System.arraycopy(ctx.pStack, funcIdx + 1, ctx.pStack, ctx.base, nActualArgs);
+            System.arraycopy(ctx.tStack, funcIdx + 1, ctx.tStack, ctx.base, nActualArgs);
+            System.arraycopy(ctx.oStack, funcIdx + 1, ctx.oStack, ctx.base, nActualArgs);
+            if (oldTop > ctx.base + nActualArgs) {
+                java.util.Arrays.fill(ctx.oStack, ctx.base + nActualArgs, oldTop, null);
+            }
+            ctx.closure = childClosure;
+            ctx.proto = ctx.closure.proto;
+            ctx.code = ctx.proto.code;
+            ctx.k = ctx.proto.constants;
+            ctx.upvals = ctx.closure.upvals;
+            ctx.pc = 0;
+            ctx.oldpc = -1;
+            ctx.varargPrepRan = false;
+
+            if (ctx.proto.isVararg && nActualArgs > ctx.proto.numParams) {
+                int nv = nActualArgs - ctx.proto.numParams;
+                ctx.varargs = new LuaValue[nv];
+                for (int i = 0; i < nv; i++) {
+                    ctx.varargs[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + ctx.proto.numParams + i);
+                }
+            } else {
+                ctx.varargs = null;
+            }
+
+            for (int i = nActualArgs; i < ctx.proto.numParams; i++) {
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, LuaNil.NIL);
+            }
+            ctx.top = ctx.base + ctx.proto.numParams;
+
+            // Lua 5.4 semantics: tail call replaces frame without firing return hook, fires tailcall hook
+            CallStack.setNextTransfer(ctx.callState, 1, childClosure.proto.numParams, null);
+            CallStack.setNextVmFrame(ctx.callState, state, ctx.base, ctx.base - 1, ctx.varargs, 0);
+            CallStack.replaceTailCall(childClosure, callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(), isMethod, isMeta, ctx.callState, ctx.co);
+        } else if (func instanceof LuaFunction fn) {
+            state.closeUpvalues(ctx.base);
+            state.closeTbc(ctx.base, null);
+
+            int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
+            if (callLine > 0) CallStack.setLine(callLine);
+            CallStack.Frame callerFrameExt = CallStack.topFrame(ctx.callState);
+            if (callerFrameExt != null) {
+                callerFrameExt.pc = ctx.pc - 1;
+                if (callLine > 0) callerFrameExt.line = callLine;
+            }
+            CallStack.CallStackState csState = ctx.callState;
+            String resolvedName = csState.nextName;
+            String namewhat = csState.nextNamewhat;
+            boolean isMeta = csState.nextMetamethod;
+            boolean isMethod = csState.nextMethod;
+            csState.nextName = null;
+            csState.nextNamewhat = null;
+            csState.nextMetamethod = false;
+            csState.nextMethod = false;
+            if (resolvedName == null) {
+                String[] info = callName(ctx, ctx.proto, ctx.pc - 1, a);
+                if (info != null) {
+                    resolvedName = info[0];
+                    namewhat = info[1];
+                    if ("method".equals(namewhat)) isMethod = true;
+                } else {
+                    resolvedName = fn.getName();
+                    namewhat = "";
+                }
+            }
+            LuaValue[] tailCArgs = getArgsForCall(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1, nActualArgs);
+            CallStack.setNextTransfer(ctx.callState, 1, nActualArgs, tailCArgs);
+            CallStack.setNextVmFrame(ctx.callState, state, ctx.base, ctx.base - 1, null, -1);
+            CallStack.replaceTailCall(fn, resolvedName, namewhat != null ? namewhat : "", callLine, isMethod, isMeta, ctx.callState, ctx.co);
+            int origTop = state.getStackTop();
+            state.setStackTop(funcIdx + nActualArgs + 1);
+            LuaValue res = null;
+            try {
+                res = fn.invoke(tailCArgs);
+            } finally {
+                state.setStackTop(origTop);
+                CallStack.Frame f = CallStack.topFrame(ctx.callState);
+                if (f != null && res != null) {
+                    LuaValue[] retVals = (res instanceof Varargs va) ? va.getValuesUnsafe() : new LuaValue[]{res};
+                    f.retValues = retVals;
+                    f.ftransfer = 1;
+                    f.ntransfer = retVals.length;
+                }
+                CallStack.pop(ctx.callState, ctx.co);
+            }
+            LuaValue[] retVals = (res instanceof Varargs va) ? va.getValuesUnsafe() : (res != null ? new LuaValue[]{res} : new LuaValue[0]);
+            int nReturns = retVals.length;
+            if (ctx.callDepth > 0) {
+                CallInfo ci = ctx.callStack[--ctx.callDepth];
+                int callerFunc = ci.funcIndex;
+                ctx.base = ci.baseIndex;
+                ctx.closure = ci.closure;
+                ctx.proto = ctx.closure.proto;
+                ctx.code = ctx.proto.code;
+                ctx.k = ctx.proto.constants;
+                ctx.upvals = ctx.closure.upvals;
+                ctx.pc = ci.savedPc;
+                ctx.varargs = ci.varargs;
+                ctx.oldpc = ci.oldpc;
+                ctx.varargPrepRan = ci.varargPrepRan;
+                state.ensureStackCapacity(callerFunc + (ci.expectedResults > 0 ? ci.expectedResults : nReturns) + 32);
+                ctx.pStack = state.getPrimitiveStack();
+                ctx.tStack = state.getTypeStack();
+                ctx.oStack = state.getObjectStack();
+                if (ci.expectedResults > 0) {
+                    for (int i = 0; i < ci.expectedResults; i++) {
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc + i, (i < nReturns) ? retVals[i] : LuaNil.NIL);
+                    }
+                } else if (ci.expectedResults < 0) {
+                    for (int i = 0; i < nReturns; i++) {
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc + i, retVals[i]);
+                    }
+                    ctx.top = callerFunc + nReturns;
+                }
+            } else {
+                return retVals;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Lazy-sync: stamp the returning frame so locals scope and hook
+     * observers see the return site.
+     */
+    private static void stampReturnFrame(VmContext ctx, int instPc, LuaValue[] retVals, int ftransfer, int ntransfer) {
+        CallStack.Frame retFrame = CallStack.topFrame(ctx.callState);
+        if (retFrame != null) {
+            retFrame.pc = instPc;
+            if (ctx.proto.lineInfo != null && instPc < ctx.proto.lineInfo.length) {
+                retFrame.line = ctx.proto.lineInfo[instPc];
+            }
+            retFrame.retValues = retVals;
+            retFrame.ftransfer = ftransfer;
+            retFrame.ntransfer = ntransfer;
+        }
+    }
+
+    /**
+     * Shared caller-restore for the {@code OP_RETURN} family. Restores the
+     * caller view into {@code ctx} and writes back results; a non-null
+     * return value must be returned from the dispatch loop immediately.
+     */
+    private static LuaValue[] returnToCaller(LuaState state, VmContext ctx, LuaValue[] retVals) {
+        if (ctx.callDepth > 0) {
+            CallStack.pop(ctx.callState, ctx.co);
+            CallInfo ci = ctx.callStack[--ctx.callDepth];
+            int callerFunc = ci.funcIndex;
+            ctx.base = ci.baseIndex;
+            ctx.closure = ci.closure;
+            ctx.proto = ctx.closure.proto;
+            ctx.code = ctx.proto.code;
+            ctx.k = ctx.proto.constants;
+            ctx.upvals = ctx.closure.upvals;
+            ctx.pc = ci.savedPc;
+            ctx.varargs = ci.varargs;
+            ctx.oldpc = ci.oldpc;
+            ctx.varargPrepRan = ci.varargPrepRan;
+            int nReturns = retVals.length;
+            if (ci.expectedResults > 0) {
+                for (int i = 0; i < ci.expectedResults; i++) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc + i, (i < nReturns) ? retVals[i] : LuaNil.NIL);
+                }
+            } else if (ci.expectedResults < 0) {
+                for (int i = 0; i < nReturns; i++) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc + i, retVals[i]);
+                }
+                ctx.top = callerFunc + nReturns;
+            }
+            state.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
+            return null;
+        }
+        state.setStackTop(ctx.savedStackTop);
+        return retVals;
+    }
+
+    /**
+     * {@code OP_FORPREP} handler (runs once per loop, so call overhead is
+     * free). Initializes the numeric loop counter or skips the loop.
+     */
+    private static void doForPrep(VmContext ctx, int a, int inst) {
+        int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
+        int regInit = ctx.base + a;
+        if (ctx.tStack[regInit] == TYPE_INT && ctx.tStack[regInit + 1] == TYPE_INT && ctx.tStack[regInit + 2] == TYPE_INT) {
+            long init = ctx.pStack[regInit];
+            long limit = ctx.pStack[regInit + 1];
+            long step = ctx.pStack[regInit + 2];
+            if (step == 0) throw new LuaException("'for' step is zero");
+            ctx.pStack[regInit + 3] = init;
+            ctx.tStack[regInit + 3] = TYPE_INT;
+            ctx.oStack[regInit + 3] = null;
+            boolean skip = step > 0 ? init > limit : init < limit;
+            if (skip) {
+                ctx.pc += bx;
+            } else {
+                long count = step > 0 ? Long.divideUnsigned(limit - init, step)
+                        : Long.divideUnsigned(init - limit, -step);
+                ctx.pStack[regInit + 1] = count;
+            }
+        } else {
+            ctx.pc = executeForPrepSlow(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, bx, ctx.pc);
+        }
+    }
+
+    /**
+     * {@code OP_VARARG} handler (runs once per vararg call).
+     * Copies varargs into registers; adjusts {@code top} for {@code C == 0}.
+     */
+    private static void doVararg(VmContext ctx, int a, int inst) {
+        int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+        int vLen = ctx.varargs != null ? ctx.varargs.length : 0;
+        if (c > 1) {
+            for (int i = 0; i < c - 1; i++) {
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + i, i < vLen ? ctx.varargs[i] : LuaNil.NIL);
+            }
+        } else if (c == 0) {
+            for (int i = 0; i < vLen; i++) {
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + i, ctx.varargs[i]);
+            }
+            ctx.top = ctx.base + a + vLen;
+        }
+    }
+
+    /**
+     * {@code OP_CLOSE} / {@code OP_TBC} handlers (tiny, cold).
+     */
+    private static void doClose(LuaState state, VmContext ctx, int a, boolean isTbc) {
+        if (isTbc) {
+            LuaValue val = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
+            String varName = ctx.proto.findLocalVarName(a, ctx.pc - 1);
+            state.pushTbc(ctx.base + a, val, varName);
+        } else {
+            state.closeUpvalues(ctx.base + a);
+            state.closeTbc(ctx.base + a, null);
+        }
+    }
+
+    /**
+     * Bare-thread fallback for the pc mirror (almost never taken; the
+     * coroutine is normally always set).
+     */
+    private static void mirrorSlow(VmContext ctx, int instPc) {
+        int curLineSlow = (ctx.proto.lineInfo != null && instPc < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[instPc] : -1;
+        CallStack.Frame curFrameSlow = CallStack.topFrame(ctx.callState);
+        if (curFrameSlow != null) {
+            curFrameSlow.pc = instPc;
+            curFrameSlow.line = curLineSlow;
+        }
+    }
+
+    /**
+     * Cached call-name resolution. {@code getobjname} is pure in
+     * (proto, pc, reg) but scans bytecode per call; this memoizes it in a
+     * tiny ctx-local direct-mapped cache. The returned array is shared and
+     * must only be read. A cached miss (null) is remembered too.
+     */
+    private static String[] callName(VmContext ctx, LuaProto p, int lastpc, int reg) {
+        int idx = (lastpc + reg * 33) & (VmContext.NAME_CACHE_SIZE - 1);
+        if (ctx.ncFilled[idx] && ctx.ncProto[idx] == p && ctx.ncPc[idx] == lastpc && ctx.ncReg[idx] == reg) {
+            String a = ctx.ncA[idx];
+            if (a == null) return null;
+            return new String[]{a, ctx.ncB[idx]};
+        }
+        String[] info = getobjname(p, lastpc, reg);
+        ctx.ncFilled[idx] = true;
+        ctx.ncProto[idx] = p;
+        ctx.ncPc[idx] = lastpc;
+        ctx.ncReg[idx] = reg;
+        if (info != null) {
+            ctx.ncA[idx] = info[0];
+            ctx.ncB[idx] = info[1];
+        } else {
+            ctx.ncA[idx] = null;
+            ctx.ncB[idx] = null;
+        }
+        return info;
     }
 
     private static CallInfo[] expandCallStack(CallInfo[] callStack) {
@@ -1264,7 +1313,11 @@ public final class BytecodeVM {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + b);
-        setLuaValue(pStack, tStack, oStack, base + a, tbl.get(LuaInteger.valueOf(c)));
+        if (tbl instanceof LuaTable lt && lt.getMetatable() == null) {
+            setLuaValue(pStack, tStack, oStack, base + a, lt.rawgetInt(c));
+        } else {
+            setLuaValue(pStack, tStack, oStack, base + a, tbl.get(LuaInteger.valueOf(c)));
+        }
     }
 
     private static void executeGetField(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
@@ -1300,7 +1353,11 @@ public final class BytecodeVM {
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + a);
         LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
-        tbl.set(LuaInteger.valueOf(b), val);
+        if (tbl instanceof LuaTable lt && lt.getMetatable() == null) {
+            lt.rawsetInt(b, val);
+        } else {
+            tbl.set(LuaInteger.valueOf(b), val);
+        }
     }
 
     private static void executeSetField(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
@@ -1704,12 +1761,12 @@ public final class BytecodeVM {
         }
     }
 
-    private static int executeExternalCall(LuaState state, LuaProto proto, int pc, int base, LuaFunction fn, int funcIdx, int nActualArgs, int nResults, int curLine) {        long[] pStack = state.getPrimitiveStack();
+    private static int executeExternalCall(LuaState state, VmContext ctx, LuaProto proto, int pc, int base, LuaFunction fn, int funcIdx, int nActualArgs, int nResults, int curLine) {        long[] pStack = state.getPrimitiveStack();
         byte[] tStack = state.getTypeStack();
         LuaValue[] oStack = state.getObjectStack();
         LuaValue[] cArgs = getArgsForCall(pStack, tStack, oStack, funcIdx + 1, nActualArgs);
         if (curLine > 0) CallStack.setLine(curLine);
-        CallStack.CallStackState csState = CallStack.currentState();
+        CallStack.CallStackState csState = ctx.callState;
         String resolvedName = csState.nextName;
         String namewhat = csState.nextNamewhat;
         boolean isMeta = csState.nextMetamethod;
@@ -1730,14 +1787,14 @@ public final class BytecodeVM {
                 namewhat = "";
             }
         }
-        CallStack.Frame callerFrame = CallStack.topFrame();
+        CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
         if (callerFrame != null) {
             callerFrame.pc = pc - 1;
         }
-        CallStack.setNextTransfer(1, nActualArgs, cArgs);
-        CallStack.setNextVmFrame(state, funcIdx + 1, funcIdx, null, -1);
-        CallStack.push(fn, resolvedName, namewhat, curLine, isMethod, isMeta);
-        CallStack.Frame extFrame = CallStack.topFrame();
+        CallStack.setNextTransfer(ctx.callState, 1, nActualArgs, cArgs);
+        CallStack.setNextVmFrame(ctx.callState, state, funcIdx + 1, funcIdx, null, -1);
+        CallStack.push(fn, resolvedName, namewhat, curLine, isMethod, isMeta, ctx.callState, ctx.co);
+        CallStack.Frame extFrame = CallStack.topFrame(ctx.callState);
         if (extFrame != null) {
             extFrame.cArgs = cArgs;
         }
@@ -1749,14 +1806,14 @@ public final class BytecodeVM {
             res = fn.invoke(cArgs);
         } finally {
             state.setStackTop(savedStackTop);
-            CallStack.Frame f = CallStack.topFrame();
+            CallStack.Frame f = CallStack.topFrame(ctx.callState);
             if (f != null && res != null) {
                 LuaValue[] retVals = (res instanceof Varargs va) ? va.getValuesUnsafe() : new LuaValue[]{res};
                 f.retValues = retVals;
                 f.ftransfer = 1;
                 f.ntransfer = retVals.length;
             }
-            CallStack.pop();
+            CallStack.pop(ctx.callState, ctx.co);
         }
         state.ensureStackCapacity(funcIdx + (nResults > 0 ? nResults : 16) + 32);
         pStack = state.getPrimitiveStack();

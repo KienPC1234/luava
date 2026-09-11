@@ -1,34 +1,43 @@
-# PLANS.md: Kế Hoạch & Thiết Kế Kỹ Thuật Register-based Bytecode VM (Giai Đoạn 3)
+# PLANS.md: Register-based Bytecode VM Technical Plan & Design (Phase 3)
 
-Tài liệu này xác lập chi tiết kiến trúc máy ảo thanh ghi (Register-based Bytecode Virtual Machine), trình biên dịch bytecode từ AST (AST-to-Bytecode Compiler), và các chiến lược tối ưu hóa phần cứng / máy ảo Java HotSpot C2 JIT cho dự án Luava.
-
----
-
-## I. Tổng Quan Kiến Trúc & Mục Tiêu
-
-### 1. Mục Tiêu Cốt Lõi
-1. **100% Tương Thích Ngữ Nghĩa Lua 5.4**:
-   - Hỗ trợ đầy đủ 83 OpCodes chuẩn của Lua 5.4.9.
-   - Định dạng lệnh chuẩn 32-bit: `iABC`, `iABx`, `iAsBx`, `iAx`, `isJ`.
-   - Cơ chế quản lý phạm vi biến: Open / Closed Upvalues, biến to-be-closed (`<close>`).
-   - Tối ưu hóa đệ quy đuôi (Tail-Call Optimization: `OP_TAILCALL`).
-   - Xử lý tham số biến thiên (Varargs: `OP_VARARGPREP`, `OP_VARARG`).
-   - Các vòng lặp tối ưu hóa: Numeric For-loop (`OP_FORPREP`, `OP_FORLOOP`) và Generic For-loop (`OP_TFORPREP`, `OP_TFORCALL`, `OP_TFORLOOP`).
-2. **Tiêu Chuẩn Hiệu Năng JVM HotSpot C2**:
-   - **Zero-Allocation Hot Paths**: Trong suốt quá trình thực thi phép tính số học, logic, di chuyển thanh ghi, rẽ nhánh, không cấp phát bất kỳ đối tượng Java nào trên heap.
-   - **HotSpot C2 Inlining Friendly**: Giữ kích thước bytecode của vòng lặp dispatch và các phương thức trợ năng nóng dưới ngưỡng inlining 325 bytes bytecode (`-XX:MaxInlineSize=325`) và tránh vượt ngưỡng `HugeMethodLimit` (8,000 bytes bytecode).
-   - **O(1) Branch Table**: Sử dụng lệnh Java `tableswitch` tự nhiên cho 83 opcodes (được HotSpot biên dịch thẳng sang indirect branch table trong assembly).
-   - **Tái Sử Dụng Khung Ngăn Xếp (Call Frame Recycling)**: Ngăn xếp cuộc gọi dạng mảng phẳng (`LuaValue[] stack`) với con trỏ `base`, `top`, `pc` dạng `int` nguyên thủy.
+This document specifies the register-based bytecode virtual machine
+architecture, the AST-to-bytecode compiler, and the hardware / Java
+HotSpot C2 JIT optimization strategies for the Luava project.
 
 ---
 
-## II. Đặc Tả Chi Tiết Tập Lệnh Lua 5.4 (Instruction Set Architecture)
+## I. Architecture Overview & Goals
 
-### 1. Khuôn Dạng Lệnh 32-bit (Instruction Layout)
-Mỗi lệnh là một số nguyên 32-bit không dấu (`int` trong Java):
+### 1. Core Goals
+1. **100% Lua 5.4 Semantic Compatibility**:
+   - Full support for the 83 standard opcodes of Lua 5.4.9.
+   - Standard 32-bit instruction formats: `iABC`, `iABx`, `iAsBx`, `iAx`, `isJ`.
+   - Variable scope management: Open / Closed Upvalues, to-be-closed
+     variables (`<close>`).
+   - Tail-call optimization (`OP_TAILCALL`).
+   - Varargs handling (`OP_VARARGPREP`, `OP_VARARG`).
+   - Optimized loops: numeric for-loop (`OP_FORPREP`, `OP_FORLOOP`) and
+     generic for-loop (`OP_TFORPREP`, `OP_TFORCALL`, `OP_TFORLOOP`).
+2. **JVM HotSpot C2 Performance Standards**:
+   - **Zero-Allocation Hot Paths**: during arithmetic, logic, register
+     moves, and branching, no Java heap object is allocated.
+   - **HotSpot C2 Inlining Friendly**: keep the dispatch-loop bytecode and
+     hot helper methods under the 325-byte inlining threshold
+     (`-XX:MaxInlineSize=325`) and below `HugeMethodLimit` (8,000 bytes).
+   - **O(1) Branch Table**: use the natural Java `tableswitch` over the 83
+     opcodes (HotSpot compiles it to an indirect branch table in assembly).
+   - **Call Frame Recycling**: flat-array call stack (`LuaValue[] stack`)
+     with primitive-`int` `base`, `top`, `pc` pointers.
+
+---
+
+## II. Lua 5.4 Instruction Set Specification (ISA)
+
+### 1. 32-bit Instruction Layout
+Each instruction is an unsigned 32-bit integer (`int` in Java):
 
 ```
-       31             24 23             16 15        8 7        0
+        31             24 23             16 15        8 7        0
 iABC:  [    B: 8 bit    |    C: 8 bit    | k |  A: 8   |  Op: 7  ]
 iABx:  [             Bx: 17 bit              |  A: 8   |  Op: 7  ]
 iAsBx: [            sBx: 17 bit (signed)     |  A: 8   |  Op: 7  ]
@@ -36,10 +45,10 @@ iAx:   [                   Ax: 25 bit                  |  Op: 7  ]
 isJ:   [                  sJ: 25 bit (signed)          |  Op: 7  ]
 ```
 
-- **Hằng số độ dời (Biases)**:
+- **Bias constants**:
   - `OFFSET_sBx = 65,535` ($2^{16} - 1$)
   - `OFFSET_sJ = 16,777,215` ($2^{24} - 1$)
-- **Hằng số vị trí bit**:
+- **Bit positions**:
   - `POS_OP = 0`, `SIZE_OP = 7`
   - `POS_A = 7`, `SIZE_A = 8`
   - `POS_k = 15`, `SIZE_k = 1`
@@ -49,15 +58,15 @@ isJ:   [                  sJ: 25 bit (signed)          |  Op: 7  ]
   - `POS_Ax = 7`, `SIZE_Ax = 25`
   - `POS_sJ = 7`, `SIZE_sJ = 25`
 
-### 2. Danh Mục 83 OpCodes & Hành Vi Chuẩn
+### 2. The 83 OpCodes & Standard Behavior
 
-| OpCode (Mã) | Định dạng | Tóm tắt ngữ nghĩa |
+| OpCode (id) | Format | Semantics summary |
 | :--- | :--- | :--- |
 | `OP_MOVE` (0) | iABC | `R[A] = R[B]` |
 | `OP_LOADI` (1) | iAsBx | `R[A] = (lua_Integer)sBx` |
 | `OP_LOADF` (2) | iAsBx | `R[A] = (lua_Number)sBx` |
 | `OP_LOADK` (3) | iABx | `R[A] = K[Bx]` |
-| `OP_LOADKX` (4) | iABx | `R[A] = K[Ax(lệnh sau)]` |
+| `OP_LOADKX` (4) | iABx | `R[A] = K[Ax(next instruction)]` |
 | `OP_LOADFALSE` (5) | iABC | `R[A] = false` |
 | `OP_LFALSESKIP` (6) | iABC | `R[A] = false; pc++` |
 | `OP_LOADTRUE` (7) | iABC | `R[A] = true` |
@@ -72,9 +81,9 @@ isJ:   [                  sJ: 25 bit (signed)          |  Op: 7  ]
 | `OP_SETTABLE` (16) | iABC | `R[A][R[B]] = RK(C)` |
 | `OP_SETI` (17) | iABC | `R[A][B] = RK(C)` |
 | `OP_SETFIELD` (18) | iABC | `R[A][K[B]] = RK(C)` |
-| `OP_NEWTABLE` (19) | iABC | `R[A] = {}` (kích thước mảng B, băm C) |
+| `OP_NEWTABLE` (19) | iABC | `R[A] = {}` (array size B, hash size C) |
 | `OP_SELF` (20) | iABC | `R[A+1] = R[B]; R[A] = R[B][RK(C)]` |
-| `OP_ADDI` (21) | iABC | `R[A] = R[B] + sC` (số nguyên trực tiếp) |
+| `OP_ADDI` (21) | iABC | `R[A] = R[B] + sC` (immediate integer) |
 | `OP_ADDK` (22) | iABC | `R[A] = R[B] + K[C]` |
 | `OP_SUBK` (23) | iABC | `R[A] = R[B] - K[C]` |
 | `OP_MULK` (24) | iABC | `R[A] = R[B] * K[C]` |
@@ -99,16 +108,16 @@ isJ:   [                  sJ: 25 bit (signed)          |  Op: 7  ]
 | `OP_BXOR` (43) | iABC | `R[A] = R[B] ~ R[C]` |
 | `OP_SHL` (44) | iABC | `R[A] = R[B] << R[C]` |
 | `OP_SHR` (45) | iABC | `R[A] = R[B] >> R[C]` |
-| `OP_MMBIN` (46) | iABC | Gọi metamethod C qua `R[A]` và `R[B]` |
-| `OP_MMBINI` (47) | iABC | Gọi metamethod C qua `R[A]` và số nguyên `sB` |
-| `OP_MMBINK` (48) | iABC | Gọi metamethod C qua `R[A]` và hằng số `K[B]` |
+| `OP_MMBIN` (46) | iABC | C metamethod call via `R[A]` and `R[B]` |
+| `OP_MMBINI` (47) | iABC | C metamethod call via `R[A]` and integer `sB` |
+| `OP_MMBINK` (48) | iABC | C metamethod call via `R[A]` and constant `K[B]` |
 | `OP_UNM` (49) | iABC | `R[A] = -R[B]` |
 | `OP_BNOT` (50) | iABC | `R[A] = ~R[B]` |
 | `OP_NOT` (51) | iABC | `R[A] = not R[B]` |
 | `OP_LEN` (52) | iABC | `R[A] = #R[B]` |
 | `OP_CONCAT` (53) | iABC | `R[A] = R[A] .. ... .. R[A + B - 1]` |
-| `OP_CLOSE` (54) | iABC | Đóng các upvalues mở $\ge R[A]$ |
-| `OP_TBC` (55) | iABC | Đánh dấu biến $R[A]$ là to-be-closed |
+| `OP_CLOSE` (54) | iABC | Close open upvalues $\ge R[A]$ |
+| `OP_TBC` (55) | iABC | Mark $R[A]$ as to-be-closed |
 | `OP_JMP` (56) | isJ | `pc += sJ` |
 | `OP_EQ` (57) | iABC | `if ((R[A] == R[B]) ~= k) pc++` |
 | `OP_LT` (58) | iABC | `if ((R[A] < R[B]) ~= k) pc++` |
@@ -121,65 +130,74 @@ isJ:   [                  sJ: 25 bit (signed)          |  Op: 7  ]
 | `OP_GEI` (65) | iABC | `if ((R[A] >= sB) ~= k) pc++` |
 | `OP_TEST` (66) | iABC | `if (not R[A] == k) pc++` |
 | `OP_TESTSET` (67) | iABC | `if (not R[B] == k) pc++ else R[A] = R[B]` |
-| `OP_CALL` (68) | iABC | Gọi hàm: $R[A..A+C-2] = R[A](R[A+1..A+B-1])$ |
-| `OP_TAILCALL` (69) | iABC | Gọi đuôi: ghi đè stack frame hiện tại |
-| `OP_RETURN` (70) | iABC | Trả về: $R[A..A+B-2]$ |
-| `OP_RETURN0` (71) | iABC | Trả về 0 giá trị |
-| `OP_RETURN1` (72) | iABC | Trả về 1 giá trị $R[A]$ |
-| `OP_FORLOOP` (73) | iABx | Cập nhật bước lặp số: `if continues then pc -= Bx` |
-| `OP_FORPREP` (74) | iABx | Khởi tạo và kiểm tra bước lặp số nguyên/thực |
-| `OP_TFORPREP` (75) | iABx | Khởi tạo upvalue cho biến lặp generic; `pc += Bx` |
-| `OP_TFORCALL` (76) | iABC | Gọi iterator function: $R[A+4..A+3+C] = R[A](R[A+1], R[A+2])$ |
+| `OP_CALL` (68) | iABC | Call: $R[A..A+C-2] = R[A](R[A+1..A+B-1])$ |
+| `OP_TAILCALL` (69) | iABC | Tail call: overwrite current stack frame |
+| `OP_RETURN` (70) | iABC | Return: $R[A..A+B-2]$ |
+| `OP_RETURN0` (71) | iABC | Return 0 values |
+| `OP_RETURN1` (72) | iABC | Return 1 value $R[A]$ |
+| `OP_FORLOOP` (73) | iABx | Numeric step update: `if continues then pc -= Bx` |
+| `OP_FORPREP` (74) | iABx | Init and check integer/float loop step |
+| `OP_TFORPREP` (75) | iABx | Init generic-loop upvalue; `pc += Bx` |
+| `OP_TFORCALL` (76) | iABC | Iterator call: $R[A+4..A+3+C] = R[A](R[A+1], R[A+2])$ |
 | `OP_TFORLOOP` (77) | iABx | `if R[A+2] ~= nil then { R[A] = R[A+2]; pc -= Bx }` |
-| `OP_SETLIST` (78) | iABC | Điền mảng: $R[A][C+i] = R[A+i], 1 \le i \le B$ |
+| `OP_SETLIST` (78) | iABC | Batch fill: $R[A][C+i] = R[A+i], 1 \le i \le B$ |
 | `OP_CLOSURE` (79) | iABx | $R[A] = \text{new closure}(KPROTO[Bx])$ |
-| `OP_VARARG` (80) | iABC | Lấy tham số biến thiên: $R[A..A+C-2] = \text{vararg}$ |
-| `OP_VARARGPREP` (81) | iABC | Điều chỉnh ngăn xếp tham số biến thiên ban đầu |
-| `OP_EXTRAARG` (82) | iAx | Tham số mở rộng $Ax$ cho lệnh đứng ngay trước |
+| `OP_VARARG` (80) | iABC | Fetch varargs: $R[A..A+C-2] = \text{vararg}$ |
+| `OP_VARARGPREP` (81) | iABC | Adjust the initial vararg parameter stack |
+| `OP_EXTRAARG` (82) | iAx | Extended $Ax$ argument for the preceding instruction |
 
-### 3. Ba Quy Chuẩn Ngữ Nghĩa Bắt Buộc Chuẩn Lua 5.4
-1. **Cặp Lệnh Ghép `OP_EXTRAARG`**:
-   - Khi index bảng hằng số `K` vượt quá phạm vi 17-bit $Bx$ trong `OP_LOADKX`, hoặc khi số phần tử mảng vượt quá phạm vi $C$ trong `OP_SETLIST`, trình biên dịch sinh lệnh `OP_EXTRAARG` ngay kế tiếp.
-   - Khi máy ảo xử lý `OP_LOADKX` hoặc `OP_SETLIST (C == 0)`, nó đọc instruction kế tiếp tại `pc++`, trích xuất 25-bit $Ax$ để xác định index thực tế.
-2. **Cơ Chế Metamethod Fallback Hai Bước (`OP_MMBIN*`)**:
-   - Trong Lua 5.4, khi biên dịch phép toán số học (`OP_ADD`, `OP_SUB`, v.v.), trình biên dịch sinh cặp lệnh: lệnh số học chính, nối tiếp ngay sau là `OP_MMBIN` (hoặc `OP_MMBINI`, `OP_MMBINK`).
-   - Nếu phép tính trên toán hạng số nguyên/số thực thành công (Fast Path), máy ảo tự động tăng `pc++` để bỏ qua lệnh `OP_MMBIN`.
-   - Nếu toán hạng không phải là số hoặc có metatable chứa hàm tương ứng, máy ảo rơi xuống thực thi lệnh `OP_MMBIN` để dispatch metamethod (`__add`, `__sub`, v.v.).
-3. **Điều Phối Ngăn Xếp Tham Số Biến Thiên (`OP_VARARGPREP`)**:
-   - Mọi prototype của hàm vararg bắt đầu bằng lệnh `OP_VARARGPREP A`.
-   - Lệnh này dịch chuyển các tham số cố định về đúng vị trí $R[0..A-1]$, dời các tham số biến thiên vào vùng vararg trước frame, đảm bảo thanh ghi cục bộ bắt đầu chuẩn xác từ $R[0]$.
+### 3. Three Mandatory Lua 5.4 Semantic Rules
+1. **Fused `OP_EXTRAARG` Pair**:
+   - When the constant-table index `K` exceeds the 17-bit $Bx$ range in
+     `OP_LOADKX`, or the array size exceeds the $C$ range in `OP_SETLIST`,
+     the compiler emits `OP_EXTRAARG` immediately after.
+   - When the VM handles `OP_LOADKX` or `OP_SETLIST (C == 0)`, it reads
+     the next instruction at `pc++` and extracts the 25-bit $Ax$ for the
+     real index.
+2. **Two-Step Metamethod Fallback (`OP_MMBIN*`)**:
+   - In Lua 5.4, compiling arithmetic (`OP_ADD`, `OP_SUB`, …) emits a
+     pair: the arithmetic instruction immediately followed by `OP_MMBIN`
+     (or `OP_MMBINI`, `OP_MMBINK`).
+   - If the operation on integer/float operands succeeds (fast path),
+     the VM does `pc++` to skip `OP_MMBIN`.
+   - Otherwise the VM falls through to `OP_MMBIN` to dispatch the
+     metamethod (`__add`, `__sub`, …).
+3. **Vararg Stack Coordination (`OP_VARARGPREP`)**:
+   - Every vararg-function prototype starts with `OP_VARARGPREP A`.
+   - It moves fixed parameters to $R[0..A-1]$ and the varargs into the
+     pre-frame vararg area, so locals start exactly at $R[0]$.
 
 ---
 
-## III. Cấu Trúc Dữ Liệu Cốt Lõi (Core Data Structures)
+## III. Core Data Structures
 
 ### 1. Prototype (`LuaProto.java`)
-Đại diện cho khối mã nhị phân tĩnh đã biên dịch:
+The compiled static binary chunk:
 ```java
 public final class LuaProto {
-    public final String source;          // Tên file / chunk ("@main.lua")
-    public final int lineDefined;        // Dòng bắt đầu
-    public final int lastLineDefined;    // Dòng kết thúc
-    public final int numParams;          // Số lượng tham số cố định
-    public final boolean isVararg;       // Có nhận varargs (...) hay không
-    public final int maxStackSize;       // Số lượng thanh ghi tối đa mà hàm sử dụng
-    
-    public final int[] code;             // Mảng lệnh 32-bit
-    public final LuaValue[] constants;   // Bảng hằng số (K)
-    public final LuaProto[] protos;      // Bảng prototype con lồng nhau
-    public final UpvalueDesc[] upvalues; // Danh sách mô tả upvalues
-    public final int[] lineInfo;         // Ánh xạ từng instruction tới số dòng mã nguồn
+    public final String source;          // File / chunk name ("@main.lua")
+    public final int lineDefined;        // First line
+    public final int lastLineDefined;    // Last line
+    public final int numParams;          // Fixed parameter count
+    public final boolean isVararg;       // Takes varargs (...) or not
+    public final int maxStackSize;       // Max registers used
+
+    public final int[] code;             // 32-bit instructions
+    public final LuaValue[] constants;   // Constant table (K)
+    public final LuaProto[] protos;      // Nested child prototypes
+    public final UpvalueDesc[] upvalues; // Upvalue descriptors
+    public final int[] lineInfo;         // Source line per instruction
 }
 ```
 
-### 2. Closure Tại Runtime (`LuaClosure.java`)
-Kế thừa từ `LuaFunction`:
+### 2. Runtime Closure (`LuaClosure.java`)
+Extends `LuaFunction`:
 ```java
 public final class LuaClosure extends LuaFunction {
     public final LuaProto proto;
     public final Upvalue[] upvals;
-    public final LuaTable env;           // Môi trường _ENV gắn kết
-    
+    public final LuaTable env;           // Bound _ENV
+
     public LuaClosure(LuaProto proto, Upvalue[] upvalues, LuaTable env, LuaState state) {
         super(state);
         this.proto = proto;
@@ -189,38 +207,46 @@ public final class LuaClosure extends LuaFunction {
 }
 ```
 
-#### 3. Cấu Trúc Ngăn Xếp Phẳng Kép/Ba & Quy Ước Bất Biến (Lazy Materialization Invariant)
-Để giải quyết triệt để vấn đề boxing overhead trên HotSpot JVM (tránh cấp phát hàng triệu object `LuaInteger` / `LuaFloat` trong vòng lặp):
-- **`long[] primitiveStack`**: Lưu trực tiếp giá trị 64-bit thô (giá trị nguyên `long`, bit-cast của `double` qua `Double.doubleToRawLongBits`, hoặc boolean `1L`/`0L`).
-- **`byte[] typeStack`**: Lưu thẻ kiểu dữ liệu byte (`TYPE_NIL = 0`, `TYPE_BOOLEAN = 1`, `TYPE_INT = 2`, `TYPE_FLOAT = 3`, `TYPE_OBJECT = 4`).
-- **`LuaValue[] objectStack`**: Chỉ lưu các tham chiếu đối tượng Heap thực thụ (`LuaTable`, `LuaClosure`, `LuaString`, `LuaUserdata`).
+#### 3. Dual/Triple Flat Stack & Read/Write Invariant (Lazy Materialization)
+To eliminate boxing overhead on HotSpot (avoid allocating millions of
+`LuaInteger` / `LuaFloat` objects in loops):
+- **`long[] primitiveStack`**: raw 64-bit values (`long` integers,
+  bit-cast `double` via `Double.doubleToRawLongBits`, booleans as `1L`/`0L`).
+- **`byte[] typeStack`**: byte type tags (`TYPE_NIL = 0`, `TYPE_BOOLEAN = 1`,
+  `TYPE_INT = 2`, `TYPE_FLOAT = 3`, `TYPE_OBJECT = 4`).
+- **`LuaValue[] objectStack`**: real heap references only (`LuaTable`,
+  `LuaClosure`, `LuaString`, `LuaUserdata`).
 
-**Quy Ước Bất Biến Đọc/Ghi (Execution Invariant):**
+**Read/Write invariant:**
 ```text
-typeStack[reg] == TYPE_INT     --> Đọc rawValue dạng long từ primitiveStack[reg]
-typeStack[reg] == TYPE_FLOAT   --> Đọc Double.longBitsToDouble(primitiveStack[reg])
-typeStack[reg] == TYPE_BOOLEAN --> Đọc boolean từ (primitiveStack[reg] != 0)
-typeStack[reg] == TYPE_NIL     --> Trả về LuaNil.NIL (không cần đọc dữ liệu)
-typeStack[reg] >= TYPE_OBJECT  --> Đọc tham chiếu đối tượng từ objectStack[reg]
+typeStack[reg] == TYPE_INT     --> read raw long from primitiveStack[reg]
+typeStack[reg] == TYPE_FLOAT   --> read Double.longBitsToDouble(primitiveStack[reg])
+typeStack[reg] == TYPE_BOOLEAN --> read boolean from (primitiveStack[reg] != 0)
+typeStack[reg] == TYPE_NIL     --> return LuaNil.NIL (no data read)
+typeStack[reg] >= TYPE_OBJECT  --> read object reference from objectStack[reg]
 ```
-- **Khi ghi giá trị nguyên thủy**: Ghi `rawValue` vào `primitiveStack[reg]`, gán `typeStack[reg] = TYPE_*`, và bắt buộc gán `objectStack[reg] = null` để JVM GC thu hồi ngay đối tượng cũ từng nằm tại ô nhớ đó.
-- **Khi ghi đối tượng Heap**: Gán đối tượng vào `objectStack[reg]`, gán `typeStack[reg] = TYPE_OBJECT`, và không cần bận tâm giá trị cũ trong `primitiveStack[reg]`.
+- **Writing a primitive**: store `rawValue` in `primitiveStack[reg]`, set
+  `typeStack[reg] = TYPE_*`, and always set `objectStack[reg] = null` so
+  the JVM GC can immediately reclaim any object previously in that slot.
+- **Writing a heap object**: store it in `objectStack[reg]`, set
+  `typeStack[reg] = TYPE_OBJECT`; the old `primitiveStack[reg]` value
+  needs no attention.
 
-### 4. Open & Closed Upvalue Không Boxing (`Upvalue.java`)
-`Upvalue` được thiết kế để không box kiểu nguyên thủy ngay cả khi đã bị đóng (closed):
+### 4. Unboxed Open & Closed Upvalues (`Upvalue.java`)
+`Upvalue` avoids boxing primitives even after being closed:
 ```java
 public final class Upvalue {
-    // Khi Open: liên kết trực tiếp với stack của LuaState
+    // When open: links directly to the LuaState stack
     private LuaState state;
     private int stackIndex;
     private boolean open;
 
-    // Khi Closed: lưu trực tiếp không qua boxing nếu là primitive
+    // When closed: unboxed storage for primitives
     private long rawValue;
     private byte typeTag;
-    private LuaValue objectValue; // Chỉ dùng khi typeTag == TYPE_OBJECT
+    private LuaValue objectValue; // Only used when typeTag == TYPE_OBJECT
 
-    // Con trỏ danh sách liên kết đơn (Open Upvalue Linked List)
+    // Singly-linked open-upvalue list pointer
     public Upvalue nextOpen;
 
     public Upvalue(LuaState state, int stackIndex) {
@@ -241,193 +267,389 @@ public final class Upvalue {
 }
 ```
 
-### 5. Danh Sách Quản Lý Open Upvalues (Open Upvalue Linked List & Instance Deduplication)
-Quy chuẩn Lua 5.4 yêu cầu mọi closure capture cùng một biến $R[A]$ trên cùng một frame **bắt buộc phải chia sẻ chung đúng một thể hiện (instance) `Upvalue` duy nhất**.
-- `LuaState` duy trì một con trỏ đầu `Upvalue openUpvaluesHead`, danh sách được sắp xếp theo chiều giảm dần của `stackIndex`.
-- **Khi tạo Upvalue mở (`findOrCreateOpenUpvalue(stackIndex)`)**:
-  Duyệt qua danh sách. Nếu tìm thấy upvalue có cùng `stackIndex`, trả về ngay instance có sẵn. Nếu chưa có, tạo mới và chèn vào đúng vị trí để giữ trật tự sắp xếp giảm dần.
-- **Khi đóng Upvalues (`closeUpvalues(fromIndex)`)**:
-  Được gọi trong `OP_CLOSE`, `OP_RETURN`, `OP_TAILCALL`, và biến to-be-closed `OP_TBC`. Duyệt từ đầu danh sách (`openUpvaluesHead`), đóng tất cả node có `stackIndex >= fromIndex` và ngắt liên kết chúng ra khỏi danh sách.
+### 5. Open Upvalue List (Linked List & Instance Deduplication)
+Lua 5.4 requires every closure capturing the same $R[A]$ on the same
+frame to share exactly one `Upvalue` instance.
+- `LuaState` keeps a head pointer `Upvalue openUpvaluesHead`, sorted by
+  descending `stackIndex`.
+- **Creating an open upvalue (`findOrCreateOpenUpvalue(stackIndex)`)**:
+  walk the list; return the existing instance on a `stackIndex` hit,
+  otherwise create one and insert it to keep descending order.
+- **Closing upvalues (`closeUpvalues(fromIndex)`)**:
+  called from `OP_CLOSE`, `OP_RETURN`, `OP_TAILCALL`, and to-be-closed
+  `OP_TBC`. Walk from the head, close every node with
+  `stackIndex >= fromIndex`, and unlink them.
 
-### 6. Khung Ngăn Xếp Cuộc Gọi (`CallInfo.java`)
-Tái sử dụng bằng pooling, hoàn toàn không cấp phát mới:
+### 6. Call Stack Frame (`CallInfo.java`)
+Pooled for reuse, never freshly allocated:
 ```java
 public final class CallInfo {
     public LuaClosure closure;
-    public int funcIndex;        // Vị trí function trên stack
+    public int funcIndex;        // Function position on the stack
     public int baseIndex;        // R(0) = stack[baseIndex]
-    public int topIndex;         // Đỉnh stack khả dụng
-    public int savedPc;          // Vị trí lệnh tiếp theo khi hàm con trả về
-    public int expectedResults;  // Số lượng kết quả gọi mong đợi (C - 1 trong OP_CALL)
+    public int topIndex;         // Available stack top
+    public int savedPc;          // Next instruction when the callee returns
+    public int expectedResults;  // Expected result count (C - 1 in OP_CALL)
 }
 ```
 
 ---
 
-## IV. Thiết Kế Trình Biên Dịch Bytecode (`BytecodeCompiler.java`)
+## IV. Bytecode Compiler Design (`BytecodeCompiler.java`)
 
-Trình biên dịch nhận vào AST (`Statement` / `Block`) từ `Parser` hiện tại và phát ra `LuaProto`.
+The compiler takes the AST (`Statement` / `Block`) from the current
+`Parser` and emits a `LuaProto`.
 
-### 1. Phân Phối Thanh Ghi (Register Allocation)
-- Duy trì cấu trúc `ScopeContext`:
-  - `int numLocals`: số biến cục bộ đang hoạt động trong scope.
-  - `int freereg`: chỉ số thanh ghi tự do tiếp theo ($R[\text{freereg}]$).
-  - Quản lý phạm vi lồng nhau bằng linked list hoặc stack các `ScopeContext`.
-- Biến tạm thời được cấp phát tại `freereg++`, và giải phóng ngay khi biểu thức kết thúc để tái sử dụng thanh ghi, giảm thiểu `maxStackSize`.
+### 1. Register Allocation
+- Maintains a `ScopeContext`:
+  - `int numLocals`: active locals in scope.
+  - `int freereg`: next free register ($R[\text{freereg}]$).
+  - Nested scopes via a linked list or stack of `ScopeContext`.
+- Temporaries allocate at `freereg++` and free as soon as the expression
+  ends for register reuse, minimizing `maxStackSize`.
 
-### 2. Vá Bước Nhảy (Jump & Branch Backpatching)
-- Các cấu trúc điều khiển (`if`, `while`, `repeat`, `for`, `goto`, `break`) sinh ra lệnh nhảy `OP_JMP` với khoảng cách chưa xác định ($sJ = 0$).
-- Quản lý danh sách liên kết các lệnh nhảy chưa vá (`labelList`, `pendingJumps`).
-- Khi gặp nhãn kết thúc khối, duyệt qua danh sách và vá độ lệch thực tế vào trường `sJ` hoặc `sBx` thông qua `Instruction.setsJ(code, pc, offset)`.
-
----
-
-## V. Thiết Kế Máy Ảo Thực Thi (`BytecodeVM.java`)
-
-### 1. Phân Tách Bytecode Tránh Ngưỡng C2 JIT `HugeMethodLimit` (8,000 bytes)
-Theo đặc tả HotSpot VM, khi phương thức có bytecode vượt quá 8,000 bytes, C2 JIT sẽ từ chối biên dịch phương thức đó. Để giải quyết:
-- **Hot Opcodes (Giữ inline trực tiếp trong `tableswitch` của `execute`)**:
-  `OP_MOVE`, `OP_LOADI`, `OP_LOADF`, `OP_LOADK`, `OP_LOADFALSE`, `OP_LOADTRUE`, `OP_LOADNIL`, `OP_GETUPVAL`, `OP_SETUPVAL`, `OP_ADD`, `OP_ADDI`, `OP_SUB`, `OP_MUL`, `OP_EQ`, `OP_EQI`, `OP_LT`, `OP_LE`, `OP_TEST`, `OP_TESTSET`, `OP_JMP`, `OP_FORPREP`, `OP_FORLOOP`.
-- **Heavy / Cold Opcodes (Bắt buộc ủy quyền ra `static` helper methods)**:
-  - `executeNewTable(state, inst, code, pc, stack, base, a)` -> xử lý bảng và `OP_EXTRAARG`.
-  - `executeSetList(state, inst, code, pc, stack, base, a)` -> xử lý điền mảng theo lô và `OP_EXTRAARG`.
-  - `executeClosure(state, inst, proto, closure, upvals, stack, base, a)` -> khởi tạo closure.
-  - `executeCall(state, inst, stack, callStack, callDepth, ...)` -> quản lý frame gọi hàm.
-  - `executeTailCall(state, inst, stack, callStack, callDepth, ...)` -> tái sắp xếp frame TCO.
-  - `executeReturn(state, inst, stack, callStack, callDepth, ...)` -> thu dọn frame và trả kết quả.
-  - `executeConcat(stack, base, a, b)` -> nối chuỗi nhiều toán hạng.
-  - `executeMetamethodBin(state, inst, op, stack, base, k, a)` -> fallback cho `OP_MMBIN*`.
-- Nhờ phân tách này, kích thước bytecode của phương thức chính `execute()` được duy trì ổn định dưới 2,500 bytes (thấp hơn nhiều so với ngưỡng 8,000 bytes), đảm bảo HotSpot C2 biên dịch thành mã máy tối ưu.
-
-### 2. Tối Ưu Hóa Đệ Quy Đuôi Chuẩn Mảng Phẳng (`OP_TAILCALL`)
-Khi gặp `OP_TAILCALL`:
-1. Tính toán địa chỉ hàm mới $R[A]$ và các tham số $R[A+1..A+B-1]$.
-2. Đóng toàn bộ upvalues mở của frame hiện tại: `state.closeUpvalues(base)`.
-3. Dịch chuyển đồng thời các tham số mới trên cả 3 mảng phẳng:
-   ```java
-   System.arraycopy(primitiveStack, base + a + 1, primitiveStack, base, nActualArgs);
-   System.arraycopy(typeStack,      base + a + 1, typeStack,      base, nActualArgs);
-   System.arraycopy(objectStack,    base + a + 1, objectStack,    base, nActualArgs);
-   // Dọn null vùng nhớ trên objectStack để triệt tiêu rò rỉ tham chiếu (GC Leak Prevention)
-   Arrays.fill(objectStack, base + nActualArgs, oldTop, null);
-   ```
-4. Cập nhật `closure = targetClosure`, `proto = closure.proto`, `code = proto.code`, `k = proto.constants`, `upvals = closure.upvals`.
-5. Đặt lại `pc = 0` và tiếp tục vòng lặp mà không tạo thêm bất kỳ Java call frame nào.
+### 2. Jump Backpatching
+- Control structures (`if`, `while`, `repeat`, `for`, `goto`, `break`)
+  emit `OP_JMP` with an unknown offset ($sJ = 0$).
+- Keeps a linked list of unpatched jumps (`labelList`, `pendingJumps`).
+- At the block-end label, walks the list and patches the real offset
+  into `sJ` / `sBx` via `Instruction.setsJ(code, pc, offset)`.
 
 ---
 
-## VI. Lộ Trình Triển Khai Từng Bước (Implementation Roadmap)
+## V. Execution VM Design (`BytecodeVM.java`)
 
-| Bước | Hạng mục công việc | File ảnh hưởng | Kết quả đầu ra |
+### 1. Splitting Bytecode to Respect the C2 JIT `HugeMethodLimit` (8,000 bytes)
+Per the HotSpot spec, a method whose bytecode exceeds 8,000 bytes is
+rejected by the C2 JIT. The mitigation:
+- **Hot opcodes (kept inline in the `execute` `tableswitch`)**:
+  `OP_MOVE`, `OP_LOADI`, `OP_LOADF`, `OP_LOADK`, `OP_LOADFALSE`,
+  `OP_LOADTRUE`, `OP_LOADNIL`, `OP_GETUPVAL`, `OP_SETUPVAL`, `OP_ADD`,
+  `OP_ADDI`, `OP_SUB`, `OP_MUL`, `OP_EQ`, `OP_EQI`, `OP_LT`, `OP_LE`,
+  `OP_TEST`, `OP_TESTSET`, `OP_JMP`, `OP_FORPREP`, `OP_FORLOOP`.
+- **Heavy / cold opcodes (delegated to `static` helpers)**:
+  - `executeNewTable(state, inst, code, pc, stack, base, a)` for tables
+    and `OP_EXTRAARG`.
+  - `executeSetList(state, inst, code, pc, stack, base, a)` for batch
+    fills and `OP_EXTRAARG`.
+  - `executeClosure(state, inst, proto, closure, upvals, stack, base, a)`
+    for closure creation.
+  - `executeCall(state, inst, stack, callStack, callDepth, ...)` for call
+    frames.
+  - `executeTailCall(state, inst, stack, callStack, callDepth, ...)` for
+    TCO frame reuse.
+  - `executeReturn(state, inst, stack, callStack, callDepth, ...)` for
+    frame teardown and results.
+  - `executeConcat(stack, base, a, b)` for multi-operand concatenation.
+  - `executeMetamethodBin(state, inst, op, stack, base, k, a)` for the
+    `OP_MMBIN*` fallback.
+
+> NOTE (2026-09-11): the "under 2,500 bytes" goal in the original plan
+> no longer holds — `execute()` has grown to ~9.8 KB of bytecode
+> (verified with `javap`), so C2 rejects it entirely (confirmed with
+> `-XX:+PrintCompilation`: the method is never compiled, not even OSR).
+> This is the measured root cause of the LuaJ gap (LuaJ's 3982-byte
+> `execute` does get OSR/C2-compiled). Splitting `execute()` back under
+> the 8 KB limit is the highest-leverage next step; see README.
+
+### 2. Flat-Array Tail-Call Optimization (`OP_TAILCALL`)
+On `OP_TAILCALL`:
+1. Compute the new function address $R[A]$ and arguments $R[A+1..A+B-1]$.
+2. Close all open upvalues of the current frame:
+   `state.closeUpvalues(base)`.
+3. Shift the new arguments across all 3 flat arrays:
+    ```java
+    System.arraycopy(primitiveStack, base + a + 1, primitiveStack, base, nActualArgs);
+    System.arraycopy(typeStack,      base + a + 1, typeStack,      base, nActualArgs);
+    System.arraycopy(objectStack,    base + a + 1, objectStack,    base, nActualArgs);
+    // Null the objectStack tail to prevent reference leaks for the GC
+    Arrays.fill(objectStack, base + nActualArgs, oldTop, null);
+    ```
+4. Update `closure = targetClosure`, `proto = closure.proto`,
+   `code = proto.code`, `k = proto.constants`, `upvals = closure.upvals`.
+5. Reset `pc = 0` and continue the loop with no new Java call frame.
+
+---
+
+## VI. Step-by-Step Implementation Roadmap
+
+| Step | Work item | Files involved | Output |
 | :--- | :--- | :--- | :--- |
-| **Bước 1** | Xây dựng ISA, mô hình dữ liệu lệnh và prototype | `OpCode.java`<br>`Instruction.java`<br>`LuaProto.java`<br>`UpvalueDesc.java` | 83 OpCodes sẵn sàng; các hàm pack/unpack 32-bit có unit test đạt 100% |
-| **Bước 2** | Cài đặt các cấu trúc runtime cốt lõi | `LuaClosure.java`<br>`CallInfo.java`<br>`Upvalue.java` | Closure thực thi được; cơ chế đóng/mở upvalue hoàn chỉnh |
-| **Bước 3** | Cài đặt `BytecodeCompiler` (AST to Bytecode) | `BytecodeCompiler.java`<br>`RegisterAllocator.java`<br>`JumpPatcher.java` | Biên dịch các câu lệnh & biểu thức Lua thành `LuaProto` hợp lệ |
-| **Bước 4** | Cài đặt `BytecodeVM` (Vòng lặp thực thi 83 OpCodes) | `BytecodeVM.java`<br>`VMExtensions.java` | Vòng lặp `tableswitch` hoàn thiện, hỗ trợ đầy đủ số học, bảng, rẽ nhánh, lời gọi hàm |
-| **Bước 5** | Tích hợp vào `LuaState` với cơ chế chuyển tiếp A/B | `LuaState.java`<br>`ChunkSerializer.java` | Cờ `LuaState.USE_BYTECODE_VM = true`; chạy song song kiểm tra đối chiếu |
-| **Bước 6** | Chạy bộ kiểm thử chuẩn và tối ưu hiệu năng | `OfficialSuiteEvaluationTest.java`<br>`PerformanceBenchmarkTest.java` | Vượt qua 31/31 suites và chạy `all.lua`; đo lường hiệu năng tiệm cận C |
+| **Step 1** | ISA, instruction model, prototype | `OpCode.java`<br>`Instruction.java`<br>`LuaProto.java`<br>`UpvalueDesc.java` | 83 opcodes ready; 32-bit pack/unpack unit-tested 100% |
+| **Step 2** | Core runtime structures | `LuaClosure.java`<br>`CallInfo.java`<br>`Upvalue.java` | Runnable closures; complete open/close upvalue mechanics |
+| **Step 3** | `BytecodeCompiler` (AST to bytecode) | `BytecodeCompiler.java` | Valid `LuaProto` for statements & expressions |
+| **Step 4** | `BytecodeVM` (83-opcode loop) | `BytecodeVM.java` | Complete `tableswitch` loop: arithmetic, tables, branches, calls |
+| **Step 5** | `LuaState` integration | `LuaState.java`<br>`ChunkSerializer.java` | `LuaState.USE_BYTECODE_VM = true`; side-by-side verification runs |
+| **Step 6** | Standard suite + performance | `OfficialSuiteEvaluationTest.java`<br>`PerformanceBenchmarkTest.java` | Pass the runnable suites; measure against C |
+
+> NOTE (2026-09-11): `RegisterAllocator.java`, `JumpPatcher.java`, and
+> `VMExtensions.java` named in the original plan were never created as
+> separate files (their logic lives inside `BytecodeCompiler` /
+> `BytecodeVM`); `all.lua` has never been run (it needs C test libs and
+> an interactive harness).
 
 ---
 
-## VII. Kiến Trúc Phân Lập Luồng & Coroutine Đa Máy Ảo (Concurrency & Multi-VM Isolation)
+## VII. Thread Isolation & Multi-VM Coroutine Architecture
 
-### 1. Bản Chất Kiến Trúc Trong Lua C
-Trong Lua C chuẩn:
-- Mỗi coroutine / thread khởi tạo qua `lua_newthread(L)` thực chất là một đối tượng `lua_State *L1` riêng biệt.
-- Mỗi `lua_State` sở hữu:
-  - Một mảng ngăn xếp riêng (`L1->stack`, `L1->top`, `L1->base`).
-  - Chuỗi open upvalues riêng (`L1->openupval`).
-  - Danh sách các biến cần đóng riêng (`L1->tbclist`).
-- Toàn bộ các `lua_State` này dùng chung `global_State *G` (bảng chuỗi, GC manager, bảng `_G`, registry).
+### 1. Coroutine Architecture in Lua C
+In standard Lua C:
+- Each coroutine created by `lua_newthread(L)` is a separate
+  `lua_State *L1` object.
+- Each `lua_State` owns:
+  - Its own stack array (`L1->stack`, `L1->top`, `L1->base`).
+  - Its own open-upvalue chain (`L1->openupval`).
+  - Its own to-be-closed list (`L1->tbclist`).
+- All `lua_State`s share one `global_State *G` (string table, GC
+  manager, `_G`, registry).
 
-### 2. Thiết Kế Phân Lập Ngăn Xếp Cho Luava (Virtual Thread & Multi-Coroutines)
-Trước đây, các mảng `primitiveStack`, `typeStack`, `objectStack` đặt trên instance `LuaState`. Khi coroutine con chạy trên Java Virtual Thread, nó gọi `BytecodeVM.execute` tại `base = 0` và đè vào thanh ghi của luồng cha.
+### 2. Stack Isolation Design for Luava (Virtual Threads & Coroutines)
+Previously the `primitiveStack`, `typeStack`, `objectStack` arrays lived
+on the `LuaState` instance. A child coroutine on a Java virtual thread
+called `BytecodeVM.execute` at `base = 0` and stomped the parent's
+registers.
 
-**Giải pháp đã hoàn thiện và chuẩn hóa**:
-1. **Chuyển quyền sở hữu ngăn xếp sang `LuaCoroutine`**:
-   - Mỗi `LuaCoroutine` sở hữu độc lập:
-     - `long[] primitiveStack` (256 slots mặc định, tự động tăng trưởng `ensureStackCapacity`).
+**Completed, standardized fix**:
+1. **Move stack ownership to `LuaCoroutine`**:
+   - Each `LuaCoroutine` independently owns:
+     - `long[] primitiveStack` (256 slots default, auto-grown by
+       `ensureStackCapacity`).
      - `byte[] typeStack`.
      - `LuaValue[] objectStack`.
-     - `Upvalue openUpvaluesHead` (chuỗi liên kết đơn các upvalues mở của luồng).
-     - `TbcEntry tbcHead` (chuỗi các biến `<close>` cần dọn dẹp khi thoát phạm vi).
-2. **Ủy quyền ngữ cảnh luồng trong `LuaState`**:
-   - Phương thức `LuaState.getCurrentThread()` ưu tiên lấy `LuaCoroutine.running()` từ `ThreadLocal`, nếu rỗng sẽ fallback về `mainThread`.
-   - Các API `getPrimitiveStack()`, `getTypeStack()`, `findOrCreateOpenUpvalue()`, `closeUpvalues()`, `pushTbc()`, `closeTbc()` đều ủy thác hoàn toàn về `getCurrentThread()`.
-3. **Liên kết Upvalue chính xác theo thread (`LuaCoroutine`)**:
-   - Lớp `Upvalue` lưu trữ tham chiếu trực tiếp đến `LuaCoroutine thread` tạo ra nó.
-   - Khi một coroutine truyền closure chứa open upvalue sang coroutine khác, việc đọc (`getValue`), ghi (`setValue`) hoặc đóng (`close`) luôn truy cập chính xác vào mảng ngăn xếp của coroutine gốc, triệt tiêu hoàn toàn race conditions và stack collision.
+     - `Upvalue openUpvaluesHead` (its open-upvalue chain).
+     - `TbcEntry tbcHead` (its pending `<close>` variables).
+2. **Thread-context delegation in `LuaState`**:
+   - `LuaState.getCurrentThread()` prefers `LuaCoroutine.running()` from
+     the `ThreadLocal`, falling back to `mainThread`.
+   - `getPrimitiveStack()`, `getTypeStack()`, `findOrCreateOpenUpvalue()`,
+     `closeUpvalues()`, `pushTbc()`, `closeTbc()` all delegate to
+     `getCurrentThread()`.
+3. **Thread-accurate upvalue links (`LuaCoroutine`)**:
+   - `Upvalue` keeps a direct reference to its creating `LuaCoroutine`.
+   - When a coroutine passes a closure with an open upvalue to another
+     coroutine, reads (`getValue`), writes (`setValue`), and closes
+     (`close`) always hit the origin coroutine's stack arrays —
+     eliminating races and stack collisions.
 
 ---
 
-## VIII. Tối Ưu Hóa Thư Viện Chuẩn Đi Kèm (StringLib & CoroutineLib Tuning)
+## VIII. Standard Library Tuning (StringLib & CoroutineLib)
 
-### 1. Tối Ưu Hóa `StringLib` (Zero-Intermediate Allocation)
-- **`string.len` Fast-Path**:
-  - Kiểm tra trực tiếp `if (args[0] instanceof LuaString ls) return LuaInteger.valueOf(ls.value().length());`, loại bỏ chi phí chuyển đổi chuỗi trung gian.
-- **`string.byte` Mảng Trực Tiếp (Eliminate `ArrayList`)**:
-  - Tính toán chính xác số byte cần trích xuất `int count = (int)(end - start + 1);`.
-  - Nếu `count == 1`, trả về ngay lập tức giá trị từ mảng cache `ASCII_CACHE` hoặc `LuaInteger.valueOf`.
-  - Nếu `count > 1`, cấp phát trực tiếp `LuaValue[count]`, loại bỏ toàn bộ chi phí boxing `ArrayList<LuaValue>` và `.toArray()`.
-- **`string.char` Cấp Phát 1 Lần**:
-  - Nếu số đối số bằng 1, ánh xạ trực tiếp ký tự vào `LuaString.valueOf(String.valueOf((char) val))` (hit `ASCII_CACHE` với 0 allocation).
-  - Nếu nhiều ký tự, cấp phát mảng `char[n]` và khởi tạo `new String(chars)` một lần duy nhất, loại bỏ chi phí giãn nở mảng ký tự liên tục của `StringBuilder`.
+### 1. `StringLib` (Zero Intermediate Allocation)
+- **`string.len` fast path**:
+  - Direct check `if (args[0] instanceof LuaString ls) return
+    LuaInteger.valueOf(ls.value().length());`, no intermediate conversion.
+- **`string.byte` direct array (no `ArrayList`)**:
+  - Compute the exact byte count `int count = (int)(end - start + 1);`.
+  - If `count == 1`, return immediately from the `ASCII_CACHE` array or
+    `LuaInteger.valueOf`.
+  - If `count > 1`, allocate `LuaValue[count]` directly — no
+    `ArrayList<LuaValue>` boxing plus `.toArray()`.
+- **`string.char` single allocation**:
+  - One argument maps straight to
+    `LuaString.valueOf(String.valueOf((char) val))` (`ASCII_CACHE` hit,
+    0 allocations).
+  - Multiple chars allocate one `char[n]` plus a single
+    `new String(chars)` — no repeated `StringBuilder` growth.
 
-### 2. Tối Ưu Hóa `CoroutineLib` & `LuaCoroutine`
-- **Tối Giản Handoff Args & Results**:
-  - Nhận diện `Varargs` tự nhiên qua `va.getValuesUnsafe()`, không sao chép lại mảng nếu không cần thiết.
-  - Tối ưu hóa chu trình phối hợp giữa luồng điều khiển và Virtual Thread qua `LockSupport.park()` và `unpark()`, giảm thiểu tối đa độ trễ chuyển ngữ cảnh (đạt mức 16.65 ms cho 1,000 lần switch).
+### 2. `CoroutineLib` & `LuaCoroutine`
+- **Lean handoff args & results**:
+  - Recognize natural `Varargs` via `va.getValuesUnsafe()`, no copy
+    unless needed.
+  - Coordinate control flow and virtual threads via
+    `LockSupport.park()` / `unpark()` to minimize switch latency.
 
 ---
 
-## IX. Phân Tích Chuyên Sâu: Bytecode Thanh Ghi vs Dịch Thẳng Ra JVM Bytecode (ASM / .class)
+## IX. Deep Dive: Register Bytecode vs Direct JVM Bytecode (ASM / .class)
 
-Một số lập trình viên đặt câu hỏi: *Liệu có nên xây dựng một Class API biên dịch mã Lua trực tiếp thành Java Bytecode (.class) thông qua thư viện ASM hoặc ByteBuddy để chạy trên JVM không?*
+Some developers ask: *should we compile Lua straight to Java bytecode
+(.class) via ASM or ByteBuddy and run it on the JVM?*
 
-### 1. So Sánh Kiến Trúc Kỹ Thuật
+### 1. Technical Comparison
 
-| Tiêu chí | Trình Thông Dịch Thanh Ghi (BytecodeVM + C2) | Dịch Thẳng Ra JVM Bytecode (ASM / .class) |
+| Criterion | Register Interpreter (BytecodeVM + C2) | Direct JVM Bytecode (ASM / .class) |
 | :--- | :--- | :--- |
-| **Chi phí khởi động (Cold Start)** | Cực nhanh (< 0.5 ms): AST -> Bytecode Lua là phép duyệt phẳng đơn giản. | Rất chậm (vài chục ms): Phải tạo bytecode JVM, verify class, nạp qua `ClassLoader.defineClass`. |
-| **Rò rỉ bộ nhớ (Metaspace Leak)** | Không có. Bytecode Lua nằm trên mảng heap thông thường, GC thu dọn tự nhiên. | **Cực kỳ nguy hiểm**: Mỗi closure/chunk là một Java class nạp vào Metaspace. Với script động nạp liên tục, Metaspace sẽ bị OOM. |
-| **Hỗ trợ Coroutine (`yield`)** | Tự nhiên: BytecodeVM lưu trữ `pc`, `base`, `stack` dễ dàng, kết hợp Virtual Thread không tốn công sức. | **Bế tắc**: JVM call stack không cho phép yield giữa chừng hàm Java bytecode trừ khi can thiệp bytecode weaving cực phức tạp. |
-| **Giới hạn kích cỡ hàm** | Không bị giới hạn 64KB bytecode JVM. Lua bytecode có thể dài tùy ý. | Dễ dính `MethodTooLargeException` do giới hạn 65,535 bytes của đặc tả JVM cho mỗi method. |
-| **Tối ưu hóa thời gian chạy (Peak Performance)** | **Tiệm cận native**: HotSpot C2 JIT tối ưu hóa cực mạnh vòng lặp `tableswitch`, register hoisting, escape analysis. | Tương đương hoặc chỉ nhỉnh hơn không đáng kể do kiểu động của Lua vẫn phải kiểm tra kiểu tại runtime (`invokevirtual`). |
+| **Cold start** | Very fast (< 0.5 ms): AST -> Lua bytecode is a flat walk. | Very slow (tens of ms): emit JVM bytecode, verify class, load via `ClassLoader.defineClass`. |
+| **Memory leak (Metaspace)** | None. Lua bytecode lives in ordinary heap arrays, GC'd naturally. | **Very dangerous**: each closure/chunk is a Java class in Metaspace. Dynamically loaded scripts OOM it. |
+| **Coroutine (`yield`) support** | Natural: BytecodeVM stores `pc`, `base`, `stack` easily, pairs with virtual threads. | **Dead end**: the JVM call stack cannot yield mid-method without extremely complex bytecode weaving. |
+| **Function size limit** | No 64 KB JVM limit. Lua bytecode can be arbitrarily long. | Hits `MethodTooLargeException` from the 65,535-byte per-method JVM limit. |
+| **Peak performance** | **Bounded by dispatch + JIT**: C2 optimizes the `tableswitch` loop, register hoisting, escape analysis — but only if the method stays compilable (see NOTE in section V). | Barely better, since dynamic Lua types still need runtime checks (`invokevirtual`). |
 
-### 2. Kết Luận Kiến Trúc
-Việc dịch runtime ra Java `.class` là một **anti-pattern** cho các ngôn ngữ động hỗ trợ coroutine như Lua. Kiến trúc **Register-based Bytecode VM kết hợp HotSpot C2 JIT** hiện tại là con đường chuẩn mực, an toàn và tối ưu nhất cho Luava. 
+### 2. Architectural Conclusion
+Compiling the runtime to Java `.class` is an **anti-pattern** for dynamic,
+coroutine-supporting languages like Lua. The **register-based bytecode VM
+plus HotSpot C2 JIT** remains the standard, safe, optimal path for Luava.
 
-Dịch ra JVM `.class` chỉ nên được cân nhắc như một công cụ biên dịch AOT độc lập ngoài dòng (`luava-aot` offline CLI compiler) nếu cần đóng gói các package tĩnh cho Android hoặc GraalVM Native Image.
+Emitting JVM `.class` should only be considered as an offline AOT tool
+(`luava-aot` CLI) for packaging static bundles for Android or GraalVM
+Native Image.
 
 ---
 
-## X. Lộ Trình Chuyển Đổi Triệt Để Thay Thế Hoàn Toàn AST Interpreter (Phased AST Retirement)
+## X. Phased AST Retirement (Replace the AST Interpreter Entirely)
 
-Để giải phóng mã nguồn, loại bỏ hoàn toàn các lớp kỹ thuật cũ và biến Bytecode VM thành engine thực thi duy nhất của Luava, lộ trình 4 bước được thiết lập như sau:
+To free the codebase, remove the legacy layers, and make the bytecode VM
+the sole Luava engine, this 4-step plan was established:
 
-### Giai Đoạn 1: Mở Rộng Bộ Test Bytecode & Bật Mặc Định (Tuần Hiện Tại)
-1. **Kiểm Thử Toàn Diện Trên Bytecode**:
-   - Chuyển `LuaState.USE_BYTECODE_VM = true` làm giá trị mặc định.
-   - Chạy toàn bộ 31 bộ test PUC-Rio Lua 5.4.9 (`OfficialSuiteEvaluationTest`) dưới chế độ Bytecode VM.
-   - Khắc phục các edge case về error message format, traceback inspection (`debug.getinfo`), và hook line events nếu có khác biệt so với AST.
+### Phase 1: Expand Bytecode Tests & Default On
+1. **Full Bytecode Coverage**:
+   - Default `LuaState.USE_BYTECODE_VM = true`.
+   - Run all 31 PUC-Rio Lua 5.4.9 suites (`OfficialSuiteEvaluationTest`)
+     under the bytecode VM.
+   - Fix edge cases in error message format, traceback inspection
+     (`debug.getinfo`), and hook line events vs the AST engine.
 
-### Giai Đoạn 2: Đồng Bộ Hóa Debugger & Profiler Lên Bytecode
+### Phase 2: Sync Debugger & Profiler to Bytecode
 1. **Line Mapping & Debug Info**:
-   - `LuaProto.lineInfo`: Ánh xạ từng địa chỉ lệnh `pc` về số dòng mã nguồn thực tế.
-   - Hoàn thiện `DebugLib.java` để đọc frame thông tin từ `CallInfo` của BytecodeVM thay vì dựa vào `CallStack` cũ của Interpreter.
+   - `LuaProto.lineInfo`: map each `pc` to the real source line.
+   - Finish `DebugLib.java` to read frame info from the BytecodeVM
+     `CallInfo` instead of the old interpreter `CallStack`.
 
-### Giai Đoạn 3: Đánh Dấu `@Deprecated` Và Cô Lập AST Interpreter
-1. Đánh dấu `@Deprecated(forRemoval = true)` lên:
+### Phase 3: `@Deprecated` and Isolate the AST Interpreter
+1. Mark `@Deprecated(forRemoval = true)`:
    - `org.luava.runtime.eval.Interpreter`
    - `org.luava.runtime.eval.Environment`
    - `org.luava.runtime.eval.VariableSlot`
-2. Chuyển tiếp toàn bộ các phương thức `LuaState.eval(...)`, `LuaState.compile(...)` sang `BytecodeCompiler.compile` và `LuaClosure`.
+2. Forward `LuaState.eval(...)` / `LuaState.compile(...)` to
+   `BytecodeCompiler.compile` and `LuaClosure`.
 
-### Giai Đoạn 4: Xóa Bỏ Hoàn Toàn AST Execution Engine (Clean Slate)
-1. Xóa bỏ các tệp tin thừa:
-   - `Interpreter.java` (~1,500 dòng AST visitor logic).
-   - `Environment.java` (~200 dòng quản lý map biến).
+### Phase 4: Remove the AST Execution Engine (Clean Slate)
+1. Delete leftover files:
+   - `Interpreter.java` (~1,500 lines of AST visitor logic).
+   - `Environment.java` (~200 lines of variable-map management).
    - `VariableSlot.java`.
-2. Đơn giản hóa `Upvalue.java`: Loại bỏ hoàn toàn các trường và constructor liên quan đến `VariableSlot` và `Environment`, chỉ giữ lại cơ chế unboxed nguyên thủy cho `BytecodeVM`.
-3. Kiểm tra lại toàn bộ build Maven và cam kết bảo toàn 100% test suite xanh.
+2. Simplify `Upvalue.java`: drop all `VariableSlot` / `Environment`
+   fields and constructors, keep only the unboxed primitive path for
+   `BytecodeVM`.
+3. Re-run the full Maven build and keep 100% of the suite green.
 
+> NOTE (2026-09-11): phases 1–4 are DONE (VM-only execution). The
+> AST-walking `Interpreter.java` / `VariableSlot.java` are gone;
+> `Environment.java` remains as the call-frame environment structure
+> (used by `CallStack` and `DebugLib`), not as an execution engine.
+
+---
+
+## XI. Plan: Beat LuaJ (Get the Dispatch Loop JIT-Compiled)
+
+### 1. Why This Is the Whole Game
+Measured on one machine, warmed 1M-iteration integer loop, 30 reps:
+
+| Engine | Per run | Dispatch loop size | JIT status (`-XX:+PrintCompilation`) |
+| :--- | :--- | :--- | :--- |
+| PUC Lua (C) | ~0.8 ms | n/a | n/a |
+| LuaJ (`LuaClosure.execute`) | ~70 ms | 3982 bytes | OSR + C2 compiled |
+| Luava (`BytecodeVM.execute`) | ~378 ms | **9799 bytes** | **never compiled, not even OSR** |
+
+HotSpot refuses any method over 8,000 bytes (`DontCompileHugeMethods =
+true` default): Luava's loop runs interpreted forever, LuaJ's does not.
+That single fact explains the 5.4x gap — no amount of micro-opts on an
+uncompiled loop can close it. The project goal is therefore mechanical
+and verifiable: **get the loop under 8 KB (target ≤ 7 KB for margin) so
+C2 compiles it, then confirm Luava's unboxed triple-stack beats LuaJ's
+boxed `LuaInteger`/`LuaDouble` model.** If the compiled loop still
+trails LuaJ, the plan's gates force a stop-and-rethink instead of blind
+tuning.
+
+Per-case bytecode sizes (via `javap -c -l`, LineNumberTable mapping):
+
+| Region (`BytecodeVM.java`) | Source lines | ~Bytes | Verdict |
+| :--- | :--- | :--- | :--- |
+| `OP_TAILCALL` (715–888) | 173 | ~1521 | EXTRACT (biggest, coldest) |
+| `OP_CALL` (598–715) | 117 | ~952 | Keep hot Lua path inline; extract cold arms |
+| Loop head (266–326: fetch, mirror, hooks, decode) | 60 | ~415 | Extract hook polling (armed-only anyway) |
+| `OP_ADD`/`SUB`/`MUL` int+float fast paths | ~22 each | ~259 each | KEEP inline (the benchmark loop lives here) |
+| Comparisons (`EQ`/`LT`/`LE` …) | ~20 each | ~230 each | Keep unless still over budget |
+| `OP_RETURN`/`RETURN0`/`RETURN1` (888–1025) | ~137 | ~1000 est. | EXTRACT second wave if needed |
+| `catch` fault decoration + `finally` | — | ~500 est. | Extract decoration to helper |
+
+Budget: 9799 → must remove ≥ 2300 bytes → target `runLoop` ≤ 7000.
+
+### 2. Design: `VmContext` (Loop-Carried State Object)
+`OP_CALL` / `OP_TAILCALL` / `OP_RETURN` mutate ~15 loop locals (`pc`,
+`base`, `top`, `callDepth`, `closure`, `proto`, `code`, `k`, `upvals`,
+`varargs`, stack arrays, `oldpc`, `varargPrepRan`), so they cannot move
+to helpers that only take values. The fix is one small mutable holder:
+
+```java
+final class VmContext {
+    int pc, base, top, callDepth, oldpc;
+    boolean varargPrepRan;
+    int scratch0;                       // in/out int for tiny helpers
+    LuaClosure closure;
+    LuaProto proto;
+    int[] code;
+    LuaValue[] k;
+    Upvalue[] upvals;
+    LuaValue[] varargs;
+    CallInfo[] callStack;
+    long[] pStack; byte[] tStack; LuaValue[] oStack;
+}
+```
+
+- `execute()` keeps setup/teardown (`try`/`catch`/`finally`, initial
+  frame push) and delegates to `runLoop(state, ctx)`.
+- Big cases become `static` helpers taking `(state, ctx, a, inst)` and
+  mutating `ctx` fields directly. Per-case temporaries (`funcIdx`,
+  `nActualArgs`, `func`) stay helper-locals; only loop-carried state
+  moves into `ctx`.
+- The duplicated `__call`-resolution loop in `OP_CALL`/`OP_TAILCALL`
+  becomes one helper: `resolveCallable(state, ctx, funcIdx, nArgs)`
+  returning the `LuaFunction`, with the adjusted arg count via
+  `ctx.scratch0`.
+- Hook polling becomes `pollHooks(ctx, co, instPc, op)` — computes
+  `curLine`/`curFrame` and stamps frames only when armed, so the hot
+  path keeps exactly one predictable `HOOKS_ARMED` boolean check.
+- `catch` fault decoration (`attachBytecodeDesc` + message rewrite)
+  becomes `decorateFault(le, ctx, faultPc)`; the `finally` (pop to
+  `initialDepth`, close upvalues, error mapping) stays in `execute()`.
+- Why this stays fast: `ctx` is allocated once per `execute()` and
+  never escapes. After the split every method is C2-compilable, and C2
+  scalar-replaces (or at worst keeps as cheap field accesses) a
+  non-escaping context. Even imperfect scalar replacement beats running
+  interpreted by an order of magnitude. The zero-call arith loop is
+  unaffected by helper-call overhead by construction.
+
+### 3. Phases and Gates
+Every phase must pass ALL FOUR gates or be reverted:
+
+- **G1 – size**: `javap -c -p BytecodeVM | max offset of runLoop ≤ 7000`.
+- **G2 – compiled**: `-XX:+PrintCompilation` shows `runLoop` with `%`
+  (OSR) and `!`/plain (C2), i.e. no longer silently interpreted.
+- **G3 – correct**: 31/31 official suites + 54 unit tests green
+  (assertions active since `3706b5b`), plus byte-identical output on the
+  3-engine complex script (`/tmp/opencode/complex.lua`).
+- **G4 – faster**: warmed `bench1m.lua` ×30 vs the LuaJ mark (~70 ms).
+
+Phases:
+
+- **Phase 1a – context + cold extraction, no behavior change.**
+  Introduce `VmContext`, move the loop to `runLoop`, extract
+  `resolveCallable` + `pollHooks` + `decorateFault`. Expect ~1500–2000
+  bytes saved. Gates G1–G4 (G4 may only partially improve here).
+- **Phase 1b – extract `OP_TAILCALL` (~1500 B).**
+  Biggest single chunk and the coldest of the big three (typical code
+  does orders of magnitude fewer tailcalls than calls/returns).
+  Re-measure; if G1 passes and G4 shows Luava < 70 ms, STOP — do not
+  extract further.
+- **Phase 1c – only if still over budget: extract the `OP_RETURN` trio
+  (~1000 B) and/or `OP_CALL` cold arms (`__call` now shared;
+  error paths).** Keep the Lua-closure fast path of `OP_CALL` inline —
+  call-heavy workloads (fib) are sensitive to it.
+- **Phase 2 – only if compiled yet still slower than LuaJ.**
+  Profile the *compiled* loop with JFR and attack the top frame (likely
+  call path or table access), one change + A/B at a time. No speculative
+  rewrites.
+
+### 4. Explicit Non-Goals and Risks
+- NOT a JIT backend, NOT JVM-bytecode emission (rejected in section IX).
+- NOT splitting by opcode range into two loops (duplicates dispatch).
+- Risk: C2 fails to scalar-replace `ctx` → field-access overhead.
+  Accepted: still compiled, still far faster than interpreted; G4 is the
+  judge.
+- Risk: semantic drift during the move. Mitigated by G3 plus the
+  negative-tested harness (empty-run and sabotage guards) — any behavior
+  change reddens the build.
+- Stop rule: if Phase 1c passes G1–G3 but G4 still trails LuaJ,
+  do NOT keep extracting; escalate to Phase 2 profiling data first.

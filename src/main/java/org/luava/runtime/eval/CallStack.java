@@ -208,7 +208,10 @@ public final class CallStack {
     }
 
     public static void setNextTransfer(int ftransfer, int ntransfer, org.luava.runtime.LuaValue[] cArgs, Environment env) {
-        CallStackState state = currentState();
+        setNextTransfer(currentState(), ftransfer, ntransfer, cArgs, env);
+    }
+
+    public static void setNextTransfer(CallStackState state, int ftransfer, int ntransfer, org.luava.runtime.LuaValue[] cArgs, Environment env) {
         state.nextFtransfer = ftransfer;
         state.nextNtransfer = ntransfer;
         state.nextCArgs = cArgs;
@@ -219,8 +222,15 @@ public final class CallStack {
         setNextTransfer(ftransfer, ntransfer, cArgs, null);
     }
 
+    public static void setNextTransfer(CallStackState state, int ftransfer, int ntransfer, org.luava.runtime.LuaValue[] cArgs) {
+        setNextTransfer(state, ftransfer, ntransfer, cArgs, null);
+    }
+
     public static void setNextVmFrame(org.luava.runtime.LuaState vmState, int baseIndex, int funcIndex, org.luava.runtime.LuaValue[] varargs, int pc) {
-        CallStackState state = currentState();
+        setNextVmFrame(currentState(), vmState, baseIndex, funcIndex, varargs, pc);
+    }
+
+    public static void setNextVmFrame(CallStackState state, org.luava.runtime.LuaState vmState, int baseIndex, int funcIndex, org.luava.runtime.LuaValue[] varargs, int pc) {
         state.nextVmState = vmState;
         state.nextBaseIndex = baseIndex;
         state.nextFuncIndex = funcIndex;
@@ -307,11 +317,28 @@ public final class CallStack {
     }
 
     public static void push(LuaFunction fn, String name, String namewhat, int line, boolean isMethod, boolean isMetamethod) {
-        push(fn, name, namewhat, line, isMethod, isMetamethod, false);
+        push(fn, name, namewhat, line, isMethod, isMetamethod, false, currentState(), LuaCoroutine.running());
+    }
+
+    /**
+     * ThreadLocal-free 6-arg {@link #push}: non-tail call on explicit state.
+     */
+    public static void push(LuaFunction fn, String name, String namewhat, int line, boolean isMethod, boolean isMetamethod,
+                            CallStackState state, LuaCoroutine cur) {
+        push(fn, name, namewhat, line, isMethod, isMetamethod, false, state, cur);
     }
 
     public static void push(LuaFunction fn, String name, String namewhat, int line, boolean isMethod, boolean isMetamethod, boolean isTailCall) {
-        CallStackState state = currentState();
+        push(fn, name, namewhat, line, isMethod, isMetamethod, isTailCall, currentState(), LuaCoroutine.running());
+    }
+
+    /**
+     * ThreadLocal-free {@link #push(LuaFunction, String, String, int, boolean, boolean, boolean)}:
+     * {@code state} and {@code cur} must be this thread's current state and
+     * running coroutine (cur may be null, same null-guard semantics).
+     */
+    public static void push(LuaFunction fn, String name, String namewhat, int line, boolean isMethod, boolean isMetamethod, boolean isTailCall,
+                            CallStackState state, LuaCoroutine cur) {
         int top = state.top;
         if (isHandlingError()) {
             if (top >= MAX_CALL_DEPTH + EXTRA_STACK_SLOTS) {
@@ -382,7 +409,6 @@ public final class CallStack {
         state.nextMetamethod = false;
         state.nextMethod = false;
         state.top = top + 1;
-        LuaCoroutine cur = LuaCoroutine.running();
         if (cur != null) {
             cur.setLastLine(-1);
             if (isTailCall) {
@@ -421,7 +447,14 @@ public final class CallStack {
     }
 
     public static void replaceTailCall(LuaFunction fn, String name, String namewhat, int line, boolean isMethod, boolean isMetamethod) {
-        CallStackState state = currentState();
+        replaceTailCall(fn, name, namewhat, line, isMethod, isMetamethod, currentState(), LuaCoroutine.running());
+    }
+
+    /**
+     * ThreadLocal-free {@link #replaceTailCall(LuaFunction, String, String, int, boolean, boolean)}.
+     */
+    public static void replaceTailCall(LuaFunction fn, String name, String namewhat, int line, boolean isMethod, boolean isMetamethod,
+                                       CallStackState state, LuaCoroutine cur) {
         if (state.top > 0) {
             String overrideName = state.nextName;
             String overrideNamewhat = state.nextNamewhat;
@@ -467,7 +500,6 @@ public final class CallStack {
             state.nextCArgs = null;
             state.nextEnv = null;
 
-            LuaCoroutine cur = LuaCoroutine.running();
             if (cur != null) {
                 cur.setLastLine(-1);
                 cur.fireTailCallHook();
@@ -510,14 +542,28 @@ public final class CallStack {
     }
 
     public static Frame topFrame() {
-        CallStackState state = currentState();
+        return topFrame(currentState());
+    }
+
+    /**
+     * ThreadLocal-free variant: the VM passes its hoisted state + coroutine
+     * (identical objects {@code currentState()} / {@code running()} would
+     * return on this thread). Behavior is exactly the static version's.
+     */
+    public static Frame topFrame(CallStackState state) {
         return (state != null && state.top > 0) ? state.stack[state.top - 1] : null;
     }
 
     public static void pop() {
-        CallStackState state = currentState();
+        pop(currentState(), LuaCoroutine.running());
+    }
+
+    /**
+     * ThreadLocal-free {@link #pop()}: {@code cur} must be the running
+     * coroutine of this thread (may be null, same null-guard semantics).
+     */
+    public static void pop(CallStackState state, LuaCoroutine cur) {
         if (state.top > 0) {
-            LuaCoroutine cur = LuaCoroutine.running();
             if (cur != null) {
                 cur.fireReturnHook();
             }
