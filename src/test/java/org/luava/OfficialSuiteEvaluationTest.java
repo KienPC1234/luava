@@ -89,12 +89,22 @@ public class OfficialSuiteEvaluationTest {
         System.out.println("\n=== LUA 5.4.9 OFFICIAL TEST SUITE PROGRESS ===");
         int passed = 0;
         int failed = 0;
+        java.util.List<String> failures = new java.util.ArrayList<>();
         for (var entry : results.entrySet()) {
             boolean ok = "PASSED".equals(entry.getValue());
-            if (ok) passed++; else failed++;
+            if (ok) passed++; else {
+                failed++;
+                failures.add(entry.getKey() + " -> " + entry.getValue());
+            }
             System.out.printf("%-20s | %s\n", entry.getKey(), entry.getValue());
         }
         System.out.printf("\nTOTAL: %d, PASSED: %d, FAILED: %d\n\n", results.size(), passed, failed);
+        // NOTE: heavy.lua (intentional memory-overflow stress) and all.lua
+        // (requires C libs + interactive _T harness) are excluded by design.
+        org.junit.jupiter.api.Assertions.assertFalse(results.isEmpty(),
+                "Official suite ran 0 files: harness misconfiguration hides regressions");
+        org.junit.jupiter.api.Assertions.assertEquals(0, failed,
+                "Official Lua 5.4.9 suites failed: " + failures);
     }
 
 }

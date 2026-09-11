@@ -18,7 +18,7 @@ public class BytecodeVMTest {
 
     @AfterEach
     void tearDown() {
-        LuaState.USE_BYTECODE_VM = false;
+        LuaState.USE_BYTECODE_VM = true;
     }
 
     @Test
