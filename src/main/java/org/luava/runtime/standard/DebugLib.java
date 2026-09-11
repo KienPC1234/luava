@@ -30,13 +30,18 @@ public final class DebugLib {
     }
 
     public static void open(org.luava.runtime.LuaState luaState, LuaTable globals) {
+        LuaTable debug = new LuaTable();
+        fillInto(debug, luaState, globals);
+        globals.rawset(LuaString.valueOf("debug"), debug);
+    }
+
+    public static void fillInto(LuaTable debug, org.luava.runtime.LuaState luaState, LuaTable globals) {
         LuaTable registry = luaState != null ? luaState.getRegistry() : new LuaTable();
         LuaTable hookTable = new LuaTable();
         hookTable.rawset(LuaString.valueOf("__mode"), LuaString.valueOf("k"));
         hookTable.setMetatable(hookTable);
         registry.rawset(LuaString.valueOf("_HOOKKEY"), hookTable);
 
-        LuaTable debug = new LuaTable();
         debug.rawset(LuaString.valueOf("getregistry"), LuaFunction.of(args -> registry));
 
         debug.rawset(LuaString.valueOf("getinfo"), LuaFunction.of(args -> {
@@ -685,8 +690,6 @@ public final class DebugLib {
             if (hkT != null) hkT.rawset(target, hook);
             return LuaNil.NIL;
         }));
-
-        globals.rawset(LuaString.valueOf("debug"), debug);
     }
 
     private static void formatTracebackFrame(StringBuilder sb, org.luava.runtime.eval.CallStack.Frame frame) {

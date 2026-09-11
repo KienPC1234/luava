@@ -32,6 +32,11 @@ public final class TableLib {
 
     public static void open(LuaTable globals) {
         LuaTable tableMod = new LuaTable();
+        fillInto(tableMod, globals);
+        globals.rawset(LuaString.valueOf("table"), tableMod);
+    }
+
+    public static void fillInto(LuaTable tableMod, LuaTable globals) {
 
         tableMod.rawset(LuaString.valueOf("insert"), LuaFunction.of(args -> {
             if (args.length < 2 || args.length > 3) {
@@ -218,8 +223,6 @@ public final class TableLib {
             }
             return LuaNil.NIL;
         }));
-
-        globals.rawset(LuaString.valueOf("table"), tableMod);
     }
 
     // ---- Quicksort ported from PUC-Rio ltablib.c (1-based indices) ----

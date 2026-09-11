@@ -23,6 +23,11 @@ public final class MathLib {
 
     public static void open(LuaTable globals) {
         LuaTable math = new LuaTable();
+        fillInto(math, globals);
+        globals.rawset(LuaString.valueOf("math"), math);
+    }
+
+    public static void fillInto(LuaTable math, LuaTable globals) {
 
         math.rawset(LuaString.valueOf("pi"), LuaFloat.valueOf(Math.PI));
         math.rawset(LuaString.valueOf("huge"), LuaFloat.valueOf(Double.POSITIVE_INFINITY));
@@ -208,8 +213,6 @@ public final class MathLib {
             setseed(rngState, s1, s2);
             return Varargs.of(LuaInteger.valueOf(s1), LuaInteger.valueOf(s2));
         }));
-
-        globals.rawset(LuaString.valueOf("math"), math);
     }
 
     private static double checkNumber(LuaValue[] args, int index, String funcName) {

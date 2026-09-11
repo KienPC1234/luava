@@ -25,6 +25,12 @@ public final class JavaInteropLib {
 
     public static void open(LuaTable globals) {
         LuaTable javaMod = new LuaTable();
+        fillInto(javaMod, globals);
+        globals.rawset(LuaString.valueOf("java"), javaMod);
+        globals.rawset(LuaString.valueOf("luajava"), javaMod);
+    }
+
+    public static void fillInto(LuaTable javaMod, LuaTable globals) {
 
         // 1. java.import / java.bindClass
         LuaFunction importFn = LuaFunction.of(args -> {
@@ -183,8 +189,5 @@ public final class JavaInteropLib {
 
             return LuaBoolean.valueOf(targetClass.isInstance(inst));
         }));
-
-        globals.rawset(LuaString.valueOf("java"), javaMod);
-        globals.rawset(LuaString.valueOf("luajava"), javaMod);
     }
 }
