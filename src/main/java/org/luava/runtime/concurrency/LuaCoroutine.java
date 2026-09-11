@@ -39,6 +39,60 @@ public final class LuaCoroutine extends LuaValue {
 
     private static final ThreadLocal<LuaCoroutine> CURRENT_COROUTINE = new ThreadLocal<>();
 
+    /**
+     * Global hook-armed flag for the VM hot path. True when at least one
+     * coroutine has an active hook. The interpreter loop checks this single
+     * predictable field instead of ThreadLocal + config per instruction.
+     * Biased to stay true (only perf cost); never false while a hook exists.
+     */
+    public static volatile boolean HOOKS_ARMED = false;
+    private static int hookArmedCount = 0;
+    private boolean hookArmedCounted = false;
+
+    private static void updateHookArmed(boolean wasActive, boolean nowActive) {
+        if (wasActive == nowActive) return;
+        synchronized (LuaCoroutine.class) {
+            if (nowActive) {
+                hookArmedCount++;
+            } else if (hookArmedCount > 0) {
+                hookArmedCount--;
+            }
+            HOOKS_ARMED = hookArmedCount > 0;
+        }
+    }
+
+    /** Disarm hook counting (idempotent; safe to call on death/close). */
+    private void disarmHookCounted() {
+        if (hookArmedCounted) {
+            hookArmedCounted = false;
+            synchronized (LuaCoroutine.class) {
+                if (hookArmedCount > 0) hookArmedCount--;
+                HOOKS_ARMED = hookArmedCount > 0;
+            }
+        }
+    }
+
+    /**
+     * Mirror of the VM program counter, written once per instruction by
+     * {@code BytecodeVM.execute} (plain field: same-thread for running reads,
+     * park/unpark happens-before edge for suspended reads). Debug readers
+     * (getinfo/traceback/getlocal) sync the top frame from this on demand
+     * instead of the loop syncing every frame eagerly.
+     */
+    public int vmPcMirror = -1;
+
+    /** Refresh the top frame's pc/line from {@link #vmPcMirror} (Lua frames only). */
+    public void syncTopFrameFromMirror() {
+        int mpc = vmPcMirror;
+        if (mpc < 0) return;
+        CallStack.Frame f = getCallStackState().getFrame(0);
+        if (f == null || !(f.function instanceof org.luava.runtime.bytecode.LuaClosure cl)) return;
+        f.pc = mpc;
+        if (cl.proto != null && cl.proto.lineInfo != null && mpc < cl.proto.lineInfo.length) {
+            f.line = cl.proto.lineInfo[mpc];
+        }
+    }
+
     private final LuaFunction entryFunction;
     private volatile Thread resumerThread;
     private volatile Thread virtualThread;
@@ -154,6 +208,7 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public void setHook(LuaValue hook, String mask, int count) {
+        boolean wasActive = hookArmedCounted;
         hookConfig.hook = (hook != null && !hook.isNil()) ? hook : LuaNil.NIL;
         hookConfig.mask = mask != null ? mask : "";
         hookConfig.count = Math.max(0, count);
@@ -162,6 +217,10 @@ public final class LuaCoroutine extends LuaValue {
         hookConfig.hookLine = hookConfig.mask.contains("l");
         hookConfig.countSoFar = 0;
         hookConfig.lastLine = -1;
+        boolean nowActive = !hookConfig.hook.isNil()
+                && (hookConfig.hookCall || hookConfig.hookReturn || hookConfig.hookLine || hookConfig.count > 0);
+        hookArmedCounted = nowActive;
+        updateHookArmed(wasActive, nowActive);
 
         CallStack.CallStackState state = getCallStackState();
         if (state != null && state.top > 1) {
@@ -173,6 +232,7 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public void clearHook() {
+        disarmHookCounted();
         hookConfig.hook = LuaNil.NIL;
         hookConfig.mask = "";
         hookConfig.count = 0;
@@ -431,6 +491,7 @@ public final class LuaCoroutine extends LuaValue {
                         handoffResult = new LuaValue[]{errVal};
                         status = Status.DEAD;
                     } finally {
+                        disarmHookCounted();
                         CURRENT_COROUTINE.remove();
                         LockSupport.unpark(resumerThread);
                     }
@@ -514,6 +575,7 @@ public final class LuaCoroutine extends LuaValue {
 
             if (virtualThread == null) {
                 status = Status.DEAD;
+                disarmHookCounted();
                 return new LuaValue[]{LuaValue.valueOf(true)};
             }
 

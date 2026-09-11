@@ -183,23 +183,42 @@ public final class BytecodeVM {
         int oldpc = -1;
         boolean varargPrepRan = false;
         Throwable caughtException = null;
+        // Hoisted: coroutine is constant for the whole execute() invocation
+        // (resume continues the same thread/CURRENT; nested coroutines get
+        // their own execute()). Saves a ThreadLocal lookup per instruction.
+        LuaCoroutine co0 = LuaCoroutine.running();
 
         try {
             while (true) {
                 int instPc = pc;
-                int curLine = (proto.lineInfo != null && instPc < proto.lineInfo.length) ? proto.lineInfo[instPc] : -1;
-                CallStack.Frame curFrame = CallStack.topFrame();
-                if (curFrame != null) {
-                    curFrame.pc = instPc;
-                    curFrame.line = curLine;
+                // Lazy frame sync: mirror pc for on-demand debug readers
+                // (getinfo/traceback/getlocal sync the top frame from this).
+                // Replaces per-instruction topFrame() + lineInfo lookup.
+                if (co0 != null) {
+                    co0.vmPcMirror = instPc;
+                } else {
+                    int curLineSlow = (proto.lineInfo != null && instPc < proto.lineInfo.length) ? proto.lineInfo[instPc] : -1;
+                    CallStack.Frame curFrameSlow = CallStack.topFrame();
+                    if (curFrameSlow != null) {
+                        curFrameSlow.pc = instPc;
+                        curFrameSlow.line = curLineSlow;
+                    }
                 }
 
                 int inst = code[pc++];
                 int op = (inst >>> Instruction.POS_OP) & Instruction.MASK_OP;
                 int a = (inst >>> Instruction.POS_A) & Instruction.MASK_A;
 
-                LuaCoroutine co = LuaCoroutine.running();
+                // Fast path: single predictable global check instead of
+                // ThreadLocal + config lookups per instruction. HOOKS_ARMED is
+                // biased to stay true (perf-only cost); hooks still verified
+                // per-coroutine inside.
+                LuaCoroutine co = LuaCoroutine.HOOKS_ARMED ? co0 : null;
                 if (co != null) {
+                    // Hooks armed: compute line/frame lazily (once per
+                    // instruction only while a hook is actually installed).
+                    int curLine = (proto.lineInfo != null && instPc < proto.lineInfo.length) ? proto.lineInfo[instPc] : -1;
+                    CallStack.Frame curFrame = CallStack.topFrame();
                     LuaCoroutine.HookConfig hc = co.getHookConfig();
                     if (!hc.hook.isNil() && !hc.inHook) {
                         // OP_CLEANUP is compiler-internal (dead-slot clearing):
@@ -208,6 +227,11 @@ public final class BytecodeVM {
                         // the loop's line, so first-event sequencing is intact).
                         boolean isCleanup = (op == OpCode.OP_CLEANUP);
                         if (hc.count > 0 && !isCleanup) {
+                            // Stamp the frame: hook observers (getlocal/traceback) read it.
+                            if (curFrame != null) {
+                                curFrame.pc = instPc;
+                                curFrame.line = curLine;
+                            }
                             co.fireCountHook();
                         }
                         if (hc.hookLine) {
@@ -221,6 +245,11 @@ public final class BytecodeVM {
                                         ? proto.lineInfo[oldpc] : -1;
                                 if (varargPrepRan || oldpc < 0 || instPc <= oldpc || curLine != oldLine) {
                                     if (curLine > 0) {
+                                        // Stamp the frame: hook observers (getlocal/traceback) read it.
+                                        if (curFrame != null) {
+                                            curFrame.pc = instPc;
+                                            curFrame.line = curLine;
+                                        }
                                         co.fireLineHookDirect(curLine, curFrame);
                                     }
                                     varargPrepRan = false;
@@ -604,6 +633,9 @@ public final class BytecodeVM {
                         CallStack.Frame callerFrame = CallStack.topFrame();
                         if (callerFrame != null) {
                             callerFrame.pc = pc - 1;
+                            if (proto.lineInfo != null && pc - 1 >= 0 && pc - 1 < proto.lineInfo.length) {
+                                callerFrame.line = proto.lineInfo[pc - 1];
+                            }
                         }
                         if (callDepth >= callStack.length) {
                             callStack = expandCallStack(callStack);
@@ -774,6 +806,11 @@ public final class BytecodeVM {
 
                         int callLine = (proto.lineInfo != null && pc - 1 < proto.lineInfo.length) ? proto.lineInfo[pc - 1] : -1;
                         if (callLine > 0) CallStack.setLine(callLine);
+                        CallStack.Frame callerFrameExt = CallStack.topFrame();
+                        if (callerFrameExt != null) {
+                            callerFrameExt.pc = pc - 1;
+                            if (callLine > 0) callerFrameExt.line = callLine;
+                        }
                         CallStack.CallStackState csState = CallStack.currentState();
                         String resolvedName = csState.nextName;
                         String namewhat = csState.nextNamewhat;
@@ -853,6 +890,11 @@ public final class BytecodeVM {
                     state.closeTbc(base, null);
                     CallStack.Frame retFrame = CallStack.topFrame();
                     if (retFrame != null) {
+                        // Lazy-sync: stamp return site (locals scope + hooks observe this frame).
+                        retFrame.pc = instPc;
+                        if (proto.lineInfo != null && instPc < proto.lineInfo.length) {
+                            retFrame.line = proto.lineInfo[instPc];
+                        }
                         retFrame.retValues = new LuaValue[0];
                         retFrame.ftransfer = 1;
                         retFrame.ntransfer = 0;
@@ -890,6 +932,11 @@ public final class BytecodeVM {
                     LuaValue ret = getLuaValue(pStack, tStack, oStack, base + a);
                     CallStack.Frame retFrame = CallStack.topFrame();
                     if (retFrame != null) {
+                        // Lazy-sync: stamp return site (locals scope + hooks observe this frame).
+                        retFrame.pc = instPc;
+                        if (proto.lineInfo != null && instPc < proto.lineInfo.length) {
+                            retFrame.line = proto.lineInfo[instPc];
+                        }
                         retFrame.retValues = new LuaValue[]{ret};
                         // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
                         retFrame.ftransfer = a + 1;
@@ -935,6 +982,11 @@ public final class BytecodeVM {
                     }
                     CallStack.Frame retFrame = CallStack.topFrame();
                     if (retFrame != null) {
+                        // Lazy-sync: stamp return site (locals scope + hooks observe this frame).
+                        retFrame.pc = instPc;
+                        if (proto.lineInfo != null && instPc < proto.lineInfo.length) {
+                            retFrame.line = proto.lineInfo[instPc];
+                        }
                         retFrame.retValues = retVals;
                         // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
                         retFrame.ftransfer = a + 1;
@@ -1020,7 +1072,18 @@ public final class BytecodeVM {
                     state.pushTbc(base + a + 3, val, "(for state)");
                     pc += bx;
                 }
-                case OpCode.OP_TFORCALL -> executeTForCall(pStack, tStack, oStack, base, a, inst);
+                case OpCode.OP_TFORCALL -> {
+                    // Stamp the generic-for frame (iterator runs arbitrary
+                    // code that may read this frame via traceback/getinfo).
+                    CallStack.Frame tforCaller = CallStack.topFrame();
+                    if (tforCaller != null) {
+                        tforCaller.pc = instPc;
+                        if (proto.lineInfo != null && instPc < proto.lineInfo.length) {
+                            tforCaller.line = proto.lineInfo[instPc];
+                        }
+                    }
+                    executeTForCall(pStack, tStack, oStack, base, a, inst);
+                }
                 case OpCode.OP_TFORLOOP -> {
                     int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
                     if (tStack[base + a + 4] != TYPE_NIL) {
@@ -1056,6 +1119,14 @@ public final class BytecodeVM {
             throw ue;
         } catch (LuaException le) {
             int faultPc = (pc > 0) ? pc - 1 : 0;
+            // Lazy-sync top frame so tracebacks/getinfo see the fault site.
+            CallStack.Frame faultFrame = CallStack.topFrame();
+            if (faultFrame != null) {
+                faultFrame.pc = faultPc;
+                if (proto.lineInfo != null && faultPc < proto.lineInfo.length) {
+                    faultFrame.line = proto.lineInfo[faultPc];
+                }
+            }
             if (!le.isDecorated()) {
                 attachBytecodeDesc(le, proto, faultPc, pStack, tStack, oStack, base);
                 int curLine = (proto.lineInfo != null && proto.lineInfo.length > 0 && faultPc < proto.lineInfo.length) ? proto.lineInfo[faultPc] : -1;

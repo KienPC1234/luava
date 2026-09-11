@@ -40,6 +40,8 @@ public final class DebugLib {
                 targetCoro = co;
                 argIdx++;
             }
+            // Lazy frame sync: refresh top frame pc/line from the VM mirror.
+            { LuaCoroutine sc = targetCoro != null ? targetCoro : LuaCoroutine.running(); if (sc != null) sc.syncTopFrameFromMirror(); }
             if (argIdx >= args.length) return LuaNil.NIL;
             LuaValue fnOrLevel = args[argIdx];
             String what = (argIdx + 1 < args.length && !args[argIdx + 1].isNil()) ? args[argIdx + 1].toLuaString() : "flnStu";
@@ -180,6 +182,8 @@ public final class DebugLib {
                 argIdx++;
             }
             int defaultLevel = (targetCoro == null || targetCoro == LuaCoroutine.running()) ? 1 : 0;
+            // Lazy frame sync: refresh top frame pc/line from the VM mirror.
+            { LuaCoroutine sc = targetCoro != null ? targetCoro : LuaCoroutine.running(); if (sc != null) sc.syncTopFrameFromMirror(); }
             int level = defaultLevel;
             if (argIdx < args.length && (args[argIdx].isInteger() || args[argIdx].isNumber())) {
                 level = (int) args[argIdx].toLong();
@@ -337,6 +341,7 @@ public final class DebugLib {
                 target = co;
                 argOffset = 1;
             }
+            if (target != null) target.syncTopFrameFromMirror();
             if (args.length <= argOffset) {
                 throw new LuaException("bad argument #" + (argOffset + 1) + " to 'getlocal' (value expected)");
             }
@@ -494,6 +499,7 @@ public final class DebugLib {
                 target = co;
                 argOffset = 1;
             }
+            if (target != null) target.syncTopFrameFromMirror();
             if (args.length <= argOffset || !args[argOffset].isNumber()) {
                 throw new LuaException("bad argument #" + (argOffset + 1) + " to 'setlocal' (number expected)");
             }
