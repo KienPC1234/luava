@@ -12,6 +12,16 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class PerformanceBenchmarkTest {
 
+    // Performance baseline (2026-09-11, same machine as Lua C reference):
+    //   1,000,000 Loop Arithmetic         | ~500 ms   (Lua C: 6.9 ms)
+    //   100,000 Table Reads & Writes      | ~163 ms   (Lua C: 4.6 ms)
+    //   500,000 Closure Upvalue Mutations | ~1350 ms  (Lua C: 17.7 ms)
+    //   Fibonacci(24) Deep Call Stack     | ~405 ms   (Lua C: 5.1 ms)
+    // History: hook-guard (~14%) + lazy debug-frame sync (~5%, A/B verified)
+    // banked a combined ~13% on arith (575 ms -> ~500 ms). The interpreter is
+    // now dispatch-bound (JFR: no single hotspot, negligible GC); the remaining
+    // ~70-85x gap to C is structural and needs a JIT backend, not micro-opts.
+
     private record BenchmarkResult(String name, double bytecodeMs) {}
 
     private BenchmarkResult runTimed(String name, String script, long expected, int warmup, int runs) {
