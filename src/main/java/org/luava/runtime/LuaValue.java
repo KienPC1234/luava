@@ -629,6 +629,18 @@ public abstract class LuaValue {
         return dispatchBinaryMetamethod(this, other, "__concat", "concatenate");
     }
 
+    /**
+     * Raw equality ({@code rawequal}, table key lookup): numbers compare by
+     * mathematical value across the integer/float subtypes, all other types
+     * by primitive equality, and metamethods are never consulted.
+     */
+    public static boolean rawEquals(LuaValue a, LuaValue b) {
+        if (a.isNumber() && b.isNumber()) {
+            return numberEquals(a, b);
+        }
+        return a.equals(b);
+    }
+
     public static boolean numberEquals(LuaValue a, LuaValue b) {
         if (a.isInteger() && b.isInteger()) {
             return a.toLong() == b.toLong();

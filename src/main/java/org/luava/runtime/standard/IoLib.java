@@ -550,6 +550,50 @@ public final class IoLib {
         return Varargs.of(LuaNil.NIL, LuaString.valueOf(text), LuaInteger.valueOf(errno != 0 ? errno : 22));
     }
 
+    /**
+     * Formats a Java I/O failure the way C's {@code strerror} would, as
+     * {@code "path: message"} (glibc style) rather than Java's
+     * {@code "path (message)"}.
+     */
+    static String posixMessage(String fname, IOException e) {
+        String msg = e.getMessage();
+        if (msg == null) msg = "I/O error";
+        if (e instanceof java.nio.file.NoSuchFileException) msg = "No such file or directory";
+        else if (e instanceof java.nio.file.AccessDeniedException) msg = "Permission denied";
+        else if (e instanceof java.nio.file.FileAlreadyExistsException) msg = "File exists";
+        else {
+            // Java embeds the path in the message as "path (reason)";
+            // normalise to glibc's "path: reason".
+            String prefix = (fname != null ? fname + " (" : null);
+            if (prefix != null && msg.startsWith(prefix) && msg.endsWith(")")) {
+                msg = msg.substring(prefix.length(), msg.length() - 1);
+            }
+        }
+        return (fname != null ? fname + ": " : "") + msg;
+    }
+
+    /** Best-effort mapping of a Java I/O failure to a POSIX errno. */
+    static int errnoOf(IOException e) {
+        if (e instanceof java.nio.file.NoSuchFileException) return 2;
+        if (e instanceof java.nio.file.AccessDeniedException) return 13;
+        if (e instanceof java.nio.file.FileAlreadyExistsException) return 17;
+        if (e instanceof java.nio.file.DirectoryNotEmptyException) return 39;
+        return 2;
+    }
+
+    /**
+     * {@code io.write} formats a float with the raw C {@code %.14g}
+     * ({@code LUA_NUMBER_FMT}), so {@code io.write(1.0)} emits {@code 1} —
+     * unlike {@code tostring}, which appends {@code .0}. Integers and
+     * strings pass through unchanged.
+     */
+    private static String writeArgString(LuaValue arg) {
+        if (arg.isFloat()) {
+            return org.luava.runtime.LuaFloat.formatFloatRaw(arg.toDouble());
+        }
+        return arg.toLuaString();
+    }
+
     public static void open(LuaTable globals) {
         LuaTable io = new LuaTable();
         fillInto(io, globals);
@@ -633,7 +677,7 @@ public final class IoLib {
                     if (!arg.isString() && !arg.isNumber()) {
                         throw new LuaException("bad argument #" + i + " to 'write' (string expected, got " + arg.typeName() + ")");
                     }
-                    fh.write(arg.toLuaString());
+                    fh.write(writeArgString(arg));
                 }
                 return args[0]; // returns the file handle
             } catch (IOException e) {
@@ -755,7 +799,7 @@ public final class IoLib {
                 org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.valueOf("__gc")));
                 return ud;
             } catch (IOException e) {
-                return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()), LuaInteger.valueOf(2));
+                return Varargs.of(LuaNil.NIL, LuaString.valueOf(posixMessage(filename, e)), LuaInteger.valueOf(errnoOf(e)));
             }
         }));
 
@@ -908,7 +952,7 @@ public final class IoLib {
                     if (!arg.isString() && !arg.isNumber()) {
                         throw new LuaException("bad argument #" + (i + 1) + " to 'write' (string expected, got " + arg.typeName() + ")");
                     }
-                    fh.write(arg.toLuaString());
+                    fh.write(writeArgString(arg));
                 }
                 return out;
             } catch (IOException e) {

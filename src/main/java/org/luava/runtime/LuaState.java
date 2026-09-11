@@ -7,6 +7,7 @@
  */
 package org.luava.runtime;
 
+import org.luava.binding.JavaAccessPolicy;
 import org.luava.binding.JavaFunctionBuilder;
 import org.luava.binding.LuaDataConverter;
 import org.luava.binding.ModuleBinder;
@@ -142,6 +143,35 @@ public final class LuaState {
 
     private long maxAllocBytes = 0;
 
+    private JavaAccessPolicy javaAccessPolicy = JavaAccessPolicy.DEFAULT;
+
+    /**
+     * Replaces the Java interop host-access policy. Use
+     * {@link JavaAccessPolicy#UNRESTRICTED} only for fully trusted scripts;
+     * the default blocks process execution, reflection, filesystem and
+     * network classes.
+     */
+    public LuaState javaPolicy(JavaAccessPolicy policy) {
+        this.javaAccessPolicy = (policy != null) ? policy : JavaAccessPolicy.DEFAULT;
+        return this;
+    }
+
+    /** Allows additional Java class/package patterns through the policy. */
+    public LuaState javaAllow(String... patterns) {
+        this.javaAccessPolicy = javaAccessPolicy.withAllow(patterns);
+        return this;
+    }
+
+    /** Denies additional Java class/package patterns through the policy. */
+    public LuaState javaDeny(String... patterns) {
+        this.javaAccessPolicy = javaAccessPolicy.withDeny(patterns);
+        return this;
+    }
+
+    public JavaAccessPolicy getJavaAccessPolicy() {
+        return javaAccessPolicy;
+    }
+
     /** Effective per-allocation cap for the currently running chunk. */
     public static long allocationLimit() {
         Long l = ACTIVE_MAX_ALLOC.get();
@@ -189,11 +219,10 @@ public final class LuaState {
             return ((LuaFunction) real).call(args);
         }));
         LuaTable argTable = new LuaTable();
-        String progName = System.getProperty("lua.prog");
-        if (progName == null || progName.isEmpty()) {
-            java.io.File localLua = new java.io.File("lua-source/src/lua");
-            progName = localLua.exists() ? localLua.getAbsolutePath() : "lua";
-        }
+        // No stand-alone program exists for an embedded engine; use a stable
+        // name instead of pointing at the reference C binary (that would make
+        // CLI-oriented suite files test PUC Lua, not Luava).
+        String progName = System.getProperty("lua.prog", "luava");
         argTable.rawset(LuaInteger.valueOf(0), LuaString.valueOf(progName));
         globals.rawset(LuaString.valueOf("arg"), argTable);
     }
@@ -216,6 +245,7 @@ public final class LuaState {
      * @return this state (fluent one-liner: {@code new LuaState().sandbox()})
      */
     public LuaState sandbox() {
+        javaAccessPolicy = JavaAccessPolicy.STRICT;
         return deny("os", "io", "package", "require", "dofile", "loadfile", "java", "luajava", "debug");
     }
 
@@ -308,7 +338,7 @@ public final class LuaState {
     }
 
     public void registerFunction(String name, LuaInvokable invokable) {
-        globals.rawset(LuaString.valueOf(name), LuaFunction.of(invokable));
+        globals.rawset(LuaString.valueOf(name), LuaFunction.ofGuarded(invokable));
     }
 
     public void registerFunction(String name, Supplier<?> supplier) {
@@ -399,6 +429,7 @@ public final class LuaState {
         if (prevMax == null && maxAllocBytes > 0) {
             ACTIVE_MAX_ALLOC.set(maxAllocBytes);
         }
+        JavaAccessPolicy prevPolicy = JavaAccessPolicy.setActive(javaAccessPolicy);
         armGuard();
         try {
             LuaFunction chunk = compile(luaSource, chunkName, globals);
@@ -407,6 +438,7 @@ public final class LuaState {
             }
             return chunk.call();
         } finally {
+            JavaAccessPolicy.restoreActive(prevPolicy);
             if (prevMax == null) {
                 ACTIVE_MAX_ALLOC.remove();
             }

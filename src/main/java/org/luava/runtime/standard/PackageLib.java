@@ -112,7 +112,11 @@ public final class PackageLib {
             }
             String filename = searchResult.toLuaString();
             try {
-                String source = Files.readString(Path.of(filename));
+                // Lua source is a byte stream; read with ISO-8859-1 so each
+                // byte maps to one char (UTF-8 would collapse multi-byte
+                // sequences and corrupt non-ASCII literals).
+                String source = new String(Files.readAllBytes(Path.of(filename)),
+                        java.nio.charset.StandardCharsets.ISO_8859_1);
                 LuaFunction chunk = state.compile(source, "@" + filename, globals);
                 return Varargs.of(chunk, LuaString.valueOf(filename));
             } catch (LuaException e) {

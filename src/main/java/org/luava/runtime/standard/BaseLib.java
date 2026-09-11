@@ -31,14 +31,6 @@ public final class BaseLib {
         globals.rawset(LuaString.valueOf("_ENV"), globals);
         globals.rawset(LuaString.valueOf("_VERSION"), LuaString.valueOf("Lua 5.4"));
 
-        globals.rawset(LuaString.valueOf("unpack"), LuaFunction.of(args -> {
-            LuaValue tableMod = globals.rawget(LuaString.valueOf("table"));
-            if (tableMod.isTable()) {
-                return tableMod.get(LuaString.valueOf("unpack")).call(args);
-            }
-            throw new LuaException("table.unpack not available");
-        }));
-
         globals.rawset(LuaString.valueOf("print"), LuaFunction.of(args -> {
             // Byte fidelity: Lua strings are byte containers (Latin-1
             // preserved), so emit raw bytes instead of letting the platform
@@ -398,7 +390,12 @@ public final class BaseLib {
 
         globals.rawset(LuaString.valueOf("rawequal"), LuaFunction.of(args -> {
             if (args.length < 2) return LuaBoolean.FALSE;
-            return LuaBoolean.valueOf(args[0].equals(args[1]));
+            // Lua 5.4: raw equality still compares numbers by mathematical
+            // value across the integer/float subtypes (1 == 1.0), but never
+            // consults metamethods. luaEquals handles the numeric case; its
+            // __eq path is unreachable here only if we avoid it, so use the
+            // dedicated raw helper.
+            return LuaBoolean.valueOf(LuaValue.rawEquals(args[0], args[1]));
         }));
 
         globals.rawset(LuaString.valueOf("rawlen"), LuaFunction.of(args -> {
