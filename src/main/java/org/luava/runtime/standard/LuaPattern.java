@@ -42,6 +42,7 @@ public final class LuaPattern {
         final int pLen;
         int matchdepth;
         int level;
+        int matchTicks;
         final Capture[] capture = new Capture[LUA_MAXCAPTURES];
 
         MatchState(byte[] src, byte[] p) {
@@ -171,7 +172,7 @@ public final class LuaPattern {
     private static int max_expand(MatchState ms, int s, int p, int ep) {
         int i = 0;
         while (singlematch(ms, s + i, p, ep)) {
-            i++;
+            if ((++i & 0xFF) == 0) org.luava.runtime.LuaState.checkGuard();
         }
         while (i >= 0) {
             int res = match(ms, s + i, ep + 1);
@@ -182,7 +183,9 @@ public final class LuaPattern {
     }
 
     private static int min_expand(MatchState ms, int s, int p, int ep) {
+        int ticks = 0;
         for (;;) {
+            if ((++ticks & 0xFF) == 0) org.luava.runtime.LuaState.checkGuard();
             int res = match(ms, s, ep + 1);
             if (res != -1) return res;
             if (singlematch(ms, s, p, ep)) {
@@ -241,6 +244,9 @@ public final class LuaPattern {
     }
 
     private static int match(MatchState ms, int s, int p) {
+        if ((++ms.matchTicks & 0x3FF) == 0) {
+            org.luava.runtime.LuaState.checkGuard();
+        }
         if (ms.matchdepth-- == 0) {
             throw new LuaException("pattern too complex");
         }

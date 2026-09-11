@@ -242,6 +242,8 @@ public final class BaseLib {
                 return Varargs.of(LuaBoolean.TRUE, result);
             } catch (org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal ccs) {
                 throw ccs;
+            } catch (org.luava.runtime.LuaExit ex) {
+                throw ex;
             } catch (LuaException le) {
                 return Varargs.of(LuaBoolean.FALSE, le.getErrorObject());
             } catch (StackOverflowError soe) {
@@ -285,6 +287,8 @@ public final class BaseLib {
                 return Varargs.of(LuaBoolean.TRUE, result);
             } catch (org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal ccs) {
                 throw ccs;
+            } catch (org.luava.runtime.LuaExit ex) {
+                throw ex;
             } catch (org.luava.runtime.eval.LuaUnwindException ue) {
                 return Varargs.of(LuaBoolean.FALSE, ue.getResult());
             } catch (LuaException le) {

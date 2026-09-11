@@ -168,6 +168,27 @@ public final class LuaCoroutine extends LuaValue {
         return tbcHead;
     }
 
+    /** Closes every pending to-be-closed variable on this thread (os.exit true). */
+    public void closeAllTbc() {
+        org.luava.runtime.LuaState.TbcEntry entry = tbcHead;
+        tbcHead = null;
+        while (entry != null) {
+            org.luava.runtime.LuaState.TbcEntry next = entry.next;
+            org.luava.runtime.LuaValue val = entry.value;
+            org.luava.runtime.LuaTable mt = val.getMetatable();
+            org.luava.runtime.LuaValue closeMth = mt != null
+                    ? mt.rawget(org.luava.runtime.LuaString.valueOf("__close")) : org.luava.runtime.LuaNil.NIL;
+            try {
+                if (!closeMth.isNil()) {
+                    org.luava.runtime.eval.CallStack.setNextCall("close", "metamethod", false, true);
+                    closeMth.call(val, org.luava.runtime.LuaNil.NIL);
+                }
+            } catch (Throwable ignored) {
+            }
+            entry = next;
+        }
+    }
+
     public void setTbcHead(org.luava.runtime.LuaState.TbcEntry tbcHead) {
         this.tbcHead = tbcHead;
     }
@@ -415,6 +436,7 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     private volatile boolean isClosing = false;
+    private volatile org.luava.runtime.LuaExit exitSignal = null;
 
     public LuaValue[] resume(LuaValue... args) {
         LuaCoroutine callerCoro = CURRENT_COROUTINE.get();
@@ -466,6 +488,14 @@ public final class LuaCoroutine extends LuaValue {
                     } catch (CoroutineCloseSignal ccs) {
                         status = Status.DEAD;
                         callStackState.clearSavedErrorStack();
+                    } catch (org.luava.runtime.LuaExit ex) {
+                        // os.exit must unwind the host, not be turned into a
+                        // normal resume failure.
+                        status = Status.DEAD;
+                        callStackState.clearSavedErrorStack();
+                        exitSignal = ex;
+                        LockSupport.unpark(resumerThread);
+                        throw ex;
                     } catch (Throwable t) {
                         error = t;
                         // Transfer death frames saved by reference during fatal
@@ -514,6 +544,10 @@ public final class LuaCoroutine extends LuaValue {
 
         if (callerCoro != null) {
             callerCoro.status = Status.RUNNING;
+        }
+
+        if (exitSignal != null) {
+            throw exitSignal;
         }
 
         if (error != null) {
