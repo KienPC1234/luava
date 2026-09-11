@@ -290,8 +290,7 @@ public final class CallStack {
         // Push a frame for the handler so that debug.traceback's default level=1
         // correctly skips the handler itself (level 0) and starts at the error site.
         boolean pushedHandlerFrame = false;
-        if (top.handler instanceof org.luava.runtime.LuaFunction fn
-                && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction)) {
+        if (top.handler instanceof org.luava.runtime.LuaFunction fn) {
             push(fn, fn.getName() != null ? fn.getName() : "?", "C", -1, false, false);
             pushedHandlerFrame = true;
         }

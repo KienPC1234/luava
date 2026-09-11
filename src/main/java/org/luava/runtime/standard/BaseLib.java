@@ -213,7 +213,7 @@ public final class BaseLib {
             System.arraycopy(args, 1, fnArgs, 0, fnArgs.length);
             org.luava.runtime.eval.CallStack.pushProtectedFrame(null);
             boolean pushedCFrame = false;
-            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
+            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
                 org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
                 org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
                 pushedCFrame = true;
@@ -256,7 +256,7 @@ public final class BaseLib {
 
             org.luava.runtime.eval.CallStack.pushProtectedFrame(msgh);
             boolean pushedCFrame = false;
-            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
+            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
                 org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
                 org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
                 pushedCFrame = true;

@@ -40,6 +40,8 @@ public final class DebugLib {
                 targetCoro = co;
                 argIdx++;
             }
+            // Lazy frame sync: refresh top frame pc/line from the VM mirror.
+            { LuaCoroutine sc = targetCoro != null ? targetCoro : LuaCoroutine.running(); if (sc != null) sc.syncTopFrameFromMirror(); }
             if (argIdx >= args.length) return LuaNil.NIL;
             LuaValue fnOrLevel = args[argIdx];
             String what = (argIdx + 1 < args.length && !args[argIdx + 1].isNil()) ? args[argIdx + 1].toLuaString() : "flnStu";
@@ -125,7 +127,7 @@ public final class DebugLib {
             }
 
             if (what.contains("l")) {
-                int cl = (fn != null && (fn.isStripped() || (!(fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)))) ? -1 : currentLine;
+                int cl = (fn != null && (fn.isStripped() || (!(fn instanceof org.luava.runtime.bytecode.LuaClosure)))) ? -1 : currentLine;
                 info.rawset(LuaString.valueOf("currentline"), LuaInteger.valueOf(cl));
             }
 
@@ -180,6 +182,8 @@ public final class DebugLib {
                 argIdx++;
             }
             int defaultLevel = (targetCoro == null || targetCoro == LuaCoroutine.running()) ? 1 : 0;
+            // Lazy frame sync: refresh top frame pc/line from the VM mirror.
+            { LuaCoroutine sc = targetCoro != null ? targetCoro : LuaCoroutine.running(); if (sc != null) sc.syncTopFrameFromMirror(); }
             int level = defaultLevel;
             if (argIdx < args.length && (args[argIdx].isInteger() || args[argIdx].isNumber())) {
                 level = (int) args[argIdx].toLong();
@@ -337,6 +341,7 @@ public final class DebugLib {
                 target = co;
                 argOffset = 1;
             }
+            if (target != null) target.syncTopFrameFromMirror();
             if (args.length <= argOffset) {
                 throw new LuaException("bad argument #" + (argOffset + 1) + " to 'getlocal' (value expected)");
             }
@@ -355,11 +360,6 @@ public final class DebugLib {
                                 }
                             }
                         }
-                    }
-                } else if (fn instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction ifn) {
-                    java.util.List<String> params = ifn.getParams();
-                    if (nvar >= 1 && nvar <= params.size()) {
-                        return LuaString.valueOf(params.get(nvar - 1));
                     }
                 }
                 return LuaNil.NIL;
@@ -389,8 +389,7 @@ public final class DebugLib {
 
             if (nvar > 0 && frame.retValues != null && frame.ftransfer > 0 && nvar >= frame.ftransfer && nvar < frame.ftransfer + frame.ntransfer) {
                 int retIdx = nvar - frame.ftransfer;
-                boolean isLua = (frame.function instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction)
-                        || (frame.function instanceof org.luava.runtime.bytecode.LuaClosure);
+                boolean isLua = (frame.function instanceof org.luava.runtime.bytecode.LuaClosure);
                 String name = isLua ? "(temporary)" : "(C temporary)";
                 return Varargs.of(LuaString.valueOf(name), frame.retValues[retIdx]);
             }
@@ -463,7 +462,7 @@ public final class DebugLib {
             } else if (nvar > 0) {
                 if (frame.retValues != null && frame.ftransfer > 0 && nvar >= frame.ftransfer && nvar < frame.ftransfer + frame.ntransfer) {
                     int retIdx = nvar - frame.ftransfer;
-                    String name = (frame.function instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) ? "(temporary)" : "(C temporary)";
+                    String name = "(C temporary)";
                     return Varargs.of(LuaString.valueOf(name), frame.retValues[retIdx]);
                 }
                 org.luava.runtime.eval.Environment env = frame.env;
@@ -500,6 +499,7 @@ public final class DebugLib {
                 target = co;
                 argOffset = 1;
             }
+            if (target != null) target.syncTopFrameFromMirror();
             if (args.length <= argOffset || !args[argOffset].isNumber()) {
                 throw new LuaException("bad argument #" + (argOffset + 1) + " to 'setlocal' (number expected)");
             }
@@ -527,8 +527,7 @@ public final class DebugLib {
             if (nvar > 0 && frame.retValues != null && frame.ftransfer > 0 && nvar >= frame.ftransfer && nvar < frame.ftransfer + frame.ntransfer) {
                 int retIdx = nvar - frame.ftransfer;
                 frame.retValues[retIdx] = val;
-                boolean isLua = (frame.function instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction)
-                        || (frame.function instanceof org.luava.runtime.bytecode.LuaClosure);
+                boolean isLua = (frame.function instanceof org.luava.runtime.bytecode.LuaClosure);
                 String name = isLua ? "(temporary)" : "(C temporary)";
                 return LuaString.valueOf(name);
             }
@@ -607,7 +606,7 @@ public final class DebugLib {
                 if (frame.retValues != null && frame.ftransfer > 0 && nvar >= frame.ftransfer && nvar < frame.ftransfer + frame.ntransfer) {
                     int retIdx = nvar - frame.ftransfer;
                     frame.retValues[retIdx] = val;
-                    String name = (frame.function instanceof org.luava.runtime.eval.Interpreter.InterpretedLuaFunction) ? "(temporary)" : "(C temporary)";
+                    String name = "(C temporary)";
                     return LuaString.valueOf(name);
                 }
                 org.luava.runtime.eval.Environment env = frame.env;
