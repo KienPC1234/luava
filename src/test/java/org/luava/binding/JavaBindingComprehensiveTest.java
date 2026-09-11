@@ -9,6 +9,7 @@ package org.luava.binding;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.luava.runtime.LuaException;
 import org.luava.runtime.LuaState;
 import org.luava.runtime.LuaValue;
 
@@ -21,6 +22,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class JavaBindingComprehensiveTest {
@@ -227,5 +229,29 @@ public class JavaBindingComprehensiveTest {
             """;
         LuaValue sumRes = state.eval(moveCode);
         assertEquals(60L, sumRes.toLong());
+    }
+
+    @Test
+    void hostFunctionExceptionsAreWrappedNotLeaked() {
+        state.registerFunction("boom", () -> {
+            throw new IllegalStateException("host boom");
+        });
+        // The raw Java exception must never escape to the host or Lua; it is
+        // wrapped in a LuaException (AGENTS.md IV.2).
+        LuaException ex = assertThrows(LuaException.class, () -> state.eval("return boom()"));
+        assertTrue(ex.getMessage().contains("host boom"));
+        // pcall sees a normal Lua error, not a leaked Java throwable.
+        LuaValue r = state.eval("local ok, err = pcall(boom); return tostring(ok)");
+        assertEquals("false", r.toLuaString());
+    }
+
+    @Test
+    void nonNumericValueIsRejectedNotCoercedToZero() {
+        state.registerFunction("echo", Long.class, x -> x);
+        assertEquals(123L, state.eval("return echo('123')").toLong());
+        // Lua's luaL_checkinteger rejects these instead of returning 0.
+        assertThrows(LuaException.class, () -> state.eval("return echo('abc')"));
+        assertThrows(LuaException.class, () -> state.eval("return echo(true)"));
+        assertThrows(LuaException.class, () -> state.eval("return echo({})"));
     }
 }

@@ -33,7 +33,7 @@ public final class JavaInteropLib {
     public static void fillInto(LuaTable javaMod, LuaTable globals) {
 
         // 1. java.import / java.bindClass
-        LuaFunction importFn = LuaFunction.of(args -> {
+        LuaFunction importFn = LuaFunction.ofGuarded(args -> {
             if (args.length == 0 || !args[0].isString()) {
                 throw new LuaException("bad argument #1 to 'java.import' (string expected)");
             }
@@ -45,7 +45,7 @@ public final class JavaInteropLib {
         javaMod.rawset(LuaString.valueOf("bindClass"), importFn);
 
         // 2. java.new
-        javaMod.rawset(LuaString.valueOf("new"), LuaFunction.of(args -> {
+        javaMod.rawset(LuaString.valueOf("new"), LuaFunction.ofGuarded(args -> {
             if (args.length == 0) {
                 throw new LuaException("bad argument #1 to 'java.new' (class or class name expected)");
             }
@@ -66,7 +66,7 @@ public final class JavaInteropLib {
         }));
 
         // 3. java.proxy
-        javaMod.rawset(LuaString.valueOf("proxy"), LuaFunction.of(args -> {
+        javaMod.rawset(LuaString.valueOf("proxy"), LuaFunction.ofGuarded(args -> {
             if (args.length < 2) {
                 throw new LuaException("java.proxy expects (interfaceNameOrClass, tableOrFunction)");
             }
@@ -120,7 +120,7 @@ public final class JavaInteropLib {
         }));
 
         // 4. java.array
-        javaMod.rawset(LuaString.valueOf("array"), LuaFunction.of(args -> {
+        javaMod.rawset(LuaString.valueOf("array"), LuaFunction.ofGuarded(args -> {
             if (args.length < 2) {
                 throw new LuaException("java.array expects (componentType, size)");
             }
@@ -155,7 +155,7 @@ public final class JavaInteropLib {
         }));
 
         // 5. java.instanceof
-        javaMod.rawset(LuaString.valueOf("instanceof"), LuaFunction.of(args -> {
+        javaMod.rawset(LuaString.valueOf("instanceof"), LuaFunction.ofGuarded(args -> {
             if (args.length < 2) return LuaBoolean.FALSE;
             if (!args[0].isUserdata()) return LuaBoolean.FALSE;
             Object inst = ((LuaUserdata) args[0]).getJavaInstance();

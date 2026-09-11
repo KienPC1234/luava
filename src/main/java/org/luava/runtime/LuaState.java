@@ -219,11 +219,10 @@ public final class LuaState {
             return ((LuaFunction) real).call(args);
         }));
         LuaTable argTable = new LuaTable();
-        String progName = System.getProperty("lua.prog");
-        if (progName == null || progName.isEmpty()) {
-            java.io.File localLua = new java.io.File("lua-source/src/lua");
-            progName = localLua.exists() ? localLua.getAbsolutePath() : "lua";
-        }
+        // No stand-alone program exists for an embedded engine; use a stable
+        // name instead of pointing at the reference C binary (that would make
+        // CLI-oriented suite files test PUC Lua, not Luava).
+        String progName = System.getProperty("lua.prog", "luava");
         argTable.rawset(LuaInteger.valueOf(0), LuaString.valueOf(progName));
         globals.rawset(LuaString.valueOf("arg"), argTable);
     }
@@ -339,7 +338,7 @@ public final class LuaState {
     }
 
     public void registerFunction(String name, LuaInvokable invokable) {
-        globals.rawset(LuaString.valueOf(name), LuaFunction.of(invokable));
+        globals.rawset(LuaString.valueOf(name), LuaFunction.ofGuarded(invokable));
     }
 
     public void registerFunction(String name, Supplier<?> supplier) {

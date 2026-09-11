@@ -56,11 +56,13 @@ public final class JavaAccessPolicy {
 
     /**
      * Strict policy installed by {@link org.luava.runtime.LuaState#sandbox()}:
-     * only the small safe allowlist is reachable; everything else is denied
-     * unless the host adds an explicit allow pattern.
+     * only the small safe allowlist can be loaded by name; everything else is
+     * denied unless the host adds an explicit allow pattern. The deny list is
+     * still carried so member access on host-registered objects cannot reach
+     * capability classes (ClassLoader, Runtime, reflection, ...).
      */
     public static final JavaAccessPolicy STRICT =
-            new JavaAccessPolicy(DEFAULT_ALLOW, new String[0], false, "strict");
+            new JavaAccessPolicy(DEFAULT_ALLOW, DEFAULT_DENY, false, "strict");
 
     private final String[] allow;
     private final String[] deny;
@@ -97,6 +99,24 @@ public final class JavaAccessPolicy {
             if (matches(p, className)) return false;
         }
         return defaultAllow;
+    }
+
+    /**
+     * Whether {@code className} is explicitly blacklisted as a capability
+     * class (Runtime, reflection, filesystem, ...). Used for member access on
+     * objects the host has already handed to Lua: host service classes are
+     * not on the deny list and stay usable, while their inherited
+     * {@code getClassLoader()} / reflection paths are cut off.
+     */
+    public boolean isDenied(String className) {
+        if (className == null) return true;
+        for (String p : allow) {
+            if (matches(p, className)) return false; // explicit allow wins
+        }
+        for (String p : deny) {
+            if (matches(p, className)) return true;
+        }
+        return false;
     }
 
     /**

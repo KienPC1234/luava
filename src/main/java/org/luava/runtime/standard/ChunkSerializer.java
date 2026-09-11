@@ -78,36 +78,6 @@ public final class ChunkSerializer {
         return baos.toByteArray();
     }
 
-    private static byte[] tryCompileWithLuac(String source, boolean strip) {
-        try {
-            String luacProg = System.getProperty("luac.prog");
-            if (luacProg == null || luacProg.isEmpty()) {
-                File localLuac = new File("lua-source/src/luac");
-                luacProg = localLuac.exists() ? localLuac.getAbsolutePath() : "luac";
-            }
-            List<String> cmd = new ArrayList<>();
-            cmd.add(luacProg);
-            if (strip) {
-                cmd.add("-s");
-            }
-            cmd.add("-o");
-            cmd.add("-");
-            cmd.add("-");
-            ProcessBuilder pb = new ProcessBuilder(cmd);
-            Process proc = pb.start();
-            try (OutputStream out = proc.getOutputStream()) {
-                out.write(source.getBytes(StandardCharsets.UTF_8));
-            }
-            byte[] bytecode = proc.getInputStream().readAllBytes();
-            int exitCode = proc.waitFor();
-            if (exitCode == 0 && bytecode.length > 0) {
-                return bytecode;
-            }
-        } catch (Throwable ignored) {
-        }
-        return null;
-    }
-
     public static byte[] dump(LuaFunction fn, boolean strip) {
         if ("C".equals(fn.getWhat())) {
             throw new LuaException("unable to dump given function");
@@ -116,34 +86,13 @@ public final class ChunkSerializer {
         boolean effectiveStrip = strip || fn.isStripped();
         try {
             byte[] payload = dumpPayload(fn, effectiveStrip);
-            byte[] luacBytecode = null;
-            String rawCode = fn.getRawSource();
-            if (rawCode == null) {
-                // Compile no longer pretty-prints every function; render
-                // lazily — only string.dump pays this cost.
-                org.luava.frontend.ast.Statements.BlockStmt body = fn.getBody();
-                rawCode = (body != null) ? AstPrinter.print(body) : null;
-            }
-            if (rawCode != null) {
-                luacBytecode = tryCompileWithLuac(rawCode, effectiveStrip);
-            }
-
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            if (luacBytecode != null) {
-                baos.write(luacBytecode);
-                baos.write(payload);
-                ByteBuffer footer = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN);
-                footer.putInt(payload.length);
-                footer.put(MAGIC_FOOTER);
-                baos.write(footer.array());
-            } else {
-                baos.write(HEADER);
-                ByteBuffer bb = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
-                bb.putLong(LUAC_INT);
-                bb.putDouble(LUAC_NUM);
-                baos.write(bb.array());
-                baos.write(payload);
-            }
+            baos.write(HEADER);
+            ByteBuffer bb = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
+            bb.putLong(LUAC_INT);
+            bb.putDouble(LUAC_NUM);
+            baos.write(bb.array());
+            baos.write(payload);
             return baos.toByteArray();
         } catch (IOException e) {
             throw new LuaException("dump failed: " + e.getMessage());

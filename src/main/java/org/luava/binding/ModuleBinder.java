@@ -197,8 +197,7 @@ public final class ModuleBinder {
                     }
                     return LuaDataConverter.toLua(res);
                 } catch (Throwable t) {
-                    Throwable cause = t.getCause() != null ? t.getCause() : t;
-                    throw new LuaException("Error invoking bound method " + methodName + ": " + cause.getMessage());
+                    throw LuaFunction.hostError("Error invoking bound method " + methodName, t);
                 }
             });
 

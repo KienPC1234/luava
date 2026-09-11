@@ -109,6 +109,32 @@ public class JavaInteropPolicyTest {
         assertDenied(strict, "return java.import('java.lang.Runtime')");
     }
 
+    @Test
+    void sandboxStillExposesHostRegisteredServices() {
+        // Host services are handed to Lua directly; the policy must not
+        // block their own methods, only class loading and capability classes.
+        LuaState s = new LuaState().sandbox();
+        s.setLive("api", new HostService());
+        assertEquals("hi", s.eval("return api.hello()").toLuaString());
+        assertEquals(5L, s.eval("return api.add(2, 3)").toLong());
+        // ...but their getClass() path cannot reach capability classes:
+        // the members are filtered out, so the call fails rather than
+        // exposing the class loader or reflection.
+        assertThrows(LuaException.class, () -> s.eval("return api.getClass().getClassLoader()", "@policy"));
+        assertThrows(LuaException.class,
+                () -> s.eval("local c = api.getClass(); return c.forName('java.lang.Runtime')", "@policy"));
+    }
+
+    public static class HostService {
+        public String hello() {
+            return "hi";
+        }
+
+        public int add(int a, int b) {
+            return a + b;
+        }
+    }
+
     private static void assertDenied(LuaState state, String code) {
         LuaException ex = assertThrows(LuaException.class, () -> state.eval(code, "@policy"));
         assertTrue(ex.getMessage().contains("access denied"),

@@ -95,6 +95,66 @@ public abstract class LuaFunction extends LuaValue {
         return fn;
     }
 
+    /**
+     * Wraps a host-provided {@link LuaInvokable} so unchecked Java exceptions
+     * never leak to the host or to Lua: control-flow signals
+     * ({@link LuaException}, {@link LuaExit}, unwind/close signals) pass
+     * through unchanged, everything else becomes a {@link LuaException}.
+     * Use for every function the host registers ({@code registerFunction},
+     * {@code JavaFunctionBuilder}).
+     */
+    public static LuaFunction ofGuarded(LuaInvokable invokable) {
+        LuaFunction fn = new LuaFunction() {
+            @Override
+            public LuaValue invoke(LuaValue... args) {
+                try {
+                    return invokable.invoke(args);
+                } catch (LuaException | LuaExit
+                        | org.luava.runtime.eval.LuaUnwindException
+                        | org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal e) {
+                    throw e;
+                } catch (StackOverflowError e) {
+                    throw new LuaException("stack overflow");
+                } catch (Throwable t) {
+                    String msg = t.getMessage() != null ? t.getMessage() : t.toString();
+                    throw new LuaException("Java error in host function: " + msg);
+                }
+            }
+
+            @Override
+            public String toLuaString() {
+                return "function: builtin@0x" + Integer.toHexString(System.identityHashCode(this));
+            }
+        };
+        fn.setWhat("C");
+        fn.setSource("=[C]");
+        fn.setLineDefined(-1);
+        fn.setLastLineDefined(-1);
+        return fn;
+    }
+
+    /**
+     * Converts a reflection/host failure into a {@link LuaException} while
+     * letting control-flow signals pass through: {@link LuaException},
+     * {@link LuaExit}, {@link org.luava.runtime.eval.LuaUnwindException} and
+     * {@link org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal}
+     * are never swallowed, so {@code os.exit} or a coroutine close triggered
+     * inside a host callback still unwinds correctly. Unwraps the
+     * {@link java.lang.reflect.InvocationTargetException} added by
+     * {@code Method.invoke}.
+     */
+    public static LuaException hostError(String context, Throwable t) {
+        Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null)
+                ? t.getCause() : t;
+        if (cause instanceof LuaException le) return le;
+        if (cause instanceof LuaExit le) throw le;
+        if (cause instanceof org.luava.runtime.eval.LuaUnwindException ue) throw ue;
+        if (cause instanceof org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal ccs) throw ccs;
+        if (cause instanceof StackOverflowError) return new LuaException("stack overflow");
+        String msg = cause.getMessage() != null ? cause.getMessage() : cause.toString();
+        return new LuaException(context + ": " + msg);
+    }
+
     @Override
     public String toLuaString() {
         return "function: 0x" + Integer.toHexString(System.identityHashCode(this));
