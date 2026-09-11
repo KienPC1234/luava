@@ -55,7 +55,6 @@ public final class BytecodeCompiler {
         fs.checkUnresolvedGotos();
         fs.emit(Instruction.encodeABC(OpCode.OP_RETURN0, 0, 0, 0), block != null ? block.endLine() : 1);
         LuaProto proto = fs.toProto();
-        proto.rawSource = org.luava.frontend.ast.AstPrinter.print(block);
         proto.body = block;
         return proto;
     }
@@ -997,7 +996,6 @@ public final class BytecodeCompiler {
             child.checkUnresolvedGotos();
             child.emit(Instruction.encodeABC(OpCode.OP_RETURN0, 0, 0, 0), lastLineDefined);
             LuaProto proto = child.toProto();
-            proto.rawSource = org.luava.frontend.ast.AstPrinter.print(body);
             proto.body = body;
             return proto;
         }
