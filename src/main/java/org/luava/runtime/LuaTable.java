@@ -255,6 +255,44 @@ public final class LuaTable extends LuaValue {
         return key;
     }
 
+    /**
+     * Integer-keyed fast lanes for the VM ({@code OP_GETI} / {@code OP_SETI}).
+     * Identical semantics to {@code rawget(LuaInteger)}/{@code rawset} for
+     * plain tables, but without boxing the index. Callers must only use
+     * these when the table has no metatable (weak modes always imply one).
+     */
+    public LuaValue rawgetInt(long idx) {
+        if (idx >= 1 && idx <= arrayPart.size()) {
+            LuaValue val = arrayPart.get((int) (idx - 1));
+            if (val instanceof WeakVal wv) {
+                LuaValue actual = wv.get();
+                if (actual == null) {
+                    arrayPart.set((int) (idx - 1), LuaNil.NIL);
+                    return LuaNil.NIL;
+                }
+                return actual;
+            }
+            if (val != null && !val.isNil()) {
+                return val;
+            }
+        }
+        return rawget(LuaInteger.valueOf(idx));
+    }
+
+    public void rawsetInt(long idx, LuaValue value) {
+        LuaValue toSet = (value == null || value.isNil()) ? LuaNil.NIL : value;
+        if (idx == arrayPart.size() + 1 && !toSet.isNil()) {
+            arrayPart.add(toSet);
+            if (!hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
+            return;
+        } else if (idx >= 1 && idx <= arrayPart.size()) {
+            if (!hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
+            arrayPart.set((int) (idx - 1), toSet);
+            return;
+        }
+        rawset(LuaInteger.valueOf(idx), value);
+    }
+
     public LuaValue rawget(LuaValue key) {
         key = normalizeKey(key);
         if (key == null || key.isNil()) {

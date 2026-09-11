@@ -1,6 +1,8 @@
 package org.luava.runtime.bytecode;
 
 import org.luava.runtime.LuaValue;
+import org.luava.runtime.concurrency.LuaCoroutine;
+import org.luava.runtime.eval.CallStack;
 import org.luava.runtime.eval.Upvalue;
 
 /**
@@ -43,4 +45,29 @@ public final class VmContext {
     public long[] pStack;
     public byte[] tStack;
     public LuaValue[] oStack;
+
+    /**
+     * Hoisted thread state, constant for a whole {@code runLoop} invocation
+     * (resume continues the same thread; nested coroutines get their own
+     * loop). Saves several {@code ThreadLocal} lookups per call/return.
+     * {@code co} may be null on bare threads (same null-guard semantics as
+     * the static {@code CallStack} methods); {@code callState} never is.
+     */
+    public LuaCoroutine co;
+    public CallStack.CallStackState callState;
+
+    /**
+     * Tiny direct-mapped memo for {@code getobjname} (pure in proto/pc/reg).
+     * Name resolution runs once per call site per execute instead of a
+     * bytecode-archaeology scan per call. Entries are ctx-local, so no
+     * cross-thread contention; a shared array is returned (callers must
+     * only read it).
+     */
+    public static final int NAME_CACHE_SIZE = 4;
+    public final LuaProto[] ncProto = new LuaProto[NAME_CACHE_SIZE];
+    public final int[] ncPc = new int[NAME_CACHE_SIZE];
+    public final int[] ncReg = new int[NAME_CACHE_SIZE];
+    public final String[] ncA = new String[NAME_CACHE_SIZE];
+    public final String[] ncB = new String[NAME_CACHE_SIZE];
+    public final boolean[] ncFilled = new boolean[NAME_CACHE_SIZE];
 }
