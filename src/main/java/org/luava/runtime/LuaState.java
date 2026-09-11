@@ -50,6 +50,111 @@ public final class LuaState {
     private final LuaCoroutine mainThread = LuaCoroutine.createMainThread();
     private final Environment rootEnvironment;
     private final List<ModuleBinder.ModuleInfo> registeredModules = new ArrayList<>();
+    private LuaValue savedLoadfile;
+    private LuaValue savedDofile;
+
+    /**
+     * Cooperative VM guard, checked once per instruction while non-null.
+     * Set via {@link #instructionLimit(long)} / {@link #timeout(Duration)}
+     * to stop runaway scripts ({@code while true do end}) from hanging the
+     * host. Null on the default (unguarded) fast path.
+     */
+    public interface LoopGuard {
+        void tick();
+    }
+
+    /**
+     * Hard instruction/time budget. Unlike a one-shot hook, once tripped it
+     * stays tripped for the rest of the top-level run, so {@code pcall} can
+     * catch the error but the very next instruction throws again — a script
+     * cannot swallow the guard and continue. The budget is re-armed at each
+     * top-level {@link #eval} entry (see {@link #armGuard()}).
+     */
+    public static final class Guard implements LoopGuard {
+        private final long maxInstr;
+        private final long timeoutNanos;
+        private long remaining;
+        private long deadline;
+        private int countdown;
+        private boolean tripped;
+
+        Guard(long maxInstr, long timeoutNanos) {
+            this.maxInstr = maxInstr;
+            this.timeoutNanos = timeoutNanos;
+        }
+
+        void arm() {
+            this.remaining = maxInstr;
+            this.deadline = timeoutNanos > 0 ? System.nanoTime() + timeoutNanos : 0;
+            this.countdown = 4096;
+            this.tripped = false;
+        }
+
+        @Override
+        public void tick() {
+            if (tripped) {
+                throw new LuaException("instruction limit exceeded");
+            }
+            if (maxInstr > 0 && --remaining < 0) {
+                tripped = true;
+                throw new LuaException("instruction limit exceeded");
+            }
+            if (timeoutNanos > 0 && --countdown <= 0) {
+                countdown = 4096;
+                if (System.nanoTime() - deadline >= 0) {
+                    tripped = true;
+                    throw new LuaException("execution timed out");
+                }
+            }
+        }
+    }
+
+    public volatile LoopGuard loopGuard;
+
+    /** Active state for stdlib guard checks (set around a top-level run). */
+    private static final ThreadLocal<LuaState> ACTIVE_STATE = new ThreadLocal<>();
+
+    /**
+     * Guard check for pure-Java stdlib loops (table.move, pattern matching,
+     * string.rep, ...) that would otherwise never return to the VM dispatch
+     * loop. Cheap no-op when no guard is active.
+     */
+    public static void checkGuard() {
+        LuaState s = ACTIVE_STATE.get();
+        if (s != null) {
+            LoopGuard g = s.loopGuard;
+            if (g != null) g.tick();
+        }
+    }
+
+    /**
+     * Maximum number of bytes a single stdlib allocation may request
+     * (string.rep, string.pack, table.concat, ...). 0 = use the Lua default
+     * (Integer.MAX_VALUE - 8). Servers should set a small value so untrusted
+     * scripts cannot OOM the host.
+     */
+    private static final ThreadLocal<Long> ACTIVE_MAX_ALLOC = new ThreadLocal<>();
+
+    public LuaState maxAllocationBytes(long bytes) {
+        this.maxAllocBytes = bytes;
+        return this;
+    }
+
+    private long maxAllocBytes = 0;
+
+    /** Effective per-allocation cap for the currently running chunk. */
+    public static long allocationLimit() {
+        Long l = ACTIVE_MAX_ALLOC.get();
+        if (l != null && l > 0) return l;
+        return Integer.MAX_VALUE - 8;
+    }
+
+    private void armGuard() {
+        LoopGuard g = loopGuard;
+        if (g instanceof Guard hard) {
+            hard.arm();
+        }
+    }
 
     public LuaState() {
         LuaValue.resetBasicMetatables();
@@ -58,6 +163,8 @@ public final class LuaState {
         this.rootEnvironment = new Environment(null, globals);
         org.luava.runtime.eval.GCManager.registerState(this);
         openStandardLibraries();
+        savedLoadfile = globals.rawget(LuaString.valueOf("loadfile"));
+        savedDofile = globals.rawget(LuaString.valueOf("dofile"));
     }
 
     private void openStandardLibraries() {
@@ -98,6 +205,69 @@ public final class LuaState {
         holder[0] = table;
         globals.rawset(LuaString.valueOf(name), table);
         return table;
+    }
+
+    /**
+     * Disables the dangerous standard libraries in one call: {@code os},
+     * {@code io}, {@code package} (+ {@code require}/{@code dofile}/
+     * {@code loadfile}) and the Java interop table. Use this before running
+     * untrusted scripts to prevent filesystem/process/reflection abuse.
+     *
+     * @return this state (fluent one-liner: {@code new LuaState().sandbox()})
+     */
+    public LuaState sandbox() {
+        return deny("os", "io", "package", "require", "dofile", "loadfile", "java", "luajava", "debug");
+    }
+
+    /** Removes the named globals (library tables or functions). */
+    public LuaState deny(String... names) {
+        for (String name : names) {
+            globals.rawset(LuaString.valueOf(name), LuaNil.NIL);
+        }
+        return this;
+    }
+
+    /**
+     * Re-enables a standard library by (lazily) reinstalling it. Supported
+     * names: math, string, table, coroutine, utf8, os, io, debug, package,
+     * java. {@code require}/{@code dofile}/{@code loadfile} are restored with
+     * the package library.
+     */
+    public LuaState allow(String name) {
+        switch (name) {
+            case "math" -> lazyLib("math", t -> MathLib.fillInto(t, globals));
+            case "string" -> {
+                LuaTable stringLib = lazyLib("string", t -> StringLib.fillInto(t, globals));
+                StringLib.installMetatable(stringLib);
+            }
+            case "table" -> lazyLib("table", t -> TableLib.fillInto(t, globals));
+            case "coroutine" -> lazyLib("coroutine", t -> CoroutineLib.fillInto(t, globals, mainThread));
+            case "utf8" -> lazyLib("utf8", t -> Utf8Lib.fillInto(t, globals));
+            case "os" -> lazyLib("os", t -> OsLib.fillInto(t, globals));
+            case "io" -> lazyLib("io", t -> IoLib.fillInto(t, globals));
+            case "debug" -> lazyLib("debug", t -> DebugLib.fillInto(t, this, globals));
+            case "java" -> {
+                LuaTable javaLib = lazyLib("java", t -> org.luava.binding.JavaInteropLib.fillInto(t, globals));
+                globals.rawset(LuaString.valueOf("luajava"), javaLib);
+            }
+            case "package" -> installPackage();
+            default -> throw new LuaException("unknown library: " + name);
+        }
+        return this;
+    }
+
+    private void installPackage() {        LuaTable pkgLib = lazyLib("package", t -> PackageLib.fillInto(t, this, globals));
+        globals.rawset(LuaString.valueOf("require"), LuaFunction.of(args -> {
+            pkgLib.ensureFilled();
+            LuaValue real = globals.rawget(LuaString.valueOf("require"));
+            return ((LuaFunction) real).call(args);
+        }));
+        if (savedLoadfile != null) {
+            globals.rawset(LuaString.valueOf("loadfile"), savedLoadfile);
+        }
+        if (savedDofile != null) {
+            globals.rawset(LuaString.valueOf("dofile"), savedDofile);
+        }
     }
 
     public LuaTable getRegistry() {
@@ -221,10 +391,28 @@ public final class LuaState {
         if (prev == null) {
             LuaCoroutine.setCurrent(mainThread);
         }
+        LuaState prevActive = ACTIVE_STATE.get();
+        if (prevActive == null) {
+            ACTIVE_STATE.set(this);
+        }
+        Long prevMax = ACTIVE_MAX_ALLOC.get();
+        if (prevMax == null && maxAllocBytes > 0) {
+            ACTIVE_MAX_ALLOC.set(maxAllocBytes);
+        }
+        armGuard();
         try {
             LuaFunction chunk = compile(luaSource, chunkName, globals);
+            if (chunk instanceof org.luava.runtime.bytecode.LuaClosure lc) {
+                lc.setState(this);
+            }
             return chunk.call();
         } finally {
+            if (prevMax == null) {
+                ACTIVE_MAX_ALLOC.remove();
+            }
+            if (prevActive == null) {
+                ACTIVE_STATE.remove();
+            }
             if (prev == null) {
                 LuaCoroutine.setCurrent(null);
             }
@@ -263,6 +451,46 @@ public final class LuaState {
         }
     }
 
+    /**
+     * Stops execution after at most {@code maxInstructions} VM instructions
+     * with a Lua error {@code "instruction limit exceeded"}. Cooperative and
+     * cheap (one field check per instruction). Pass {@code 0} to disable.
+     */
+    public LuaState instructionLimit(long maxInstructions) {
+        if (maxInstructions <= 0) {
+            loopGuard = null;
+            return this;
+        }
+        long timeoutNanos = (loopGuard instanceof Guard g) ? g.timeoutNanos : 0;
+        Guard guard = new Guard(maxInstructions, timeoutNanos);
+        guard.arm();
+        loopGuard = guard;
+        return this;
+    }
+
+    /**
+     * Stops execution after {@code timeout} of wall-clock time with a Lua
+     * error {@code "execution timed out"}. Checked periodically (not every
+     * instruction) to keep the hot path cheap. Pass {@code null} to disable.
+     */
+    public LuaState timeout(Duration timeout) {
+        if (timeout == null || timeout.isZero() || timeout.isNegative()) {
+            loopGuard = null;
+            return this;
+        }
+        long maxInstr = (loopGuard instanceof Guard g) ? g.maxInstr : 0;
+        Guard guard = new Guard(maxInstr, timeout.toNanos());
+        guard.arm();
+        loopGuard = guard;
+        return this;
+    }
+
+    /** Clears any instruction/timeout guard installed by this state. */
+    public LuaState clearGuard() {
+        loopGuard = null;
+        return this;
+    }
+
     public String generateEmmyDocs() {
         StringBuilder sb = new StringBuilder();
         for (ModuleBinder.ModuleInfo info : registeredModules) {
@@ -291,10 +519,17 @@ public final class LuaState {
         LuaTable chunkGlobals = (chunkEnvVal instanceof LuaTable t) ? t : globals;
 
         if (luaSource.startsWith("\u001b")) {
-            return org.luava.runtime.standard.ChunkSerializer.undump(
+            LuaFunction fn = org.luava.runtime.standard.ChunkSerializer.undump(
                 luaSource.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1),
                 chunkName, chunkEnvVal, globals, rootEnvironment
             );
+            // undump may build a closure without a state; bind this state so
+            // the loopGuard/instructionLimit applies (otherwise invoke() would
+            // lazily create a fresh, unguarded LuaState).
+            if (fn instanceof org.luava.runtime.bytecode.LuaClosure lc) {
+                lc.setState(this);
+            }
+            return fn;
         }
 
         try {
@@ -396,8 +631,26 @@ public final class LuaState {
         }
     }
 
-    public static final class TbcEntry {
-        public final int stackIndex;
+    /**
+     * Runs {@code os.exit(_, true)} close semantics: closes pending
+     * to-be-closed variables of the running thread, then runs finalizers.
+     * Called from {@code os.exit} before unwinding with {@link LuaExit}.
+     */
+    public static void runExitFinalizers() {
+        LuaCoroutine cur = LuaCoroutine.running();
+        if (cur != null) {
+            try {
+                cur.closeAllTbc();
+            } catch (Throwable ignored) {
+            }
+        }
+        try {
+            org.luava.runtime.eval.GCManager.collect();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static final class TbcEntry {        public final int stackIndex;
         public final LuaValue value;
         public final String varName;
         public TbcEntry next;

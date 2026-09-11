@@ -1,0 +1,72 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Build & test (Java 21 LTS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Show toolchain
+        run: |
+          java -version
+          mvn -version
+
+      - name: Build reference PUC Lua 5.4.9 (needed by files.lua/main.lua)
+        run: |
+          curl -fsSL https://www.lua.org/ftp/lua-5.4.9.tar.gz -o /tmp/lua.tar.gz
+          tar -xzf /tmp/lua.tar.gz -C /tmp
+          # One-line patch the repo's reference build carries: when no script
+          # argument is given, createargtable must see script == 0.
+          sed -i 's|  createargtable(L, argv, argc, script);|  if (script == argc) script = 0;\n  createargtable(L, argv, argc, script);|' \
+            /tmp/lua-5.4.9/src/lua.c
+          make -C /tmp/lua-5.4.9 linux-readline
+          mkdir -p lua-source/src
+          cp /tmp/lua-5.4.9/src/lua lua-source/src/lua
+          cp /tmp/lua-5.4.9/src/luac lua-source/src/luac
+          chmod +x lua-source/src/lua lua-source/src/luac
+          ./lua-source/src/lua -v
+
+      - name: Verify no preview / FFM usage
+        run: |
+          if grep -rn -- "--enable-preview\|java.lang.foreign" src/main pom.xml; then
+            echo "::error::preview/FFM usage found (must stay stock Java 21 LTS)"; exit 1
+          fi
+          echo "no preview/FFM references"
+
+      - name: License header check (spotless)
+        run: mvn -B -ntp validate
+
+      - name: Compile (no --enable-preview)
+        run: mvn -B -ntp compile
+
+      - name: Full test suite (PUC Lua 5.4.9 + unit)
+        run: mvn -B -ntp test
+
+      - name: Package
+        run: mvn -B -ntp package -DskipTests
+
+      - name: Upload surefire reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          if-no-files-found: ignore

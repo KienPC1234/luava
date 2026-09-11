@@ -246,9 +246,22 @@ public final class OsLib {
         }));
 
         os.rawset(LuaString.valueOf("exit"), LuaFunction.of(args -> {
-            int code = (args.length > 0 && args[0].isInteger()) ? (int) args[0].toLong() : 0;
-            System.exit(code);
-            return LuaNil.NIL;
+            int code;
+            LuaValue first = (args.length > 0) ? args[0] : LuaNil.NIL;
+            if (first.isBoolean()) {
+                code = first.toBoolean() ? 0 : 1;
+            } else if (first.isInteger()) {
+                code = (int) first.toLong();
+            } else {
+                code = 0;
+            }
+            boolean close = args.length > 1 && args[1].toBoolean();
+            if (close) {
+                org.luava.runtime.LuaState.runExitFinalizers();
+            }
+            // Never call System.exit: that would kill an embedding server.
+            // Unwind via an Error so pcall cannot swallow the exit request.
+            throw new org.luava.runtime.LuaExit(code);
         }));
 
         os.rawset(LuaString.valueOf("remove"), LuaFunction.of(args -> {
