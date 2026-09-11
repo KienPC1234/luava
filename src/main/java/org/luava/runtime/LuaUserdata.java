@@ -164,6 +164,7 @@ public final class LuaUserdata extends LuaValue {
 
             // Static Class context
             if (instance instanceof Class<?> clazz) {
+                org.luava.binding.JavaAccessPolicy.active().check(clazz.getName());
                 if ("class".equals(name)) return this;
                 if ("new".equals(name)) {
                     return createConstructorFunction(clazz);
@@ -541,7 +542,9 @@ public final class LuaUserdata extends LuaValue {
             return list;
         });
         for (Field f : fields) {
-            if (f.getName().equals(name) && Modifier.isStatic(f.getModifiers()) == isStatic) {
+            if (f.getName().equals(name)
+                    && Modifier.isStatic(f.getModifiers()) == isStatic
+                    && org.luava.binding.JavaAccessPolicy.active().isAllowed(f.getDeclaringClass().getName())) {
                 return f;
             }
         }
@@ -561,7 +564,9 @@ public final class LuaUserdata extends LuaValue {
         });
         List<Method> result = new ArrayList<>();
         for (Method m : methods) {
-            if (m.getName().equals(name) && Modifier.isStatic(m.getModifiers()) == isStatic) {
+            if (m.getName().equals(name)
+                    && Modifier.isStatic(m.getModifiers()) == isStatic
+                    && org.luava.binding.JavaAccessPolicy.active().isAllowed(m.getDeclaringClass().getName())) {
                 result.add(m);
             }
         }

@@ -49,17 +49,61 @@ guards are one-liners:
 
 ```java
 LuaState sandboxed = new LuaState()
-        .sandbox()                          // drop os/io/package + Java interop
+        .sandbox()                          // drop os/io/package + strict Java policy
         .instructionLimit(10_000_000)       // or .timeout(Duration.ofSeconds(1))
         .setLive("api", myService);
 sandboxed.eval(userScript);                 // while true do end -> Lua error, host survives
 ```
 
 - `sandbox()` removes `os`, `io`, `package`, `require`, `dofile`,
-  `loadfile`, `java` and `luajava`. `deny("os","io")` / `allow("os")`
-  give fine-grained control.
+  `loadfile`, `java` and `luajava`, and switches the Java interop layer to
+  the strict allowlist. `deny("os","io")` / `allow("os")` give
+  fine-grained control.
 - `instructionLimit(n)` and `timeout(d)` abort runaway scripts with a
   catchable Lua error (`pcall` works); the default path pays nothing.
+
+### Java interop access policy
+
+The `java.*` bridge is filtered by a host-access policy so untrusted
+scripts cannot escape through reflection. Every `java.import`,
+`java.new`, `java.proxy`, `java.array` and every `Class` member lookup is
+checked against the active policy.
+
+- `JavaAccessPolicy.DEFAULT` (a fresh `LuaState`) blocks process
+  execution (`Runtime`, `ProcessBuilder`, `ProcessHandle`), JVM exit
+  (`System`), reflection (`Class`, `ClassLoader`, `java.lang.reflect.*`,
+  `java.lang.invoke.*`), the filesystem (`java.io.*`, `java.nio.*`) and
+  the network (`java.net.*`), while allowing ordinary application and
+  collection classes (`java.util.*`, `java.lang.Math`, `StringBuilder`,
+  ...).
+- `sandbox()` installs `JavaAccessPolicy.STRICT`: only the safe allowlist
+  is reachable, and `allow("java")` does **not** re-open the dangerous
+  classes.
+- `state.javaPolicy(policy)`, `state.javaAllow("java.io.*")` and
+  `state.javaDeny("com.acme.internal.*")` tune it; patterns are exact
+  names, package prefixes (`java.io.*`) or `*`.
+- `JavaAccessPolicy.UNRESTRICTED` disables filtering — use only for fully
+  trusted scripts.
+
+## Scope: server embedding, not a drop-in `lua` CLI
+
+Luava is an **embedding engine for JVM servers**, not a replacement for
+the stand-alone `lua` binary. Scripts are loaded by the host through
+`eval` / `setLive` / `registerFunction`; host applications expose exactly
+the API they want. Features that only make sense for the C command-line
+interpreter are intentionally out of scope:
+
+- loading native C modules (`.so` / `LUA_CPATH`) — hosts register Java
+  functions instead;
+- `os.execute`-driven CLI test scaffolding (`main.lua`) and the
+  `MEMLIMIT` environment-variable tests;
+- `heavy.lua`'s deliberate 1 GB allocation stress.
+
+The official suite is therefore run as an engine test: `main.lua` and
+`files.lua`'s `arg[0]`-driven CLI blocks pass against the reference C
+binary, not Luava, and are reported as such rather than counted as Luava
+compliance. `all.lua` (needs the C `T` harness) and `heavy.lua` are
+excluded by design.
 
 ## Conformance status
 

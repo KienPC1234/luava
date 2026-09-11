@@ -38,12 +38,8 @@ public final class JavaInteropLib {
                 throw new LuaException("bad argument #1 to 'java.import' (string expected)");
             }
             String className = args[0].toLuaString();
-            try {
-                Class<?> clazz = Class.forName(className);
-                return new LuaUserdata(clazz);
-            } catch (ClassNotFoundException e) {
-                throw new LuaException("Class not found: " + className);
-            }
+            Class<?> clazz = loadClass(className);
+            return new LuaUserdata(clazz);
         });
         javaMod.rawset(LuaString.valueOf("import"), importFn);
         javaMod.rawset(LuaString.valueOf("bindClass"), importFn);
@@ -55,12 +51,9 @@ public final class JavaInteropLib {
             }
             Class<?> clazz;
             if (args[0].isString()) {
-                try {
-                    clazz = Class.forName(args[0].toLuaString());
-                } catch (ClassNotFoundException e) {
-                    throw new LuaException("Class not found: " + args[0].toLuaString());
-                }
+                clazz = loadClass(args[0].toLuaString());
             } else if (args[0].isUserdata() && ((LuaUserdata) args[0]).getJavaInstance() instanceof Class<?> c) {
+                checkClass(c);
                 clazz = c;
             } else {
                 throw new LuaException("bad argument #1 to 'java.new' (expected Class or class name string)");
@@ -79,12 +72,9 @@ public final class JavaInteropLib {
             }
             Class<?> iface;
             if (args[0].isString()) {
-                try {
-                    iface = Class.forName(args[0].toLuaString());
-                } catch (ClassNotFoundException e) {
-                    throw new LuaException("Interface not found: " + args[0].toLuaString());
-                }
+                iface = loadClass(args[0].toLuaString());
             } else if (args[0].isUserdata() && ((LuaUserdata) args[0]).getJavaInstance() instanceof Class<?> c) {
+                checkClass(c);
                 iface = c;
             } else {
                 throw new LuaException("bad argument #1 to 'java.proxy' (interface expected)");
@@ -149,14 +139,11 @@ public final class JavaInteropLib {
                     case "String", "string" -> String.class;
                     case "Object", "object" -> Object.class;
                     default -> {
-                        try {
-                            yield Class.forName(typeName);
-                        } catch (ClassNotFoundException e) {
-                            throw new LuaException("Unknown array component type: " + typeName);
-                        }
+                        yield loadClass(typeName);
                     }
                 };
             } else if (args[0].isUserdata() && ((LuaUserdata) args[0]).getJavaInstance() instanceof Class<?> c) {
+                checkClass(c);
                 compType = c;
             } else {
                 throw new LuaException("bad argument #1 to 'java.array' (expected component type string or Class)");
@@ -176,12 +163,10 @@ public final class JavaInteropLib {
 
             Class<?> targetClass;
             if (args[1].isString()) {
-                try {
-                    targetClass = Class.forName(args[1].toLuaString());
-                } catch (ClassNotFoundException e) {
-                    return LuaBoolean.FALSE;
-                }
+                targetClass = loadClassOrNull(args[1].toLuaString());
+                if (targetClass == null) return LuaBoolean.FALSE;
             } else if (args[1].isUserdata() && ((LuaUserdata) args[1]).getJavaInstance() instanceof Class<?> c) {
+                checkClass(c);
                 targetClass = c;
             } else {
                 return LuaBoolean.FALSE;
@@ -189,5 +174,33 @@ public final class JavaInteropLib {
 
             return LuaBoolean.valueOf(targetClass.isInstance(inst));
         }));
+    }
+
+    /** Loads a class after checking it against the active access policy. */
+    static Class<?> loadClass(String className) {
+        JavaAccessPolicy.active().check(className);
+        try {
+            return Class.forName(className);
+        } catch (ClassNotFoundException e) {
+            throw new LuaException("Class not found: " + className);
+        }
+    }
+
+    /** Checks a Class userdata before it is used as a type handle. */
+    static void checkClass(Class<?> clazz) {
+        JavaAccessPolicy.active().check(clazz.getName());
+    }
+
+    /**
+     * Loads a class for a boolean {@code instanceof} probe: denied or
+     * missing classes both yield {@code null} instead of throwing.
+     */
+    static Class<?> loadClassOrNull(String className) {
+        if (!JavaAccessPolicy.active().isAllowed(className)) return null;
+        try {
+            return Class.forName(className);
+        } catch (ClassNotFoundException e) {
+            return null;
+        }
     }
 }

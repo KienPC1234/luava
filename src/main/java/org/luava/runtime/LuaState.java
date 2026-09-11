@@ -7,6 +7,7 @@
  */
 package org.luava.runtime;
 
+import org.luava.binding.JavaAccessPolicy;
 import org.luava.binding.JavaFunctionBuilder;
 import org.luava.binding.LuaDataConverter;
 import org.luava.binding.ModuleBinder;
@@ -142,6 +143,35 @@ public final class LuaState {
 
     private long maxAllocBytes = 0;
 
+    private JavaAccessPolicy javaAccessPolicy = JavaAccessPolicy.DEFAULT;
+
+    /**
+     * Replaces the Java interop host-access policy. Use
+     * {@link JavaAccessPolicy#UNRESTRICTED} only for fully trusted scripts;
+     * the default blocks process execution, reflection, filesystem and
+     * network classes.
+     */
+    public LuaState javaPolicy(JavaAccessPolicy policy) {
+        this.javaAccessPolicy = (policy != null) ? policy : JavaAccessPolicy.DEFAULT;
+        return this;
+    }
+
+    /** Allows additional Java class/package patterns through the policy. */
+    public LuaState javaAllow(String... patterns) {
+        this.javaAccessPolicy = javaAccessPolicy.withAllow(patterns);
+        return this;
+    }
+
+    /** Denies additional Java class/package patterns through the policy. */
+    public LuaState javaDeny(String... patterns) {
+        this.javaAccessPolicy = javaAccessPolicy.withDeny(patterns);
+        return this;
+    }
+
+    public JavaAccessPolicy getJavaAccessPolicy() {
+        return javaAccessPolicy;
+    }
+
     /** Effective per-allocation cap for the currently running chunk. */
     public static long allocationLimit() {
         Long l = ACTIVE_MAX_ALLOC.get();
@@ -216,6 +246,7 @@ public final class LuaState {
      * @return this state (fluent one-liner: {@code new LuaState().sandbox()})
      */
     public LuaState sandbox() {
+        javaAccessPolicy = JavaAccessPolicy.STRICT;
         return deny("os", "io", "package", "require", "dofile", "loadfile", "java", "luajava", "debug");
     }
 
@@ -399,6 +430,7 @@ public final class LuaState {
         if (prevMax == null && maxAllocBytes > 0) {
             ACTIVE_MAX_ALLOC.set(maxAllocBytes);
         }
+        JavaAccessPolicy prevPolicy = JavaAccessPolicy.setActive(javaAccessPolicy);
         armGuard();
         try {
             LuaFunction chunk = compile(luaSource, chunkName, globals);
@@ -407,6 +439,7 @@ public final class LuaState {
             }
             return chunk.call();
         } finally {
+            JavaAccessPolicy.restoreActive(prevPolicy);
             if (prevMax == null) {
                 ACTIVE_MAX_ALLOC.remove();
             }
