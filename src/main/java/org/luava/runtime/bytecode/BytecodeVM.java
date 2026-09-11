@@ -901,7 +901,7 @@ public final class BytecodeVM {
         LuaValue func = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx);
         while (!(func instanceof LuaFunction)) {
             LuaTable mt = func.getMetatable();
-            LuaValue tm = mt != null ? mt.rawget(LuaString.valueOf("__call")) : null;
+            LuaValue tm = mt != null ? mt.rawget(LuaValue.Meta.CALL) : null;
             if (tm != null && !tm.isNil()) {
                 ctx.thread.ensureStackCapacity(funcIdx + nArgs + 3);
                 ctx.pStack = ctx.thread.getPrimitiveStack();

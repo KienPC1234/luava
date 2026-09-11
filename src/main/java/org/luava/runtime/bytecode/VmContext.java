@@ -73,13 +73,14 @@ public final class VmContext {
     public LuaCoroutine thread;
 
     /**
-     * Tiny direct-mapped memo for {@code getobjname} (pure in proto/pc/reg).
+     * Direct-mapped memo for {@code getobjname} (pure in proto/pc/reg).
      * Name resolution runs once per call site per execute instead of a
      * bytecode-archaeology scan per call. Entries are ctx-local, so no
-     * cross-thread contention; a shared array is returned (callers must
-     * only read it).
+     * cross-thread contention; the stored array is shared and callers must
+     * only read it. Sized so method-heavy code with many call sites does not
+     * thrash (a 4-entry table did, re-scanning on nearly every call).
      */
-    public static final int NAME_CACHE_SIZE = 4;
+    public static final int NAME_CACHE_SIZE = 256;
     public final LuaProto[] ncProto = new LuaProto[NAME_CACHE_SIZE];
     public final int[] ncPc = new int[NAME_CACHE_SIZE];
     public final int[] ncReg = new int[NAME_CACHE_SIZE];
