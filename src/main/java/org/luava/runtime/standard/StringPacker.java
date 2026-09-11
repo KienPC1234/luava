@@ -306,7 +306,8 @@ public final class StringPacker {
             if (opt.code == '!') { maxalign = opt.size; continue; }
 
             int pad = getpadding(out.size(), opt.align);
-            if ((long) out.size() + pad + (opt.size > 0 ? opt.size : 0) > Integer.MAX_VALUE) {
+            long cap = org.luava.runtime.LuaState.allocationLimit();
+            if ((long) out.size() + pad + (opt.size > 0 ? opt.size : 0) > cap) {
                 throw new LuaException("bad argument to 'string.pack' (format result too large)");
             }
             for (int p = 0; p < pad; p++) out.write(0);

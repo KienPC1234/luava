@@ -73,7 +73,8 @@ public final class StringLib {
                 }
             }
             long totallen = n * l + (n - 1) * lsep;
-            if (totallen < 0 || totallen > Integer.MAX_VALUE - 8) {
+            long cap = org.luava.runtime.LuaState.allocationLimit();
+            if (totallen < 0 || totallen > cap) {
                 throw new LuaException("resulting string too large");
             }
             if (sep.isEmpty()) {

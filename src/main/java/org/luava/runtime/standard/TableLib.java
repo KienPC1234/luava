@@ -174,10 +174,12 @@ public final class TableLib {
                 }
                 if (t > f && t <= e && a1 == a2) {
                     for (long i = n - 1; i >= 0; i--) {
+                        if ((i & 0xFF) == 0) org.luava.runtime.LuaState.checkGuard();
                         a2.set(LuaInteger.valueOf(t + i), a1.get(LuaInteger.valueOf(f + i)));
                     }
                 } else {
                     for (long i = 0; i < n; i++) {
+                        if ((i & 0xFF) == 0) org.luava.runtime.LuaState.checkGuard();
                         a2.set(LuaInteger.valueOf(t + i), a1.get(LuaInteger.valueOf(f + i)));
                     }
                 }

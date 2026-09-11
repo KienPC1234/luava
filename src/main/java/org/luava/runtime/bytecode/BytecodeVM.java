@@ -207,6 +207,8 @@ public final class BytecodeVM {
      */
     private static LuaValue[] runLoop(LuaState state, VmContext ctx) {
         LuaCoroutine co0 = ctx.co;
+        // Cooperative runaway-script guard, constant for this execute() call.
+        LuaState.LoopGuard guard = state.loopGuard;
 
         try {
             while (true) {
@@ -218,6 +220,10 @@ public final class BytecodeVM {
                     co0.vmPcMirror = instPc;
                 } else {
                     mirrorSlow(ctx, instPc);
+                }
+
+                if (guard != null) {
+                    guard.tick();
                 }
 
                 int inst = ctx.code[ctx.pc++];
