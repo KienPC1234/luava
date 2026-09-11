@@ -196,6 +196,7 @@ public final class Utf8Lib {
         }));
 
         LuaFunction iterAuxStrict = LuaFunction.of(args -> {
+            if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'utf8.codes' iterator (string expected)");
             byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
             long n = args.length > 1 ? args[1].toLong() : 0;
@@ -214,6 +215,7 @@ public final class Utf8Lib {
         });
 
         LuaFunction iterAuxLax = LuaFunction.of(args -> {
+            if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'utf8.codes' iterator (string expected)");
             byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
             long n = args.length > 1 ? args[1].toLong() : 0;

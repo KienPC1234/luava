@@ -380,7 +380,7 @@ public final class LuaUserdata extends LuaValue {
             try {
                 Object[] javaArgs = convertArgs(bestMatch.getParameterTypes(), bestMatch.isVarArgs(), args);
                 Object obj = bestMatch.newInstance(javaArgs);
-                return new LuaUserdata(obj);
+                return LuaDataConverter.wrapLive(obj);
             } catch (Throwable t) {
                 throw new LuaException("Error invoking constructor for " + clazz.getName() + ": " + t.getMessage());
             }

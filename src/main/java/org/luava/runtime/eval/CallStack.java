@@ -74,7 +74,15 @@ public final class CallStack {
         }
     }
 
-    public static final int MAX_CALL_DEPTH = 200;
+    /**
+     * Maximum Lua call depth. Frames live on the heap (pooled CallInfo +
+     * reused Frame objects), not the Java call stack, so thousands of
+     * levels are cheap and match C behavior for legitimate deep recursion
+     * (PUC Lua handles 8000+). Unbounded recursion still fails cleanly
+     * with "stack overflow" instead of OOMing the heap. Coroutine nesting
+     * has its own separate limit (MAX_NESTED_COROUTINES).
+     */
+    public static final int MAX_CALL_DEPTH = 10000;
     public static final int EXTRA_STACK_SLOTS = 50;
 
     public static final class ProtectedFrame {

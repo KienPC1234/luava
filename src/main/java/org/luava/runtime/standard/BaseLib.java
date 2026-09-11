@@ -33,11 +33,16 @@ public final class BaseLib {
         }));
 
         globals.rawset(LuaString.valueOf("print"), LuaFunction.of(args -> {
+            // Byte fidelity: Lua strings are byte containers (Latin-1
+            // preserved), so emit raw bytes instead of letting the platform
+            // charset double-encode non-ASCII output.
             for (int i = 0; i < args.length; i++) {
-                if (i > 0) System.out.print("\t");
-                System.out.print(args[i].toLuaString());
+                if (i > 0) System.out.write('\t');
+                byte[] b = args[i].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+                System.out.write(b, 0, b.length);
             }
-            System.out.println();
+            System.out.write('\n');
+            System.out.flush();
             return LuaNil.NIL;
         }));
 
