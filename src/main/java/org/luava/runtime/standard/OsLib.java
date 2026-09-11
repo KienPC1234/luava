@@ -272,9 +272,9 @@ public final class OsLib {
             try {
                 boolean deleted = Files.deleteIfExists(Path.of(filename));
                 if (deleted) return LuaBoolean.TRUE;
-                return Varargs.of(LuaNil.NIL, LuaString.valueOf(filename + ": No such file or directory"), LuaInteger.valueOf(2));
+                return fileResult(false, filename, 2);
             } catch (IOException e) {
-                return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()));
+                return fileResult(false, filename, errnoOf(e));
             }
         }));
 
@@ -286,7 +286,9 @@ public final class OsLib {
                 Files.move(Path.of(oldName), Path.of(newName), StandardCopyOption.REPLACE_EXISTING);
                 return LuaBoolean.TRUE;
             } catch (IOException e) {
-                return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()));
+                // C's os.rename passes NULL as the file name, so the message
+                // is just strerror(errno) with no path prefix.
+                return fileResult(false, null, errnoOf(e));
             }
         }));
 
@@ -317,5 +319,38 @@ public final class OsLib {
             }
             return LuaNil.NIL;
         }));
+    }
+
+    /**
+     * Mirrors {@code luaL_fileresult}: on failure push {@code nil}, the
+     * strerror-style message (prefixed with the file name only when one is
+     * given) and the errno. Used by {@code os.remove} / {@code os.rename}.
+     */
+    private static Varargs fileResult(boolean ok, String fname, int errno) {
+        if (ok) return Varargs.of(LuaBoolean.TRUE);
+        String msg = strerror(errno);
+        String text = (fname != null) ? fname + ": " + msg : msg;
+        return Varargs.of(LuaNil.NIL, LuaString.valueOf(text), LuaInteger.valueOf(errno));
+    }
+
+    /** Best-effort mapping of a Java I/O failure to a POSIX errno. */
+    private static int errnoOf(IOException e) {
+        if (e instanceof java.nio.file.NoSuchFileException) return 2;   // ENOENT
+        if (e instanceof java.nio.file.FileAlreadyExistsException) return 17; // EEXIST
+        if (e instanceof java.nio.file.AccessDeniedException) return 13; // EACCES
+        if (e instanceof java.nio.file.DirectoryNotEmptyException) return 39; // ENOTEMPTY
+        return 2;
+    }
+
+    private static String strerror(int errno) {
+        return switch (errno) {
+            case 2 -> "No such file or directory";
+            case 13 -> "Permission denied";
+            case 17 -> "File exists";
+            case 20 -> "Not a directory";
+            case 21 -> "Is a directory";
+            case 39 -> "Directory not empty";
+            default -> "I/O error";
+        };
     }
 }

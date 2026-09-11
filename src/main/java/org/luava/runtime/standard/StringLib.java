@@ -290,7 +290,7 @@ public final class StringLib {
                                 } else if (Double.isNaN(d)) {
                                     b.append("(0/0)");
                                 } else {
-                                    b.append(Double.toHexString(d).toLowerCase(java.util.Locale.US));
+                                    b.append(formatHexFloat(false, "", 0, -1, d));
                                 }
                             } else if (v.isString()) {
                                 b.append(formatQuoted(v.toLuaString()));
@@ -601,52 +601,248 @@ public final class StringLib {
             return rep;
         }
 
-        String precStr = (prec >= 0 ? "." + prec : "");
-        String widthStr = (width > 0 ? String.valueOf(width) : "");
         char s = spec.charAt(0);
 
-        if (s == 'g' || s == 'G') {
-            boolean hash = flags.contains("#");
-            String cleanFlags = flags.replace("#", "");
-            String raw = String.format(java.util.Locale.US, "%" + cleanFlags + precStr + s, d);
-            if (!hash) {
-                int expIdx = -1;
-                for (int i = 0; i < raw.length(); i++) {
-                    char ch = raw.charAt(i);
-                    if (ch == 'e' || ch == 'E') {
-                        expIdx = i;
-                        break;
-                    }
-                }
-                String mantissa = (expIdx >= 0) ? raw.substring(0, expIdx) : raw;
-                String exponent = (expIdx >= 0) ? raw.substring(expIdx) : "";
-                if (mantissa.indexOf('.') >= 0) {
-                    while (mantissa.endsWith("0")) {
-                        mantissa = mantissa.substring(0, mantissa.length() - 1);
-                    }
-                    if (mantissa.endsWith(".")) {
-                        mantissa = mantissa.substring(0, mantissa.length() - 1);
-                    }
-                }
-                raw = mantissa + exponent;
-            }
-            if (width > raw.length()) {
-                int pad = width - raw.length();
-                if (flags.contains("-")) {
-                    return raw + " ".repeat(pad);
-                } else if (flags.contains("0")) {
-                    if (raw.startsWith("+") || raw.startsWith("-") || raw.startsWith(" ")) {
-                        return raw.substring(0, 1) + "0".repeat(pad) + raw.substring(1);
-                    } else {
-                        return "0".repeat(pad) + raw;
-                    }
-                } else {
-                    return " ".repeat(pad) + raw;
-                }
-            }
-            return raw;
-        } else {
-            return String.format(java.util.Locale.US, "%" + flags + widthStr + precStr + s, d);
+        if (s == 'a' || s == 'A') {
+            return formatHexFloat(s == 'A', flags, width, prec, d);
         }
+
+        // %f / %e / %g must round the *exact* binary value to the requested
+        // decimal precision (glibc semantics, ties-to-even). Java's
+        // String.format first rounds to ~17 significant digits and is wrong
+        // for large magnitudes and subnormals, so format from BigDecimal.
+        boolean upper = (s == 'E' || s == 'G');
+        boolean hash = flags.contains("#");
+        boolean neg = (Double.doubleToRawLongBits(d) & 0x8000000000000000L) != 0;
+        double av = neg ? -d : d;
+        String body;
+        if (s == 'f' || s == 'F') {
+            body = formatFixed(av, prec < 0 ? 6 : prec, hash);
+        } else if (s == 'e' || s == 'E') {
+            body = formatScientific(av, prec < 0 ? 6 : prec, hash, upper);
+        } else {
+            body = formatGeneral(av, prec < 0 ? 6 : (prec == 0 ? 1 : prec), hash, upper);
+        }
+        String sign = neg ? "-" : flags.contains("+") ? "+" : flags.contains(" ") ? " " : "";
+        String rep = sign + body;
+        if (width > rep.length()) {
+            int pad = width - rep.length();
+            if (flags.contains("-")) return rep + " ".repeat(pad);
+            if (flags.contains("0")) return sign + "0".repeat(pad) + body;
+            return " ".repeat(pad) + rep;
+        }
+        return rep;
+    }
+
+    /** C {@code %f}: fixed notation with {@code prec} decimal places. */
+    private static String formatFixed(double v, int prec, boolean hash) {
+        java.math.BigDecimal bd = new java.math.BigDecimal(v)
+                .setScale(prec, java.math.RoundingMode.HALF_EVEN);
+        String plain = bd.toPlainString();
+        if (prec == 0 && hash) plain += ".";
+        return plain;
+    }
+
+    /** C {@code %e}: scientific notation with {@code prec} fraction digits. */
+    private static String formatScientific(double v, int prec, boolean hash, boolean upper) {
+        int sig = prec + 1;
+        String digits;
+        int exp;
+        if (v == 0.0) {
+            digits = "0";
+            exp = 0;
+        } else {
+            java.math.BigDecimal r = new java.math.BigDecimal(v)
+                    .round(new java.math.MathContext(sig, java.math.RoundingMode.HALF_EVEN));
+            exp = r.precision() - r.scale() - 1;
+            digits = r.unscaledValue().abs().toString();
+        }
+        StringBuilder ds = new StringBuilder(digits);
+        while (ds.length() < sig) ds.append('0');
+        StringBuilder sb = new StringBuilder();
+        sb.append(ds.charAt(0));
+        if (prec > 0 || hash) {
+            sb.append('.');
+            if (sig > 1) sb.append(ds, 1, sig);
+        }
+        sb.append(upper ? 'E' : 'e');
+        sb.append(exp < 0 ? '-' : '+');
+        int ae = Math.abs(exp);
+        if (ae < 10) sb.append('0');
+        sb.append(ae);
+        return sb.toString();
+    }
+
+    /** C {@code %g}: {@code %e} or {@code %f} depending on the exponent. */
+    private static String formatGeneral(double v, int sig, boolean hash, boolean upper) {
+        java.math.BigDecimal r = new java.math.BigDecimal(v)
+                .round(new java.math.MathContext(sig, java.math.RoundingMode.HALF_EVEN));
+        int exp = (v == 0.0) ? 0 : (r.precision() - r.scale() - 1);
+        String body;
+        if (exp >= -4 && exp < sig) {
+            body = formatFixed(v, sig - 1 - exp, hash);
+        } else {
+            body = formatScientific(v, sig - 1, hash, upper);
+        }
+        if (!hash) body = stripTrailingZeros(body);
+        return body;
+    }
+
+    /** Removes trailing fraction zeros (and a bare dot) from an %e/%f body. */
+    private static String stripTrailingZeros(String s) {
+        int eIdx = -1;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == 'e' || c == 'E') { eIdx = i; break; }
+        }
+        String mant = (eIdx >= 0) ? s.substring(0, eIdx) : s;
+        String exp = (eIdx >= 0) ? s.substring(eIdx) : "";
+        if (mant.indexOf('.') >= 0) {
+            int end = mant.length();
+            while (end > 0 && mant.charAt(end - 1) == '0') end--;
+            if (end > 0 && mant.charAt(end - 1) == '.') end--;
+            mant = mant.substring(0, end);
+        }
+        return mant + exp;
+    }
+
+    /**
+     * C99 {@code %a}/{@code %A} hexadecimal floating point, matching glibc:
+     * a normalized leading digit {@code 1..2}, a dot and fractional hex
+     * digits only when needed (or when {@code #} is given), an always-signed
+     * decimal exponent, precision-based rounding (round-half-to-even) and
+     * full width/flag handling. {@code prec < 0} means "as many digits as
+     * needed" (exact value).
+     */
+    private static String formatHexFloat(boolean upper, String flags, int width, int prec, double d) {
+        if (Double.isInfinite(d) || Double.isNaN(d)) {
+            // C formats %a inf/nan like %g: signed, uppercased for %A.
+            String rep;
+            if (Double.isInfinite(d)) {
+                rep = d < 0 ? "-inf" : "inf";
+            } else {
+                boolean neg = (Double.doubleToRawLongBits(d) & 0x8000000000000000L) != 0;
+                rep = neg ? "-nan" : "nan";
+            }
+            if (!rep.startsWith("-")) {
+                if (flags.contains("+")) rep = "+" + rep;
+                else if (flags.contains(" ")) rep = " " + rep;
+            }
+            if (upper) rep = rep.toUpperCase(java.util.Locale.US);
+            return padHex(rep, flags, width);
+        }
+
+        long bits = Double.doubleToRawLongBits(d);
+        boolean negative = (bits & 0x8000000000000000L) != 0;
+        int expBits = (int) ((bits >>> 52) & 0x7FF);
+        long mantissaBits = bits & 0x000FFFFFFFFFFFFFL;
+
+        int e;          // exponent of the leading digit
+        int lead;       // leading hex digit (1 for normals, 0 for subnormals/zero)
+        long fracBits;  // 52-bit fraction after the leading digit, MSB-first
+        if (d == 0.0) {
+            // glibc: frexp(0) -> (0, 0), so the literal is 0x0p+0.
+            e = 0;
+            lead = 0;
+            fracBits = 0;
+        } else if (expBits == 0) {
+            // Subnormal: value = 0.fraction * 2^-1022.
+            e = -1022;
+            lead = 0;
+            fracBits = mantissaBits;
+        } else {
+            // Normal: value = 1.fraction * 2^(expBits-1023).
+            e = expBits - 1023;
+            lead = 1;
+            fracBits = mantissaBits;
+        }
+
+        // Exact fractional hex digits: 13 nibbles derived from 52 bits.
+        int[] digits = new int[13];
+        for (int i = 0; i < 13; i++) {
+            digits[i] = (int) ((fracBits >>> (48 - 4 * i)) & 0xF);
+        }
+        int exactLen = 13;
+        while (exactLen > 0 && digits[exactLen - 1] == 0) exactLen--;
+
+        int[] out;
+        int fracLen;
+        if (prec < 0) {
+            fracLen = exactLen;
+            out = java.util.Arrays.copyOf(digits, fracLen);
+        } else {
+            fracLen = prec;
+            out = new int[fracLen];
+            System.arraycopy(digits, 0, out, 0, Math.min(fracLen, 13));
+            // Round half-to-even on the first discarded nibble.
+            if (fracLen < 13) {
+                int guard = digits[fracLen];
+                boolean roundUp;
+                if (guard > 8) {
+                    roundUp = true;
+                } else if (guard < 8) {
+                    roundUp = false;
+                } else {
+                    boolean sticky = false;
+                    for (int i = fracLen + 1; i < 13; i++) {
+                        if (digits[i] != 0) { sticky = true; break; }
+                    }
+                    int last = (fracLen > 0) ? out[fracLen - 1] : lead;
+                    roundUp = sticky || (last & 1) == 1;
+                }
+                if (roundUp) {
+                    int i = fracLen - 1;
+                    boolean carry = true;
+                    while (i >= 0 && carry) {
+                        int v = out[i] + 1;
+                        if (v == 16) { out[i] = 0; carry = true; }
+                        else { out[i] = v; carry = false; }
+                        i--;
+                    }
+                    if (carry) lead++;
+                }
+            }
+        }
+
+        boolean hash = flags.contains("#");
+        StringBuilder sb = new StringBuilder();
+        if (negative) sb.append('-');
+        else if (flags.contains("+")) sb.append('+');
+        else if (flags.contains(" ")) sb.append(' ');
+
+        sb.append('0').append(upper ? 'X' : 'x');
+        sb.append(hexDigit(lead, upper));
+        if (fracLen > 0 || hash) {
+            sb.append('.');
+            for (int i = 0; i < fracLen; i++) sb.append(hexDigit(out[i], upper));
+        }
+        sb.append(upper ? 'P' : 'p');
+        sb.append(e >= 0 ? "+" : "-").append(Math.abs(e));
+
+        return padHex(sb.toString(), flags, width);
+    }
+
+    private static char hexDigit(int v, boolean upper) {
+        return (char) (v < 10 ? '0' + v : (upper ? 'A' : 'a') + v - 10);
+    }
+
+    /** Applies width/zero/left-justify padding to a hex-float literal. */
+    private static String padHex(String rep, String flags, int width) {
+        if (width <= rep.length()) return rep;
+        int pad = width - rep.length();
+        if (flags.contains("-")) {
+            return rep + " ".repeat(pad);
+        }
+        if (flags.contains("0")) {
+            // Zero padding goes after the sign and the "0x" prefix.
+            int prefix = 0;
+            if (rep.startsWith("+") || rep.startsWith("-") || rep.startsWith(" ")) prefix = 1;
+            if (rep.length() > prefix + 1 && rep.charAt(prefix) == '0'
+                    && (rep.charAt(prefix + 1) == 'x' || rep.charAt(prefix + 1) == 'X')) {
+                prefix += 2;
+            }
+            return rep.substring(0, prefix) + "0".repeat(pad) + rep.substring(prefix);
+        }
+        return " ".repeat(pad) + rep;
     }
 }

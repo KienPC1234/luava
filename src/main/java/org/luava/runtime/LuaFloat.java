@@ -56,6 +56,17 @@ public final class LuaFloat extends LuaValue {
     // even, so round the exact value with BigDecimal (HALF_EVEN) and render
     // manually with C %g style rules.
     static String formatFloat(double v) {
+        String s = formatFloatRaw(v);
+        if (s.matches("-?[0-9]+")) s += ".0";
+        return s;
+    }
+
+    /**
+     * Raw C {@code %.14g} rendering without the {@code .0} suffix that
+     * {@code tostring} adds. Used by {@code io.write}, which (per
+     * {@code LUA_NUMBER_FMT}) prints floats exactly as {@code %g} does.
+     */
+    public static String formatFloatRaw(double v) {
         if (Double.isNaN(v)) {
             return (Double.doubleToRawLongBits(v) < 0) ? "-nan" : "nan";
         }
@@ -97,7 +108,6 @@ public final class LuaFloat extends LuaValue {
             sb.append(digits);
             s = sb.toString();
         }
-        if (s.matches("-?[0-9]+")) s += ".0";
         return s;
     }
 

@@ -113,8 +113,8 @@ and `heavy.lua` are excluded by design.
 
 - **30/30** runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass on
   Luava (`OfficialSuiteEvaluationTest`, asserts failures so the build goes
-  red on any regression; 100 unit tests green alongside, including the
-  Java-interop policy suite (11) and the sandbox suite (15)).
+  red on any regression; 111 unit tests green alongside, including a
+  byte-for-byte differential conformance suite against stock PUC Lua 5.4).
 - Test files are checksum-identical to the upstream tarball; the harness
   never edits them.
 - Excluded by design: `heavy.lua` (intentional memory-overflow stress),
