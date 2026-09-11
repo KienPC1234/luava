@@ -24,10 +24,10 @@ Key design points:
 
 ## Quick start
 
-Requirements: JDK 21+, Maven 3.9+.
+Requirements: JDK 21+ (stock LTS, **no `--enable-preview`**), Maven 3.9+.
 
 ```bash
-mvn compile          # build (uses --enable-preview)
+mvn compile          # build
 mvn test             # full suite: PUC Lua 5.4.9 files + unit tests
 mvn package          # jar in target/
 ```
@@ -42,7 +42,24 @@ System.out.println(state.call("add", 10, 20).toLong());
 // 30
 ```
 
-Run tests with `java --enable-preview -Xmx2g` (surefire is preconfigured).
+### Safe embedding (untrusted scripts)
+
+Luava targets the same niche as LuaJ but with a security-first API. Both
+guards are one-liners:
+
+```java
+LuaState sandboxed = new LuaState()
+        .sandbox()                          // drop os/io/package + Java interop
+        .instructionLimit(10_000_000)       // or .timeout(Duration.ofSeconds(1))
+        .setLive("api", myService);
+sandboxed.eval(userScript);                 // while true do end -> Lua error, host survives
+```
+
+- `sandbox()` removes `os`, `io`, `package`, `require`, `dofile`,
+  `loadfile`, `java` and `luajava`. `deny("os","io")` / `allow("os")`
+  give fine-grained control.
+- `instructionLimit(n)` and `timeout(d)` abort runaway scripts with a
+  catchable Lua error (`pcall` works); the default path pays nothing.
 
 ## Conformance status
 
@@ -84,10 +101,12 @@ loop=300000 | fmt=ff|"a\"b"|0.333 | ALL-OK
 | Number fast path | Native | Unboxed triple-stack | Boxed `LuaInteger`/`LuaDouble` objects |
 | Coroutines | Own C stacks | Java virtual threads, per-coroutine stacks | Java threads / OrphanedThread |
 | Compliance evidence | Reference | 31/31 PUC 5.4.9 files | Hand-written 5.2-era scripts, no PUC suite |
+| Cold start (fresh JVM, 100k loop) | n/a | **~211 ms** (≈112 ms JVM boot + ~100 ms engine) | ~211 ms (≈114 ms boot + ~100 ms engine) |
 | Warmed 1M-iteration loop | ~8 ms | **~41 ms** | ~70 ms |
 | fib(24) | — | **~63 ms** | ~70 ms |
 | Table 100k r/w | — | **~39 ms** | ~59 ms |
 | Closure 500k calls | — | **~168 ms** | ~215 ms |
+| Runtime deps | libc | Pure Java 21 LTS (no preview, no JNI/FFM) | Java, optional BCEL for its JIT |
 | JIT status of dispatch loop | n/a | **Compiled**: `runLoop()` at 6955 bytes fits under HotSpot's 8 KB `HugeMethodLimit` (OSR + C2 verified via `PrintCompilation`) | Compiled: OSR + C2 at 3982 bytes |
 
 Luava beats LuaJ on every measured workload while implementing the newer
