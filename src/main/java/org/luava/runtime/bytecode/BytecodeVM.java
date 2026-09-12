@@ -146,17 +146,18 @@ public final class BytecodeVM {
         VmContext ctx = new VmContext();
         LuaCoroutine coInit = LuaCoroutine.running();
         ctx.co = coInit;
+        ctx.thread = coInit != null ? coInit : state.getMainThread();
         ctx.callState = coInit != null ? coInit.getCallStackState() : CallStack.currentState();
-        state.ensureStackCapacity(256);
-        ctx.pStack = state.getPrimitiveStack();
-        ctx.tStack = state.getTypeStack();
-        ctx.oStack = state.getObjectStack();
+        ctx.thread.ensureStackCapacity(256);
+        ctx.pStack = ctx.thread.getPrimitiveStack();
+        ctx.tStack = ctx.thread.getTypeStack();
+        ctx.oStack = ctx.thread.getObjectStack();
 
         ctx.callStack = new CallInfo[256];
         for (int i = 0; i < ctx.callStack.length; i++) ctx.callStack[i] = new CallInfo();
         ctx.callDepth = 0;
 
-        ctx.savedStackTop = state.getStackTop();
+        ctx.savedStackTop = ctx.thread.getStackTop();
         ctx.base = ctx.savedStackTop;
         ctx.top = ctx.base;
         ctx.pc = 0;
@@ -167,11 +168,11 @@ public final class BytecodeVM {
         ctx.k = ctx.proto.constants;
         ctx.upvals = ctx.closure.upvals;
 
-        state.ensureStackCapacity(ctx.base + ctx.proto.maxStackSize + 64);
-        state.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
-        ctx.pStack = state.getPrimitiveStack();
-        ctx.tStack = state.getTypeStack();
-        ctx.oStack = state.getObjectStack();
+        ctx.thread.ensureStackCapacity(ctx.base + ctx.proto.maxStackSize + 64);
+        ctx.thread.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
+        ctx.pStack = ctx.thread.getPrimitiveStack();
+        ctx.tStack = ctx.thread.getTypeStack();
+        ctx.oStack = ctx.thread.getObjectStack();
 
         int nArgs = initialArgs != null ? initialArgs.length : 0;
         for (int i = 0; i < ctx.proto.numParams; i++) {
@@ -621,11 +622,11 @@ public final class BytecodeVM {
                         ctx.upvals = ctx.closure.upvals;
                         ctx.pc = 0;
 
-                        state.ensureStackCapacity(ctx.base + ctx.proto.maxStackSize + 64);
-                        state.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
-                        ctx.pStack = state.getPrimitiveStack();
-                        ctx.tStack = state.getTypeStack();
-                        ctx.oStack = state.getObjectStack();
+                        ctx.thread.ensureStackCapacity(ctx.base + ctx.proto.maxStackSize + 64);
+                        ctx.thread.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
+                        ctx.pStack = ctx.thread.getPrimitiveStack();
+                        ctx.tStack = ctx.thread.getTypeStack();
+                        ctx.oStack = ctx.thread.getObjectStack();
 
                         if (ctx.proto.isVararg && nActualArgs > ctx.proto.numParams) {
                             int nv = nActualArgs - ctx.proto.numParams;
@@ -652,9 +653,9 @@ public final class BytecodeVM {
                         if (nResults < 0) {
                             ctx.top = newTop;
                         }
-                        ctx.pStack = state.getPrimitiveStack();
-                        ctx.tStack = state.getTypeStack();
-                        ctx.oStack = state.getObjectStack();
+                        ctx.pStack = ctx.thread.getPrimitiveStack();
+                        ctx.tStack = ctx.thread.getTypeStack();
+                        ctx.oStack = ctx.thread.getObjectStack();
                     }
                 }
                 case OpCode.OP_TAILCALL -> {
@@ -664,8 +665,8 @@ public final class BytecodeVM {
                     }
                 }
                 case OpCode.OP_RETURN0 -> {
-                    state.closeUpvalues(ctx.base);
-                    state.closeTbc(ctx.base, null);
+                    if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.base);
+                    if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
                     LuaValue[] retVals0 = new LuaValue[0];
                     stampReturnFrame(ctx, instPc, retVals0, 1, 0);
                     LuaValue[] r0 = returnToCaller(state, ctx, retVals0);
@@ -674,8 +675,8 @@ public final class BytecodeVM {
                     }
                 }
                 case OpCode.OP_RETURN1 -> {
-                    state.closeUpvalues(ctx.base);
-                    state.closeTbc(ctx.base, null);
+                    if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.base);
+                    if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
                     LuaValue ret = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
                     LuaValue[] retVals1 = new LuaValue[]{ret};
                     // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
@@ -686,8 +687,8 @@ public final class BytecodeVM {
                     }
                 }
                 case OpCode.OP_RETURN -> {
-                    state.closeUpvalues(ctx.base);
-                    state.closeTbc(ctx.base, null);
+                    if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.base);
+                    if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int nReturns = b > 0 ? b - 1 : (ctx.top - (ctx.base + a));
                     LuaValue[] retVals = new LuaValue[nReturns];
@@ -814,7 +815,7 @@ public final class BytecodeVM {
             }
         }
         state.closeTbc(ctx.savedStackTop, errVal);
-        state.setStackTop(ctx.savedStackTop);
+        ctx.thread.setStackTop(ctx.savedStackTop);
     }
 
     /**
@@ -900,12 +901,12 @@ public final class BytecodeVM {
         LuaValue func = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx);
         while (!(func instanceof LuaFunction)) {
             LuaTable mt = func.getMetatable();
-            LuaValue tm = mt != null ? mt.rawget(LuaString.valueOf("__call")) : null;
+            LuaValue tm = mt != null ? mt.rawget(LuaValue.Meta.CALL) : null;
             if (tm != null && !tm.isNil()) {
-                state.ensureStackCapacity(funcIdx + nArgs + 3);
-                ctx.pStack = state.getPrimitiveStack();
-                ctx.tStack = state.getTypeStack();
-                ctx.oStack = state.getObjectStack();
+                ctx.thread.ensureStackCapacity(funcIdx + nArgs + 3);
+                ctx.pStack = ctx.thread.getPrimitiveStack();
+                ctx.tStack = ctx.thread.getTypeStack();
+                ctx.oStack = ctx.thread.getObjectStack();
                 System.arraycopy(ctx.pStack, funcIdx, ctx.pStack, funcIdx + 1, nArgs + 1);
                 System.arraycopy(ctx.tStack, funcIdx, ctx.tStack, funcIdx + 1, nArgs + 1);
                 System.arraycopy(ctx.oStack, funcIdx, ctx.oStack, funcIdx + 1, nArgs + 1);
@@ -1029,13 +1030,13 @@ public final class BytecodeVM {
             CallStack.setNextTransfer(ctx.callState, 1, nActualArgs, tailCArgs);
             CallStack.setNextVmFrame(ctx.callState, state, ctx.base, ctx.base - 1, null, -1);
             CallStack.replaceTailCall(fn, resolvedName, namewhat != null ? namewhat : "", callLine, isMethod, isMeta, ctx.callState, ctx.co);
-            int origTop = state.getStackTop();
-            state.setStackTop(funcIdx + nActualArgs + 1);
+            int origTop = ctx.thread.getStackTop();
+            ctx.thread.setStackTop(funcIdx + nActualArgs + 1);
             LuaValue res = null;
             try {
                 res = fn.invoke(tailCArgs);
             } finally {
-                state.setStackTop(origTop);
+                ctx.thread.setStackTop(origTop);
                 CallStack.Frame f = CallStack.topFrame(ctx.callState);
                 if (f != null && res != null) {
                     LuaValue[] retVals = (res instanceof Varargs va) ? va.getValuesUnsafe() : new LuaValue[]{res};
@@ -1060,10 +1061,10 @@ public final class BytecodeVM {
                 ctx.varargs = ci.varargs;
                 ctx.oldpc = ci.oldpc;
                 ctx.varargPrepRan = ci.varargPrepRan;
-                state.ensureStackCapacity(callerFunc + (ci.expectedResults > 0 ? ci.expectedResults : nReturns) + 32);
-                ctx.pStack = state.getPrimitiveStack();
-                ctx.tStack = state.getTypeStack();
-                ctx.oStack = state.getObjectStack();
+                ctx.thread.ensureStackCapacity(callerFunc + (ci.expectedResults > 0 ? ci.expectedResults : nReturns) + 32);
+                ctx.pStack = ctx.thread.getPrimitiveStack();
+                ctx.tStack = ctx.thread.getTypeStack();
+                ctx.oStack = ctx.thread.getObjectStack();
                 if (ci.expectedResults > 0) {
                     for (int i = 0; i < ci.expectedResults; i++) {
                         setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc + i, (i < nReturns) ? retVals[i] : LuaNil.NIL);
@@ -1129,10 +1130,10 @@ public final class BytecodeVM {
                 }
                 ctx.top = callerFunc + nReturns;
             }
-            state.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
+            ctx.thread.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
             return null;
         }
-        state.setStackTop(ctx.savedStackTop);
+        ctx.thread.setStackTop(ctx.savedStackTop);
         return retVals;
     }
 
@@ -1219,22 +1220,14 @@ public final class BytecodeVM {
     private static String[] callName(VmContext ctx, LuaProto p, int lastpc, int reg) {
         int idx = (lastpc + reg * 33) & (VmContext.NAME_CACHE_SIZE - 1);
         if (ctx.ncFilled[idx] && ctx.ncProto[idx] == p && ctx.ncPc[idx] == lastpc && ctx.ncReg[idx] == reg) {
-            String a = ctx.ncA[idx];
-            if (a == null) return null;
-            return new String[]{a, ctx.ncB[idx]};
+            return ctx.ncInfo[idx];
         }
         String[] info = getobjname(p, lastpc, reg);
         ctx.ncFilled[idx] = true;
         ctx.ncProto[idx] = p;
         ctx.ncPc[idx] = lastpc;
         ctx.ncReg[idx] = reg;
-        if (info != null) {
-            ctx.ncA[idx] = info[0];
-            ctx.ncB[idx] = info[1];
-        } else {
-            ctx.ncA[idx] = null;
-            ctx.ncB[idx] = null;
-        }
+        ctx.ncInfo[idx] = info;
         return info;
     }
 
@@ -1775,9 +1768,9 @@ public final class BytecodeVM {
         }
     }
 
-    private static int executeExternalCall(LuaState state, VmContext ctx, LuaProto proto, int pc, int base, LuaFunction fn, int funcIdx, int nActualArgs, int nResults, int curLine) {        long[] pStack = state.getPrimitiveStack();
-        byte[] tStack = state.getTypeStack();
-        LuaValue[] oStack = state.getObjectStack();
+    private static int executeExternalCall(LuaState state, VmContext ctx, LuaProto proto, int pc, int base, LuaFunction fn, int funcIdx, int nActualArgs, int nResults, int curLine) {        long[] pStack = ctx.thread.getPrimitiveStack();
+        byte[] tStack = ctx.thread.getTypeStack();
+        LuaValue[] oStack = ctx.thread.getObjectStack();
         LuaValue[] cArgs = getArgsForCall(pStack, tStack, oStack, funcIdx + 1, nActualArgs);
         if (curLine > 0) CallStack.setLine(curLine);
         CallStack.CallStackState csState = ctx.callState;
@@ -1812,14 +1805,14 @@ public final class BytecodeVM {
         if (extFrame != null) {
             extFrame.cArgs = cArgs;
         }
-        int savedStackTop = state.getStackTop();
+        int savedStackTop = ctx.thread.getStackTop();
         // Lua 5.4: GC traverses stack up to top; restrict stack top to active arguments during external calls
-        state.setStackTop(funcIdx + nActualArgs + 1);
+        ctx.thread.setStackTop(funcIdx + nActualArgs + 1);
         LuaValue res = null;
         try {
             res = fn.invoke(cArgs);
         } finally {
-            state.setStackTop(savedStackTop);
+            ctx.thread.setStackTop(savedStackTop);
             CallStack.Frame f = CallStack.topFrame(ctx.callState);
             if (f != null && res != null) {
                 LuaValue[] retVals = (res instanceof Varargs va) ? va.getValuesUnsafe() : new LuaValue[]{res};
@@ -1829,10 +1822,10 @@ public final class BytecodeVM {
             }
             CallStack.pop(ctx.callState, ctx.co);
         }
-        state.ensureStackCapacity(funcIdx + (nResults > 0 ? nResults : 16) + 32);
-        pStack = state.getPrimitiveStack();
-        tStack = state.getTypeStack();
-        oStack = state.getObjectStack();
+        ctx.thread.ensureStackCapacity(funcIdx + (nResults > 0 ? nResults : 16) + 32);
+        pStack = ctx.thread.getPrimitiveStack();
+        tStack = ctx.thread.getTypeStack();
+        oStack = ctx.thread.getObjectStack();
         if (nResults > 0) {
             if (res instanceof Varargs va) {
                 LuaValue[] vals = va.getValuesUnsafe();
@@ -1850,9 +1843,9 @@ public final class BytecodeVM {
             if (res instanceof Varargs va) {
                 LuaValue[] vals = va.getValuesUnsafe();
                 state.ensureStackCapacity(funcIdx + vals.length + 32);
-                pStack = state.getPrimitiveStack();
-                tStack = state.getTypeStack();
-                oStack = state.getObjectStack();
+                pStack = ctx.thread.getPrimitiveStack();
+                tStack = ctx.thread.getTypeStack();
+                oStack = ctx.thread.getObjectStack();
                 for (int i = 0; i < vals.length; i++) {
                     setLuaValue(pStack, tStack, oStack, funcIdx + i, vals[i]);
                 }

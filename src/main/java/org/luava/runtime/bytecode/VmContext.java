@@ -64,17 +64,26 @@ public final class VmContext {
     public CallStack.CallStackState callState;
 
     /**
-     * Tiny direct-mapped memo for {@code getobjname} (pure in proto/pc/reg).
+     * Effective thread for stack operations: {@code co} when running inside a
+     * coroutine, otherwise the state's main thread (mirrors
+     * {@code LuaState.getCurrentThread()} without the ThreadLocal lookup).
+     * Hoisted once per {@code execute()}; the VM uses it for all hot-path
+     * stack reads/growth so a Lua-to-Lua call never re-resolves the thread.
+     */
+    public LuaCoroutine thread;
+
+    /**
+     * Direct-mapped memo for {@code getobjname} (pure in proto/pc/reg).
      * Name resolution runs once per call site per execute instead of a
      * bytecode-archaeology scan per call. Entries are ctx-local, so no
-     * cross-thread contention; a shared array is returned (callers must
-     * only read it).
+     * cross-thread contention; the stored array is shared and callers must
+     * only read it. Sized so method-heavy code with many call sites does not
+     * thrash (a 4-entry table did, re-scanning on nearly every call).
      */
-    public static final int NAME_CACHE_SIZE = 4;
+    public static final int NAME_CACHE_SIZE = 256;
     public final LuaProto[] ncProto = new LuaProto[NAME_CACHE_SIZE];
     public final int[] ncPc = new int[NAME_CACHE_SIZE];
     public final int[] ncReg = new int[NAME_CACHE_SIZE];
-    public final String[] ncA = new String[NAME_CACHE_SIZE];
-    public final String[] ncB = new String[NAME_CACHE_SIZE];
+    public final String[][] ncInfo = new String[NAME_CACHE_SIZE][];
     public final boolean[] ncFilled = new boolean[NAME_CACHE_SIZE];
 }

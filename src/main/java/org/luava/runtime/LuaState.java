@@ -700,7 +700,7 @@ public final class LuaState {
             return;
         }
         LuaTable mt = val.getMetatable();
-        if (mt == null || mt.rawget(LuaString.valueOf("__close")).isNil()) {
+        if (mt == null || mt.rawget(LuaValue.Meta.CLOSE).isNil()) {
             throw new LuaException("variable '" + (varName != null ? varName : "?") + "' got a non-closable value");
         }
         LuaCoroutine thread = getCurrentThread();
@@ -715,7 +715,7 @@ public final class LuaState {
             thread.setTbcHead(entry.next);
             LuaValue val = entry.value;
             LuaTable mt = val.getMetatable();
-            LuaValue closeMth = mt != null ? mt.rawget(LuaString.valueOf("__close")) : LuaNil.NIL;
+            LuaValue closeMth = mt != null ? mt.rawget(LuaValue.Meta.CLOSE) : LuaNil.NIL;
             try {
                 if (closeMth.isNil()) {
                     throw new LuaException("attempt to call a nil value (metamethod 'close')");

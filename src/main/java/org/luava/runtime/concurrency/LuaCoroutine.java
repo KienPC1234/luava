@@ -47,6 +47,33 @@ public final class LuaCoroutine extends LuaValue {
     private static final ThreadLocal<LuaCoroutine> CURRENT_COROUTINE = new ThreadLocal<>();
 
     /**
+     * Handoff rendezvous sequence numbers. A plain status-flag handshake
+     * (set status, unpark, spin/park while status unchanged) has a
+     * lost-wakeup race: the resumer can observe SUSPENDED and return before
+     * the yielding side reaches its wait, then re-resume and be told
+     * "cannot resume non-suspended coroutine". The old code masked it only
+     * because an unconditional park is slow enough that the counterpart was
+     * always already blocked. Monotonic per-side counters make the handoff
+     * exact: the resumer waits for a <em>new</em> yield/death event
+     * ({@link #yieldSeq}) and the yielder waits for a <em>new</em> resume
+     * ({@link #resumeSeq}), with the expected value snapshotted before the
+     * event is published.
+     */
+    private volatile long yieldSeq = 0;
+    private volatile long resumeSeq = 0;
+
+    /**
+     * Bounded spin budget before falling back to {@link LockSupport#park()}.
+     * A resume/yield handoff normally completes in a few hundred nanoseconds,
+     * but an unconditional park costs a full Loom context switch (~20us on
+     * this hardware). Spinning briefly on the (volatile) sequence lets the
+     * counterpart be observed without descheduling; after the budget we park
+     * as before, so a contended environment only wastes the bounded budget
+     * and still makes progress.
+     */
+    private static final long HANDOFF_SPIN_NANOS = 50_000L;
+
+    /**
      * Global hook-armed flag for the VM hot path. True when at least one
      * coroutine has an active hook. The interpreter loop checks this single
      * predictable field instead of ThreadLocal + config per instruction.
@@ -446,6 +473,7 @@ public final class LuaCoroutine extends LuaValue {
             resumeArgs = va.getValuesUnsafe();
         }
 
+        long seenYield;
         synchronized (this) {
             if (status == Status.DEAD) {
                 return RESUME_DEAD_ERROR;
@@ -472,6 +500,10 @@ public final class LuaCoroutine extends LuaValue {
             callStackState.deathStack = null;
             callStackState.deathTop = 0;
             error = null;
+            // Snapshot the yield counter before publishing this resume, so
+            // the wait below observes only a yield/death from *this* cycle.
+            seenYield = yieldSeq;
+            resumeSeq++;
 
             if (virtualThread == null) {
                 virtualThread = Thread.ofVirtual().name("lua-coroutine-" + System.identityHashCode(this)).start(() -> {
@@ -494,6 +526,7 @@ public final class LuaCoroutine extends LuaValue {
                         status = Status.DEAD;
                         callStackState.clearSavedErrorStack();
                         exitSignal = ex;
+                        yieldSeq++;
                         LockSupport.unpark(resumerThread);
                         throw ex;
                     } catch (Throwable t) {
@@ -530,6 +563,7 @@ public final class LuaCoroutine extends LuaValue {
                     } finally {
                         disarmHookCounted();
                         CURRENT_COROUTINE.remove();
+                        yieldSeq++;
                         LockSupport.unpark(resumerThread);
                     }
                 });
@@ -538,9 +572,7 @@ public final class LuaCoroutine extends LuaValue {
             }
         }
 
-        while (status == Status.RUNNING || status == Status.NORMAL) {
-            LockSupport.park();
-        }
+        awaitYield(seenYield);
 
         if (callerCoro != null) {
             callerCoro.status = Status.RUNNING;
@@ -578,12 +610,14 @@ public final class LuaCoroutine extends LuaValue {
         }
         current.handoffResult = (args != null && args.length > 0 ? args : EMPTY_VALUES);
         current.status = Status.SUSPENDED;
+        // Snapshot the resume counter before publishing this yield, so the
+        // wait below observes only a resume/close from *this* cycle.
+        long seenResume = current.resumeSeq;
+        current.yieldSeq++;
 
         LockSupport.unpark(current.resumerThread);
 
-        while (current.status == Status.SUSPENDED) {
-            LockSupport.park();
-        }
+        current.awaitResume(seenResume);
 
         if (current.isClosing) {
             throw new CoroutineCloseSignal();
@@ -592,8 +626,41 @@ public final class LuaCoroutine extends LuaValue {
         return current.handoffArgs != null ? current.handoffArgs : EMPTY_VALUES;
     }
 
+    /**
+     * Wait until the coroutine publishes a yield/death event newer than
+     * {@code seen}. Spins briefly before parking so a fast handoff avoids a
+     * Loom context switch; the sequence counter makes the wait exact even
+     * when the event lands before this method is reached.
+     */
+    private void awaitYield(long seen) {
+        long deadline = System.nanoTime() + HANDOFF_SPIN_NANOS;
+        while (yieldSeq == seen) {
+            if (System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            } else {
+                LockSupport.park();
+            }
+        }
+    }
+
+    /**
+     * Wait until the coroutine publishes a resume/close event newer than
+     * {@code seen} (see {@link #awaitYield}).
+     */
+    private void awaitResume(long seen) {
+        long deadline = System.nanoTime() + HANDOFF_SPIN_NANOS;
+        while (resumeSeq == seen) {
+            if (System.nanoTime() < deadline) {
+                Thread.onSpinWait();
+            } else {
+                LockSupport.park();
+            }
+        }
+    }
+
     public LuaValue[] close() {
         LuaCoroutine callerCoro = CURRENT_COROUTINE.get();
+        long seenYield;
         synchronized (this) {
             if (status == Status.RUNNING || status == Status.NORMAL) {
                 throw new LuaException("cannot close a " + status.label() + " coroutine");
@@ -627,12 +694,12 @@ public final class LuaCoroutine extends LuaValue {
             this.isClosing = true;
             this.resumerThread = Thread.currentThread();
             this.status = Status.RUNNING;
+            seenYield = yieldSeq;
+            resumeSeq++;
             LockSupport.unpark(virtualThread);
         }
 
-        while (status == Status.RUNNING || status == Status.NORMAL) {
-            LockSupport.park();
-        }
+        awaitYield(seenYield);
 
         if (callerCoro != null) {
             callerCoro.status = Status.RUNNING;

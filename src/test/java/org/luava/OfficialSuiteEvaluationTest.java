@@ -27,6 +27,7 @@ public class OfficialSuiteEvaluationTest {
     void evaluateOfficialLua549Tests() {
         String suiteProp = System.getProperty("suite");
         final String targetSuite = (suiteProp != null && !suiteProp.isEmpty() && !suiteProp.equals("${suite}")) ? suiteProp : null;
+        ensureLibsLink();
         File dir = new File("tests/lua-5.4.9-tests");
         File[] files = dir.listFiles((d, name) -> name.endsWith(".lua") && (targetSuite != null ? name.equals(targetSuite) : !isExcluded(name)));
         if (files == null) return;
@@ -135,4 +136,33 @@ public class OfficialSuiteEvaluationTest {
         return name.equals("heavy.lua") || name.equals("all.lua") || name.equals("main.lua");
     }
 
+    /**
+     * The PUC suites address their C-module/aux-file directory as the
+     * CWD-relative path {@code libs/} (see {@code attrib.lua}: {@code DIR =
+     * "libs" .. dirsep}). The reference runner executes from inside
+     * {@code tests/lua-5.4.9-tests/}, where that directory lives. Our harness
+     * runs from the repo root, so ensure the conventional
+     * {@code libs -> tests/lua-5.4.9-tests/libs} link exists (fresh clones
+     * and CI checkouts do not have it). This is environment setup, not test
+     * tampering: no file under {@code tests/} is touched.
+     */
+    private static void ensureLibsLink() {
+        try {
+            java.nio.file.Path link = java.nio.file.Paths.get("libs");
+            java.nio.file.Path target = java.nio.file.Paths.get("tests/lua-5.4.9-tests/libs");
+            if (java.nio.file.Files.exists(link) || java.nio.file.Files.isSymbolicLink(link)) {
+                return;
+            }
+            if (!java.nio.file.Files.isDirectory(target)) {
+                return;
+            }
+            try {
+                java.nio.file.Files.createSymbolicLink(link, target);
+            } catch (UnsupportedOperationException | SecurityException e) {
+                System.out.println("NOTE: cannot create 'libs' symlink (" + e + "); attrib.lua may fail");
+            }
+        } catch (java.io.IOException e) {
+            System.out.println("NOTE: cannot ensure 'libs' link (" + e + "); attrib.lua may fail");
+        }
+    }
 }
