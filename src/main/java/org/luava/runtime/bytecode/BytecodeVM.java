@@ -644,9 +644,12 @@ public final class BytecodeVM {
                         ctx.top = ctx.base + ctx.proto.numParams;
 
                         // Lua 5.4 semantics: call hook runs after stack frame and arguments are established
-                        CallStack.setNextTransfer(ctx.callState, 1, childClosure.proto.numParams, null);
-                        CallStack.setNextVmFrame(ctx.callState, state, ctx.base, funcIdx, ctx.varargs, 0);
-                        CallStack.push(childClosure, callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(), isMethod, isMeta, ctx.callState, ctx.co);
+                        CallStack.pushVmFrame(childClosure,
+                                callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(),
+                                isMethod, isMeta,
+                                1, childClosure.proto.numParams,
+                                state, ctx.base, funcIdx, ctx.varargs,
+                                ctx.callState, ctx.co);
                     } else if (func instanceof LuaFunction fn) {
                         int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
                         int newTop = executeExternalCall(state, ctx, ctx.proto, ctx.pc, ctx.base, fn, funcIdx, nActualArgs, nResults, callLine);
