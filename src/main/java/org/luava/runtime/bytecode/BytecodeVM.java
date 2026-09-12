@@ -1391,6 +1391,15 @@ public final class BytecodeVM {
     private static void executeGetTable(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+        int tb = base + b;
+        int kb = base + c;
+        // Fast lane: plain table + integer key. Skips key boxing and the
+        // virtual get(); the result still unboxes into registers.
+        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
+                && tStack[kb] == TYPE_INT) {
+            setLuaValue(pStack, tStack, oStack, base + a, lt.rawgetInt(pStack[kb]));
+            return;
+        }
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + b);
         LuaValue key = getLuaValue(pStack, tStack, oStack, base + c);
         setLuaValue(pStack, tStack, oStack, base + a, tbl.get(key));
@@ -1428,6 +1437,17 @@ public final class BytecodeVM {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
+        int tb = base + a;
+        int kb = base + b;
+        // Fast lane: plain table + integer key. Skips key boxing, the
+        // virtual set() and the metatable probe; the value still boxes
+        // (tables hold objects). Mirrors the OP_SETI lane.
+        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
+                && tStack[kb] == TYPE_INT) {
+            LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
+            lt.rawsetInt(pStack[kb], val);
+            return;
+        }
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + a);
         LuaValue key = getLuaValue(pStack, tStack, oStack, base + b);
         LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
