@@ -662,7 +662,7 @@ public final class CallStack {
      */
     public static void pop(CallStackState state, LuaCoroutine cur) {
         if (state.top > 0) {
-            if (cur != null) {
+            if (cur != null && LuaCoroutine.HOOKS_ARMED) {
                 cur.fireReturnHook();
             }
             state.top--;
@@ -699,7 +699,7 @@ public final class CallStack {
                     topFrame.varargs = null;
                 }
             }
-            if (cur != null) {
+            if (cur != null && LuaCoroutine.HOOKS_ARMED) {
                 if (state.top > 0) {
                     cur.setLastLine(state.stack[state.top - 1].lastLine);
                 } else {

@@ -670,9 +670,14 @@ public final class BytecodeVM {
                 case OpCode.OP_RETURN0 -> {
                     if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.base);
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
-                    LuaValue[] retVals0 = new LuaValue[0];
-                    stampReturnFrame(ctx, instPc, retVals0, 1, 0);
-                    LuaValue[] r0 = returnToCaller(state, ctx, retVals0);
+                    LuaValue[] r0;
+                    if (LuaCoroutine.HOOKS_ARMED) {
+                        LuaValue[] retVals0 = new LuaValue[0];
+                        stampReturnFrame(ctx, instPc, retVals0, 1, 0);
+                        r0 = returnToCaller(state, ctx, retVals0);
+                    } else {
+                        r0 = returnToCallerRaw(state, ctx, ctx.base + a, 0);
+                    }
                     if (r0 != null) {
                         return r0;
                     }
@@ -680,11 +685,16 @@ public final class BytecodeVM {
                 case OpCode.OP_RETURN1 -> {
                     if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.base);
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
-                    LuaValue ret = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
-                    LuaValue[] retVals1 = new LuaValue[]{ret};
-                    // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
-                    stampReturnFrame(ctx, instPc, retVals1, a + 1, 1);
-                    LuaValue[] r1 = returnToCaller(state, ctx, retVals1);
+                    LuaValue[] r1;
+                    if (LuaCoroutine.HOOKS_ARMED) {
+                        LuaValue ret = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
+                        LuaValue[] retVals1 = new LuaValue[]{ret};
+                        // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
+                        stampReturnFrame(ctx, instPc, retVals1, a + 1, 1);
+                        r1 = returnToCaller(state, ctx, retVals1);
+                    } else {
+                        r1 = returnToCallerRaw(state, ctx, ctx.base + a, 1);
+                    }
                     if (r1 != null) {
                         return r1;
                     }
@@ -694,13 +704,18 @@ public final class BytecodeVM {
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int nReturns = b > 0 ? b - 1 : (ctx.top - (ctx.base + a));
-                    LuaValue[] retVals = new LuaValue[nReturns];
-                    for (int i = 0; i < nReturns; i++) {
-                        retVals[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + i);
+                    LuaValue[] rN;
+                    if (LuaCoroutine.HOOKS_ARMED) {
+                        LuaValue[] retVals = new LuaValue[nReturns];
+                        for (int i = 0; i < nReturns; i++) {
+                            retVals[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + i);
+                        }
+                        // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
+                        stampReturnFrame(ctx, instPc, retVals, a + 1, nReturns);
+                        rN = returnToCaller(state, ctx, retVals);
+                    } else {
+                        rN = returnToCallerRaw(state, ctx, ctx.base + a, nReturns);
                     }
-                    // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
-                    stampReturnFrame(ctx, instPc, retVals, a + 1, nReturns);
-                    LuaValue[] rN = returnToCaller(state, ctx, retVals);
                     if (rN != null) {
                         return rN;
                     }
@@ -1137,6 +1152,68 @@ public final class BytecodeVM {
             return null;
         }
         ctx.thread.setStackTop(ctx.savedStackTop);
+        return retVals;
+    }
+
+    /**
+     * Hook-free return path: copies raw register triples straight from the
+     * callee's result registers into the caller's, without boxing values
+     * into {@code LuaValue} ({@code getLuaValue}), allocating a result
+     * array, stamping the frame, and unboxing again ({@code setLuaValue}).
+     * Only valid while no hook is armed: the stamped {@code retValues} are
+     * observable solely by return hooks (fired in {@code pop} before the
+     * frame is discarded) and by debug readers of live frames, and a
+     * normally-returned frame is popped immediately, so skipping the stamp
+     * is unobservable. Callers must use {@link #returnToCaller} whenever
+     * {@code HOOKS_ARMED} is true.
+     */
+    private static LuaValue[] returnToCallerRaw(LuaState state, VmContext ctx, int srcIdx, int nReturns) {
+        if (ctx.callDepth > 0) {
+            CallStack.pop(ctx.callState, ctx.co);
+            CallInfo ci = ctx.callStack[--ctx.callDepth];
+            int callerFunc = ci.funcIndex;
+            ctx.base = ci.baseIndex;
+            ctx.closure = ci.closure;
+            ctx.proto = ctx.closure.proto;
+            ctx.code = ctx.proto.code;
+            ctx.k = ctx.proto.constants;
+            ctx.upvals = ctx.closure.upvals;
+            ctx.pc = ci.savedPc;
+            ctx.varargs = ci.varargs;
+            ctx.oldpc = ci.oldpc;
+            ctx.varargPrepRan = ci.varargPrepRan;
+            if (ci.expectedResults > 0) {
+                int n = Math.min(ci.expectedResults, nReturns);
+                // Direct triple copy: cheaper than System.arraycopy's fixed
+                // overhead for the tiny (usually 0-2) result counts here,
+                // and avoids all LuaValue boxing.
+                for (int i = 0; i < n; i++) {
+                    ctx.pStack[callerFunc + i] = ctx.pStack[srcIdx + i];
+                    ctx.tStack[callerFunc + i] = ctx.tStack[srcIdx + i];
+                    ctx.oStack[callerFunc + i] = ctx.oStack[srcIdx + i];
+                }
+                for (int i = n; i < ci.expectedResults; i++) {
+                    ctx.tStack[callerFunc + i] = TYPE_NIL;
+                    ctx.pStack[callerFunc + i] = 0;
+                    ctx.oStack[callerFunc + i] = null;
+                }
+            } else if (ci.expectedResults < 0) {
+                for (int i = 0; i < nReturns; i++) {
+                    ctx.pStack[callerFunc + i] = ctx.pStack[srcIdx + i];
+                    ctx.tStack[callerFunc + i] = ctx.tStack[srcIdx + i];
+                    ctx.oStack[callerFunc + i] = ctx.oStack[srcIdx + i];
+                }
+                ctx.top = callerFunc + nReturns;
+            }
+            ctx.thread.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
+            return null;
+        }
+        // Top-level return must box for the host; rare (once per execute).
+        ctx.thread.setStackTop(ctx.savedStackTop);
+        LuaValue[] retVals = new LuaValue[nReturns];
+        for (int i = 0; i < nReturns; i++) {
+            retVals[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, srcIdx + i);
+        }
         return retVals;
     }
 
