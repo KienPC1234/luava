@@ -668,7 +668,7 @@ public final class BytecodeVM {
                     }
                 }
                 case OpCode.OP_RETURN0 -> {
-                    if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.base);
+                    if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
                     LuaValue[] r0;
                     if (LuaCoroutine.HOOKS_ARMED) {
@@ -683,7 +683,7 @@ public final class BytecodeVM {
                     }
                 }
                 case OpCode.OP_RETURN1 -> {
-                    if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.base);
+                    if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
                     LuaValue[] r1;
                     if (LuaCoroutine.HOOKS_ARMED) {
@@ -700,7 +700,7 @@ public final class BytecodeVM {
                     }
                 }
                 case OpCode.OP_RETURN -> {
-                    if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.base);
+                    if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int nReturns = b > 0 ? b - 1 : (ctx.top - (ctx.base + a));
@@ -769,7 +769,7 @@ public final class BytecodeVM {
                     }
                 }
                 case OpCode.OP_SETLIST -> ctx.pc = executeSetList(ctx.code, ctx.pc, inst, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, ctx.top);
-                case OpCode.OP_CLOSURE -> executeClosure(state, ctx.proto, ctx.closure, ctx.upvals, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_CLOSURE -> executeClosure(state, ctx.thread, ctx.proto, ctx.closure, ctx.upvals, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
                 case OpCode.OP_VARARG -> doVararg(ctx, a, inst);
                 case OpCode.OP_VARARGPREP -> {
                     // Pre-aligned in call setup
@@ -818,7 +818,7 @@ public final class BytecodeVM {
         while (CallStack.depth() > ctx.initialDepth) {
             CallStack.pop(ctx.callState, ctx.co);
         }
-        state.closeUpvalues(ctx.savedStackTop);
+        state.closeUpvalues(ctx.thread, ctx.savedStackTop);
         LuaValue errVal = null;
         if (ctx.thrown != null) {
             if (ctx.thrown instanceof org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal) {
@@ -957,7 +957,7 @@ public final class BytecodeVM {
         int nActualArgs = ctx.scratch0;
 
         if (func instanceof LuaClosure childClosure) {
-            state.closeUpvalues(ctx.base);
+            state.closeUpvalues(ctx.thread, ctx.base);
             CallStack.CallStackState csState = ctx.callState;
             String callName = csState.nextName;
             String callNamewhat = csState.nextNamewhat;
@@ -1014,7 +1014,7 @@ public final class BytecodeVM {
             CallStack.setNextVmFrame(ctx.callState, state, ctx.base, ctx.base - 1, ctx.varargs, 0);
             CallStack.replaceTailCall(childClosure, callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(), isMethod, isMeta, ctx.callState, ctx.co);
         } else if (func instanceof LuaFunction fn) {
-            state.closeUpvalues(ctx.base);
+            state.closeUpvalues(ctx.thread, ctx.base);
             state.closeTbc(ctx.base, null);
 
             int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
@@ -1273,7 +1273,7 @@ public final class BytecodeVM {
             String varName = ctx.proto.findLocalVarName(a, ctx.pc - 1);
             state.pushTbc(ctx.base + a, val, varName);
         } else {
-            state.closeUpvalues(ctx.base + a);
+            state.closeUpvalues(ctx.thread, ctx.base + a);
             state.closeTbc(ctx.base + a, null);
         }
     }
@@ -1357,7 +1357,7 @@ public final class BytecodeVM {
         return pc;
     }
 
-    private static void executeClosure(LuaState state, LuaProto proto, LuaClosure closure, Upvalue[] upvals,
+    private static void executeClosure(LuaState state, LuaCoroutine thread, LuaProto proto, LuaClosure closure, Upvalue[] upvals,
                                        long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
         int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
         LuaProto childProto = proto.protos[bx];
@@ -1365,7 +1365,7 @@ public final class BytecodeVM {
         for (int i = 0; i < childProto.upvalues.length; i++) {
             UpvalueDesc desc = childProto.upvalues[i];
             if (desc.inStack) {
-                childUpvals[i] = state.findOrCreateOpenUpvalue(base + desc.index, desc.name);
+                childUpvals[i] = state.findOrCreateOpenUpvalue(thread, base + desc.index, desc.name);
             } else {
                 childUpvals[i] = upvals[desc.index];
             }
