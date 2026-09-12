@@ -10,6 +10,47 @@ package org.luava.runtime;
 public abstract class LuaValue {
     public static final LuaValue[] EMPTY_ARRAY = new LuaValue[0];
 
+    /**
+     * Interned metamethod names. {@code LuaString.valueOf} routes short
+     * strings through a concurrent interning map, so resolving e.g.
+     * {@code "__index"} on every table access pays a hash lookup plus
+     * hashCode. These constants are resolved once at class init; metamethod
+     * dispatch uses them directly.
+     */
+    public static final class Meta {
+        public static final LuaString INDEX = LuaString.valueOf("__index");
+        public static final LuaString NEWINDEX = LuaString.valueOf("__newindex");
+        public static final LuaString CALL = LuaString.valueOf("__call");
+        public static final LuaString LEN = LuaString.valueOf("__len");
+        public static final LuaString TOSTRING = LuaString.valueOf("__tostring");
+        public static final LuaString NAME = LuaString.valueOf("__name");
+        public static final LuaString MODE = LuaString.valueOf("__mode");
+        public static final LuaString METATABLE = LuaString.valueOf("__metatable");
+        public static final LuaString EQ = LuaString.valueOf("__eq");
+        public static final LuaString LT = LuaString.valueOf("__lt");
+        public static final LuaString LE = LuaString.valueOf("__le");
+        public static final LuaString CONCAT = LuaString.valueOf("__concat");
+        public static final LuaString CLOSE = LuaString.valueOf("__close");
+        public static final LuaString GC = LuaString.valueOf("__gc");
+        public static final LuaString PAIRS = LuaString.valueOf("__pairs");
+        public static final LuaString UNM = LuaString.valueOf("__unm");
+        public static final LuaString BNOT = LuaString.valueOf("__bnot");
+        public static final LuaString ADD = LuaString.valueOf("__add");
+        public static final LuaString SUB = LuaString.valueOf("__sub");
+        public static final LuaString MUL = LuaString.valueOf("__mul");
+        public static final LuaString DIV = LuaString.valueOf("__div");
+        public static final LuaString IDIV = LuaString.valueOf("__idiv");
+        public static final LuaString MOD = LuaString.valueOf("__mod");
+        public static final LuaString POW = LuaString.valueOf("__pow");
+        public static final LuaString BAND = LuaString.valueOf("__band");
+        public static final LuaString BOR = LuaString.valueOf("__bor");
+        public static final LuaString BXOR = LuaString.valueOf("__bxor");
+        public static final LuaString SHL = LuaString.valueOf("__shl");
+        public static final LuaString SHR = LuaString.valueOf("__shr");
+
+        private Meta() {}
+    }
+
     public static LuaBoolean valueOf(boolean b) {
         return LuaBoolean.valueOf(b);
     }
@@ -32,7 +73,7 @@ public abstract class LuaValue {
         if (this.isTable() || this.isUserdata()) {
             LuaTable mt = getMetatable();
             if (mt != null) {
-                LuaValue nameVal = mt.rawget(LuaString.valueOf("__name"));
+                LuaValue nameVal = mt.rawget(Meta.NAME);
                 if (nameVal != null && nameVal.isString()) {
                     return nameVal.toLuaString();
                 }
@@ -150,7 +191,7 @@ public abstract class LuaValue {
                 mt = t.getMetatable();
             }
             if (mt != null) {
-                LuaValue handler = mt.rawget(LuaString.valueOf("__index"));
+                LuaValue handler = mt.rawget(Meta.INDEX);
                 if (!handler.isNil()) {
                     if (handler.isFunction()) {
                         org.luava.runtime.eval.CallStack.setNextCall("index", true);
@@ -181,7 +222,7 @@ public abstract class LuaValue {
                 mt = t.getMetatable();
             }
             if (mt != null) {
-                LuaValue handler = mt.rawget(LuaString.valueOf("__newindex"));
+                LuaValue handler = mt.rawget(Meta.NEWINDEX);
                 if (!handler.isNil()) {
                     if (handler.isFunction()) {
                         org.luava.runtime.eval.CallStack.setNextCall("newindex", true);
@@ -207,7 +248,7 @@ public abstract class LuaValue {
         while (!(target instanceof LuaFunction)) {
             LuaTable mt = target.getMetatable();
             if (mt != null) {
-                LuaValue handler = mt.rawget(LuaString.valueOf("__call"));
+                LuaValue handler = mt.rawget(Meta.CALL);
                 if (!handler.isNil()) {
                     LuaValue[] callArgs = new LuaValue[currentArgs.length + 1];
                     callArgs[0] = target;
@@ -233,7 +274,7 @@ public abstract class LuaValue {
         }
         LuaTable mt = getMetatable();
         if (mt != null) {
-            LuaValue handler = mt.rawget(LuaString.valueOf("__len"));
+            LuaValue handler = mt.rawget(Meta.LEN);
             if (!handler.isNil()) {
                 org.luava.runtime.eval.CallStack.setNextCall("len", true);
                 return handler.call(this, this);
@@ -403,7 +444,7 @@ public abstract class LuaValue {
         }
         LuaTable mt = getMetatable();
         if (mt != null) {
-            LuaValue handler = mt.rawget(LuaString.valueOf("__unm"));
+            LuaValue handler = mt.rawget(Meta.UNM);
             if (!handler.isNil()) {
                 org.luava.runtime.eval.CallStack.setNextCall("unm", true);
                 return handler.call(this, this);
@@ -556,9 +597,9 @@ public abstract class LuaValue {
         }
         LuaTable mt = getMetatable();
         if (mt != null) {
-            LuaValue handler = mt.rawget(LuaString.valueOf("__bnot"));
+            LuaValue handler = mt.rawget(Meta.BNOT);
             if (!handler.isNil()) {
-                if (!(handler instanceof LuaFunction) && (handler.getMetatable() == null || handler.getMetatable().rawget(LuaString.valueOf("__call")).isNil())) {
+                if (!(handler instanceof LuaFunction) && (handler.getMetatable() == null || handler.getMetatable().rawget(Meta.CALL).isNil())) {
                     throw new LuaException("attempt to call a " + handler.typeName() + " value (metamethod 'bnot')");
                 }
                 org.luava.runtime.eval.CallStack.setNextCall("bnot", true);
@@ -745,12 +786,12 @@ public abstract class LuaValue {
         LuaTable mt = getMetatable();
         LuaValue handler = null;
         if (mt != null) {
-            handler = mt.rawget(LuaString.valueOf("__eq"));
+            handler = mt.rawget(Meta.EQ);
         }
         if (handler == null || handler.isNil()) {
             LuaTable otherMt = other.getMetatable();
             if (otherMt != null) {
-                handler = otherMt.rawget(LuaString.valueOf("__eq"));
+                handler = otherMt.rawget(Meta.EQ);
             }
         }
         if (handler != null && !handler.isNil()) {
@@ -769,7 +810,7 @@ public abstract class LuaValue {
         }
         LuaValue handler = getBinaryHandler(this, other, "__lt");
         if (handler != null) {
-            if (!(handler instanceof LuaFunction) && (handler.getMetatable() == null || handler.getMetatable().rawget(LuaString.valueOf("__call")).isNil())) {
+            if (!(handler instanceof LuaFunction) && (handler.getMetatable() == null || handler.getMetatable().rawget(Meta.CALL).isNil())) {
                 throw new LuaException("attempt to call a " + handler.typeName() + " value (metamethod 'lt')");
             }
             org.luava.runtime.eval.CallStack.setNextCall("lt", true);
@@ -790,7 +831,7 @@ public abstract class LuaValue {
         }
         LuaValue handler = getBinaryHandler(this, other, "__le");
         if (handler != null) {
-            if (!(handler instanceof LuaFunction) && (handler.getMetatable() == null || handler.getMetatable().rawget(LuaString.valueOf("__call")).isNil())) {
+            if (!(handler instanceof LuaFunction) && (handler.getMetatable() == null || handler.getMetatable().rawget(Meta.CALL).isNil())) {
                 throw new LuaException("attempt to call a " + handler.typeName() + " value (metamethod 'le')");
             }
             org.luava.runtime.eval.CallStack.setNextCall("le", true);
@@ -806,7 +847,7 @@ public abstract class LuaValue {
         LuaValue handler = getBinaryHandler(a, b, event);
         if (handler != null) {
             String eventName = event.startsWith("__") ? event.substring(2) : event;
-            if (!(handler instanceof LuaFunction) && (handler.getMetatable() == null || handler.getMetatable().rawget(LuaString.valueOf("__call")).isNil())) {
+            if (!(handler instanceof LuaFunction) && (handler.getMetatable() == null || handler.getMetatable().rawget(Meta.CALL).isNil())) {
                 throw new LuaException("attempt to call a " + handler.typeName() + " value (metamethod '" + eventName + "')");
             }
             org.luava.runtime.eval.CallStack.setNextCall(eventName, true);
@@ -822,17 +863,47 @@ public abstract class LuaValue {
     }
 
     private static LuaValue getBinaryHandler(LuaValue a, LuaValue b, String event) {
+        LuaString key = metaKey(event);
         LuaTable mt = a.getMetatable();
         if (mt != null) {
-            LuaValue handler = mt.rawget(LuaString.valueOf(event));
+            LuaValue handler = mt.rawget(key);
             if (!handler.isNil()) return handler;
         }
         mt = b.getMetatable();
         if (mt != null) {
-            LuaValue handler = mt.rawget(LuaString.valueOf(event));
+            LuaValue handler = mt.rawget(key);
             if (!handler.isNil()) return handler;
         }
         return null;
+    }
+
+    /** Resolve a metamethod event name to its interned {@link Meta} key. */
+    private static LuaString metaKey(String event) {
+        return switch (event) {
+            case "__add" -> Meta.ADD;
+            case "__sub" -> Meta.SUB;
+            case "__mul" -> Meta.MUL;
+            case "__div" -> Meta.DIV;
+            case "__idiv" -> Meta.IDIV;
+            case "__mod" -> Meta.MOD;
+            case "__pow" -> Meta.POW;
+            case "__band" -> Meta.BAND;
+            case "__bor" -> Meta.BOR;
+            case "__bxor" -> Meta.BXOR;
+            case "__shl" -> Meta.SHL;
+            case "__shr" -> Meta.SHR;
+            case "__concat" -> Meta.CONCAT;
+            case "__eq" -> Meta.EQ;
+            case "__lt" -> Meta.LT;
+            case "__le" -> Meta.LE;
+            case "__index" -> Meta.INDEX;
+            case "__newindex" -> Meta.NEWINDEX;
+            case "__call" -> Meta.CALL;
+            case "__len" -> Meta.LEN;
+            case "__unm" -> Meta.UNM;
+            case "__bnot" -> Meta.BNOT;
+            default -> LuaString.valueOf(event);
+        };
     }
 
     public static LuaException argError(int argNum, String funcName, String extramsg) {

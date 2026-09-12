@@ -156,7 +156,7 @@ public final class LuaTable extends LuaValue {
 
     public void updateWeakMode() {
         if (metatable != null) {
-            LuaValue mode = metatable.rawget(LuaString.valueOf("__mode"));
+            LuaValue mode = metatable.rawget(LuaValue.Meta.MODE);
             if (mode.isString()) {
                 String s = mode.toLuaString();
                 weakKeys = s.contains("k");
@@ -424,7 +424,7 @@ public final class LuaTable extends LuaValue {
                 }
                 LuaTable mt = tbl.getMetatable();
                 if (mt == null) return LuaNil.NIL;
-                LuaValue handler = mt.rawget(LuaString.valueOf("__index"));
+                LuaValue handler = mt.rawget(LuaValue.Meta.INDEX);
                 if (handler.isNil()) return LuaNil.NIL;
                 if (handler.isFunction()) {
                     org.luava.runtime.eval.CallStack.setNextCall("index", true);
@@ -450,7 +450,7 @@ public final class LuaTable extends LuaValue {
                     return;
                 }
                 LuaTable mt = tbl.getMetatable();
-                LuaValue handler = mt.rawget(LuaString.valueOf("__newindex"));
+                LuaValue handler = mt.rawget(LuaValue.Meta.NEWINDEX);
                 if (handler.isNil()) {
                     tbl.rawset(key, value);
                     return;
@@ -473,7 +473,7 @@ public final class LuaTable extends LuaValue {
     public LuaValue len() {
         ensureFilled();
         if (metatable != null) {
-            LuaValue handler = metatable.rawget(LuaString.valueOf("__len"));
+            LuaValue handler = metatable.rawget(LuaValue.Meta.LEN);
             if (!handler.isNil()) {
                 org.luava.runtime.eval.CallStack.setNextCall("len", true);
                 return handler.call(this, this);
@@ -655,7 +655,7 @@ public final class LuaTable extends LuaValue {
     @Override
     public String toLuaString() {
         if (metatable != null) {
-            LuaValue handler = metatable.rawget(LuaString.valueOf("__tostring"));
+            LuaValue handler = metatable.rawget(LuaValue.Meta.TOSTRING);
             if (!handler.isNil()) {
                 LuaValue res = handler.call(this);
                 if (!res.isString()) {
@@ -663,7 +663,7 @@ public final class LuaTable extends LuaValue {
                 }
                 return res.toLuaString();
             }
-            LuaValue nameVal = metatable.rawget(LuaString.valueOf("__name"));
+            LuaValue nameVal = metatable.rawget(LuaValue.Meta.NAME);
             if (nameVal != null && nameVal.isString()) {
                 return nameVal.toLuaString() + ": 0x" + Integer.toHexString(System.identityHashCode(this));
             }

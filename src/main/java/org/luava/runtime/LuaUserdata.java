@@ -117,7 +117,7 @@ public final class LuaUserdata extends LuaValue {
     @Override
     public LuaValue get(LuaValue key) {
         if (metatable != null) {
-            LuaValue handler = metatable.rawget(LuaString.valueOf("__index"));
+            LuaValue handler = metatable.rawget(LuaValue.Meta.INDEX);
             if (!handler.isNil()) {
                 if (handler.isFunction()) {
                     return handler.call(this, key);
@@ -222,7 +222,7 @@ public final class LuaUserdata extends LuaValue {
     @Override
     public LuaValue call(LuaValue... args) {
         if (metatable != null) {
-            LuaValue handler = metatable.rawget(LuaString.valueOf("__call"));
+            LuaValue handler = metatable.rawget(LuaValue.Meta.CALL);
             if (!handler.isNil()) {
                 LuaValue[] callArgs = new LuaValue[args.length + 1];
                 callArgs[0] = this;
@@ -283,7 +283,7 @@ public final class LuaUserdata extends LuaValue {
     @Override
     public void set(LuaValue key, LuaValue value) {
         if (metatable != null) {
-            LuaValue handler = metatable.rawget(LuaString.valueOf("__newindex"));
+            LuaValue handler = metatable.rawget(LuaValue.Meta.NEWINDEX);
             if (!handler.isNil()) {
                 if (handler.isFunction()) {
                     handler.call(this, key, value);
