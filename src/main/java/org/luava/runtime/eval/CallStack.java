@@ -443,6 +443,80 @@ public final class CallStack {
         }
     }
 
+    /**
+     * Fused frame push for the VM's Lua-to-Lua call path ({@code OP_CALL}).
+     * The generic {@link #push} receives its payload through the
+     * {@code next*} staging fields ({@code setNextTransfer} +
+     * {@code setNextVmFrame} then {@code push}), which costs ~20 field
+     * writes per call just to shuttle values. This variant takes the frame
+     * payload directly and writes the reused frame once, never touching
+     * {@code next*}. Callers that use this must not mix it with the staged
+     * path for the same call (all other paths keep the stage-then-push
+     * discipline, so no stale values leak).
+     *
+     * <p>Hook notifications are gated on the global armed flag: when no hook
+     * exists anywhere, firing is a proven no-op, so the virtual calls and
+     * the {@code lastLine} reset are skipped entirely.
+     */
+    public static void pushVmFrame(LuaFunction fn, String name, String namewhat, int line,
+                                   boolean isMethod, boolean isMetamethod,
+                                   int ftransfer, int ntransfer,
+                                   org.luava.runtime.LuaState vmState, int baseIndex, int funcIndex,
+                                   org.luava.runtime.LuaValue[] varargs,
+                                   CallStackState state, LuaCoroutine cur) {
+        int top = state.top;
+        if (!state.protectedFrames.isEmpty() && isHandlingError(state)) {
+            if (top >= MAX_CALL_DEPTH + EXTRA_STACK_SLOTS) {
+                org.luava.runtime.LuaException le = new org.luava.runtime.LuaException("error in error handling");
+                le.setDecorated(true);
+                throw le;
+            }
+        } else {
+            if (top >= MAX_CALL_DEPTH) {
+                throw new org.luava.runtime.LuaException("stack overflow");
+            }
+        }
+
+        if (top >= state.stack.length) {
+            Frame[] newStack = new Frame[state.stack.length * 2];
+            System.arraycopy(state.stack, 0, newStack, 0, state.stack.length);
+            state.stack = newStack;
+        }
+        Frame frame = state.stack[top];
+        String resolvedName = name != null ? name : (fn != null ? fn.getName() : null);
+        if (frame == null) {
+            frame = new Frame(fn, resolvedName, namewhat, line, isMethod, isMetamethod);
+            frame.lastLine = -1;
+            state.stack[top] = frame;
+        } else {
+            frame.function = fn;
+            frame.name = resolvedName;
+            frame.namewhat = namewhat;
+            frame.line = line;
+            frame.lastLine = -1;
+            frame.isMethod = isMethod;
+            frame.isMetamethod = isMetamethod;
+            frame.temps.clear();
+            frame.cArgs = null;
+            frame.retValues = null;
+            frame.env = null;
+            frame.pc = 0;
+        }
+        frame.isTailCall = false;
+        frame.ftransfer = ftransfer;
+        frame.ntransfer = ntransfer;
+        frame.baseIndex = baseIndex;
+        frame.funcIndex = funcIndex;
+        frame.pc = 0;
+        frame.state = vmState;
+        frame.varargs = varargs;
+        state.top = top + 1;
+        if (cur != null && LuaCoroutine.HOOKS_ARMED) {
+            cur.setLastLine(-1);
+            cur.fireCallHook();
+        }
+    }
+
     public static void push(LuaFunction fn, String name, int line) {
         pushWithState(fn, name, line, false);
     }
@@ -588,7 +662,7 @@ public final class CallStack {
      */
     public static void pop(CallStackState state, LuaCoroutine cur) {
         if (state.top > 0) {
-            if (cur != null) {
+            if (cur != null && LuaCoroutine.HOOKS_ARMED) {
                 cur.fireReturnHook();
             }
             state.top--;
@@ -625,7 +699,7 @@ public final class CallStack {
                     topFrame.varargs = null;
                 }
             }
-            if (cur != null) {
+            if (cur != null && LuaCoroutine.HOOKS_ARMED) {
                 if (state.top > 0) {
                     cur.setLastLine(state.stack[state.top - 1].lastLine);
                 } else {
