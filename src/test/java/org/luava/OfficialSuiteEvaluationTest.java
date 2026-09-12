@@ -143,23 +143,31 @@ public class OfficialSuiteEvaluationTest {
      * {@code tests/lua-5.4.9-tests/}, where that directory lives. Our harness
      * runs from the repo root, so ensure the conventional
      * {@code libs -> tests/lua-5.4.9-tests/libs} link exists (fresh clones
-     * and CI checkouts do not have it). This is environment setup, not test
-     * tampering: no file under {@code tests/} is touched.
+     * and CI checkouts do not have it). {@code attrib.lua} additionally
+     * writes {@code libs/P1/*} without creating parent dirs (the PUC
+     * environment provides them), so the scratch subdir is ensured here too.
+     * This is environment setup, not test tampering: no file under
+     * {@code tests/} is modified (the link target and the empty scratch dir
+     * are untracked and invisible to git).
      */
     private static void ensureLibsLink() {
         try {
             java.nio.file.Path link = java.nio.file.Paths.get("libs");
             java.nio.file.Path target = java.nio.file.Paths.get("tests/lua-5.4.9-tests/libs");
-            if (java.nio.file.Files.exists(link) || java.nio.file.Files.isSymbolicLink(link)) {
-                return;
-            }
             if (!java.nio.file.Files.isDirectory(target)) {
                 return;
             }
+            if (!java.nio.file.Files.exists(link) && !java.nio.file.Files.isSymbolicLink(link)) {
+                try {
+                    java.nio.file.Files.createSymbolicLink(link, target);
+                } catch (UnsupportedOperationException | SecurityException e) {
+                    System.out.println("NOTE: cannot create 'libs' symlink (" + e + "); attrib.lua may fail");
+                }
+            }
             try {
-                java.nio.file.Files.createSymbolicLink(link, target);
+                java.nio.file.Files.createDirectories(target.resolve("P1"));
             } catch (UnsupportedOperationException | SecurityException e) {
-                System.out.println("NOTE: cannot create 'libs' symlink (" + e + "); attrib.lua may fail");
+                System.out.println("NOTE: cannot create 'libs/P1' scratch dir (" + e + "); attrib.lua may fail");
             }
         } catch (java.io.IOException e) {
             System.out.println("NOTE: cannot ensure 'libs' link (" + e + "); attrib.lua may fail");

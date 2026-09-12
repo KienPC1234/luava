@@ -1167,6 +1167,45 @@ public final class BytecodeVM {
      * is unobservable. Callers must use {@link #returnToCaller} whenever
      * {@code HOOKS_ARMED} is true.
      */
+    /**
+     * Cold top-level boxing for {@link #returnToCallerRaw} (once per
+     * execute): kept out of line so the hot restore stays under
+     * {@code MaxInlineSize} and fuses into the dispatch loop.
+     */
+    private static LuaValue[] boxTopLevelResults(VmContext ctx, int srcIdx, int nReturns) {
+        ctx.thread.setStackTop(ctx.savedStackTop);
+        LuaValue[] retVals = new LuaValue[nReturns];
+        for (int i = 0; i < nReturns; i++) {
+            retVals[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, srcIdx + i);
+        }
+        return retVals;
+    }
+
+    /**
+     * Cold open-result copy for {@link #returnToCallerRaw} (vararg-result
+     * calls only): kept out of line for the same reason.
+     */
+    private static void copyOpenResults(VmContext ctx, int callerFunc, int srcIdx, int nReturns) {
+        for (int i = 0; i < nReturns; i++) {
+            ctx.pStack[callerFunc + i] = ctx.pStack[srcIdx + i];
+            ctx.tStack[callerFunc + i] = ctx.tStack[srcIdx + i];
+            ctx.oStack[callerFunc + i] = ctx.oStack[srcIdx + i];
+        }
+        ctx.top = callerFunc + nReturns;
+    }
+
+    /**
+     * Cold nil-fill for {@link #returnToCallerRaw} (short-result calls
+     * only): kept out of line for the same reason.
+     */
+    private static void fillNilResults(VmContext ctx, int callerFunc, int from, int expectedResults) {
+        for (int i = from; i < expectedResults; i++) {
+            ctx.tStack[callerFunc + i] = TYPE_NIL;
+            ctx.pStack[callerFunc + i] = 0;
+            ctx.oStack[callerFunc + i] = null;
+        }
+    }
+
     private static LuaValue[] returnToCallerRaw(LuaState state, VmContext ctx, int srcIdx, int nReturns) {
         if (ctx.callDepth > 0) {
             CallStack.pop(ctx.callState, ctx.co);
@@ -1192,29 +1231,17 @@ public final class BytecodeVM {
                     ctx.tStack[callerFunc + i] = ctx.tStack[srcIdx + i];
                     ctx.oStack[callerFunc + i] = ctx.oStack[srcIdx + i];
                 }
-                for (int i = n; i < ci.expectedResults; i++) {
-                    ctx.tStack[callerFunc + i] = TYPE_NIL;
-                    ctx.pStack[callerFunc + i] = 0;
-                    ctx.oStack[callerFunc + i] = null;
+                if (n < ci.expectedResults) {
+                    fillNilResults(ctx, callerFunc, n, ci.expectedResults);
                 }
             } else if (ci.expectedResults < 0) {
-                for (int i = 0; i < nReturns; i++) {
-                    ctx.pStack[callerFunc + i] = ctx.pStack[srcIdx + i];
-                    ctx.tStack[callerFunc + i] = ctx.tStack[srcIdx + i];
-                    ctx.oStack[callerFunc + i] = ctx.oStack[srcIdx + i];
-                }
-                ctx.top = callerFunc + nReturns;
+                copyOpenResults(ctx, callerFunc, srcIdx, nReturns);
             }
             ctx.thread.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
             return null;
         }
         // Top-level return must box for the host; rare (once per execute).
-        ctx.thread.setStackTop(ctx.savedStackTop);
-        LuaValue[] retVals = new LuaValue[nReturns];
-        for (int i = 0; i < nReturns; i++) {
-            retVals[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, srcIdx + i);
-        }
-        return retVals;
+        return boxTopLevelResults(ctx, srcIdx, nReturns);
     }
 
     /**
@@ -1391,6 +1418,15 @@ public final class BytecodeVM {
     private static void executeGetTable(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+        int tb = base + b;
+        int kb = base + c;
+        // Fast lane: plain table + integer key. Skips key boxing and the
+        // virtual get(); the result still unboxes into registers.
+        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
+                && tStack[kb] == TYPE_INT) {
+            setLuaValue(pStack, tStack, oStack, base + a, lt.rawgetInt(pStack[kb]));
+            return;
+        }
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + b);
         LuaValue key = getLuaValue(pStack, tStack, oStack, base + c);
         setLuaValue(pStack, tStack, oStack, base + a, tbl.get(key));
@@ -1428,6 +1464,17 @@ public final class BytecodeVM {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
+        int tb = base + a;
+        int kb = base + b;
+        // Fast lane: plain table + integer key. Skips key boxing, the
+        // virtual set() and the metatable probe; the value still boxes
+        // (tables hold objects). Mirrors the OP_SETI lane.
+        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
+                && tStack[kb] == TYPE_INT) {
+            LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
+            lt.rawsetInt(pStack[kb], val);
+            return;
+        }
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + a);
         LuaValue key = getLuaValue(pStack, tStack, oStack, base + b);
         LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
