@@ -632,7 +632,15 @@ public final class LuaState {
     }
 
     public org.luava.runtime.eval.Upvalue findOrCreateOpenUpvalue(int stackIndex, String name) {
-        LuaCoroutine thread = getCurrentThread();
+        return findOrCreateOpenUpvalue(getCurrentThread(), stackIndex, name);
+    }
+
+    /**
+     * Hot-path overload: the VM already holds its thread ({@code ctx.thread},
+     * identical to {@code getCurrentThread()} for the whole execute), so
+     * pass it explicitly instead of paying a ThreadLocal lookup per call.
+     */
+    public org.luava.runtime.eval.Upvalue findOrCreateOpenUpvalue(LuaCoroutine thread, int stackIndex, String name) {
         org.luava.runtime.eval.Upvalue prev = null;
         org.luava.runtime.eval.Upvalue curr = thread.getOpenUpvaluesHead();
         while (curr != null && curr.getStackIndex() >= stackIndex) {
@@ -654,7 +662,11 @@ public final class LuaState {
     }
 
     public void closeUpvalues(int fromIndex) {
-        LuaCoroutine thread = getCurrentThread();
+        closeUpvalues(getCurrentThread(), fromIndex);
+    }
+
+    /** Hot-path overload: explicit thread, no ThreadLocal lookup (see above). */
+    public void closeUpvalues(LuaCoroutine thread, int fromIndex) {
         while (thread.getOpenUpvaluesHead() != null && thread.getOpenUpvaluesHead().getStackIndex() >= fromIndex) {
             org.luava.runtime.eval.Upvalue uv = thread.getOpenUpvaluesHead();
             thread.setOpenUpvaluesHead(uv.nextOpen);
