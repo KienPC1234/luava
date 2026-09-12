@@ -17,9 +17,7 @@ import org.luava.runtime.Varargs;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 
 public final class LuaPattern {
     private LuaPattern() {}
@@ -52,9 +50,8 @@ public final class LuaPattern {
             this.pLen = p.length;
             this.matchdepth = MAXCCALLS;
             this.level = 0;
-            for (int i = 0; i < LUA_MAXCAPTURES; i++) {
-                capture[i] = new Capture();
-            }
+            // capture[] slots stay null until first capture use (capAt);
+            // capture-less patterns never allocate them.
         }
 
         void reprepstate() {
@@ -199,8 +196,9 @@ public final class LuaPattern {
     private static int start_capture(MatchState ms, int s, int p, int what) {
         int level = ms.level;
         if (level >= LUA_MAXCAPTURES) throw new LuaException("too many captures");
-        ms.capture[level].init = s;
-        ms.capture[level].len = what;
+        Capture cap = capAt(ms, level);
+        cap.init = s;
+        cap.len = what;
         ms.level = level + 1;
         int res = match(ms, s, p);
         if (res == -1) {
@@ -211,24 +209,25 @@ public final class LuaPattern {
 
     private static int capture_to_close(MatchState ms) {
         for (int level = ms.level - 1; level >= 0; level--) {
-            if (ms.capture[level].len == CAP_UNFINISHED) return level;
+            if (capAt(ms, level).len == CAP_UNFINISHED) return level;
         }
         throw new LuaException("invalid pattern capture");
     }
 
     private static int end_capture(MatchState ms, int s, int p) {
         int l = capture_to_close(ms);
-        ms.capture[l].len = s - ms.capture[l].init;
+        Capture cl = capAt(ms, l);
+        cl.len = s - cl.init;
         int res = match(ms, s, p);
         if (res == -1) {
-            ms.capture[l].len = CAP_UNFINISHED;
+            cl.len = CAP_UNFINISHED;
         }
         return res;
     }
 
     private static int check_capture(MatchState ms, int l) {
         l -= '1';
-        if (l < 0 || l >= ms.level || ms.capture[l].len == CAP_UNFINISHED) {
+        if (l < 0 || l >= ms.level || capAt(ms, l).len == CAP_UNFINISHED) {
             throw new LuaException("invalid capture index %" + (l + 1));
         }
         return l;
@@ -236,8 +235,9 @@ public final class LuaPattern {
 
     private static int match_capture(MatchState ms, int s, int l) {
         int idx = check_capture(ms, l);
-        int len = ms.capture[idx].len;
-        if (ms.srcLen - s >= len && Arrays.equals(ms.src, ms.capture[idx].init, ms.capture[idx].init + len, ms.src, s, s + len)) {
+        Capture ci = capAt(ms, idx);
+        int len = ci.len;
+        if (ms.srcLen - s >= len && Arrays.equals(ms.src, ci.init, ci.init + len, ms.src, s, s + len)) {
             return s + len;
         }
         return -1;
@@ -364,29 +364,43 @@ public final class LuaPattern {
     }
 
 
-    private static void push_onecapture(MatchState ms, int i, int s, int e, List<LuaValue> out) {
+    /** Lazy capture slot: capture-less patterns (the common case) never pay
+     * for the 32 Capture objects a MatchState would otherwise allocate. */
+    private static Capture capAt(MatchState ms, int i) {
+        Capture c = ms.capture[i];
+        if (c == null) {
+            c = new Capture();
+            ms.capture[i] = c;
+        }
+        return c;
+    }
+
+    private static LuaValue pushOneCapture(MatchState ms, int i, int s, int e) {
         if (i >= ms.level) {
             if (i != 0) throw new LuaException("invalid capture index %" + (i + 1));
             byte[] bytes = Arrays.copyOfRange(ms.src, s, e);
-            out.add(LuaString.valueOf(new String(bytes, StandardCharsets.ISO_8859_1)));
+            return LuaString.valueOf(new String(bytes, StandardCharsets.ISO_8859_1));
         } else {
-            int len = ms.capture[i].len;
+            Capture c = capAt(ms, i);
+            int len = c.len;
             if (len == CAP_UNFINISHED) {
                 throw new LuaException("unfinished capture");
             } else if (len == CAP_POSITION) {
-                out.add(LuaInteger.valueOf(ms.capture[i].init + 1));
+                return LuaInteger.valueOf(c.init + 1);
             } else {
-                byte[] bytes = Arrays.copyOfRange(ms.src, ms.capture[i].init, ms.capture[i].init + len);
-                out.add(LuaString.valueOf(new String(bytes, StandardCharsets.ISO_8859_1)));
+                byte[] bytes = Arrays.copyOfRange(ms.src, c.init, c.init + len);
+                return LuaString.valueOf(new String(bytes, StandardCharsets.ISO_8859_1));
             }
         }
     }
 
-    private static void push_captures(MatchState ms, int s, int e, List<LuaValue> out) {
+    private static LuaValue[] pushCaptures(MatchState ms, int s, int e) {
         int nlevels = (ms.level == 0) ? 1 : ms.level;
+        LuaValue[] out = new LuaValue[nlevels];
         for (int i = 0; i < nlevels; i++) {
-            push_onecapture(ms, i, s, e, out);
+            out[i] = pushOneCapture(ms, i, s, e);
         }
+        return out;
     }
 
     // C posrelatI uses lua_Integer: huge positions must saturate past the
@@ -447,13 +461,13 @@ public final class LuaPattern {
             ms.reprepstate();
             int res = match(ms, s, 0);
             if (res != -1) {
-                List<LuaValue> captures = new ArrayList<>();
-                captures.add(LuaInteger.valueOf(s + 1));
-                captures.add(LuaInteger.valueOf(res));
+                LuaValue[] out = new LuaValue[2 + ms.level];
+                out[0] = LuaInteger.valueOf(s + 1);
+                out[1] = LuaInteger.valueOf(res);
                 for (int i = 0; i < ms.level; i++) {
-                    push_onecapture(ms, i, s, res, captures);
+                    out[2 + i] = pushOneCapture(ms, i, s, res);
                 }
-                return Varargs.of(captures.toArray(new LuaValue[0]));
+                return Varargs.of(out);
             }
             if (anchor) break;
         }
@@ -474,9 +488,7 @@ public final class LuaPattern {
             ms.reprepstate();
             int res = match(ms, s, 0);
             if (res != -1) {
-                List<LuaValue> captures = new ArrayList<>();
-                push_captures(ms, s, res, captures);
-                return Varargs.of(captures.toArray(new LuaValue[0]));
+                return Varargs.of(pushCaptures(ms, s, res));
             }
             if (anchor) break;
         }
@@ -524,13 +536,12 @@ public final class LuaPattern {
 
     private static boolean add_value(MatchState ms, ByteArrayOutputStream b, int s, int e, LuaValue tr) {
         if (tr.isFunction()) {
-            List<LuaValue> args = new ArrayList<>();
-            push_captures(ms, s, e, args);
+            LuaValue[] args = pushCaptures(ms, s, e);
             org.luava.runtime.concurrency.LuaCoroutine curCoro = org.luava.runtime.concurrency.LuaCoroutine.running();
             if (curCoro != null) curCoro.enterNonYieldable();
             LuaValue res;
             try {
-                res = tr.call(args.toArray(new LuaValue[0]));
+                res = tr.call(args);
             } finally {
                 if (curCoro != null) curCoro.exitNonYieldable();
             }
@@ -545,9 +556,7 @@ public final class LuaPattern {
                 return true;
             }
         } else if (tr.isTable()) {
-            List<LuaValue> args = new ArrayList<>();
-            push_onecapture(ms, 0, s, e, args);
-            LuaValue key = args.get(0);
+            LuaValue key = pushOneCapture(ms, 0, s, e);
             org.luava.runtime.concurrency.LuaCoroutine curCoro = org.luava.runtime.concurrency.LuaCoroutine.running();
             if (curCoro != null) curCoro.enterNonYieldable();
             LuaValue res;
@@ -592,9 +601,7 @@ public final class LuaPattern {
                 } else if (next == '0') {
                     b.write(ms.src, s, e - s);
                 } else if (next >= '1' && next <= '9') {
-                    List<LuaValue> cap = new ArrayList<>();
-                    push_onecapture(ms, next - '1', s, e, cap);
-                    byte[] bytes = cap.get(0).toLuaString().getBytes(StandardCharsets.ISO_8859_1);
+                    byte[] bytes = pushOneCapture(ms, next - '1', s, e).toLuaString().getBytes(StandardCharsets.ISO_8859_1);
                     b.write(bytes, 0, bytes.length);
                 } else {
                     throw new LuaException("invalid use of '%' in replacement string");
@@ -620,9 +627,7 @@ public final class LuaPattern {
                 int e = match(ms, s, 0);
                 if (e != -1 && e != lastmatch) {
                     state[0] = state[1] = e;
-                    List<LuaValue> captures = new ArrayList<>();
-                    push_captures(ms, s, e, captures);
-                    return Varargs.of(captures.toArray(new LuaValue[0]));
+                    return Varargs.of(pushCaptures(ms, s, e));
                 }
             }
             state[0] = src.length + 1;

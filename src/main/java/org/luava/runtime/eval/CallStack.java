@@ -458,13 +458,12 @@ public final class CallStack {
      * exists anywhere, firing is a proven no-op, so the virtual calls and
      * the {@code lastLine} reset are skipped entirely.
      */
-    public static void pushVmFrame(LuaFunction fn, String name, String namewhat, int line,
-                                   boolean isMethod, boolean isMetamethod,
-                                   int ftransfer, int ntransfer,
-                                   org.luava.runtime.LuaState vmState, int baseIndex, int funcIndex,
-                                   org.luava.runtime.LuaValue[] varargs,
-                                   CallStackState state, LuaCoroutine cur) {
-        int top = state.top;
+    /**
+     * Cold depth-limit enforcement for {@link #pushVmFrame} (kept out of
+     * line so the hot push stays under {@code MaxInlineSize} and fuses into
+     * the VM dispatch loop). Semantics identical to the inline version.
+     */
+    private static void checkPushDepth(CallStackState state, int top) {
         if (!state.protectedFrames.isEmpty() && isHandlingError(state)) {
             if (top >= MAX_CALL_DEPTH + EXTRA_STACK_SLOTS) {
                 org.luava.runtime.LuaException le = new org.luava.runtime.LuaException("error in error handling");
@@ -476,11 +475,34 @@ public final class CallStack {
                 throw new org.luava.runtime.LuaException("stack overflow");
             }
         }
+    }
+
+    /** Cold frame-stack growth for {@link #pushVmFrame} (see above). */
+    private static void growFrameStack(CallStackState state) {
+        Frame[] newStack = new Frame[state.stack.length * 2];
+        System.arraycopy(state.stack, 0, newStack, 0, state.stack.length);
+        state.stack = newStack;
+    }
+
+    /** Cold hook notification for {@link #pushVmFrame} (see above). */
+    private static void firePushHook(LuaCoroutine cur) {
+        cur.setLastLine(-1);
+        cur.fireCallHook();
+    }
+
+    public static void pushVmFrame(LuaFunction fn, String name, String namewhat, int line,
+                                   boolean isMethod, boolean isMetamethod,
+                                   int ftransfer, int ntransfer,
+                                   org.luava.runtime.LuaState vmState, int baseIndex, int funcIndex,
+                                   org.luava.runtime.LuaValue[] varargs,
+                                   CallStackState state, LuaCoroutine cur) {
+        int top = state.top;
+        if (top >= MAX_CALL_DEPTH || !state.protectedFrames.isEmpty()) {
+            checkPushDepth(state, top);
+        }
 
         if (top >= state.stack.length) {
-            Frame[] newStack = new Frame[state.stack.length * 2];
-            System.arraycopy(state.stack, 0, newStack, 0, state.stack.length);
-            state.stack = newStack;
+            growFrameStack(state);
         }
         Frame frame = state.stack[top];
         String resolvedName = name != null ? name : (fn != null ? fn.getName() : null);
@@ -512,9 +534,17 @@ public final class CallStack {
         frame.varargs = varargs;
         state.top = top + 1;
         if (cur != null && LuaCoroutine.HOOKS_ARMED) {
-            cur.setLastLine(-1);
-            cur.fireCallHook();
+            firePushHook(cur);
         }
+    }
+
+    /** Cold first-use frame allocation for {@link #pushVmFrame} (see above). */
+    private static Frame allocFrame(CallStackState state, int top, LuaFunction fn, String resolvedName,
+                                    String namewhat, int line, boolean isMethod, boolean isMetamethod) {
+        Frame frame = new Frame(fn, resolvedName, namewhat, line, isMethod, isMetamethod);
+        frame.lastLine = -1;
+        state.stack[top] = frame;
+        return frame;
     }
 
     public static void push(LuaFunction fn, String name, int line) {
@@ -663,23 +693,13 @@ public final class CallStack {
     public static void pop(CallStackState state, LuaCoroutine cur) {
         if (state.top > 0) {
             if (cur != null && LuaCoroutine.HOOKS_ARMED) {
-                cur.fireReturnHook();
+                popReturnHook(cur);
             }
             state.top--;
             Frame topFrame = state.stack[state.top];
             if (topFrame != null) {
                 if (state.preserveForDeath) {
-                    // Fatal unwind: save reference (no wipe, no copy) for
-                    // dead-coroutine traceback. Top still decrements so
-                    // unwind loops terminate.
-                    if (state.deathStack == null) {
-                        state.deathStack = new Frame[Math.max(state.top + 1, 16)];
-                    } else if (state.deathTop >= state.deathStack.length) {
-                        Frame[] bigger = new Frame[state.deathStack.length * 2];
-                        System.arraycopy(state.deathStack, 0, bigger, 0, state.deathTop);
-                        state.deathStack = bigger;
-                    }
-                    state.deathStack[state.deathTop++] = topFrame;
+                    preserveDeadFrame(state, topFrame);
                 } else {
                     topFrame.function = null;
                     topFrame.name = null;
@@ -707,6 +727,28 @@ public final class CallStack {
                 }
             }
         }
+    }
+
+    /**
+     * Cold paths of {@link #pop} (hook firing, fatal-unwind preservation):
+     * kept out of line so the hot wipe stays under {@code MaxInlineSize}.
+     */
+    private static void popReturnHook(LuaCoroutine cur) {
+        cur.fireReturnHook();
+    }
+
+    private static void preserveDeadFrame(CallStackState state, Frame topFrame) {
+        // Fatal unwind: save reference (no wipe, no copy) for
+        // dead-coroutine traceback. Top still decrements so
+        // unwind loops terminate.
+        if (state.deathStack == null) {
+            state.deathStack = new Frame[Math.max(state.top + 1, 16)];
+        } else if (state.deathTop >= state.deathStack.length) {
+            Frame[] bigger = new Frame[state.deathStack.length * 2];
+            System.arraycopy(state.deathStack, 0, bigger, 0, state.deathTop);
+            state.deathStack = bigger;
+        }
+        state.deathStack[state.deathTop++] = topFrame;
     }
 
     public static void popTailCall() {
