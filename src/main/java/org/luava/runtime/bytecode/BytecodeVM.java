@@ -106,7 +106,11 @@ public final class BytecodeVM {
     }
 
     public static void setLuaValue(long[] pStack, byte[] tStack, LuaValue[] oStack, int idx, LuaValue val) {
-        if (val == null || val.isNil()) {
+        // Reference-compare the nil singleton before the virtual isNil()
+        // so the two hottest cases (nil and primitives) avoid a virtual
+        // dispatch. Non-primitive subclasses that override isNil (Varargs)
+        // still route through the final isNil() check below.
+        if (val == null || val == LuaNil.NIL) {
             tStack[idx] = TYPE_NIL;
             pStack[idx] = 0;
             oStack[idx] = null;
@@ -121,6 +125,10 @@ public final class BytecodeVM {
         } else if (val instanceof LuaBoolean lb) {
             tStack[idx] = TYPE_BOOLEAN;
             pStack[idx] = lb.toBoolean() ? 1L : 0L;
+            oStack[idx] = null;
+        } else if (val.isNil()) {
+            tStack[idx] = TYPE_NIL;
+            pStack[idx] = 0;
             oStack[idx] = null;
         } else {
             tStack[idx] = TYPE_OBJECT;

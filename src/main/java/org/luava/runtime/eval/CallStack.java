@@ -395,7 +395,6 @@ public final class CallStack {
             frame.lastLine = -1;
             frame.isMethod = isMethod;
             frame.isMetamethod = isMetamethod;
-            frame.temps.clear();
             frame.cArgs = null;
             frame.retValues = null;
             frame.ftransfer = 0;
@@ -518,7 +517,6 @@ public final class CallStack {
             frame.lastLine = -1;
             frame.isMethod = isMethod;
             frame.isMetamethod = isMetamethod;
-            frame.temps.clear();
             frame.cArgs = null;
             frame.retValues = null;
             frame.env = null;
@@ -605,7 +603,6 @@ public final class CallStack {
             frame.isMethod = m;
             frame.isMetamethod = isMeta;
             frame.isTailCall = true;
-            frame.temps.clear();
             frame.cArgs = state.nextCArgs;
             frame.retValues = null;
             frame.ftransfer = state.nextFtransfer;
@@ -701,20 +698,17 @@ public final class CallStack {
                 if (state.preserveForDeath) {
                     preserveDeadFrame(state, topFrame);
                 } else {
+                    // Slim wipe: null the reference fields so pooled frames
+                    // pin no Lua state (GC). Primitive/debug fields are
+                    // always overwritten by the next push/replace, and
+                    // temps is always empty (pushTemp has no callers), so
+                    // resetting them here is pure hot-path overhead.
                     topFrame.function = null;
                     topFrame.name = null;
                     topFrame.namewhat = null;
-                    topFrame.lastLine = -1;
                     topFrame.env = null;
-                    topFrame.temps.clear();
                     topFrame.cArgs = null;
                     topFrame.retValues = null;
-                    topFrame.ftransfer = 0;
-                    topFrame.ntransfer = 0;
-                    topFrame.isTailCall = false;
-                    topFrame.baseIndex = -1;
-                    topFrame.funcIndex = -1;
-                    topFrame.pc = -1;
                     topFrame.state = null;
                     topFrame.varargs = null;
                 }
@@ -757,20 +751,13 @@ public final class CallStack {
             state.top--;
             Frame topFrame = state.stack[state.top];
             if (topFrame != null) {
+                // Slim wipe (see pop()): reference fields only.
                 topFrame.function = null;
                 topFrame.name = null;
                 topFrame.namewhat = null;
-                topFrame.lastLine = -1;
                 topFrame.env = null;
-                topFrame.temps.clear();
                 topFrame.cArgs = null;
                 topFrame.retValues = null;
-                topFrame.ftransfer = 0;
-                topFrame.ntransfer = 0;
-                topFrame.isTailCall = false;
-                topFrame.baseIndex = -1;
-                topFrame.funcIndex = -1;
-                topFrame.pc = -1;
                 topFrame.state = null;
                 topFrame.varargs = null;
             }
