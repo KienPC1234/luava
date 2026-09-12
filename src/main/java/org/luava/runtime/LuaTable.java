@@ -392,6 +392,12 @@ public final class LuaTable extends LuaValue {
             if (hashPart.containsKey(key)) {
                 hashPart.put(key, LuaNil.NIL);
             }
+        } else if (!weakKeys && !weakValues) {
+            // Hot path (plain tables): single lookup. Values are never
+            // null, so put() alone both inserts and overwrites; the old
+            // containsKey()+prune() pair was pure overhead here
+            // (pruneDeadKeys is a no-op without weak modes).
+            hashPart.put(key, toStore);
         } else {
             if (!hashPart.containsKey(key)) {
                 pruneDeadKeys();
@@ -441,6 +447,14 @@ public final class LuaTable extends LuaValue {
     @Override
     public void set(LuaValue key, LuaValue value) {
         ensureFilled();
+        // Fast path: no metatable means no __newindex chain; the rawget
+        // probe below would be pure overhead (a second hash lookup on top
+        // of rawset's own). Semantics identical: the loop's first iteration
+        // with mt == null does exactly rawset(key, value).
+        if (getMetatable() == null) {
+            rawset(key, value);
+            return;
+        }
         LuaValue t = this;
         for (int loop = 0; loop < 2000; loop++) {
             if (t instanceof LuaTable tbl) {
