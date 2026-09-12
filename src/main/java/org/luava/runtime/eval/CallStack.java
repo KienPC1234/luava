@@ -643,13 +643,20 @@ public final class CallStack {
     }
 
     public static void setLine(int line) {
-        CallStackState state = currentState();
+        setLine(currentState(), LuaCoroutine.running(), line);
+    }
+
+    /**
+     * ThreadLocal-free {@link #setLine(int)} for VM callers that already
+     * hoisted the call state + running coroutine. Behavior identical; saves
+     * two {@code ThreadLocalMap} lookups per external/tail call.
+     */
+    public static void setLine(CallStackState state, LuaCoroutine cur, int line) {
         Frame topFrame = null;
         if (state.top > 0) {
             topFrame = state.stack[state.top - 1];
             topFrame.line = line;
         }
-        LuaCoroutine cur = LuaCoroutine.running();
         if (cur != null) {
             cur.fireLineAndCountHook(line, topFrame);
         }
