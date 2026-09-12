@@ -385,6 +385,20 @@ public final class LuaTable extends LuaValue {
                 if (!hashPart.isEmpty()) hashPart.remove(key);
                 arrayPart.set((int) (idx - 1), toStore);
                 return;
+            } else if (!toSet.isNil()) {
+                // Gap insert (e.g. filling from 2, or reverse fill): grow
+                // the array part when dense enough, then retry above.
+                maybeRehashForInt();
+                int size = arrayPart.size();
+                if (idx == (long) size + 1) {
+                    arrayPart.add(toStore);
+                    if (!hashPart.isEmpty()) hashPart.remove(key);
+                    return;
+                } else if (idx >= 1 && idx <= size) {
+                    if (!hashPart.isEmpty()) hashPart.remove(key);
+                    arrayPart.set((int) (idx - 1), toStore);
+                    return;
+                }
             }
         }
 
@@ -404,6 +418,91 @@ public final class LuaTable extends LuaValue {
             }
             LuaValue keyToStore = (weakKeys && isCollectable(key)) ? new WeakKey(key) : key;
             hashPart.put(keyToStore, toStore);
+        }
+    }
+
+    /**
+     * Array-part growth trigger for out-of-range integer inserts.
+     * Gated by hash occupancy so sparse keys (t[1000000] = x) stay in the
+     * hash part instead of forcing a huge array; skipped for weak tables.
+     */
+    private int rehashThreshold = 64;
+
+    private void maybeRehashForInt() {
+        if (!weakKeys && !weakValues && hashPart.size() >= rehashThreshold) {
+            rehash();
+        }
+    }
+
+    /** Maximum array-part size (2^24 slots = 128 MB of refs); larger integer
+     * keys stay in the hash part. Bounds memory on hostile sparse inserts. */
+    private static final long MAX_ARRAY_SIZE = 1L << 24;
+
+    /** Smallest i with {@code key <= 2^i} (key >= 1). */
+    private static int arrayBucket(long key) {
+        return 32 - Integer.numberOfLeadingZeros((int) Math.min(key - 1, 0x7FFFFFFFL));
+    }
+
+    /**
+     * Lua-style rehash: size the array part to the largest power of two
+     * that dense integer keys fill beyond half, then migrate those keys
+     * out of the hash part. Sparse leftovers stay hashed. Never shrinks.
+     * Values and iteration completeness are preserved; only the internal
+     * placement changes (pairs order is unspecified, as in C Lua).
+     */
+    private void rehash() {
+        int[] nums = new int[25]; // nums[i] = # int keys in (2^(i-1), 2^i]
+        for (int i = 0; i < arrayPart.size(); i++) {
+            LuaValue v = arrayPart.get(i);
+            if (v instanceof WeakVal wv) v = wv.get();
+            if (v != null && !v.isNil()) {
+                int b = arrayBucket(i + 1L);
+                if (b < nums.length) nums[b]++;
+            }
+        }
+        for (LuaValue k : hashPart.keySet()) {
+            if (k != null && k.isInteger()) {
+                long idx = k.toLong();
+                if (idx >= 1 && idx <= MAX_ARRAY_SIZE) {
+                    int b = arrayBucket(idx);
+                    if (b < nums.length) nums[b]++;
+                }
+            }
+        }
+        // Optimal size: largest 2^i with more than half its slots used.
+        int cumulative = 0;
+        int optimal = 0;
+        for (int i = 0; i < nums.length; i++) {
+            cumulative += nums[i];
+            long half = (i == 0) ? 0 : (1L << (i - 1));
+            if (nums[i] > 0 && cumulative > half) {
+                optimal = 1 << i;
+            }
+        }
+        if (optimal <= arrayPart.size()) {
+            // No progress (all sparse): back the threshold off so a sparse
+            // workload does not rehash on every insert (O(n^2)).
+            rehashThreshold = Math.max(rehashThreshold * 2, hashPart.size() + 1);
+            return;
+        }
+        arrayPart.ensureCapacity(optimal);
+        while (arrayPart.size() < optimal) {
+            arrayPart.add(LuaNil.NIL);
+        }
+        java.util.Iterator<Map.Entry<LuaValue, LuaValue>> it = hashPart.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<LuaValue, LuaValue> e = it.next();
+            LuaValue k = e.getKey();
+            if (k != null && k.isInteger()) {
+                long idx = k.toLong();
+                if (idx >= 1 && idx <= optimal) {
+                    LuaValue v = e.getValue();
+                    // Array-first reads make hash shadows invisible; drop
+                    // nil ones, overwrite with live ones (same visible value).
+                    arrayPart.set((int) idx - 1, (v == null || v.isNil()) ? LuaNil.NIL : v);
+                    it.remove();
+                }
+            }
         }
     }
 
