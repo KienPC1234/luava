@@ -498,10 +498,22 @@ public final class BytecodeCompiler {
             int[] keyRegs = new int[nvars];
             int[] keyConsts = new int[nvars];
             int[] keyKinds = new int[nvars]; // 0: reg (SETTABLE), 1: int (SETI), 2: str (SETFIELD)
+            // Single-target `t[k] = v` (the hot loop shape: sieve t[j]=false,
+            // table_ops t[i]=...): the RHS is already fully evaluated into a
+            // valReg before the store, so nothing else can write the table or
+            // key locals in between. Use their registers directly instead of
+            // snapshotting via MOVE into fresh temps. Multi-target assignments
+            // keep the snapshot (an earlier store may alias a later target).
+            boolean directOperands = nvars == 1;
             for (int i = 0; i < nvars; i++) {
                 if (as.targets().get(i) instanceof Expressions.TableAccessExpr tae) {
-                    int tr = allocReg();
-                    compileExprToReg(tae.table(), tr);
+                    int tr;
+                    if (directOperands) {
+                        tr = compileExprToAnyReg(tae.table());
+                    } else {
+                        tr = allocReg();
+                        compileExprToReg(tae.table(), tr);
+                    }
                     tblRegs[i] = tr;
                     if (tae.key() instanceof Expressions.IntegerLiteral il && il.value() >= 0 && il.value() <= 255) {
                         keyKinds[i] = 1;
@@ -515,14 +527,24 @@ public final class BytecodeCompiler {
                             keyRegs[i] = -1;
                         } else {
                             keyKinds[i] = 0;
-                            int kr = allocReg();
-                            compileExprToReg(tae.key(), kr);
+                            int kr;
+                            if (directOperands) {
+                                kr = compileExprToAnyReg(tae.key());
+                            } else {
+                                kr = allocReg();
+                                compileExprToReg(tae.key(), kr);
+                            }
                             keyRegs[i] = kr;
                         }
                     } else {
                         keyKinds[i] = 0;
-                        int kr = allocReg();
-                        compileExprToReg(tae.key(), kr);
+                        int kr;
+                        if (directOperands) {
+                            kr = compileExprToAnyReg(tae.key());
+                        } else {
+                            kr = allocReg();
+                            compileExprToReg(tae.key(), kr);
+                        }
                         keyRegs[i] = kr;
                     }
                 } else {
