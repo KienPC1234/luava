@@ -325,6 +325,24 @@ public final class LuaTable extends LuaValue {
 
     public LuaValue rawget(LuaValue key) {
         ensureFilled();
+        // String-key fast lane: the dominant field/method access shape
+        // (t.x, t["k"]). Strings are never float-normalized, never nil and
+        // never integer-keyed, and are never wrapped as WeakKey, so the
+        // normalizeKey + isNil + isInteger virtual chain is pure overhead.
+        // WeakVal unwrap is preserved (weak-value tables still store values
+        // wrapped).
+        if (key instanceof LuaString) {
+            LuaValue val = hashPart.get(key);
+            if (val instanceof WeakVal wv) {
+                LuaValue actual = wv.get();
+                if (actual == null) {
+                    hashPart.remove(key);
+                    return LuaNil.NIL;
+                }
+                return actual;
+            }
+            return val != null ? val : LuaNil.NIL;
+        }
         key = normalizeKey(key);
         if (key == null || key.isNil()) {
             return LuaNil.NIL;

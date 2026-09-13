@@ -106,7 +106,11 @@ public final class BytecodeVM {
     }
 
     public static void setLuaValue(long[] pStack, byte[] tStack, LuaValue[] oStack, int idx, LuaValue val) {
-        if (val == null || val.isNil()) {
+        // Reference-compare the nil singleton before the virtual isNil()
+        // so the two hottest cases (nil and primitives) avoid a virtual
+        // dispatch. Non-primitive subclasses that override isNil (Varargs)
+        // still route through the final isNil() check below.
+        if (val == null || val == LuaNil.NIL) {
             tStack[idx] = TYPE_NIL;
             pStack[idx] = 0;
             oStack[idx] = null;
@@ -121,6 +125,10 @@ public final class BytecodeVM {
         } else if (val instanceof LuaBoolean lb) {
             tStack[idx] = TYPE_BOOLEAN;
             pStack[idx] = lb.toBoolean() ? 1L : 0L;
+            oStack[idx] = null;
+        } else if (val.isNil()) {
+            tStack[idx] = TYPE_NIL;
+            pStack[idx] = 0;
             oStack[idx] = null;
         } else {
             tStack[idx] = TYPE_OBJECT;
@@ -566,101 +574,7 @@ public final class BytecodeVM {
                     }
                     clearDeadTemp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.proto, ctx.base, b, ctx.pc - 1);
                 }
-                case OpCode.OP_CALL -> {
-                    int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-
-                    int funcIdx = ctx.base + a;
-                    int nResults = c - 1;
-                    LuaFunction func = resolveCallable(state, ctx, funcIdx, b > 0 ? b - 1 : (ctx.top - (funcIdx + 1)), a);
-                    int nActualArgs = ctx.scratch0;
-
-                    if (func instanceof LuaClosure childClosure) {
-                        CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
-                        if (callerFrame != null) {
-                            callerFrame.pc = ctx.pc - 1;
-                            if (ctx.proto.lineInfo != null && ctx.pc - 1 >= 0 && ctx.pc - 1 < ctx.proto.lineInfo.length) {
-                                callerFrame.line = ctx.proto.lineInfo[ctx.pc - 1];
-                            }
-                        }
-                        if (ctx.callDepth >= ctx.callStack.length) {
-                            ctx.callStack = expandCallStack(ctx.callStack);
-                        }
-                        CallInfo ci = ctx.callStack[ctx.callDepth++];
-                        ci.init(ctx.closure, funcIdx, ctx.base, ctx.top, ctx.pc, nResults);
-                        ci.varargs = ctx.varargs;
-                        ci.oldpc = ctx.oldpc;
-                        ci.varargPrepRan = ctx.varargPrepRan;
-                        ctx.oldpc = -1;
-                        ctx.varargPrepRan = false;
-                        CallStack.CallStackState csState = ctx.callState;
-                        String callName = csState.nextName;
-                        String callNamewhat = csState.nextNamewhat;
-                        boolean isMeta = csState.nextMetamethod;
-                        boolean isMethod = csState.nextMethod;
-                        csState.nextName = null;
-                        csState.nextNamewhat = null;
-                        csState.nextMetamethod = false;
-                        csState.nextMethod = false;
-                        if (callName == null) {
-                            String[] info = callName(ctx, ctx.proto, ctx.pc - 1, a);
-                            if (info != null) {
-                                callName = info[0];
-                                callNamewhat = info[1];
-                                if ("method".equals(callNamewhat)) isMethod = true;
-                            } else {
-                                callName = childClosure.getName();
-                                callNamewhat = "";
-                            }
-                        }
-
-                        ctx.base = funcIdx + 1;
-                        ctx.closure = childClosure;
-                        ctx.proto = ctx.closure.proto;
-                        ctx.code = ctx.proto.code;
-                        ctx.k = ctx.proto.constants;
-                        ctx.upvals = ctx.closure.upvals;
-                        ctx.pc = 0;
-
-                        ctx.thread.ensureStackCapacity(ctx.base + ctx.proto.maxStackSize + 64);
-                        ctx.thread.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
-                        ctx.pStack = ctx.thread.getPrimitiveStack();
-                        ctx.tStack = ctx.thread.getTypeStack();
-                        ctx.oStack = ctx.thread.getObjectStack();
-
-                        if (ctx.proto.isVararg && nActualArgs > ctx.proto.numParams) {
-                            int nv = nActualArgs - ctx.proto.numParams;
-                            ctx.varargs = new LuaValue[nv];
-                            for (int i = 0; i < nv; i++) {
-                                ctx.varargs[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + ctx.proto.numParams + i);
-                            }
-                        } else {
-                            ctx.varargs = null;
-                        }
-
-                        for (int i = nActualArgs; i < ctx.proto.numParams; i++) {
-                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, LuaNil.NIL);
-                        }
-                        ctx.top = ctx.base + ctx.proto.numParams;
-
-                        // Lua 5.4 semantics: call hook runs after stack frame and arguments are established
-                        CallStack.pushVmFrame(childClosure,
-                                callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(),
-                                isMethod, isMeta,
-                                1, childClosure.proto.numParams,
-                                state, ctx.base, funcIdx, ctx.varargs,
-                                ctx.callState, ctx.co);
-                    } else if (func instanceof LuaFunction fn) {
-                        int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
-                        int newTop = executeExternalCall(state, ctx, ctx.proto, ctx.pc, ctx.base, fn, funcIdx, nActualArgs, nResults, callLine);
-                        if (nResults < 0) {
-                            ctx.top = newTop;
-                        }
-                        ctx.pStack = ctx.thread.getPrimitiveStack();
-                        ctx.tStack = ctx.thread.getTypeStack();
-                        ctx.oStack = ctx.thread.getObjectStack();
-                    }
-                }
+                case OpCode.OP_CALL -> executeCallOp(state, ctx, a, inst);
                 case OpCode.OP_TAILCALL -> {
                     LuaValue[] tailResult = doTailCall(state, ctx, a, inst);
                     if (tailResult != null) {
@@ -669,7 +583,7 @@ public final class BytecodeVM {
                 }
                 case OpCode.OP_RETURN0 -> {
                     if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
-                    if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
+                    if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.thread, ctx.base, null);
                     LuaValue[] r0;
                     if (LuaCoroutine.HOOKS_ARMED) {
                         LuaValue[] retVals0 = new LuaValue[0];
@@ -684,7 +598,7 @@ public final class BytecodeVM {
                 }
                 case OpCode.OP_RETURN1 -> {
                     if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
-                    if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
+                    if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.thread, ctx.base, null);
                     LuaValue[] r1;
                     if (LuaCoroutine.HOOKS_ARMED) {
                         LuaValue ret = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
@@ -701,7 +615,7 @@ public final class BytecodeVM {
                 }
                 case OpCode.OP_RETURN -> {
                     if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
-                    if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.base, null);
+                    if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.thread, ctx.base, null);
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int nReturns = b > 0 ? b - 1 : (ctx.top - (ctx.base + a));
                     LuaValue[] rN;
@@ -946,6 +860,129 @@ public final class BytecodeVM {
     }
 
     /**
+     * {@code OP_CALL} handler. Outlined from the dispatch loop so the loop
+     * itself keeps C2 inline budget and this method gets a fresh one: the
+     * per-call helpers ({@code resolveCallable}, {@code pushVmFrame}, ...)
+     * are all under {@code FreqInlineSize} and can fuse into this unit,
+     * while inside the 7 KB {@code runLoop} they starve (even 22-byte
+     * callees are rejected there). Mutates {@code ctx} directly; void
+     * because a Lua-to-Lua call never terminates the loop.
+     *
+     * <p>Note: {@code OP_RETURN} is deliberately <em>not</em> outlined the
+     * same way: a 296-byte return helper gets re-inlined into
+     * {@code runLoop} on loop-heavy compiles and wrecks hot-loop code
+     * quality (arith_loop -40%, confirmed via {@code CompileCommand
+     * dontinline} recovery), so the return bodies stay inline.
+     */
+    private static void executeCallOp(LuaState state, VmContext ctx, int a, int inst) {
+        int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
+        int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+
+        int funcIdx = ctx.base + a;
+        int nResults = c - 1;
+        // Fast lane: the register already holds a LuaFunction (the dominant
+        // case: local/upvalue function calls). resolveCallable's boxing +
+        // metamethod walk is pure overhead then; it only matters for tables
+        // with __call or userdata. Same argument-count semantics.
+        int nArgs;
+        LuaFunction func;
+        if (ctx.tStack[funcIdx] == TYPE_OBJECT && ctx.oStack[funcIdx] instanceof LuaFunction direct) {
+            func = direct;
+            nArgs = b > 0 ? b - 1 : (ctx.top - (funcIdx + 1));
+        } else {
+            func = resolveCallable(state, ctx, funcIdx, b > 0 ? b - 1 : (ctx.top - (funcIdx + 1)), a);
+            nArgs = ctx.scratch0;
+        }
+        int nActualArgs = nArgs;
+
+        if (func instanceof LuaClosure childClosure) {
+            CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
+            if (callerFrame != null) {
+                callerFrame.pc = ctx.pc - 1;
+                if (ctx.proto.lineInfo != null && ctx.pc - 1 >= 0 && ctx.pc - 1 < ctx.proto.lineInfo.length) {
+                    callerFrame.line = ctx.proto.lineInfo[ctx.pc - 1];
+                }
+            }
+            if (ctx.callDepth >= ctx.callStack.length) {
+                ctx.callStack = expandCallStack(ctx.callStack);
+            }
+            CallInfo ci = ctx.callStack[ctx.callDepth++];
+            ci.init(ctx.closure, funcIdx, ctx.base, ctx.top, ctx.pc, nResults);
+            ci.varargs = ctx.varargs;
+            ci.oldpc = ctx.oldpc;
+            ci.varargPrepRan = ctx.varargPrepRan;
+            ctx.oldpc = -1;
+            ctx.varargPrepRan = false;
+            CallStack.CallStackState csState = ctx.callState;
+            String callName = csState.nextName;
+            String callNamewhat = csState.nextNamewhat;
+            boolean isMeta = csState.nextMetamethod;
+            boolean isMethod = csState.nextMethod;
+            csState.nextName = null;
+            csState.nextNamewhat = null;
+            csState.nextMetamethod = false;
+            csState.nextMethod = false;
+            if (callName == null) {
+                String[] info = callName(ctx, ctx.proto, ctx.pc - 1, a);
+                if (info != null) {
+                    callName = info[0];
+                    callNamewhat = info[1];
+                    if ("method".equals(callNamewhat)) isMethod = true;
+                } else {
+                    callName = childClosure.getName();
+                    callNamewhat = "";
+                }
+            }
+
+            ctx.base = funcIdx + 1;
+            ctx.closure = childClosure;
+            ctx.proto = ctx.closure.proto;
+            ctx.code = ctx.proto.code;
+            ctx.k = ctx.proto.constants;
+            ctx.upvals = ctx.closure.upvals;
+            ctx.pc = 0;
+
+            ctx.thread.ensureStackCapacity(ctx.base + ctx.proto.maxStackSize + 64);
+            ctx.thread.setStackTop(ctx.base + ctx.proto.maxStackSize + 64);
+            ctx.pStack = ctx.thread.getPrimitiveStack();
+            ctx.tStack = ctx.thread.getTypeStack();
+            ctx.oStack = ctx.thread.getObjectStack();
+
+            if (ctx.proto.isVararg && nActualArgs > ctx.proto.numParams) {
+                int nv = nActualArgs - ctx.proto.numParams;
+                ctx.varargs = new LuaValue[nv];
+                for (int i = 0; i < nv; i++) {
+                    ctx.varargs[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + ctx.proto.numParams + i);
+                }
+            } else {
+                ctx.varargs = null;
+            }
+
+            for (int i = nActualArgs; i < ctx.proto.numParams; i++) {
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, LuaNil.NIL);
+            }
+            ctx.top = ctx.base + ctx.proto.numParams;
+
+            // Lua 5.4 semantics: call hook runs after stack frame and arguments are established
+            CallStack.pushVmFrame(childClosure,
+                    callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(),
+                    isMethod, isMeta,
+                    1, childClosure.proto.numParams,
+                    state, ctx.base, funcIdx, ctx.varargs,
+                    ctx.callState, ctx.co);
+        } else if (func instanceof LuaFunction fn) {
+            int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
+            int newTop = executeExternalCall(state, ctx, ctx.proto, ctx.pc, ctx.base, fn, funcIdx, nActualArgs, nResults, callLine);
+            if (nResults < 0) {
+                ctx.top = newTop;
+            }
+            ctx.pStack = ctx.thread.getPrimitiveStack();
+            ctx.tStack = ctx.thread.getTypeStack();
+            ctx.oStack = ctx.thread.getObjectStack();
+        }
+    }
+
+    /**
      * {@code OP_TAILCALL} handler (largest single case, ~1.5 KB).
      * Mutates {@code ctx} directly; a non-null return value must be
      * returned from the dispatch loop immediately.
@@ -1015,10 +1052,10 @@ public final class BytecodeVM {
             CallStack.replaceTailCall(childClosure, callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(), isMethod, isMeta, ctx.callState, ctx.co);
         } else if (func instanceof LuaFunction fn) {
             state.closeUpvalues(ctx.thread, ctx.base);
-            state.closeTbc(ctx.base, null);
+            state.closeTbc(ctx.thread, ctx.base, null);
 
             int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
-            if (callLine > 0) CallStack.setLine(callLine);
+            if (callLine > 0) CallStack.setLine(ctx.callState, ctx.co, callLine);
             CallStack.Frame callerFrameExt = CallStack.topFrame(ctx.callState);
             if (callerFrameExt != null) {
                 callerFrameExt.pc = ctx.pc - 1;
@@ -1899,7 +1936,7 @@ public final class BytecodeVM {
         byte[] tStack = ctx.thread.getTypeStack();
         LuaValue[] oStack = ctx.thread.getObjectStack();
         LuaValue[] cArgs = getArgsForCall(pStack, tStack, oStack, funcIdx + 1, nActualArgs);
-        if (curLine > 0) CallStack.setLine(curLine);
+        if (curLine > 0) CallStack.setLine(ctx.callState, ctx.co, curLine);
         CallStack.CallStackState csState = ctx.callState;
         String resolvedName = csState.nextName;
         String namewhat = csState.nextNamewhat;
