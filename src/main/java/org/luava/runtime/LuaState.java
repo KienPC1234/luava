@@ -720,7 +720,15 @@ public final class LuaState {
     }
 
     public void closeTbc(int fromIndex, LuaValue errorObj) {
-        LuaCoroutine thread = getCurrentThread();
+        closeTbc(getCurrentThread(), fromIndex, errorObj);
+    }
+
+    /**
+     * ThreadLocal-free {@link #closeTbc(int, LuaValue)} for VM callers that
+     * already hoisted the running thread (avoids a {@code ThreadLocalMap}
+     * lookup on every return path).
+     */
+    public void closeTbc(LuaCoroutine thread, int fromIndex, LuaValue errorObj) {
         Throwable lastError = null;
         while (thread.getTbcHead() != null && thread.getTbcHead().stackIndex >= fromIndex) {
             TbcEntry entry = thread.getTbcHead();
