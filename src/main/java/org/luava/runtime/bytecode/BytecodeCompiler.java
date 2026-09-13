@@ -628,6 +628,24 @@ public final class BytecodeCompiler {
             return -1;
         }
 
+        /**
+         * The "K" opcode for a binary operator whose right operand may be a
+         * constant, mirroring PUC lcode.c codearith's opcode selection.
+         * Returns -1 when there is no K variant (bitwise and comparisons).
+         */
+        int binaryKOpcode(TokenType op) {
+            return switch (op) {
+                case PLUS -> OpCode.OP_ADDK;
+                case MINUS -> OpCode.OP_SUBK;
+                case STAR -> OpCode.OP_MULK;
+                case SLASH -> OpCode.OP_DIVK;
+                case DOUBLE_SLASH -> OpCode.OP_IDIVK;
+                case PERCENT -> OpCode.OP_MODK;
+                case CARET -> OpCode.OP_POWK;
+                default -> -1;
+            };
+        }
+
         void assignTarget(Expression target, int valReg, int line) {
             if (target instanceof Expressions.VariableExpr ve) {
                 LocalVar lv = findLocal(ve.name());
@@ -1406,6 +1424,27 @@ public final class BytecodeCompiler {
                 freereg = Math.max(freereg, targetReg + 1);
             } else {
                 b = compileExprToAnyReg(be.left(), be.line());
+            }
+            // PUC lcode.c codearith -> exp2RK/validop: when the right operand
+            // is a constant (integer/float/string) and the opcode has a "K"
+            // variant, encode it as K[C] instead of loading a register. This
+            // removes one dispatch for shapes like `i * 3` (table_ops).
+            int kOp = -1;
+            int kIdx = -1;
+            if (!(be.right() instanceof Expressions.FunctionCallExpr)
+                    && !(be.right() instanceof Expressions.VarargLiteral)) {
+                int ci = constIndexOf(be.right());
+                if (ci >= 0 && ci <= 255) {
+                    kOp = binaryKOpcode(be.operator());
+                    if (kOp >= 0) {
+                        kIdx = ci;
+                    }
+                }
+            }
+            if (kOp >= 0) {
+                emit(Instruction.encodeABC(kOp, targetReg, b, kIdx, 0), be.line());
+                freeRegs(Math.max(saveFreereg, targetReg + 1));
+                return;
             }
             int c = compileExprToAnyReg(be.right());
             int op = switch (be.operator()) {

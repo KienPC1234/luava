@@ -1564,21 +1564,51 @@ public final class BytecodeVM {
     private static void executeSlowAddK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        LuaValue vb = getLuaValue(pStack, tStack, oStack, base + b);
-        setLuaValue(pStack, tStack, oStack, base + a, vb.add(k[c]));
+        int regB = base + b;
+        int regA = base + a;
+        LuaValue kc = k[c];
+        if (tStack[regB] == TYPE_INT && kc instanceof LuaInteger ki) {
+            pStack[regA] = pStack[regB] + ki.toLong();
+            tStack[regA] = TYPE_INT;
+            oStack[regA] = null;
+            return;
+        }
+        if (isNumber(tStack[regB]) && kc.isNumber()) {
+            double db = tStack[regB] == TYPE_INT ? pStack[regB] : Double.longBitsToDouble(pStack[regB]);
+            pStack[regA] = Double.doubleToRawLongBits(db + kc.toDouble());
+            tStack[regA] = TYPE_FLOAT;
+            oStack[regA] = null;
+            return;
+        }
+        setLuaValue(pStack, tStack, oStack, regA, getLuaValue(pStack, tStack, oStack, regB).add(kc));
+    }
+
+    private static void executeSlowSubK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+        int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
+        int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+        int regB = base + b;
+        int regA = base + a;
+        LuaValue kc = k[c];
+        if (tStack[regB] == TYPE_INT && kc instanceof LuaInteger ki) {
+            pStack[regA] = pStack[regB] - ki.toLong();
+            tStack[regA] = TYPE_INT;
+            oStack[regA] = null;
+            return;
+        }
+        if (isNumber(tStack[regB]) && kc.isNumber()) {
+            double db = tStack[regB] == TYPE_INT ? pStack[regB] : Double.longBitsToDouble(pStack[regB]);
+            pStack[regA] = Double.doubleToRawLongBits(db - kc.toDouble());
+            tStack[regA] = TYPE_FLOAT;
+            oStack[regA] = null;
+            return;
+        }
+        setLuaValue(pStack, tStack, oStack, regA, getLuaValue(pStack, tStack, oStack, regB).sub(kc));
     }
 
     private static void executeSlowSub(long[] pStack, byte[] tStack, LuaValue[] oStack, int regA, int regB, int regC) {
         LuaValue vb = getLuaValue(pStack, tStack, oStack, regB);
         LuaValue vc = getLuaValue(pStack, tStack, oStack, regC);
         setLuaValue(pStack, tStack, oStack, regA, vb.sub(vc));
-    }
-
-    private static void executeSlowSubK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
-        int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-        int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        LuaValue vb = getLuaValue(pStack, tStack, oStack, base + b);
-        setLuaValue(pStack, tStack, oStack, base + a, vb.sub(k[c]));
     }
 
     private static void executeSlowMul(long[] pStack, byte[] tStack, LuaValue[] oStack, int regA, int regB, int regC) {
@@ -1590,8 +1620,26 @@ public final class BytecodeVM {
     private static void executeSlowMulK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        LuaValue vb = getLuaValue(pStack, tStack, oStack, base + b);
-        setLuaValue(pStack, tStack, oStack, base + a, vb.mul(k[c]));
+        int regB = base + b;
+        int regA = base + a;
+        // Unboxed fast lanes mirroring OP_MUL: the constant is a compile-time
+        // literal (normally LuaInteger), so int*int must stay in the raw
+        // register world instead of boxing through getLuaValue().mul().
+        LuaValue kc = k[c];
+        if (tStack[regB] == TYPE_INT && kc instanceof LuaInteger ki) {
+            pStack[regA] = pStack[regB] * ki.toLong();
+            tStack[regA] = TYPE_INT;
+            oStack[regA] = null;
+            return;
+        }
+        if (isNumber(tStack[regB]) && kc.isNumber()) {
+            double db = tStack[regB] == TYPE_INT ? pStack[regB] : Double.longBitsToDouble(pStack[regB]);
+            pStack[regA] = Double.doubleToRawLongBits(db * kc.toDouble());
+            tStack[regA] = TYPE_FLOAT;
+            oStack[regA] = null;
+            return;
+        }
+        setLuaValue(pStack, tStack, oStack, regA, getLuaValue(pStack, tStack, oStack, regB).mul(kc));
     }
 
     private static void executeSlowDiv(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
@@ -2257,6 +2305,26 @@ public final class BytecodeVM {
                 }
                 String[] info = getobjname(proto, faultPc, culpritReg);
                 if (info != null && info[0] != null) desc = "(" + info[1] + " '" + info[0] + "')";
+            }
+            case OpCode.OP_ADDK, OpCode.OP_SUBK, OpCode.OP_MULK, OpCode.OP_MODK, OpCode.OP_POWK,
+                 OpCode.OP_DIVK, OpCode.OP_IDIVK -> {
+                // K variants: B is a register, C indexes the constant table.
+                int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
+                int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+                LuaValue valB = getLuaValue(pStack, tStack, oStack, base + b);
+                LuaValue valC = (proto.constants != null && c < proto.constants.length) ? proto.constants[c] : LuaNil.NIL;
+                int culpritReg = b;
+                if (msg.contains("has no integer representation")) {
+                    if (hasIntegerRepresentation(valB)) {
+                        culpritReg = -1; // constant side
+                    }
+                } else if (valB.isNumber() || (valB instanceof LuaString ls && ls.isNumber())) {
+                    culpritReg = -1; // constant side is the culprit
+                }
+                if (culpritReg >= 0) {
+                    String[] info = getobjname(proto, faultPc, culpritReg);
+                    if (info != null && info[0] != null) desc = "(" + info[1] + " '" + info[0] + "')";
+                }
             }
             case OpCode.OP_ADDI, OpCode.OP_SHLI, OpCode.OP_SHRI -> {
                 int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
