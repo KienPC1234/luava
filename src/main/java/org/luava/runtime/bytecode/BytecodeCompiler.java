@@ -463,8 +463,33 @@ public final class BytecodeCompiler {
                 }
             }
 
+            // PUC lcode.c luaK_storevar -> exp2RK: a literal RHS is encoded as
+            // a constant operand RK(C) (flagK=1) instead of a register loaded
+            // by a separate instruction. This removes one dispatch per store
+            // in loops like `sieve[j]=false`. Only for a single target whose
+            // target is a table access (so the value is only consumed by the
+            // store, never observed as a register) and when the constant index
+            // fits the 8-bit C field.
+            boolean constValApplies = nvars == 1 && numFixedVals == 1
+                    && as.targets().get(0) instanceof Expressions.TableAccessExpr
+                    && !(as.values().get(0) instanceof Expressions.FunctionCallExpr)
+                    && !(as.values().get(0) instanceof Expressions.VarargLiteral);
+            int constValIdx = -1;
+            if (constValApplies) {
+                int ci = constIndexOf(as.values().get(0));
+                if (ci >= 0 && ci <= 255) {
+                    constValIdx = ci;
+                }
+            }
+
             for (int i = 0; i < nvars; i++) {
                 if (i < numFixedVals) {
+                    if (constValIdx >= 0) {
+                        // Value is carried by the constant table; no register
+                        // load is emitted (mirrors PUC exp2RK).
+                        valRegs[i] = -1;
+                        continue;
+                    }
                     valRegs[i] = allocReg();
                     String inferredName = null;
                     if (as.targets().get(i) instanceof Expressions.VariableExpr ve) {
@@ -558,7 +583,16 @@ public final class BytecodeCompiler {
                 // so its line info matches the line where the RHS expression ends.
                 int assignLine = (i < as.values().size()) ? exprEndLine(as.values().get(i)) : as.line();
                 if (tblRegs[i] >= 0) {
-                    if (keyKinds[i] == 1) {
+                    if (constValIdx >= 0) {
+                        // Literal RHS as RK(C) constant operand.
+                        if (keyKinds[i] == 1) {
+                            emit(Instruction.encodeABC(OpCode.OP_SETI, tblRegs[i], keyConsts[i], constValIdx, 1), assignLine);
+                        } else if (keyKinds[i] == 2) {
+                            emit(Instruction.encodeABC(OpCode.OP_SETFIELD, tblRegs[i], keyConsts[i], constValIdx, 1), assignLine);
+                        } else {
+                            emit(Instruction.encodeABC(OpCode.OP_SETTABLE, tblRegs[i], keyRegs[i], constValIdx, 1), assignLine);
+                        }
+                    } else if (keyKinds[i] == 1) {
                         emit(Instruction.encodeABC(OpCode.OP_SETI, tblRegs[i], keyConsts[i], valRegs[i], 0), assignLine);
                     } else if (keyKinds[i] == 2) {
                         emit(Instruction.encodeABC(OpCode.OP_SETFIELD, tblRegs[i], keyConsts[i], valRegs[i], 0), assignLine);
@@ -571,6 +605,27 @@ public final class BytecodeCompiler {
             }
 
             freeRegs(saveFreereg);
+        }
+
+        /**
+         * Constant-table index for a literal expression, or -1 if the
+         * expression is not a literal. Mirrors PUC lcode.c exp2RK: nil,
+         * booleans, integers, floats and strings can be stored as RK(C) in
+         * a single table-store instruction.
+         */
+        int constIndexOf(Expression expr) {
+            if (expr instanceof Expressions.NilLiteral) {
+                return addConst(LuaNil.NIL);
+            } else if (expr instanceof Expressions.BooleanLiteral bl) {
+                return addConst(bl.value() ? LuaBoolean.TRUE : LuaBoolean.FALSE);
+            } else if (expr instanceof Expressions.IntegerLiteral il) {
+                return addConst(LuaInteger.valueOf(il.value()));
+            } else if (expr instanceof Expressions.FloatLiteral fl) {
+                return addConst(LuaFloat.valueOf(fl.value()));
+            } else if (expr instanceof Expressions.StringLiteral sl) {
+                return addConst(sl.luaString());
+            }
+            return -1;
         }
 
         void assignTarget(Expression target, int valReg, int line) {
