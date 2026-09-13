@@ -880,8 +880,20 @@ public final class BytecodeVM {
 
         int funcIdx = ctx.base + a;
         int nResults = c - 1;
-        LuaFunction func = resolveCallable(state, ctx, funcIdx, b > 0 ? b - 1 : (ctx.top - (funcIdx + 1)), a);
-        int nActualArgs = ctx.scratch0;
+        // Fast lane: the register already holds a LuaFunction (the dominant
+        // case: local/upvalue function calls). resolveCallable's boxing +
+        // metamethod walk is pure overhead then; it only matters for tables
+        // with __call or userdata. Same argument-count semantics.
+        int nArgs;
+        LuaFunction func;
+        if (ctx.tStack[funcIdx] == TYPE_OBJECT && ctx.oStack[funcIdx] instanceof LuaFunction direct) {
+            func = direct;
+            nArgs = b > 0 ? b - 1 : (ctx.top - (funcIdx + 1));
+        } else {
+            func = resolveCallable(state, ctx, funcIdx, b > 0 ? b - 1 : (ctx.top - (funcIdx + 1)), a);
+            nArgs = ctx.scratch0;
+        }
+        int nActualArgs = nArgs;
 
         if (func instanceof LuaClosure childClosure) {
             CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
