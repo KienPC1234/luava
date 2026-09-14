@@ -463,8 +463,33 @@ public final class BytecodeCompiler {
                 }
             }
 
+            // PUC lcode.c luaK_storevar -> exp2RK: a literal RHS is encoded as
+            // a constant operand RK(C) (flagK=1) instead of a register loaded
+            // by a separate instruction. This removes one dispatch per store
+            // in loops like `sieve[j]=false`. Only for a single target whose
+            // target is a table access (so the value is only consumed by the
+            // store, never observed as a register) and when the constant index
+            // fits the 8-bit C field.
+            boolean constValApplies = nvars == 1 && numFixedVals == 1
+                    && as.targets().get(0) instanceof Expressions.TableAccessExpr
+                    && !(as.values().get(0) instanceof Expressions.FunctionCallExpr)
+                    && !(as.values().get(0) instanceof Expressions.VarargLiteral);
+            int constValIdx = -1;
+            if (constValApplies) {
+                int ci = constIndexOf(as.values().get(0));
+                if (ci >= 0 && ci <= 255) {
+                    constValIdx = ci;
+                }
+            }
+
             for (int i = 0; i < nvars; i++) {
                 if (i < numFixedVals) {
+                    if (constValIdx >= 0) {
+                        // Value is carried by the constant table; no register
+                        // load is emitted (mirrors PUC exp2RK).
+                        valRegs[i] = -1;
+                        continue;
+                    }
                     valRegs[i] = allocReg();
                     String inferredName = null;
                     if (as.targets().get(i) instanceof Expressions.VariableExpr ve) {
@@ -498,10 +523,22 @@ public final class BytecodeCompiler {
             int[] keyRegs = new int[nvars];
             int[] keyConsts = new int[nvars];
             int[] keyKinds = new int[nvars]; // 0: reg (SETTABLE), 1: int (SETI), 2: str (SETFIELD)
+            // Single-target `t[k] = v` (the hot loop shape: sieve t[j]=false,
+            // table_ops t[i]=...): the RHS is already fully evaluated into a
+            // valReg before the store, so nothing else can write the table or
+            // key locals in between. Use their registers directly instead of
+            // snapshotting via MOVE into fresh temps. Multi-target assignments
+            // keep the snapshot (an earlier store may alias a later target).
+            boolean directOperands = nvars == 1;
             for (int i = 0; i < nvars; i++) {
                 if (as.targets().get(i) instanceof Expressions.TableAccessExpr tae) {
-                    int tr = allocReg();
-                    compileExprToReg(tae.table(), tr);
+                    int tr;
+                    if (directOperands) {
+                        tr = compileExprToAnyReg(tae.table());
+                    } else {
+                        tr = allocReg();
+                        compileExprToReg(tae.table(), tr);
+                    }
                     tblRegs[i] = tr;
                     if (tae.key() instanceof Expressions.IntegerLiteral il && il.value() >= 0 && il.value() <= 255) {
                         keyKinds[i] = 1;
@@ -515,14 +552,24 @@ public final class BytecodeCompiler {
                             keyRegs[i] = -1;
                         } else {
                             keyKinds[i] = 0;
-                            int kr = allocReg();
-                            compileExprToReg(tae.key(), kr);
+                            int kr;
+                            if (directOperands) {
+                                kr = compileExprToAnyReg(tae.key());
+                            } else {
+                                kr = allocReg();
+                                compileExprToReg(tae.key(), kr);
+                            }
                             keyRegs[i] = kr;
                         }
                     } else {
                         keyKinds[i] = 0;
-                        int kr = allocReg();
-                        compileExprToReg(tae.key(), kr);
+                        int kr;
+                        if (directOperands) {
+                            kr = compileExprToAnyReg(tae.key());
+                        } else {
+                            kr = allocReg();
+                            compileExprToReg(tae.key(), kr);
+                        }
                         keyRegs[i] = kr;
                     }
                 } else {
@@ -536,7 +583,16 @@ public final class BytecodeCompiler {
                 // so its line info matches the line where the RHS expression ends.
                 int assignLine = (i < as.values().size()) ? exprEndLine(as.values().get(i)) : as.line();
                 if (tblRegs[i] >= 0) {
-                    if (keyKinds[i] == 1) {
+                    if (constValIdx >= 0) {
+                        // Literal RHS as RK(C) constant operand.
+                        if (keyKinds[i] == 1) {
+                            emit(Instruction.encodeABC(OpCode.OP_SETI, tblRegs[i], keyConsts[i], constValIdx, 1), assignLine);
+                        } else if (keyKinds[i] == 2) {
+                            emit(Instruction.encodeABC(OpCode.OP_SETFIELD, tblRegs[i], keyConsts[i], constValIdx, 1), assignLine);
+                        } else {
+                            emit(Instruction.encodeABC(OpCode.OP_SETTABLE, tblRegs[i], keyRegs[i], constValIdx, 1), assignLine);
+                        }
+                    } else if (keyKinds[i] == 1) {
                         emit(Instruction.encodeABC(OpCode.OP_SETI, tblRegs[i], keyConsts[i], valRegs[i], 0), assignLine);
                     } else if (keyKinds[i] == 2) {
                         emit(Instruction.encodeABC(OpCode.OP_SETFIELD, tblRegs[i], keyConsts[i], valRegs[i], 0), assignLine);
@@ -549,6 +605,60 @@ public final class BytecodeCompiler {
             }
 
             freeRegs(saveFreereg);
+        }
+
+        /**
+         * Constant-table index for a literal expression, or -1 if the
+         * expression is not a literal. Mirrors PUC lcode.c exp2RK: nil,
+         * booleans, integers, floats and strings can be stored as RK(C) in
+         * a single table-store instruction.
+         */
+        int constIndexOf(Expression expr) {
+            if (expr instanceof Expressions.NilLiteral) {
+                return addConst(LuaNil.NIL);
+            } else if (expr instanceof Expressions.BooleanLiteral bl) {
+                return addConst(bl.value() ? LuaBoolean.TRUE : LuaBoolean.FALSE);
+            } else if (expr instanceof Expressions.IntegerLiteral il) {
+                return addConst(LuaInteger.valueOf(il.value()));
+            } else if (expr instanceof Expressions.FloatLiteral fl) {
+                return addConst(LuaFloat.valueOf(fl.value()));
+            } else if (expr instanceof Expressions.StringLiteral sl) {
+                return addConst(sl.luaString());
+            }
+            return -1;
+        }
+
+        /**
+         * The "K" opcode for a binary operator whose right operand may be a
+         * constant, mirroring PUC lcode.c codearith's opcode selection.
+         * Returns -1 when there is no K variant (bitwise and comparisons).
+         */
+        int binaryKOpcode(TokenType op) {
+            return switch (op) {
+                case PLUS -> OpCode.OP_ADDK;
+                case MINUS -> OpCode.OP_SUBK;
+                case STAR -> OpCode.OP_MULK;
+                case SLASH -> OpCode.OP_DIVK;
+                case DOUBLE_SLASH -> OpCode.OP_IDIVK;
+                case PERCENT -> OpCode.OP_MODK;
+                case CARET -> OpCode.OP_POWK;
+                default -> -1;
+            };
+        }
+
+        /**
+         * Immediate compare opcode for {@code R[A] <op> imm}, mirroring PUC
+         * codeorder/codeorderI. Only ordered comparisons have an immediate
+         * form; equality uses OP_EQI. Returns -1 when the operator has none.
+         */
+        int compareIOpcode(TokenType op) {
+            return switch (op) {
+                case LESS -> OpCode.OP_LTI;
+                case LESS_EQUAL -> OpCode.OP_LEI;
+                case GREATER -> OpCode.OP_GTI;
+                case GREATER_EQUAL -> OpCode.OP_GEI;
+                default -> -1;
+            };
         }
 
         void assignTarget(Expression target, int valReg, int line) {
@@ -1292,6 +1402,30 @@ public final class BytecodeCompiler {
                 freeRegs(Math.max(saveFreereg, targetReg + 1));
                 return;
             }
+            // PUC lcode.c codeorder/codeorderI: ordered comparisons against a
+            // small integer immediate use OP_LTI/LEI/GTI/GEI (and equality uses
+            // OP_EQI), avoiding a register load for the constant. The value is
+            // still materialised as a boolean here (same LFALSESKIP/LOADTRUE
+            // shape as the register form).
+            if (be.right() instanceof Expressions.IntegerLiteral cil) {
+                long iv = cil.value();
+                if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                    int cmpOp = compareIOpcode(be.operator());
+                    boolean eqOp = be.operator() == TokenType.EQUAL_EQUAL;
+                    if (cmpOp >= 0 || eqOp) {
+                        int rb = compileExprToAnyReg(be.left(), be.line());
+                        if (eqOp) {
+                            emit(Instruction.encodeABCsB(OpCode.OP_EQI, rb, (int) iv), be.line());
+                        } else {
+                            emit(Instruction.encodeABCsB(cmpOp, rb, (int) iv), be.line());
+                        }
+                        emit(Instruction.encodeABC(OpCode.OP_LFALSESKIP, targetReg, 0, 0), be.line());
+                        emit(Instruction.encodeABC(OpCode.OP_LOADTRUE, targetReg, 0, 0), be.line());
+                        freeRegs(Math.max(saveFreereg, targetReg + 1));
+                        return;
+                    }
+                }
+            }
             if (be.operator() == TokenType.GREATER) {
                 int b = compileExprToAnyReg(be.left(), be.line());
                 int c = compileExprToAnyReg(be.right());
@@ -1329,6 +1463,44 @@ public final class BytecodeCompiler {
                 freereg = Math.max(freereg, targetReg + 1);
             } else {
                 b = compileExprToAnyReg(be.left(), be.line());
+            }
+            // PUC lcode.c luaK_arith: `x + small` uses the immediate form
+            // OP_ADDI (no constant-table entry, no register load). Only for
+            // addition: PUC emits an accompanying OP_MMBINI carrying the
+            // metamethod name for the falling-through case, but Luava's
+            // compiler does not emit MMBIN*, and ADDI's slow path is `__add`.
+            // Encoding `x - k` as ADDI(-k) would therefore call `__add` for
+            // table/metatable operands (coroutine.lua "yields inside
+            // metamethods"); subtraction keeps the OP_SUBK path, which calls
+            // the correct `.sub`.
+            if (be.operator() == TokenType.PLUS && be.right() instanceof Expressions.IntegerLiteral ril) {
+                long imm = ril.value();
+                if (imm >= -Instruction.OFFSET_sC && imm <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                    emit(Instruction.encodeABCsC(OpCode.OP_ADDI, targetReg, b, (int) imm), be.line());
+                    freeRegs(Math.max(saveFreereg, targetReg + 1));
+                    return;
+                }
+            }
+            // PUC lcode.c codearith -> exp2RK/validop: when the right operand
+            // is a constant (integer/float/string) and the opcode has a "K"
+            // variant, encode it as K[C] instead of loading a register. This
+            // removes one dispatch for shapes like `i * 3` (table_ops).
+            int kOp = -1;
+            int kIdx = -1;
+            if (!(be.right() instanceof Expressions.FunctionCallExpr)
+                    && !(be.right() instanceof Expressions.VarargLiteral)) {
+                int ci = constIndexOf(be.right());
+                if (ci >= 0 && ci <= 255) {
+                    kOp = binaryKOpcode(be.operator());
+                    if (kOp >= 0) {
+                        kIdx = ci;
+                    }
+                }
+            }
+            if (kOp >= 0) {
+                emit(Instruction.encodeABC(kOp, targetReg, b, kIdx, 0), be.line());
+                freeRegs(Math.max(saveFreereg, targetReg + 1));
+                return;
             }
             int c = compileExprToAnyReg(be.right());
             int op = switch (be.operator()) {

@@ -27,6 +27,7 @@ public final class Instruction {
     public static final int POS_C = 24;
     public static final int SIZE_C = 8;
     public static final int MASK_C = (1 << SIZE_C) - 1;
+    public static final int OFFSET_sC = (MASK_C >> 1); // 127; matches PUC lopcodes.h
 
     public static final int POS_Bx = 15;
     public static final int SIZE_Bx = 17;
@@ -62,6 +63,16 @@ public final class Instruction {
         return (i >>> POS_k) & MASK_k;
     }
 
+    /** Signed immediate in the C field (PUC {@code GETARG_sC}/{@code sC2int}). */
+    public static int getsC(int i) {
+        return ((i >>> POS_C) & MASK_C) - OFFSET_sC;
+    }
+
+    /** Signed immediate in the B field (PUC {@code GETARG_sB} equals sC2int(B)). */
+    public static int getsB(int i) {
+        return ((i >>> POS_B) & MASK_B) - OFFSET_sC;
+    }
+
     public static int getBx(int i) {
         return (i >>> POS_Bx) & MASK_Bx;
     }
@@ -88,6 +99,19 @@ public final class Instruction {
 
     public static int encodeABC(int op, int a, int b, int c) {
         return encodeABC(op, a, b, c, 0);
+    }
+
+    /** Encode an iABC with a signed C-field immediate (PUC {@code int2sC}). */
+    public static int encodeABCsC(int op, int a, int b, int sc) {
+        return encodeABC(op, a, b, sc + OFFSET_sC);
+    }
+
+    /**
+     * Encode an iABC with a signed B-field immediate (PUC {@code GETARG_sB}
+     * = {@code sC2int(B)}, used by OP_EQI/LTI/LEI/GTI/GEI). C and k are 0.
+     */
+    public static int encodeABCsB(int op, int a, int sb) {
+        return encodeABC(op, a, sb + OFFSET_sC, 0, 0);
     }
 
     public static int encodeABx(int op, int a, int bx) {
