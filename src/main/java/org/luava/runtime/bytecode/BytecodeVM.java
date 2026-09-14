@@ -351,7 +351,7 @@ public final class BytecodeVM {
                 }
                 case OpCode.OP_ADDI -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    int sc = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+                    int sc = Instruction.getsC(inst);
                     int regB = ctx.base + b;
                     int regA = ctx.base + a;
                     if (ctx.tStack[regB] == TYPE_INT) {
@@ -506,7 +506,7 @@ public final class BytecodeVM {
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
                 case OpCode.OP_EQI -> {
-                    int sb = ((inst >>> Instruction.POS_B) & Instruction.MASK_B) - 128;
+                    int sb = Instruction.getsB(inst);
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
                     int regA = ctx.base + a;
                     boolean cond = (ctx.tStack[regA] == TYPE_INT && ctx.pStack[regA] == sb);
@@ -554,6 +554,74 @@ public final class BytecodeVM {
                         cond = Double.longBitsToDouble(ctx.pStack[regA]) <= Double.longBitsToDouble(ctx.pStack[regB]);
                     } else {
                         cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessOrEqual(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB));
+                    }
+                    if (cond != (flagK == 1)) ctx.pc++;
+                }
+                case OpCode.OP_LTI -> {
+                    // PUC lvm.c op_orderI: compare R[A] with the signed
+                    // immediate sB against 0 (or, for GTI/GEI, 1) using the
+                    // numeric ordering macros. Integer and float lanes are
+                    // unboxed; other types fall back to the metamethod via
+                    // the slow path.
+                    int sb = Instruction.getsB(inst);
+                    int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
+                    int regA = ctx.base + a;
+                    byte ta = ctx.tStack[regA];
+                    boolean cond;
+                    if (ta == TYPE_INT) {
+                        cond = ctx.pStack[regA] < sb;
+                    } else if (ta == TYPE_FLOAT) {
+                        cond = Double.longBitsToDouble(ctx.pStack[regA]) < sb;
+                    } else {
+                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessThan(LuaInteger.valueOf(sb));
+                    }
+                    if (cond != (flagK == 1)) ctx.pc++;
+                }
+                case OpCode.OP_LEI -> {
+                    int sb = Instruction.getsB(inst);
+                    int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
+                    int regA = ctx.base + a;
+                    byte ta = ctx.tStack[regA];
+                    boolean cond;
+                    if (ta == TYPE_INT) {
+                        cond = ctx.pStack[regA] <= sb;
+                    } else if (ta == TYPE_FLOAT) {
+                        cond = Double.longBitsToDouble(ctx.pStack[regA]) <= sb;
+                    } else {
+                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessOrEqual(LuaInteger.valueOf(sb));
+                    }
+                    if (cond != (flagK == 1)) ctx.pc++;
+                }
+                case OpCode.OP_GTI -> {
+                    int sb = Instruction.getsB(inst);
+                    int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
+                    int regA = ctx.base + a;
+                    byte ta = ctx.tStack[regA];
+                    boolean cond;
+                    if (ta == TYPE_INT) {
+                        cond = ctx.pStack[regA] > sb;
+                    } else if (ta == TYPE_FLOAT) {
+                        cond = Double.longBitsToDouble(ctx.pStack[regA]) > sb;
+                    } else {
+                        // PUC op_orderI(GTI, inv=1, TM_LT): metamethod sees the
+                        // immediate on the left, i.e. `im < R[A]`.
+                        cond = LuaInteger.valueOf(sb).luaLessThan(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA));
+                    }
+                    if (cond != (flagK == 1)) ctx.pc++;
+                }
+                case OpCode.OP_GEI -> {
+                    int sb = Instruction.getsB(inst);
+                    int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
+                    int regA = ctx.base + a;
+                    byte ta = ctx.tStack[regA];
+                    boolean cond;
+                    if (ta == TYPE_INT) {
+                        cond = ctx.pStack[regA] >= sb;
+                    } else if (ta == TYPE_FLOAT) {
+                        cond = Double.longBitsToDouble(ctx.pStack[regA]) >= sb;
+                    } else {
+                        // PUC op_orderI(GEI, inv=1, TM_LE): `im <= R[A]`.
+                        cond = LuaInteger.valueOf(sb).luaLessOrEqual(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA));
                     }
                     if (cond != (flagK == 1)) ctx.pc++;
                 }

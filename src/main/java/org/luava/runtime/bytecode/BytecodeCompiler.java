@@ -646,6 +646,21 @@ public final class BytecodeCompiler {
             };
         }
 
+        /**
+         * Immediate compare opcode for {@code R[A] <op> imm}, mirroring PUC
+         * codeorder/codeorderI. Only ordered comparisons have an immediate
+         * form; equality uses OP_EQI. Returns -1 when the operator has none.
+         */
+        int compareIOpcode(TokenType op) {
+            return switch (op) {
+                case LESS -> OpCode.OP_LTI;
+                case LESS_EQUAL -> OpCode.OP_LEI;
+                case GREATER -> OpCode.OP_GTI;
+                case GREATER_EQUAL -> OpCode.OP_GEI;
+                default -> -1;
+            };
+        }
+
         void assignTarget(Expression target, int valReg, int line) {
             if (target instanceof Expressions.VariableExpr ve) {
                 LocalVar lv = findLocal(ve.name());
@@ -1387,6 +1402,30 @@ public final class BytecodeCompiler {
                 freeRegs(Math.max(saveFreereg, targetReg + 1));
                 return;
             }
+            // PUC lcode.c codeorder/codeorderI: ordered comparisons against a
+            // small integer immediate use OP_LTI/LEI/GTI/GEI (and equality uses
+            // OP_EQI), avoiding a register load for the constant. The value is
+            // still materialised as a boolean here (same LFALSESKIP/LOADTRUE
+            // shape as the register form).
+            if (be.right() instanceof Expressions.IntegerLiteral cil) {
+                long iv = cil.value();
+                if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                    int cmpOp = compareIOpcode(be.operator());
+                    boolean eqOp = be.operator() == TokenType.EQUAL_EQUAL;
+                    if (cmpOp >= 0 || eqOp) {
+                        int rb = compileExprToAnyReg(be.left(), be.line());
+                        if (eqOp) {
+                            emit(Instruction.encodeABCsB(OpCode.OP_EQI, rb, (int) iv), be.line());
+                        } else {
+                            emit(Instruction.encodeABCsB(cmpOp, rb, (int) iv), be.line());
+                        }
+                        emit(Instruction.encodeABC(OpCode.OP_LFALSESKIP, targetReg, 0, 0), be.line());
+                        emit(Instruction.encodeABC(OpCode.OP_LOADTRUE, targetReg, 0, 0), be.line());
+                        freeRegs(Math.max(saveFreereg, targetReg + 1));
+                        return;
+                    }
+                }
+            }
             if (be.operator() == TokenType.GREATER) {
                 int b = compileExprToAnyReg(be.left(), be.line());
                 int c = compileExprToAnyReg(be.right());
@@ -1424,6 +1463,23 @@ public final class BytecodeCompiler {
                 freereg = Math.max(freereg, targetReg + 1);
             } else {
                 b = compileExprToAnyReg(be.left(), be.line());
+            }
+            // PUC lcode.c luaK_arith: `x + small` uses the immediate form
+            // OP_ADDI (no constant-table entry, no register load). Only for
+            // addition: PUC emits an accompanying OP_MMBINI carrying the
+            // metamethod name for the falling-through case, but Luava's
+            // compiler does not emit MMBIN*, and ADDI's slow path is `__add`.
+            // Encoding `x - k` as ADDI(-k) would therefore call `__add` for
+            // table/metatable operands (coroutine.lua "yields inside
+            // metamethods"); subtraction keeps the OP_SUBK path, which calls
+            // the correct `.sub`.
+            if (be.operator() == TokenType.PLUS && be.right() instanceof Expressions.IntegerLiteral ril) {
+                long imm = ril.value();
+                if (imm >= -Instruction.OFFSET_sC && imm <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                    emit(Instruction.encodeABCsC(OpCode.OP_ADDI, targetReg, b, (int) imm), be.line());
+                    freeRegs(Math.max(saveFreereg, targetReg + 1));
+                    return;
+                }
             }
             // PUC lcode.c codearith -> exp2RK/validop: when the right operand
             // is a constant (integer/float/string) and the opcode has a "K"
