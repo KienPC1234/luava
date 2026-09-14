@@ -796,23 +796,44 @@ public final class BytecodeCompiler {
                     default -> op = -1;
                 }
                 if (op >= 0) {
+                    // PUC codeorderI: `x <op> small_int` uses the immediate
+                    // form (LEI/LTI/EQI), avoiding a LOADI/LOADK.
+                    if (be.right() instanceof Expressions.IntegerLiteral cil) {
+                        long iv = cil.value();
+                        if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                            int b = compileExprToAnyReg(be.left(), be.line());
+                            int iop = switch (be.operator()) {
+                                case LESS -> OpCode.OP_LTI;
+                                case LESS_EQUAL -> OpCode.OP_LEI;
+                                case EQUAL_EQUAL -> OpCode.OP_EQI;
+                                default -> -1;
+                            };
+                            emit(Instruction.encodeABCsB(iop, b, (int) iv), be.line());
+                            return emitJmp(line);
+                        }
+                    }
                     int b = compileExprToAnyReg(be.left(), be.line());
                     int c = compileExprToAnyReg(be.right());
                     emit(Instruction.encodeABC(op, b, c, 0, 0), be.line());
                     return emitJmp(line);
                 }
                 // GREATER / GREATER_EQUAL are lowered to swapped LT/LE:
-                // a > b == b < a, a >= b == b <= a.
-                if (be.operator() == TokenType.GREATER) {
+                // a > b == b < a, a >= b == b <= a. PUC codeorder handles the
+                // "immediate on the left" case as GTI/GEI.
+                if (be.operator() == TokenType.GREATER || be.operator() == TokenType.GREATER_EQUAL) {
+                    boolean ge = be.operator() == TokenType.GREATER_EQUAL;
+                    if (be.left() instanceof Expressions.IntegerLiteral cil) {
+                        long iv = cil.value();
+                        if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                            int b = compileExprToAnyReg(be.right(), be.line());
+                            int iop = ge ? OpCode.OP_GEI : OpCode.OP_GTI;
+                            emit(Instruction.encodeABCsB(iop, b, (int) iv), be.line());
+                            return emitJmp(line);
+                        }
+                    }
                     int b = compileExprToAnyReg(be.left(), be.line());
                     int c = compileExprToAnyReg(be.right());
-                    emit(Instruction.encodeABC(OpCode.OP_LT, c, b, 0, 0), be.line());
-                    return emitJmp(line);
-                }
-                if (be.operator() == TokenType.GREATER_EQUAL) {
-                    int b = compileExprToAnyReg(be.left(), be.line());
-                    int c = compileExprToAnyReg(be.right());
-                    emit(Instruction.encodeABC(OpCode.OP_LE, c, b, 0, 0), be.line());
+                    emit(Instruction.encodeABC(ge ? OpCode.OP_LE : OpCode.OP_LT, c, b, 0, 0), be.line());
                     return emitJmp(line);
                 }
             }
