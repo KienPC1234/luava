@@ -794,9 +794,7 @@ public final class BytecodeCompiler {
         void compileWhile(Statements.WhileStmt ws) {
             clearDeadSlotsAtLoopEntry(ws.line());
             int loopStart = code.size();
-            int condReg = compileExprToAnyReg(ws.condition());
-            emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), ws.line());
-            int falseJmp = emitJmp(ws.line());
+            int falseJmp = emitConditionFalseJump(ws.condition(), ws.line());
 
             LoopInfo loop = new LoopInfo(loopStart, locals.size());
             loopStack.push(loop);
