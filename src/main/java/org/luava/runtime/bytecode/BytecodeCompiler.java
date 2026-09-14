@@ -719,13 +719,58 @@ public final class BytecodeCompiler {
 
 
 
-        void compileIf(Statements.IfStmt is) {
-            List<Integer> exitJmps = new ArrayList<>();
+        /**
+         * Emits the code that jumps past the "then" block when
+         * {@code condition} is false, and returns the pc of that jump.
+         *
+         * <p>For comparison conditions this mirrors PUC lcode.c codeorder:
+         * the comparison instruction and the jump are emitted directly
+         * (OP_LT/LE/EQ/… with k=1 and its sJ), so {@code if a < b then} is
+         * two instructions instead of the materialise-a-boolean + TEST +
+         * JMP sequence. Everything else keeps the general value + TEST path.
+         */
+        int emitConditionFalseJump(Expression condition, int line) {
+            if (condition instanceof Expressions.BinaryExpr be) {
+                int op = -1;
+                // k=0: the VM skips the following JMP when the comparison
+                // holds, so the JMP fires exactly when the condition is
+                // false (matching the TEST k=0 path below).
+                switch (be.operator()) {
+                    case LESS -> op = OpCode.OP_LT;
+                    case LESS_EQUAL -> op = OpCode.OP_LE;
+                    case EQUAL_EQUAL -> op = OpCode.OP_EQ;
+                    default -> op = -1;
+                }
+                if (op >= 0) {
+                    int b = compileExprToAnyReg(be.left(), be.line());
+                    int c = compileExprToAnyReg(be.right());
+                    emit(Instruction.encodeABC(op, b, c, 0, 0), be.line());
+                    return emitJmp(line);
+                }
+                // GREATER / GREATER_EQUAL are lowered to swapped LT/LE:
+                // a > b == b < a, a >= b == b <= a.
+                if (be.operator() == TokenType.GREATER) {
+                    int b = compileExprToAnyReg(be.left(), be.line());
+                    int c = compileExprToAnyReg(be.right());
+                    emit(Instruction.encodeABC(OpCode.OP_LT, c, b, 0, 0), be.line());
+                    return emitJmp(line);
+                }
+                if (be.operator() == TokenType.GREATER_EQUAL) {
+                    int b = compileExprToAnyReg(be.left(), be.line());
+                    int c = compileExprToAnyReg(be.right());
+                    emit(Instruction.encodeABC(OpCode.OP_LE, c, b, 0, 0), be.line());
+                    return emitJmp(line);
+                }
+            }
+            int condReg = compileExprToAnyReg(condition, line);
+            emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), line);
+            return emitJmp(line);
+        }
+
+        void compileIf(Statements.IfStmt is) {            List<Integer> exitJmps = new ArrayList<>();
             for (int i = 0; i < is.branches().size(); i++) {
                 Statements.IfBranch branch = is.branches().get(i);
-                int condReg = compileExprToAnyReg(branch.condition());
-                emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), branch.thenLine());
-                int falseJmp = emitJmp(branch.thenLine());
+                int falseJmp = emitConditionFalseJump(branch.condition(), branch.thenLine());
                 compileBlock(branch.block());
                 // In Lua 5.4 (lparser.c: test_then_block), only emit jump over following else/elseif,
                 // and use the line of the last statement in the 'then' block.
