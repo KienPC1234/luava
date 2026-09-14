@@ -490,7 +490,17 @@ public final class BytecodeCompiler {
                         valRegs[i] = -1;
                         continue;
                     }
-                    valRegs[i] = allocReg();
+                    // PUC lcode.c exp2reg: for a single local target with a
+                    // "pure" RHS, discharge the expression straight into the
+                    // variable's register (no temp + MOVE). `acc = acc + i`
+                    // becomes one ADD into acc's register.
+                    LocalVar directLocal = null;
+                    if (nvars == 1 && as.targets().get(0) instanceof Expressions.VariableExpr dve
+                            && isPureExpr(as.values().get(0))) {
+                        LocalVar dlv = findLocal(dve.name());
+                        if (dlv != null) directLocal = dlv;
+                    }
+                    valRegs[i] = (directLocal != null) ? directLocal.reg : allocReg();
                     String inferredName = null;
                     if (as.targets().get(i) instanceof Expressions.VariableExpr ve) {
                         inferredName = ve.name();
@@ -613,6 +623,46 @@ public final class BytecodeCompiler {
          * booleans, integers, floats and strings can be stored as RK(C) in
          * a single table-store instruction.
          */
+        /**
+         * True when evaluating {@code expr} writes only a single target
+         * register and never a run/window that could clobber neighbouring
+         * locals. Used to discharge an assignment RHS straight into a local's
+         * register (PUC exp2reg). Excluded: function calls and varargs
+         * (multi-result windows), table constructors (may end in a multret
+         * field), concatenation (CONCAT uses targetReg and targetReg+1), and
+         * AND/OR (which can branch and rewrite the target).
+         */
+        boolean isPureExpr(Expression expr) {
+            if (expr == null) return false;
+            if (expr instanceof Expressions.FunctionCallExpr
+                    || expr instanceof Expressions.VarargLiteral
+                    || expr instanceof Expressions.TableConstructorExpr) {
+                return false;
+            }
+            if (expr instanceof Expressions.BinaryExpr be) {
+                return switch (be.operator()) {
+                    // Arithmetic, bitwise and comparisons write only targetReg.
+                    case PLUS, MINUS, STAR, SLASH, DOUBLE_SLASH, PERCENT, CARET,
+                         AMPERSAND, PIPE, TILDE, SHL, SHR,
+                         EQUAL_EQUAL, TILDE_EQUAL, LESS, LESS_EQUAL,
+                         GREATER, GREATER_EQUAL -> isPureExpr(be.left()) && isPureExpr(be.right());
+                    // CONCAT uses a second register; AND/OR branch and rewrite.
+                    default -> false;
+                };
+            }
+            if (expr instanceof Expressions.UnaryExpr ue) {
+                return isPureExpr(ue.operand());
+            }
+            if (expr instanceof Expressions.ParenExpr pe) {
+                return isPureExpr(pe.expression());
+            }
+            if (expr instanceof Expressions.TableAccessExpr tae) {
+                return isPureExpr(tae.table()) && isPureExpr(tae.key());
+            }
+            // Literals, variable reads and function definitions (one CLOSURE).
+            return true;
+        }
+
         int constIndexOf(Expression expr) {
             if (expr instanceof Expressions.NilLiteral) {
                 return addConst(LuaNil.NIL);
@@ -665,7 +715,11 @@ public final class BytecodeCompiler {
             if (target instanceof Expressions.VariableExpr ve) {
                 LocalVar lv = findLocal(ve.name());
                 if (lv != null) {
-                    emit(Instruction.encodeABC(OpCode.OP_MOVE, lv.reg, valReg, 0), line);
+                    // Skip self-MOVE when the RHS was compiled directly into
+                    // the local's own register (pure single-target path).
+                    if (lv.reg != valReg) {
+                        emit(Instruction.encodeABC(OpCode.OP_MOVE, lv.reg, valReg, 0), line);
+                    }
                     return;
                 }
                 int up = findOrAddUpval(ve.name());
@@ -719,13 +773,79 @@ public final class BytecodeCompiler {
 
 
 
-        void compileIf(Statements.IfStmt is) {
-            List<Integer> exitJmps = new ArrayList<>();
+        /**
+         * Emits the code that jumps past the "then" block when
+         * {@code condition} is false, and returns the pc of that jump.
+         *
+         * <p>For comparison conditions this mirrors PUC lcode.c codeorder:
+         * the comparison instruction and the jump are emitted directly
+         * (OP_LT/LE/EQ/… with k=1 and its sJ), so {@code if a < b then} is
+         * two instructions instead of the materialise-a-boolean + TEST +
+         * JMP sequence. Everything else keeps the general value + TEST path.
+         */
+        int emitConditionFalseJump(Expression condition, int line) {
+            if (condition instanceof Expressions.BinaryExpr be) {
+                int op = -1;
+                // k=0: the VM skips the following JMP when the comparison
+                // holds, so the JMP fires exactly when the condition is
+                // false (matching the TEST k=0 path below).
+                switch (be.operator()) {
+                    case LESS -> op = OpCode.OP_LT;
+                    case LESS_EQUAL -> op = OpCode.OP_LE;
+                    case EQUAL_EQUAL -> op = OpCode.OP_EQ;
+                    default -> op = -1;
+                }
+                if (op >= 0) {
+                    // PUC codeorderI: `x <op> small_int` uses the immediate
+                    // form (LEI/LTI/EQI), avoiding a LOADI/LOADK.
+                    if (be.right() instanceof Expressions.IntegerLiteral cil) {
+                        long iv = cil.value();
+                        if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                            int b = compileExprToAnyReg(be.left(), be.line());
+                            int iop = switch (be.operator()) {
+                                case LESS -> OpCode.OP_LTI;
+                                case LESS_EQUAL -> OpCode.OP_LEI;
+                                case EQUAL_EQUAL -> OpCode.OP_EQI;
+                                default -> -1;
+                            };
+                            emit(Instruction.encodeABCsB(iop, b, (int) iv), be.line());
+                            return emitJmp(line);
+                        }
+                    }
+                    int b = compileExprToAnyReg(be.left(), be.line());
+                    int c = compileExprToAnyReg(be.right());
+                    emit(Instruction.encodeABC(op, b, c, 0, 0), be.line());
+                    return emitJmp(line);
+                }
+                // GREATER / GREATER_EQUAL are lowered to swapped LT/LE:
+                // a > b == b < a, a >= b == b <= a. PUC codeorder handles the
+                // "immediate on the left" case as GTI/GEI.
+                if (be.operator() == TokenType.GREATER || be.operator() == TokenType.GREATER_EQUAL) {
+                    boolean ge = be.operator() == TokenType.GREATER_EQUAL;
+                    if (be.left() instanceof Expressions.IntegerLiteral cil) {
+                        long iv = cil.value();
+                        if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                            int b = compileExprToAnyReg(be.right(), be.line());
+                            int iop = ge ? OpCode.OP_GEI : OpCode.OP_GTI;
+                            emit(Instruction.encodeABCsB(iop, b, (int) iv), be.line());
+                            return emitJmp(line);
+                        }
+                    }
+                    int b = compileExprToAnyReg(be.left(), be.line());
+                    int c = compileExprToAnyReg(be.right());
+                    emit(Instruction.encodeABC(ge ? OpCode.OP_LE : OpCode.OP_LT, c, b, 0, 0), be.line());
+                    return emitJmp(line);
+                }
+            }
+            int condReg = compileExprToAnyReg(condition, line);
+            emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), line);
+            return emitJmp(line);
+        }
+
+        void compileIf(Statements.IfStmt is) {            List<Integer> exitJmps = new ArrayList<>();
             for (int i = 0; i < is.branches().size(); i++) {
                 Statements.IfBranch branch = is.branches().get(i);
-                int condReg = compileExprToAnyReg(branch.condition());
-                emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), branch.thenLine());
-                int falseJmp = emitJmp(branch.thenLine());
+                int falseJmp = emitConditionFalseJump(branch.condition(), branch.thenLine());
                 compileBlock(branch.block());
                 // In Lua 5.4 (lparser.c: test_then_block), only emit jump over following else/elseif,
                 // and use the line of the last statement in the 'then' block.
@@ -749,9 +869,7 @@ public final class BytecodeCompiler {
         void compileWhile(Statements.WhileStmt ws) {
             clearDeadSlotsAtLoopEntry(ws.line());
             int loopStart = code.size();
-            int condReg = compileExprToAnyReg(ws.condition());
-            emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), ws.line());
-            int falseJmp = emitJmp(ws.line());
+            int falseJmp = emitConditionFalseJump(ws.condition(), ws.line());
 
             LoopInfo loop = new LoopInfo(loopStart, locals.size());
             loopStack.push(loop);
@@ -794,7 +912,6 @@ public final class BytecodeCompiler {
 
             // Lua 5.4 (lparser.c: repeatstat): condition test and jump back are evaluated at the 'until' line
             int condLine = rs.condition().line();
-            int condReg = compileExprToAnyReg(rs.condition());
 
             boolean hasClose = false;
             int firstCloseReg = Integer.MAX_VALUE;
@@ -813,6 +930,7 @@ public final class BytecodeCompiler {
             }
 
             if (hasClose && firstCloseReg != Integer.MAX_VALUE) {
+                int condReg = compileExprToAnyReg(rs.condition());
                 emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 1, 0), condLine);
                 int exitJmpTarget = emitJmp(condLine);
                 emit(Instruction.encodeABC(OpCode.OP_CLOSE, firstCloseReg, 0, 0), condLine);
@@ -826,8 +944,11 @@ public final class BytecodeCompiler {
                     // (Re-entry reuses registers; without CLOSE all iterations share one upvalue.)
                     emit(Instruction.encodeABC(OpCode.OP_CLOSE, firstCapturedReg, 0, 0), condLine);
                 }
-                emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), condLine);
-                int repeatJmp = emitJmp(condLine);
+                // PUC repeatstat: cond() lowers to "jump back when the
+                // condition is false" (luaK_goiftrue), so this is exactly the
+                // same compare + JMP shape as an if-condition, not an
+                // inverted one.
+                int repeatJmp = emitConditionFalseJump(rs.condition(), condLine);
                 patchJmp(repeatJmp, loopStart);
             }
 
