@@ -837,7 +837,6 @@ public final class BytecodeCompiler {
 
             // Lua 5.4 (lparser.c: repeatstat): condition test and jump back are evaluated at the 'until' line
             int condLine = rs.condition().line();
-            int condReg = compileExprToAnyReg(rs.condition());
 
             boolean hasClose = false;
             int firstCloseReg = Integer.MAX_VALUE;
@@ -856,6 +855,7 @@ public final class BytecodeCompiler {
             }
 
             if (hasClose && firstCloseReg != Integer.MAX_VALUE) {
+                int condReg = compileExprToAnyReg(rs.condition());
                 emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 1, 0), condLine);
                 int exitJmpTarget = emitJmp(condLine);
                 emit(Instruction.encodeABC(OpCode.OP_CLOSE, firstCloseReg, 0, 0), condLine);
@@ -869,8 +869,11 @@ public final class BytecodeCompiler {
                     // (Re-entry reuses registers; without CLOSE all iterations share one upvalue.)
                     emit(Instruction.encodeABC(OpCode.OP_CLOSE, firstCapturedReg, 0, 0), condLine);
                 }
-                emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), condLine);
-                int repeatJmp = emitJmp(condLine);
+                // PUC repeatstat: cond() lowers to "jump back when the
+                // condition is false" (luaK_goiftrue), so this is exactly the
+                // same compare + JMP shape as an if-condition, not an
+                // inverted one.
+                int repeatJmp = emitConditionFalseJump(rs.condition(), condLine);
                 patchJmp(repeatJmp, loopStart);
             }
 
