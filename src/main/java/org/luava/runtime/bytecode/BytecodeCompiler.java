@@ -490,7 +490,17 @@ public final class BytecodeCompiler {
                         valRegs[i] = -1;
                         continue;
                     }
-                    valRegs[i] = allocReg();
+                    // PUC lcode.c exp2reg: for a single local target with a
+                    // "pure" RHS, discharge the expression straight into the
+                    // variable's register (no temp + MOVE). `acc = acc + i`
+                    // becomes one ADD into acc's register.
+                    LocalVar directLocal = null;
+                    if (nvars == 1 && as.targets().get(0) instanceof Expressions.VariableExpr dve
+                            && isPureExpr(as.values().get(0))) {
+                        LocalVar dlv = findLocal(dve.name());
+                        if (dlv != null) directLocal = dlv;
+                    }
+                    valRegs[i] = (directLocal != null) ? directLocal.reg : allocReg();
                     String inferredName = null;
                     if (as.targets().get(i) instanceof Expressions.VariableExpr ve) {
                         inferredName = ve.name();
@@ -613,6 +623,46 @@ public final class BytecodeCompiler {
          * booleans, integers, floats and strings can be stored as RK(C) in
          * a single table-store instruction.
          */
+        /**
+         * True when evaluating {@code expr} writes only a single target
+         * register and never a run/window that could clobber neighbouring
+         * locals. Used to discharge an assignment RHS straight into a local's
+         * register (PUC exp2reg). Excluded: function calls and varargs
+         * (multi-result windows), table constructors (may end in a multret
+         * field), concatenation (CONCAT uses targetReg and targetReg+1), and
+         * AND/OR (which can branch and rewrite the target).
+         */
+        boolean isPureExpr(Expression expr) {
+            if (expr == null) return false;
+            if (expr instanceof Expressions.FunctionCallExpr
+                    || expr instanceof Expressions.VarargLiteral
+                    || expr instanceof Expressions.TableConstructorExpr) {
+                return false;
+            }
+            if (expr instanceof Expressions.BinaryExpr be) {
+                return switch (be.operator()) {
+                    // Arithmetic, bitwise and comparisons write only targetReg.
+                    case PLUS, MINUS, STAR, SLASH, DOUBLE_SLASH, PERCENT, CARET,
+                         AMPERSAND, PIPE, TILDE, SHL, SHR,
+                         EQUAL_EQUAL, TILDE_EQUAL, LESS, LESS_EQUAL,
+                         GREATER, GREATER_EQUAL -> isPureExpr(be.left()) && isPureExpr(be.right());
+                    // CONCAT uses a second register; AND/OR branch and rewrite.
+                    default -> false;
+                };
+            }
+            if (expr instanceof Expressions.UnaryExpr ue) {
+                return isPureExpr(ue.operand());
+            }
+            if (expr instanceof Expressions.ParenExpr pe) {
+                return isPureExpr(pe.expression());
+            }
+            if (expr instanceof Expressions.TableAccessExpr tae) {
+                return isPureExpr(tae.table()) && isPureExpr(tae.key());
+            }
+            // Literals, variable reads and function definitions (one CLOSURE).
+            return true;
+        }
+
         int constIndexOf(Expression expr) {
             if (expr instanceof Expressions.NilLiteral) {
                 return addConst(LuaNil.NIL);
@@ -665,7 +715,11 @@ public final class BytecodeCompiler {
             if (target instanceof Expressions.VariableExpr ve) {
                 LocalVar lv = findLocal(ve.name());
                 if (lv != null) {
-                    emit(Instruction.encodeABC(OpCode.OP_MOVE, lv.reg, valReg, 0), line);
+                    // Skip self-MOVE when the RHS was compiled directly into
+                    // the local's own register (pure single-target path).
+                    if (lv.reg != valReg) {
+                        emit(Instruction.encodeABC(OpCode.OP_MOVE, lv.reg, valReg, 0), line);
+                    }
                     return;
                 }
                 int up = findOrAddUpval(ve.name());
