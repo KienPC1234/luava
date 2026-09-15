@@ -1,0 +1,25 @@
+Luava benchmark baseline — 2026-09-14
+=====================================
+Harness: benchmarks/harness/interleave.sh (paired, order-flipped, median of
+pairs of best-of-iters). Pinned taskset -c 20 except coroutines (no pin).
+Method: 3 pairs, warm=3, iters=5. Ratio column = LuaJ/Luava (B/A);
+> 1.0 means Luava is faster.
+
+task                      Luava(ms)   LuaJ(ms)   LuaJ/Luava
+01_arith_loop             194.245     285.535    1.470   (Luava wins)
+02_fibonacci             5077.230    2520.180    0.496   (Luava 2.01x behind)
+03_table_ops               95.360      96.695    1.014   (tie)
+04_string_concat           62.605      23.440    0.374   (Luava 2.67x behind)
+05_closures                93.120      58.195    0.625   (Luava 1.60x behind)
+06_coroutines             287.050    4622.920   16.105   (Luava wins 16x)
+07_hash_table             149.620     260.780    1.743   (Luava wins)
+08_oop_metatables         780.865     623.940    0.799   (Luava 1.25x behind)
+09_string_pattern         141.615      78.540    0.555   (Luava 1.80x behind)
+10_sieve                  339.940     353.855    1.041   (Luava wins ~4%)
+
+NOTE: absolute numbers depend on warm/iters; plan.md §2.1 used a different
+setting and reports slightly different absolutes. What is authoritative for
+gates is the RATIO under this fixed harness.
+
+Base jar archived: /tmp/opencode/harness_base.jar
+Source commit at baseline: 5bcfba9 (30/30 suites, 111 unit tests green).
