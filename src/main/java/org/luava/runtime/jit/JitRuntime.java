@@ -28,6 +28,12 @@ public final class JitRuntime {
         return (long) jc.handle.invokeExact(callee, up, p, t, o, base);
     }
 
+    /** Object-returning variant for factories and escaping values. */
+    public static LuaValue invokeObj(JitCode jc, LuaClosure callee, Object[] up, long[] p, byte[] t, LuaValue[] o,
+            int base) throws Throwable {
+        return (LuaValue) jc.objHandle.invokeExact(callee, up, p, t, o, base);
+    }
+
     /** Fills registers [from, to) with nil (missing-call-argument semantics). */
     public static void nilFill(long[] p, byte[] t, LuaValue[] o, int from, int to) {
         for (int i = from; i < to; i++) {

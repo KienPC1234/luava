@@ -996,13 +996,40 @@ public final class BytecodeVM {
             long[] pStack = ctx.thread.getPrimitiveStack();
             byte[] tStack = ctx.thread.getTypeStack();
             LuaValue[] oStack = ctx.thread.getObjectStack();
-            // The compiled kernel always yields exactly one integer result
-            // (RETURN0/multi-value shapes deopt inside); mirror the
+            if (!jc.returnsInt) {
+                // Object-returning kernel (factories): box-free registers in,
+                // one boxed value out.
+                LuaValue r = (LuaValue) jc.objHandle.invokeExact(child, (Object[]) child.upvals, pStack,
+                        tStack, oStack, base);
+                ctx.pStack = pStack;
+                ctx.tStack = tStack;
+                ctx.oStack = oStack;
+                closeOnJitReturn(state, ctx, base);
+                if (nResults == 1) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, r);
+                } else if (nResults == 0) {
+                    // Discarded.
+                } else if (nResults < 0) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, r);
+                    ctx.top = funcIdx + 1;
+                } else {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, r);
+                    for (int i = 1; i < nResults; i++) {
+                        ctx.pStack[funcIdx + i] = 0;
+                        ctx.tStack[funcIdx + i] = TYPE_NIL;
+                        ctx.oStack[funcIdx + i] = null;
+                    }
+                }
+                return 1;
+            }
+            // The compiled integer kernel always yields exactly one integer
+            // result (RETURN0/multi-value shapes deopt inside); mirror the
             // returnToCallerRaw layout framelessly.
             long r = (long) jc.handle.invokeExact(child, (Object[]) child.upvals, pStack, tStack, oStack, base);
             ctx.pStack = pStack;
             ctx.tStack = tStack;
             ctx.oStack = oStack;
+            closeOnJitReturn(state, ctx, base);
             if (nResults == 1) {
                 ctx.pStack[funcIdx] = r;
                 ctx.tStack[funcIdx] = TYPE_INT;
@@ -1066,6 +1093,19 @@ public final class BytecodeVM {
     @SuppressWarnings("unchecked")
     private static <T extends Throwable> RuntimeException sneakyThrow(Throwable t) throws T {
         throw (T) t;
+    }
+
+    /**
+     * Mirrors the interpreter's return path: closes open upvalues at or
+     * above the callee base. Required because a caller's captured locals
+     * may alias the callee register window; without this, slot reuse after
+     * return would corrupt them. Runs once per top-level JIT call (inner
+     * recursion never escapes to the interpreter mid-flight).
+     */
+    private static void closeOnJitReturn(LuaState state, VmContext ctx, int base) {
+        if (ctx.thread.getOpenUpvaluesHead() != null) {
+            state.closeUpvalues(ctx.thread, base);
+        }
     }
 
     private static boolean jitDebugLogged;
