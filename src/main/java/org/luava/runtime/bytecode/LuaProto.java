@@ -37,6 +37,8 @@ public final class LuaProto {
     public volatile JitCode jitCode;
     /** Set when compilation or guards prove the proto unsuitable for JIT. */
     public volatile boolean jitDisabled;
+    /** True while a background compile is queued/running (avoids duplicates). */
+    public volatile boolean jitQueued;
     /** Conservative yield marker; JIT-able protos are proven non-yielding. */
     public boolean mayYield;
     /** Interpreter-side call counter driving tier-up. */
