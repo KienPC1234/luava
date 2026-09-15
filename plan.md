@@ -372,6 +372,13 @@ nào regression > 3%.
   signature), `EXTRAARG` no-op.
 - Quy tắc giữ nguyên: có CALL thì phải pure; callee JIT phải pure;
   TAILCALL vẫn từ chối.
+- **Revert `OP_CLOSURE` khỏi JIT** (đo paired: closures 66ms → 76ms):
+  body toàn allocation, JIT không bớt việc nào mà thêm entry cost
+  (helper tốn 2 ThreadLocal lookup mà interpreter không cần). Factories ở
+  interpreter. Ghi vào §7.
+- **Fix `closeUpvalues` ở JIT return** (`closeOnJitReturn` trong
+  `tryJitCall`): upvalue mở của caller có thể alias vùng callee; thiếu nó
+  là bug hỏng dữ liệu (không chỉ perf).
 
 **Kết quả:** 30/30 + 111 xanh cả hai chế độ (ép threshold=1: **43 proto**
 compile); fuzz **56/56** (thêm table-write nóng, `__newindex`, string key,
@@ -456,6 +463,8 @@ mục tiêu chỉ là "hòa call-heavy cơ bản".
 ### 7.1 Interpreter đã thử & revert (có bằng chứng, bar 3%)
 | Thử nghiệm | Kết quả | Nguyên nhân thất bại |
 |---|---|---|
+| JIT `OP_CLOSURE`/object-return (`make_counter`) | closures 66→76ms (+15%, paired 7) | body toàn allocation, helper tốn 2 ThreadLocal lookup; revert, factories ở interpreter |
+| JIT return thiếu `closeUpvalues` | (bug, chưa đo) | upvalue mở của caller alias vùng callee → hỏng khi slot tái dùng; fix `closeOnJitReturn` |
 | Lazy callName (P1b) | hòa tuyệt đối | Name đã cache 256-entry, ~2%; machinery phức tạp vô ích |
 | Cache callName external (P2e) | 1/3 (dưới bar) | Walk gốc chỉ ~20ns |
 | SELF fast lane (P2f) | 1/3 thua | OOP dùng metatable → lane không bao giờ cháy |
