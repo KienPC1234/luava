@@ -353,20 +353,38 @@ nào regression > 3%.
 
 ---
 
-### Phase 5 — Mở rộng độ phủ opcode (1–2 tuần)
+### Phase 5 — Mở rộng độ phủ opcode — ✅ XONG v1 (2026-09-15: table R/W + NEWTABLE)
 
-**Việc:** thêm dần, mỗi opcode một commit + fuzz đối chiếu:
-- Table: `NEWTABLE, SETTABLE, SETI, SETFIELD, SETTABUP, SETLIST, SELF, GETTABUP`.
-- Metamethod: `MMBIN/MMBINI/MMBINK`, `UNM, BNOT, NOT, LEN, CONCAT`.
-- Varargs: `VARARG, VARARGPREP`.
-- Generic loop: `TFORPREP, TFORCALL, TFORLOOP`.
-- `CLOSE, TBC` (to-be-closed) — hoặc cấm JIT proto chứa chúng.
-- `EXTRAARG`, `LOADKX`.
+**Việc (đã làm):**
+- Nền tảng bắt buộc trước: **resume-at-pc thật** — frame push trước,
+  `tryJitCall` 3-trạng thái (1=xong frameless, 2=resume tại `jitResumePc`,
+  0=chạy từ đầu); nested deopt convert về call-pc của frame hiện tại qua
+  try/catch trong code JIT. Bắt được **bug fusion+resume** (skip store +
+  resume tại CALL = thanh ghi stale → stress deep-recursion fail) nhờ
+  `LuavaStressTest` với JIT bật; sửa bằng resume fused-CALL tại def-pc và
+  chỉ skip store khi proto pure.
+- READ: `GETTABUP/GETTABLE/GETI/GETFIELD` — guard table + metatable-null,
+  mirror đúng fast lane interpreter (`rawgetInt`/`get`), còn lại deopt.
+  Bắt được **bug stack imbalance** (guard ăn mất ref) nhờ probe dịch trực
+  tiếp + ASM `COMPUTE_FRAMES`.
+- WRITE: `SETTABUP/SETTABLE/SETI/SETFIELD` (mirror fast lane, deopt nếu
+  metamethod), `NEWTABLE` (hằng số qua `self.proto.constants`, không đổi
+  signature), `EXTRAARG` no-op.
+- Quy tắc giữ nguyên: có CALL thì phải pure; callee JIT phải pure;
+  TAILCALL vẫn từ chối.
 
-**Gates mỗi opcode:** G-CORRECT + fuzz; G-PERF chỉ ghi nhận (không bắt buộc
-mỗi opcode phải nhanh hơn, nhưng tổng thể sau phase phải cải thiện).
+**Kết quả:** 30/30 + 111 xanh cả hai chế độ (ép threshold=1: **43 proto**
+compile); fuzz **56/56** (thêm table-write nóng, `__newindex`, string key,
+NEWTABLE); fib ~264ms, closures ~65ms, các task khác trong noise.
 
-**Rollback:** cờ từng opcode trong translator.
+**Chưa làm (dời):** `SELF`, `LEN`, `CONCAT`, `UNM/BNOT/NOT`, varargs,
+generic loop, `CLOSE/TBC`, `SETLIST`, `MMBIN*`, `LOADKX` — cần khi
+oop/metatable vào diện.
+
+**Gates mỗi opcode:** ✅ G-CORRECT + fuzz (56/56); G-PERF chỉ ghi nhận
+(table-write kernel ~10x nội bộ, tổng thể không regression).
+
+**Rollback:** cờ từng opcode trong translator (`analyze`).
 
 ---
 
