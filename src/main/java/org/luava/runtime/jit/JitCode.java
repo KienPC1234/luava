@@ -21,20 +21,31 @@ import org.luava.runtime.bytecode.LuaProto;
 public final class JitCode {
     public final LuaProto proto;
     public final MethodHandle handle;
+    /** Object-returning variant (null when the proto returns an integer). */
+    public final MethodHandle objHandle;
     public final int maxStack;
     public final int numParams;
     /** True when the proto has no observable side effects (pure integer
      * kernel): restart-from-entry deopt is safe and other JIT code may
      * call it directly. */
     public final boolean pure;
+    /** True when every reachable single-value return yields an integer. */
+    public final boolean returnsInt;
     public int deopts;
 
     public JitCode(LuaProto proto, MethodHandle handle, boolean pure) {
+        this(proto, handle, null, pure, true);
+    }
+
+    public JitCode(LuaProto proto, MethodHandle handle, MethodHandle objHandle, boolean pure,
+            boolean returnsInt) {
         this.proto = proto;
         this.handle = handle;
+        this.objHandle = objHandle;
         this.maxStack = proto.maxStackSize;
         this.numParams = proto.numParams;
         this.pure = pure;
+        this.returnsInt = returnsInt;
         this.deopts = 0;
     }
 }

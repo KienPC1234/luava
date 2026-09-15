@@ -946,32 +946,40 @@ public final class BytecodeVM {
      * dontinline} recovery), so the return bodies stay inline.
      */
     /**
-     * Hybrid JIT fast lane (plan.md Phase 2/4). Runs a compiled integer
-     * kernel directly on the caller's register window instead of pushing an
-     * interpreter frame. Returns true when the call was fully handled.
-     * Returns false (without touching interpreter state) when the JIT is
-     * disabled, the proto is cold/unsuitable, an entry guard fails, or the
-     * compiled code deopts mid-flight; the caller then proceeds with the
-     * normal interpreter path, which re-runs the pure kernel identically.
+     * Hybrid JIT fast lane (plan.md Phase 2/4/5). Runs a compiled kernel
+     * directly on the caller's register window instead of pushing an
+     * interpreter frame.
+     *
+     * <p>Returns 1 when the call was fully handled (single int result at
+     * {@code base+0} copied to the caller per {@code nResults}), 0 when the
+     * JIT was not attempted (cold, unsuitable, entry guard), and 2 when the
+     * compiled code deopted mid-flight. On 2, {@code ctx.jitResumePc} holds
+     * the faulting pc and the caller resumes the interpreter there with all
+     * committed state intact (no restart, so table/upvalue writes are safe).
+     * Nested JIT deopts are converted to the outer call pc by generated
+     * try/catch, and callees re-invoked from scratch are always pure.
      */
-    private static boolean tryJitCall(LuaState state, VmContext ctx, LuaClosure child,
+    private static int tryJitCall(LuaState state, VmContext ctx, LuaClosure child,
             int funcIdx, int nActualArgs, int nResults) {
         if (!LuaState.ENABLE_JIT) {
-            return false;
+            return 0;
         }
         if (LuaCoroutine.HOOKS_ARMED || state.loopGuard != null) {
-            return false;
+            return 0;
         }
         LuaProto proto = child.proto;
+        if (proto.mayYield) {
+            return 0;
+        }
         JitCode jc = proto.jitCode;
         if (jc == null) {
             if (proto.jitDisabled) {
-                return false;
+                return 0;
             }
             int hot = proto.hotCount + 1;
             proto.hotCount = hot;
             if (hot < LuaState.JIT_HOT_THRESHOLD) {
-                return false;
+                return 0;
             }
             // Tier-up is a request: background thread compiles (or
             // synchronously under luava.jit.sync); this call stays interpreted.
@@ -980,36 +988,77 @@ public final class BytecodeVM {
             } catch (Throwable t) {
                 proto.jitDisabled = true;
             }
-            return false;
+            return 0;
         }
         int base = funcIdx + 1;
         if (nActualArgs < proto.numParams) {
-            return false;
-        }
-        long[] pStack = ctx.pStack;
-        byte[] tStack = ctx.tStack;
-        LuaValue[] oStack = ctx.oStack;
-        for (int i = 0; i < proto.numParams; i++) {
-            if (tStack[base + i] != TYPE_INT) {
-                return false;
-            }
+            return 0;
         }
         try {
             ctx.thread.ensureStackCapacity(base + proto.maxStackSize + 64);
-            pStack = ctx.thread.getPrimitiveStack();
-            tStack = ctx.thread.getTypeStack();
-            oStack = ctx.thread.getObjectStack();
+            long[] pStack = ctx.thread.getPrimitiveStack();
+            byte[] tStack = ctx.thread.getTypeStack();
+            LuaValue[] oStack = ctx.thread.getObjectStack();
+            if (!jc.returnsInt) {
+                // Object-returning kernel (factories): box-free registers in,
+                // one boxed value out.
+                LuaValue r = (LuaValue) jc.objHandle.invokeExact(child, (Object[]) child.upvals, pStack,
+                        tStack, oStack, base);
+                ctx.pStack = pStack;
+                ctx.tStack = tStack;
+                ctx.oStack = oStack;
+                ctx.top = base + proto.numParams;
+                closeOnJitReturn(state, ctx, base);
+                if (nResults == 1) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, r);
+                } else if (nResults == 0) {
+                    // Discarded.
+                } else if (nResults < 0) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, r);
+                    ctx.top = funcIdx + 1;
+                } else {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, r);
+                    for (int i = 1; i < nResults; i++) {
+                        ctx.pStack[funcIdx + i] = 0;
+                        ctx.tStack[funcIdx + i] = TYPE_NIL;
+                        ctx.oStack[funcIdx + i] = null;
+                    }
+                }
+                return 1;
+            }
+            // The compiled integer kernel always yields exactly one integer
+            // result (RETURN0/multi-value shapes deopt inside); mirror the
+            // returnToCallerRaw layout framelessly.
             long r = (long) jc.handle.invokeExact(child, (Object[]) child.upvals, pStack, tStack, oStack, base);
             ctx.pStack = pStack;
             ctx.tStack = tStack;
             ctx.oStack = oStack;
-            ctx.pStack[funcIdx] = r;
-            ctx.tStack[funcIdx] = TYPE_INT;
-            ctx.oStack[funcIdx] = null;
-            if (nResults < 0) {
+            // Mirror the interpreter: after a fixed call its top is the
+            // callee flavor (pure callees never move it).
+            ctx.top = base + proto.numParams;
+            closeOnJitReturn(state, ctx, base);
+            if (nResults == 1) {
+                ctx.pStack[funcIdx] = r;
+                ctx.tStack[funcIdx] = TYPE_INT;
+                ctx.oStack[funcIdx] = null;
+            } else if (nResults == 0) {
+                // Discarded.
+            } else if (nResults < 0) {
+                ctx.pStack[funcIdx] = r;
+                ctx.tStack[funcIdx] = TYPE_INT;
+                ctx.oStack[funcIdx] = null;
                 ctx.top = funcIdx + 1;
+            } else {
+                ctx.pStack[funcIdx] = r;
+                ctx.tStack[funcIdx] = TYPE_INT;
+                ctx.oStack[funcIdx] = null;
+                for (int i = 1; i < nResults; i++) {
+                    ctx.pStack[funcIdx + i] = 0;
+                    ctx.tStack[funcIdx + i] = TYPE_NIL;
+                    ctx.oStack[funcIdx + i] = null;
+                }
             }
-            return true;
+            return 1;
         } catch (DeoptSignal d) {
             if (++jc.deopts > 8) {
                 proto.jitCode = null;
@@ -1025,14 +1074,44 @@ public final class BytecodeVM {
                 }
                 System.err.println("[jit] deopt pc=" + d.pc + " proto=" + proto.name + extra);
             }
-            return false;
+            ctx.jitResumePc = d.pc;
+            return 2;
+        } catch (StackOverflowError soe) {
+            // Deep JIT recursion: fall back so the interpreter raises the
+            // proper Lua stack-overflow error.
+            proto.jitCode = null;
+            proto.jitDisabled = true;
+            ctx.jitResumePc = 0;
+            return 2;
         } catch (Throwable t) {
             if (jitDebug()) {
                 System.err.println("[jit] FAILED proto=" + proto.name + " : " + t);
             }
             proto.jitCode = null;
             proto.jitDisabled = true;
-            return false;
+            if (t instanceof LuaException || t instanceof RuntimeException || t instanceof Error) {
+                throw sneakyThrow(t);
+            }
+            return 0;
+        }
+    }
+
+    /** Rethrows any throwable without a checked-exception declaration. */
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> RuntimeException sneakyThrow(Throwable t) throws T {
+        throw (T) t;
+    }
+
+    /**
+     * Mirrors the interpreter's return path: closes open upvalues at or
+     * above the callee base. Required because a caller's captured locals
+     * may alias the callee register window; without this, slot reuse after
+     * return would corrupt them. Runs once per top-level JIT call (inner
+     * recursion never escapes to the interpreter mid-flight).
+     */
+    private static void closeOnJitReturn(LuaState state, VmContext ctx, int base) {
+        if (ctx.thread.getOpenUpvaluesHead() != null) {
+            state.closeUpvalues(ctx.thread, base);
         }
     }
 
@@ -1069,10 +1148,12 @@ public final class BytecodeVM {
         int nActualArgs = nArgs;
 
         if (func instanceof LuaClosure childClosure) {
-            // Hybrid JIT fast lane (plan.md Phase 2/4): a compiled integer
-            // kernel runs directly on the register window. Any guard failure
-            // falls through to the interpreter below with identical semantics.
-            if (tryJitCall(state, ctx, childClosure, funcIdx, nActualArgs, nResults)) {
+            // Hybrid JIT fast lane (plan.md Phase 2/4/5): a compiled kernel
+            // runs framelessly on the register window. 1 = handled; 2 = run
+            // the interpreter below but resume at the deopt pc instead of 0;
+            // 0 = cold/unsuitable, run from scratch.
+            int jit = tryJitCall(state, ctx, childClosure, funcIdx, nActualArgs, nResults);
+            if (jit == 1) {
                 return;
             }
             CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
@@ -1149,6 +1230,11 @@ public final class BytecodeVM {
                     1, childClosure.proto.numParams,
                     state, ctx.base, funcIdx, ctx.varargs,
                     ctx.callState, ctx.co);
+            if (jit == 2) {
+                // JIT deopt: registers already hold the committed prefix;
+                // continue the interpreter at the faulting instruction.
+                ctx.pc = ctx.jitResumePc;
+            }
         } else if (func instanceof LuaFunction fn) {
             int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
             int newTop = executeExternalCall(state, ctx, ctx.proto, ctx.pc, ctx.base, fn, funcIdx, nActualArgs, nResults, callLine);

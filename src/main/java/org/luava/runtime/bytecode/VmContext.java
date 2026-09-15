@@ -30,6 +30,9 @@ public final class VmContext {
     public int top;
     public int callDepth;
     public int oldpc;
+    /** Resume pc installed by a JIT deopt (executeCallOp applies it after
+     * pushing the interpreter frame); -1 when the call runs from scratch. */
+    public int jitResumePc = -1;
     public boolean varargPrepRan;
     /** Scratch in/out slot for tiny helpers (e.g. callable resolution). */
     public int scratch0;

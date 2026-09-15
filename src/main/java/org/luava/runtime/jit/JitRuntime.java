@@ -28,12 +28,40 @@ public final class JitRuntime {
         return (long) jc.handle.invokeExact(callee, up, p, t, o, base);
     }
 
+    /** Object-returning variant for factories and escaping values. */
+    public static LuaValue invokeObj(JitCode jc, LuaClosure callee, Object[] up, long[] p, byte[] t, LuaValue[] o,
+            int base) throws Throwable {
+        return (LuaValue) jc.objHandle.invokeExact(callee, up, p, t, o, base);
+    }
+
     /** Fills registers [from, to) with nil (missing-call-argument semantics). */
     public static void nilFill(long[] p, byte[] t, LuaValue[] o, int from, int to) {
         for (int i = from; i < to; i++) {
             p[i] = 0;
             t[i] = 0;
             o[i] = null;
+        }
+    }
+
+    /**
+     * Mirrors the interpreter's fixed-count {@code OP_SETLIST}: bulk-appends
+     * registers into a table. Metatables bypass raw writes exactly like the
+     * interpreter (plain tables take the raw path, anything else the
+     * {@code set} path that may raise).
+     */
+    public static void setList(long[] p, byte[] t, LuaValue[] o, int funcIdx, int n, int last) {
+        org.luava.runtime.LuaValue tbl =
+                org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx);
+        if (tbl instanceof org.luava.runtime.LuaTable lt) {
+            for (int i = 1; i <= n; i++) {
+                lt.rawset(org.luava.runtime.LuaInteger.valueOf(last + i),
+                        org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + i));
+            }
+        } else {
+            for (int i = 1; i <= n; i++) {
+                tbl.set(org.luava.runtime.LuaInteger.valueOf(last + i),
+                        org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + i));
+            }
         }
     }
 }
