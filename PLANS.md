@@ -485,6 +485,16 @@ Emitting JVM `.class` should only be considered as an offline AOT tool
 (`luava-aot` CLI) for packaging static bundles for Android or GraalVM
 Native Image.
 
+> UPDATE (2026-09-14): this verdict is now **reopened and superseded by
+> `plan.md`** (Hybrid Tiered JIT). A translator spike
+> (`/tmp/opencode/jitspike`) that emits one JVM method per Lua proto took
+> fib(35) from ~5300 ms (interpreter) to ~185 ms — 13x faster than LuaJ and
+> 4x faster than C Lua. The three §IX objections are addressed in `plan.md`
+> §3: hidden classes + LRU code cache for Metaspace, a hard rule that
+> yield-capable functions never JIT (preserving the 16x coroutine win), and
+> an opcode-count ceiling so huge protos stay interpreted. The interpreter
+> remains the default engine and fallback; JIT is an opt-in accelerator.
+
 ---
 
 ## X. Phased AST Retirement (Replace the AST Interpreter Entirely)

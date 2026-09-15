@@ -7,6 +7,8 @@
  */
 package org.luava.runtime.eval;
 
+import org.luava.runtime.LuaFloat;
+import org.luava.runtime.LuaInteger;
 import org.luava.runtime.LuaNil;
 import org.luava.runtime.LuaValue;
 import org.luava.runtime.LuaState;
@@ -132,6 +134,28 @@ public final class Upvalue {
         return objectValue;
     }
 
+    /**
+     * JIT fast lane: true when this upvalue is closed and currently holds an
+     * integer, so generated code can read/write the raw long without boxing.
+     * Open, aliased (join) or non-integer upvalues take the generic path.
+     */
+    public boolean isClosedInt() {
+        return joinDelegate == null && !isOpenOnStack && typeTag == BytecodeVM.TYPE_INT;
+    }
+
+    /** Raw integer payload; only valid when {@link #isClosedInt()}. */
+    public long getClosedInt() {
+        return rawValue;
+    }
+
+    /** Overwrites a closed upvalue with an integer (type stays integer). */
+    public void setClosedInt(long v) {
+        rawValue = v;
+        typeTag = BytecodeVM.TYPE_INT;
+        objectValue = null;
+        closedValue = null;
+    }
+
     public void close() {
         if (isOpenOnStack && thread != null && stackIndex >= 0) {
             this.typeTag = thread.getTypeStack()[stackIndex];
@@ -199,6 +223,22 @@ public final class Upvalue {
         }
         if (slot != null) {
             slot.set(v);
+            return;
+        }
+        // Preserve primitive tags (instead of forcing OBJECT) so type
+        // queries and the JIT int lane observe the true representation.
+        if (v instanceof LuaInteger li) {
+            this.rawValue = li.toLong();
+            this.typeTag = BytecodeVM.TYPE_INT;
+            this.objectValue = null;
+            this.closedValue = null;
+            return;
+        }
+        if (v instanceof LuaFloat lf) {
+            this.rawValue = Double.doubleToRawLongBits(lf.toDouble());
+            this.typeTag = BytecodeVM.TYPE_FLOAT;
+            this.objectValue = null;
+            this.closedValue = null;
             return;
         }
         this.closedValue = v;
