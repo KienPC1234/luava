@@ -42,4 +42,26 @@ public final class JitRuntime {
             o[i] = null;
         }
     }
+
+    /**
+     * Mirrors the interpreter's fixed-count {@code OP_SETLIST}: bulk-appends
+     * registers into a table. Metatables bypass raw writes exactly like the
+     * interpreter (plain tables take the raw path, anything else the
+     * {@code set} path that may raise).
+     */
+    public static void setList(long[] p, byte[] t, LuaValue[] o, int funcIdx, int n, int last) {
+        org.luava.runtime.LuaValue tbl =
+                org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx);
+        if (tbl instanceof org.luava.runtime.LuaTable lt) {
+            for (int i = 1; i <= n; i++) {
+                lt.rawset(org.luava.runtime.LuaInteger.valueOf(last + i),
+                        org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + i));
+            }
+        } else {
+            for (int i = 1; i <= n; i++) {
+                tbl.set(org.luava.runtime.LuaInteger.valueOf(last + i),
+                        org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + i));
+            }
+        }
+    }
 }

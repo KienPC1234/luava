@@ -13,7 +13,6 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.luava.runtime.bytecode.LuaClosure;
 import org.luava.runtime.bytecode.LuaProto;
-import org.luava.runtime.bytecode.OpCode;
 
 /**
  * Compiles eligible Lua protos to hidden JVM classes (one method per Lua
@@ -173,15 +172,10 @@ public final class JitCompiler {
             return false;
         }
         // Conservative yield rule: the JIT subset has no global/table
-        // writes through metamethods, no varargs, no TAILCALL and no
-        // yield-capable calls (only pure self/monomorphic targets), so it
-        // can never reach coroutine.yield.
-        for (int inst : proto.code) {
-            int op = org.luava.runtime.bytecode.Instruction.getOp(inst);
-            if (op == OpCode.OP_TAILCALL) {
-                return false;
-            }
-        }
+        // writes through metamethods, no varargs and no yield-capable calls
+        // (only pure self/monomorphic targets, resolved with guards), so it
+        // can never reach coroutine.yield. TAILCALL is supported by the
+        // translator under the same purity contract as CALL.
         proto.mayYield = false;
         return true;
     }
