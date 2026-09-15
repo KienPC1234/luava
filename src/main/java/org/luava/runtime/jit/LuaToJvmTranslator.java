@@ -36,6 +36,7 @@ public final class LuaToJvmTranslator implements Opcodes {
     private static final String EXEC_DESC =
             "(Lorg/luava/runtime/bytecode/LuaClosure;[Ljava/lang/Object;[J[B[Lorg/luava/runtime/LuaValue;I)J";
     private static final int TYPE_INT = 2;
+    private static final int TYPE_OBJECT = 4;
 
     private LuaToJvmTranslator() {}
 
@@ -65,9 +66,11 @@ public final class LuaToJvmTranslator implements Opcodes {
 
     /** Returns null when the proto is outside the integer-subset. */
     public static Translation translate(LuaProto proto, String internalName) {
-        if (!eligible(proto)) {
+        Info info = analyze(proto);
+        if (info == null) {
             return null;
         }
+        boolean pure = info.pure();
         int len = proto.code.length;
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
         cw.visit(V21, ACC_PUBLIC | ACC_FINAL | ACC_SUPER, internalName, null, "java/lang/Object", null);
@@ -89,11 +92,20 @@ public final class LuaToJvmTranslator implements Opcodes {
             }
         }
         boolean[] skipStore = new boolean[len];
+        int[] fusedDef = new int[len];
         for (int pc = 0; pc < len; pc++) {
+            fusedDef[pc] = -1;
             if (fusedUp[pc] >= 0) {
                 int def = lastWrite(proto.code, pc, Instruction.getA(proto.code[pc]));
                 if (def >= 0) {
-                    skipStore[def] = true;
+                    fusedDef[pc] = def;
+                    // Skipping the GETUPVAL store is only sound when resume
+                    // recomputes it: pure protos resume fused calls at the
+                    // def pc (prefix is side-effect free); impure leaves
+                    // always materialize so any resume pc sees valid regs.
+                    if (pure) {
+                        skipStore[def] = true;
+                    }
                 }
             }
         }
@@ -121,7 +133,8 @@ public final class LuaToJvmTranslator implements Opcodes {
         MethodVisitor mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC, EXEC_NAME, EXEC_DESC, null, null);
         mv.visitCode();
         emitPrologue(mv, fusedBList, fusedBCount);
-        emitBody(mv, internalName, proto, newLabels(len), fusedUp, skipStore, fusedBList, fusedBCount);
+        emitBody(mv, internalName, proto, newLabels(len), fusedUp, fusedDef, skipStore, fusedBList,
+                fusedBCount);
         mv.visitMaxs(0, 0);
         mv.visitEnd();
         if (fusedBCount > 0) {
@@ -137,7 +150,8 @@ public final class LuaToJvmTranslator implements Opcodes {
                 mi.visitInsn(ICONST_1);
                 mi.visitVarInsn(ISTORE, 9 + 2 * i);
             }
-            emitBody(mi, internalName, proto, newLabels(len), fusedUp, skipStore, fusedBList, fusedBCount);
+            emitBody(mi, internalName, proto, newLabels(len), fusedUp, fusedDef, skipStore, fusedBList,
+                    fusedBCount);
             mi.visitMaxs(0, 0);
             mi.visitEnd();
         }
@@ -186,7 +200,7 @@ public final class LuaToJvmTranslator implements Opcodes {
      * closures provably still hold.
      */
     private static void emitBody(MethodVisitor mv, String owner, LuaProto proto, Label[] labels,
-            int[] fusedUp, boolean[] skipStore, int[] fusedBList, int fusedBCount) {
+            int[] fusedUp, int[] fusedDef, boolean[] skipStore, int[] fusedBList, int fusedBCount) {
         int len = proto.code.length;
         for (int pc = 0; pc < len; pc++) {
             mv.visitLabel(labels[pc]);
@@ -204,6 +218,35 @@ public final class LuaToJvmTranslator implements Opcodes {
                 case OpCode.OP_LOADK -> {
                     long kv = ((LuaInteger) proto.constants[Instruction.getBx(inst)]).toLong();
                     emitStoreIntConst(mv, a, kv);
+                }
+                case OpCode.OP_GETTABUP -> emitGetTabUp(mv, a, b, c, pc);
+                case OpCode.OP_GETTABLE -> emitGetTable(mv, a, b, c, pc);
+                case OpCode.OP_GETI -> emitGetI(mv, a, b, c, pc);
+                case OpCode.OP_GETFIELD -> emitGetField(mv, a, b, c, pc);
+                case OpCode.OP_SETTABUP -> emitSetTabUp(mv, proto, a, b, c, Instruction.getk(inst), pc);
+                case OpCode.OP_SETTABLE -> emitSetTable(mv, proto, a, b, c, Instruction.getk(inst), pc);
+                case OpCode.OP_SETI -> emitSetI(mv, proto, a, b, c, Instruction.getk(inst), pc);
+                case OpCode.OP_SETFIELD -> emitSetField(mv, proto, a, b, c, Instruction.getk(inst), pc);
+                case OpCode.OP_NEWTABLE -> {
+                    mv.visitTypeInsn(NEW, "org/luava/runtime/LuaTable");
+                    mv.visitInsn(DUP);
+                    mv.visitMethodInsn(INVOKESPECIAL, "org/luava/runtime/LuaTable", "<init>", "()V", false);
+                    mv.visitVarInsn(ASTORE, 8);
+                    mv.visitVarInsn(ALOAD, 2);
+                    emitIndex(mv, a);
+                    mv.visitInsn(LCONST_0);
+                    mv.visitInsn(LASTORE);
+                    mv.visitVarInsn(ALOAD, 3);
+                    emitIndex(mv, a);
+                    ldcInt(mv, TYPE_OBJECT);
+                    mv.visitInsn(BASTORE);
+                    mv.visitVarInsn(ALOAD, 4);
+                    emitIndex(mv, a);
+                    mv.visitVarInsn(ALOAD, 8);
+                    mv.visitInsn(AASTORE);
+                }
+                case OpCode.OP_EXTRAARG -> {
+                    // Size hints consumed by NEWTABLE; nothing to execute.
                 }
                 case OpCode.OP_GETUPVAL -> {
                     if (skipStore[pc]) {
@@ -334,7 +377,11 @@ public final class LuaToJvmTranslator implements Opcodes {
                             }
                         }
                     }
-                    emitCall(mv, owner, proto, a, b - 1, pc, fusedUp[pc], slot, fusedBList, fusedBCount);
+                    // Fused calls resume at the skipped GETUPVAL so the
+                    // interpreter recomputes the function register.
+                    int resumePc = fusedDef[pc] >= 0 ? fusedDef[pc] : pc;
+                    emitCall(mv, owner, proto, a, b - 1, resumePc, fusedUp[pc], slot, fusedBList,
+                            fusedBCount);
                 }
                 case OpCode.OP_RETURN1 -> {
                     emitGuardInt(mv, a, pc);
@@ -356,10 +403,10 @@ public final class LuaToJvmTranslator implements Opcodes {
 
     /**
      * Analyzes a proto for the integer subset. Returns null when any
-     * reachable shape is unsupported. Rules preserving deopt-restart
-     * safety: a proto with calls must be pure (no upvalue writes), and an
-     * impure leaf must take no parameters (frame setup would otherwise
-     * clobber JIT state on resume-at-pc).
+     * reachable shape is unsupported. Safety rules: a proto with calls must
+     * be pure (no upvalue writes), because a nested deopt re-invokes the
+     * callee from scratch; impure leaves resume at the faulting pc with
+     * committed state intact.
      */
     public static Info analyze(LuaProto proto) {
         if (proto.isVararg || proto.protos.length != 0) {
@@ -374,12 +421,23 @@ public final class LuaToJvmTranslator implements Opcodes {
         }
         boolean hasCalls = false;
         boolean hasSetupVal = false;
+        boolean hasTableWrite = false;
         for (int inst : code) {
             switch (Instruction.getOp(inst)) {
                 case OpCode.OP_MOVE,
                         OpCode.OP_LOADI,
                         OpCode.OP_GETUPVAL,
                         OpCode.OP_SETUPVAL,
+                        OpCode.OP_GETTABUP,
+                        OpCode.OP_GETTABLE,
+                        OpCode.OP_GETI,
+                        OpCode.OP_GETFIELD,
+                        OpCode.OP_SETTABUP,
+                        OpCode.OP_SETTABLE,
+                        OpCode.OP_SETI,
+                        OpCode.OP_SETFIELD,
+                        OpCode.OP_NEWTABLE,
+                        OpCode.OP_EXTRAARG,
                         OpCode.OP_ADD,
                         OpCode.OP_SUB,
                         OpCode.OP_ADDI,
@@ -406,6 +464,11 @@ public final class LuaToJvmTranslator implements Opcodes {
             if (Instruction.getOp(inst) == OpCode.OP_SETUPVAL) {
                 hasSetupVal = true;
             }
+            switch (Instruction.getOp(inst)) {
+                case OpCode.OP_SETTABUP, OpCode.OP_SETTABLE, OpCode.OP_SETI, OpCode.OP_SETFIELD -> hasTableWrite =
+                        true;
+                default -> {}
+            }
             if (Instruction.getOp(inst) == OpCode.OP_CALL) {
                 hasCalls = true;
                 int bb = Instruction.getB(inst);
@@ -415,13 +478,10 @@ public final class LuaToJvmTranslator implements Opcodes {
                 }
             }
         }
-        if (hasCalls && hasSetupVal) {
+        if (hasCalls && (hasSetupVal || hasTableWrite)) {
             return null;
         }
-        if (hasSetupVal && proto.numParams != 0) {
-            return null;
-        }
-        return new Info(!hasSetupVal);
+        return new Info(!hasSetupVal && !hasTableWrite);
     }
 
     /** Strict integer-subset eligibility; anything else stays interpreted. */
@@ -504,8 +564,8 @@ public final class LuaToJvmTranslator implements Opcodes {
      * proto via the {@link JitRuntime} helper. Anything else deopts to the
      * interpreter.
      */
-    private static void emitCall(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs, int pc,
-            int fusedB, int hoistSlot, int[] fusedBList, int fusedBCount) {
+    private static void emitCall(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs,
+            int resumePc, int fusedB, int hoistSlot, int[] fusedBList, int fusedBCount) {
         Label done = new Label();
         if (hoistSlot >= 0) {
             // Fast tier: entry-classified self callee straight into the
@@ -515,7 +575,7 @@ public final class LuaToJvmTranslator implements Opcodes {
             mv.visitJumpInsn(IFEQ, general);
             mv.visitVarInsn(ALOAD, 10 + 2 * hoistSlot);
             mv.visitVarInsn(ASTORE, 8);
-            emitInnerInvoke(mv, owner, proto, a, nArgs, pc, fusedBList, fusedBCount);
+            emitInnerInvoke(mv, owner, proto, a, nArgs, resumePc, fusedBList, fusedBCount);
             mv.visitJumpInsn(GOTO, done);
             mv.visitLabel(general);
         }
@@ -537,7 +597,7 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitTypeInsn(INSTANCEOF, "org/luava/runtime/bytecode/LuaClosure");
         Label isClosure = new Label();
         mv.visitJumpInsn(IFNE, isClosure);
-        emitDeopt(mv, pc);
+        emitDeopt(mv, resumePc);
         mv.visitLabel(isClosure);
         // Same proto -> direct INVOKESTATIC; else a pure JIT proto -> helper.
         mv.visitVarInsn(ALOAD, 8);
@@ -551,7 +611,7 @@ public final class LuaToJvmTranslator implements Opcodes {
         Label generalCall = new Label();
         mv.visitJumpInsn(IF_ACMPNE, generalCall);
         mv.visitLabel(selfProto);
-        emitDirectInvoke(mv, owner, proto, a, nArgs, pc);
+        emitDirectInvoke(mv, owner, proto, a, nArgs, resumePc);
         mv.visitJumpInsn(GOTO, done);
         // General monomorphic call: callee must be compiled and pure, with
         // an exact argument-count match (missing args would read stale regs).
@@ -570,20 +630,20 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ASTORE, 21);
         Label hasJit = new Label();
         mv.visitJumpInsn(IFNONNULL, hasJit);
-        emitDeopt(mv, pc);
+        emitDeopt(mv, resumePc);
         mv.visitLabel(hasJit);
         mv.visitVarInsn(ALOAD, 21);
         mv.visitFieldInsn(GETFIELD, "org/luava/runtime/jit/JitCode", "pure", "Z");
         Label isPure = new Label();
         mv.visitJumpInsn(IFNE, isPure);
-        emitDeopt(mv, pc);
+        emitDeopt(mv, resumePc);
         mv.visitLabel(isPure);
         ldcInt(mv, nArgs);
         mv.visitVarInsn(ALOAD, 20);
         mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "numParams", "I");
         Label arityOk = new Label();
         mv.visitJumpInsn(IF_ICMPEQ, arityOk);
-        emitDeopt(mv, pc);
+        emitDeopt(mv, resumePc);
         mv.visitLabel(arityOk);
         // Dynamic capacity guard with the callee's own maxStack.
         mv.visitVarInsn(ILOAD, 5);
@@ -596,7 +656,7 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitInsn(ARRAYLENGTH);
         Label capOkGen = new Label();
         mv.visitJumpInsn(IF_ICMPLT, capOkGen);
-        emitDeopt(mv, pc);
+        emitDeopt(mv, resumePc);
         mv.visitLabel(capOkGen);
         mv.visitVarInsn(ALOAD, 21);
         mv.visitVarInsn(ALOAD, 8);
@@ -610,9 +670,9 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ILOAD, 5);
         ldcInt(mv, a + 1);
         mv.visitInsn(IADD);
-        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "invoke",
+        emitGuardedInvoke(mv, "org/luava/runtime/jit/JitRuntime", "invoke",
                 "(Lorg/luava/runtime/jit/JitCode;Lorg/luava/runtime/bytecode/LuaClosure;[Ljava/lang/Object;[J[B[Lorg/luava/runtime/LuaValue;I)J",
-                false);
+                resumePc);
         mv.visitVarInsn(LSTORE, 6);
         mv.visitVarInsn(ALOAD, 2);
         emitIndex(mv, a);
@@ -624,7 +684,7 @@ public final class LuaToJvmTranslator implements Opcodes {
 
     /** Direct INVOKESTATIC into this proto's own exec (self-recursion). */
     private static void emitDirectInvoke(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs,
-            int pc) {
+            int resumePc) {
         // Capacity guard for the callee window.
         mv.visitVarInsn(ILOAD, 5);
         ldcInt(mv, a + 1 + proto.maxStackSize);
@@ -633,7 +693,7 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitInsn(ARRAYLENGTH);
         Label capOk = new Label();
         mv.visitJumpInsn(IF_ICMPLT, capOk);
-        emitDeopt(mv, pc);
+        emitDeopt(mv, resumePc);
         mv.visitLabel(capOk);
         // Missing arguments are nil-filled exactly like the interpreter.
         if (nArgs < proto.numParams) {
@@ -650,6 +710,8 @@ public final class LuaToJvmTranslator implements Opcodes {
                     "([J[B[Lorg/luava/runtime/LuaValue;II)V", false);
         }
         // Direct self-recursion: exec(callee, callee.upvals, p, t, o, base+a+1).
+        // A nested deopt is converted to this call's resumePc: the caller resumes
+        // here and re-invokes the (pure) callee from scratch.
         mv.visitVarInsn(ALOAD, 8);
         mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
         mv.visitInsn(DUP);
@@ -661,7 +723,7 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ILOAD, 5);
         ldcInt(mv, a + 1);
         mv.visitInsn(IADD);
-        mv.visitMethodInsn(INVOKESTATIC, owner, EXEC_NAME, EXEC_DESC, false);
+        emitGuardedInvoke(mv, owner, EXEC_NAME, EXEC_DESC, resumePc);
         mv.visitVarInsn(LSTORE, 6);
         mv.visitVarInsn(ALOAD, 2);
         emitIndex(mv, a);
@@ -671,13 +733,34 @@ public final class LuaToJvmTranslator implements Opcodes {
     }
 
     /**
+     * Emits an INVOKESTATIC whose {@link DeoptSignal} is converted to the
+     * enclosing call resumePc, so the interpreter resumes the current frame at
+     * the call instead of unwinding with a foreign pc.
+     */
+    private static void emitGuardedInvoke(MethodVisitor mv, String owner, String name, String desc, int pc) {
+        Label tryStart = new Label();
+        Label tryEnd = new Label();
+        Label handler = new Label();
+        Label cont = new Label();
+        mv.visitLabel(tryStart);
+        mv.visitMethodInsn(INVOKESTATIC, owner, name, desc, false);
+        mv.visitLabel(tryEnd);
+        mv.visitJumpInsn(GOTO, cont);
+        mv.visitLabel(handler);
+        mv.visitInsn(POP);
+        emitDeopt(mv, pc);
+        mv.visitLabel(cont);
+        mv.visitTryCatchBlock(tryStart, tryEnd, handler, "org/luava/runtime/jit/DeoptSignal");
+    }
+
+    /**
      * Prologue-free self-recursion into {@code execInner}. The caller passes
      * its entry-verified closures down, so the callee skips re-verification.
      * Sound because the whole chain shares one closure (callee == self) and
      * upvalues cannot change mid-flight.
      */
     private static void emitInnerInvoke(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs,
-            int pc, int[] fusedBList, int fusedBCount) {
+            int resumePc, int[] fusedBList, int fusedBCount) {
         // Capacity guard for the callee window.
         mv.visitVarInsn(ILOAD, 5);
         ldcInt(mv, a + 1 + proto.maxStackSize);
@@ -686,7 +769,7 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitInsn(ARRAYLENGTH);
         Label capOk = new Label();
         mv.visitJumpInsn(IF_ICMPLT, capOk);
-        emitDeopt(mv, pc);
+        emitDeopt(mv, resumePc);
         mv.visitLabel(capOk);
         // Missing arguments are nil-filled exactly like the interpreter.
         if (nArgs < proto.numParams) {
@@ -716,13 +799,227 @@ public final class LuaToJvmTranslator implements Opcodes {
         for (int i = 0; i < fusedBCount; i++) {
             mv.visitVarInsn(ALOAD, 10 + 2 * i);
         }
-        mv.visitMethodInsn(INVOKESTATIC, owner, EXEC_INNER_NAME, innerDesc(fusedBCount), false);
+        emitGuardedInvoke(mv, owner, EXEC_INNER_NAME, innerDesc(fusedBCount), resumePc);
         mv.visitVarInsn(LSTORE, 6);
         mv.visitVarInsn(ALOAD, 2);
         emitIndex(mv, a);
         mv.visitVarInsn(LLOAD, 6);
         mv.visitInsn(LASTORE);
         emitTagIntNull(mv, a);
+    }
+
+    /**
+     * Pushes the assigned value as a LuaValue: a constant when {@code k==1},
+     * otherwise the boxed register. Leaves it on the stack.
+     */
+    private static void emitBoxValue(MethodVisitor mv, LuaProto proto, int reg, int c, int k, int pc) {
+        if (k == 1) {
+            emitLoadConst(mv, c);
+        } else {
+            mv.visitVarInsn(ALOAD, 2);
+            mv.visitVarInsn(ALOAD, 3);
+            mv.visitVarInsn(ALOAD, 4);
+            emitIndex(mv, reg);
+            mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/bytecode/BytecodeVM", "getLuaValue",
+                    "([J[B[Lorg/luava/runtime/LuaValue;I)Lorg/luava/runtime/LuaValue;", false);
+        }
+    }
+
+    private static void emitSetTabUp(MethodVisitor mv, LuaProto proto, int a, int b, int c, int k, int pc) {
+        mv.visitVarInsn(ALOAD, 1);
+        ldcInt(mv, a);
+        mv.visitInsn(AALOAD);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/eval/Upvalue");
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/eval/Upvalue", "getValue",
+                "()Lorg/luava/runtime/LuaValue;", false);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardPlainTable(mv, pc);
+        emitLoadConst(mv, b);
+        emitBoxValue(mv, proto, c, c, k, pc);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "set",
+                "(Lorg/luava/runtime/LuaValue;Lorg/luava/runtime/LuaValue;)V", false);
+    }
+
+    private static void emitSetTable(MethodVisitor mv, LuaProto proto, int a, int b, int c, int k, int pc) {
+        // Fast lane mirrors the interpreter: plain table + integer key.
+        // Scratch local 9 is free: table writes forbid calls (analyze),
+        // hence no fused-callee or vc-param locals exist here.
+        emitGuardInt(mv, b, pc);
+        emitGuardObject(mv, a, pc);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardPlainTable(mv, pc);
+        mv.visitInsn(POP);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, b);
+        mv.visitInsn(LALOAD);
+        mv.visitVarInsn(LSTORE, 6);
+        emitBoxValue(mv, proto, c, c, k, pc);
+        mv.visitVarInsn(ASTORE, 9);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/LuaTable");
+        mv.visitVarInsn(LLOAD, 6);
+        mv.visitVarInsn(ALOAD, 9);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawsetInt",
+                "(JLorg/luava/runtime/LuaValue;)V", false);
+    }
+
+    private static void emitSetI(MethodVisitor mv, LuaProto proto, int a, int b, int c, int k, int pc) {
+        emitGuardObject(mv, a, pc);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardPlainTable(mv, pc);
+        mv.visitInsn(POP);
+        emitBoxValue(mv, proto, c, c, k, pc);
+        mv.visitVarInsn(ASTORE, 9);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/LuaTable");
+        mv.visitLdcInsn((long) b);
+        mv.visitVarInsn(ALOAD, 9);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawsetInt",
+                "(JLorg/luava/runtime/LuaValue;)V", false);
+    }
+
+    private static void emitSetField(MethodVisitor mv, LuaProto proto, int a, int b, int c, int k, int pc) {
+        emitGuardObject(mv, a, pc);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardPlainTable(mv, pc);
+        emitLoadConst(mv, b);
+        emitBoxValue(mv, proto, c, c, k, pc);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "set",
+                "(Lorg/luava/runtime/LuaValue;Lorg/luava/runtime/LuaValue;)V", false);
+    }
+    private static void emitLoadConst(MethodVisitor mv, int c) {
+        mv.visitVarInsn(ALOAD, 0);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
+                "Lorg/luava/runtime/bytecode/LuaProto;");
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "constants",
+                "[Lorg/luava/runtime/LuaValue;");
+        ldcInt(mv, c);
+        mv.visitInsn(AALOAD);
+    }
+
+    /**
+     * Guards that the LuaValue in local 8 is a metatable-free LuaTable,
+     * leaving the checked table on the stack. Anything else deopts (a
+     * metamethod could observe or alter state).
+     */
+    private static void emitGuardPlainTable(MethodVisitor mv, int pc) {
+        mv.visitTypeInsn(INSTANCEOF, "org/luava/runtime/LuaTable");
+        Label isTable = new Label();
+        mv.visitJumpInsn(IFNE, isTable);
+        emitDeopt(mv, pc);
+        mv.visitLabel(isTable);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/LuaTable");
+        mv.visitInsn(DUP);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "getMetatable",
+                "()Lorg/luava/runtime/LuaTable;", false);
+        Label noMeta = new Label();
+        mv.visitJumpInsn(IFNULL, noMeta);
+        emitDeopt(mv, pc);
+        mv.visitLabel(noMeta);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/LuaTable");
+    }
+
+    private static void emitStoreValueReg(MethodVisitor mv, int a) {
+        // Expects the LuaValue on the stack; stores via setLuaValue.
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/bytecode/BytecodeVM", "setLuaValue",
+                "([J[B[Lorg/luava/runtime/LuaValue;ILorg/luava/runtime/LuaValue;)V", false);
+    }
+
+    private static void emitGetTabUp(MethodVisitor mv, int a, int b, int c, int pc) {
+        mv.visitVarInsn(ALOAD, 1);
+        ldcInt(mv, b);
+        mv.visitInsn(AALOAD);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/eval/Upvalue");
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/eval/Upvalue", "getValue",
+                "()Lorg/luava/runtime/LuaValue;", false);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardPlainTable(mv, pc);
+        // lt.get(k[c])
+        emitLoadConst(mv, c);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "get",
+                "(Lorg/luava/runtime/LuaValue;)Lorg/luava/runtime/LuaValue;", false);
+        emitStoreValueReg(mv, a);
+    }
+
+    private static void emitGetTable(MethodVisitor mv, int a, int b, int c, int pc) {
+        // Fast lane mirrors the interpreter: plain table + integer key.
+        emitGuardInt(mv, c, pc);
+        emitGuardObject(mv, b, pc);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, b);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardPlainTable(mv, pc);
+        // lt.rawgetInt(p[base+c])
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, c);
+        mv.visitInsn(LALOAD);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawgetInt",
+                "(J)Lorg/luava/runtime/LuaValue;", false);
+        emitStoreValueReg(mv, a);
+    }
+
+    private static void emitGetI(MethodVisitor mv, int a, int b, int c, int pc) {
+        emitGuardObject(mv, b, pc);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, b);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardPlainTable(mv, pc);
+        mv.visitLdcInsn((long) c);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawgetInt",
+                "(J)Lorg/luava/runtime/LuaValue;", false);
+        emitStoreValueReg(mv, a);
+    }
+
+    private static void emitGetField(MethodVisitor mv, int a, int b, int c, int pc) {
+        emitGuardObject(mv, b, pc);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, b);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardPlainTable(mv, pc);
+        emitLoadConst(mv, c);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "get",
+                "(Lorg/luava/runtime/LuaValue;)Lorg/luava/runtime/LuaValue;", false);
+        emitStoreValueReg(mv, a);
+    }
+
+    private static void emitGuardObject(MethodVisitor mv, int reg, int pc) {
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, reg);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_OBJECT);
+        Label ok = new Label();
+        mv.visitJumpInsn(IF_ICMPEQ, ok);
+        emitDeopt(mv, pc);
+        mv.visitLabel(ok);
     }
 
     private static void emitGuardInt(MethodVisitor mv, int reg, int pc) {
@@ -866,8 +1163,31 @@ public final class LuaToJvmTranslator implements Opcodes {
             case OpCode.OP_GETUPVAL -> {
                 return false;
             }
+            case OpCode.OP_GETTABUP -> {
+                return false;
+            }
+            case OpCode.OP_GETTABLE -> {
+                return b == reg || c == reg;
+            }
+            case OpCode.OP_GETI, OpCode.OP_GETFIELD -> {
+                return b == reg;
+            }
             case OpCode.OP_SETUPVAL -> {
                 return a == reg;
+            }
+            case OpCode.OP_SETTABUP -> {
+                return Instruction.getk(inst) == 0 && Instruction.getC(inst) == reg;
+            }
+            case OpCode.OP_SETTABLE -> {
+                return a == reg
+                        || b == reg
+                        || (Instruction.getk(inst) == 0 && Instruction.getC(inst) == reg);
+            }
+            case OpCode.OP_SETI, OpCode.OP_SETFIELD -> {
+                return a == reg || (Instruction.getk(inst) == 0 && Instruction.getC(inst) == reg);
+            }
+            case OpCode.OP_NEWTABLE, OpCode.OP_EXTRAARG -> {
+                return false;
             }
             default -> {
                 return a == reg || b == reg || c == reg;
@@ -883,6 +1203,11 @@ public final class LuaToJvmTranslator implements Opcodes {
                     OpCode.OP_LOADI,
                     OpCode.OP_LOADK,
                     OpCode.OP_GETUPVAL,
+                    OpCode.OP_GETTABUP,
+                    OpCode.OP_GETTABLE,
+                    OpCode.OP_GETI,
+                    OpCode.OP_GETFIELD,
+                    OpCode.OP_NEWTABLE,
                     OpCode.OP_ADD,
                     OpCode.OP_SUB,
                     OpCode.OP_ADDI,
@@ -891,6 +1216,11 @@ public final class LuaToJvmTranslator implements Opcodes {
                 return a == reg;
             }
             case OpCode.OP_SETUPVAL,
+                    OpCode.OP_SETTABUP,
+                    OpCode.OP_SETTABLE,
+                    OpCode.OP_SETI,
+                    OpCode.OP_SETFIELD,
+                    OpCode.OP_EXTRAARG,
                     OpCode.OP_JMP,
                     OpCode.OP_RETURN1,
                     OpCode.OP_RETURN0 -> {
