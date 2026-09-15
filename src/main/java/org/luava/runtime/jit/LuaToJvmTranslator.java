@@ -39,8 +39,29 @@ public final class LuaToJvmTranslator implements Opcodes {
 
     private LuaToJvmTranslator() {}
 
+    private static final String EXEC_INNER_NAME = "execInner";
+
     /** Result of a successful translation. */
     public record Translation(String internalName, byte[] bytes) {}
+
+    /** Descriptor of the prologue-free recursive entry (verified closures). */
+    static String innerDesc(int fusedBCount) {
+        StringBuilder sb = new StringBuilder(
+                "(Lorg/luava/runtime/bytecode/LuaClosure;[Ljava/lang/Object;[J[B[Lorg/luava/runtime/LuaValue;I");
+        for (int i = 0; i < fusedBCount; i++) {
+            sb.append("Lorg/luava/runtime/bytecode/LuaClosure;");
+        }
+        sb.append(")J");
+        return sb.toString();
+    }
+
+    private static Label[] newLabels(int len) {
+        Label[] labels = new Label[len];
+        for (int i = 0; i < len; i++) {
+            labels[i] = new Label();
+        }
+        return labels;
+    }
 
     /** Returns null when the proto is outside the integer-subset. */
     public static Translation translate(LuaProto proto, String internalName) {
@@ -50,16 +71,9 @@ public final class LuaToJvmTranslator implements Opcodes {
         int len = proto.code.length;
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
         cw.visit(V21, ACC_PUBLIC | ACC_FINAL | ACC_SUPER, internalName, null, "java/lang/Object", null);
-        MethodVisitor mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC, EXEC_NAME, EXEC_DESC, null, null);
-        mv.visitCode();
-
-        Label[] labels = new Label[len];
-        for (int i = 0; i < len; i++) {
-            labels[i] = new Label();
-        }
 
         // Locals: 0=self 1=up 2=p 3=t 4=o 5=base 6-7=long scratch 8=ref scratch
-        // 9+ = hoisted fused-callee closures and their upvalue arrays.
+        // 9+ = hoisted fused-callee flags (int) and closures.
         // Fuse map: callPc -> upvalue index when the CALL's function register
         // is provably (straight-line, no intervening read) the value of one
         // GETUPVAL. The fused GETUPVAL emits no store; the CALL reads the
@@ -83,8 +97,11 @@ public final class LuaToJvmTranslator implements Opcodes {
                 }
             }
         }
-        // Distinct fused upvalue indexes, each hoisted to two locals at entry:
-        // the verified callee closure and its upvalue array.
+        // Distinct fused upvalue indexes, each classified once at entry:
+        // flag = whether upvals[b] currently holds exactly `self`. Upvalues
+        // cannot change mid-flight (no hooks, no yield, no writes in the
+        // pure subset), so this is sound; a mismatch only selects the slow
+        // path, never deopts.
         int[] fusedBList = new int[len];
         int fusedBCount = 0;
         for (int pc = 0; pc < len; pc++) {
@@ -101,11 +118,36 @@ public final class LuaToJvmTranslator implements Opcodes {
                 }
             }
         }
+        MethodVisitor mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC, EXEC_NAME, EXEC_DESC, null, null);
+        mv.visitCode();
+        emitPrologue(mv, fusedBList, fusedBCount);
+        emitBody(mv, internalName, proto, newLabels(len), fusedUp, skipStore, fusedBList, fusedBCount);
+        mv.visitMaxs(0, 0);
+        mv.visitEnd();
+        if (fusedBCount > 0) {
+            // Prologue-free recursive entry. Sound only because every caller
+            // passes down entry-verified closures for the same upvalue array
+            // (self-recursion on one closure); anything else uses exec.
+            MethodVisitor mi =
+                    cw.visitMethod(ACC_PUBLIC | ACC_STATIC, EXEC_INNER_NAME, innerDesc(fusedBCount), null, null);
+            mi.visitCode();
+            for (int i = 0; i < fusedBCount; i++) {
+                mi.visitVarInsn(ALOAD, 6 + i);
+                mi.visitVarInsn(ASTORE, 10 + 2 * i);
+                mi.visitInsn(ICONST_1);
+                mi.visitVarInsn(ISTORE, 9 + 2 * i);
+            }
+            emitBody(mi, internalName, proto, newLabels(len), fusedUp, skipStore, fusedBList, fusedBCount);
+            mi.visitMaxs(0, 0);
+            mi.visitEnd();
+        }
+        cw.visitEnd();
+        return new Translation(internalName, cw.toByteArray());
+    }
+
+    private static void emitPrologue(MethodVisitor mv, int[] fusedBList, int fusedBCount) {
         // Entry prologue: classify each distinct fused callee once per
-        // invocation. Upvalues cannot change mid-flight (no hooks, no yield,
-        // no writes in the pure subset), so recording "is this the same
-        // proto as self" here is sound; the general path re-validates
-        // anyway. A mismatch only selects the slow path, never deopts.
+        // invocation (identity against `self`, a single reference compare).
         for (int i = 0; i < fusedBCount; i++) {
             int b = fusedBList[i];
             int flagSlot = 9 + 2 * i;
@@ -118,17 +160,9 @@ public final class LuaToJvmTranslator implements Opcodes {
                     "()Lorg/luava/runtime/LuaValue;", false);
             mv.visitInsn(DUP);
             mv.visitVarInsn(ASTORE, 8);
-            mv.visitTypeInsn(INSTANCEOF, "org/luava/runtime/bytecode/LuaClosure");
+            mv.visitVarInsn(ALOAD, 0);
             Label notSelf = new Label();
             Label nextB = new Label();
-            mv.visitJumpInsn(IFEQ, notSelf);
-            mv.visitVarInsn(ALOAD, 8);
-            mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
-            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
-                    "Lorg/luava/runtime/bytecode/LuaProto;");
-            mv.visitVarInsn(ALOAD, 0);
-            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
-                    "Lorg/luava/runtime/bytecode/LuaProto;");
             mv.visitJumpInsn(IF_ACMPNE, notSelf);
             mv.visitInsn(ICONST_1);
             mv.visitVarInsn(ISTORE, flagSlot);
@@ -143,6 +177,17 @@ public final class LuaToJvmTranslator implements Opcodes {
             mv.visitVarInsn(ASTORE, cloSlot);
             mv.visitLabel(nextB);
         }
+    }
+
+    /**
+     * Emits the per-instruction bodies. Shared verbatim by {@code exec}
+     * (after the prologue) and {@code execInner} (after verified-closure
+     * init): fused call sites target {@code execInner} because the hoisted
+     * closures provably still hold.
+     */
+    private static void emitBody(MethodVisitor mv, String owner, LuaProto proto, Label[] labels,
+            int[] fusedUp, boolean[] skipStore, int[] fusedBList, int fusedBCount) {
+        int len = proto.code.length;
         for (int pc = 0; pc < len; pc++) {
             mv.visitLabel(labels[pc]);
             int inst = proto.code[pc];
@@ -289,7 +334,7 @@ public final class LuaToJvmTranslator implements Opcodes {
                             }
                         }
                     }
-                    emitCall(mv, internalName, proto, a, b - 1, pc, fusedUp[pc], slot);
+                    emitCall(mv, owner, proto, a, b - 1, pc, fusedUp[pc], slot, fusedBList, fusedBCount);
                 }
                 case OpCode.OP_RETURN1 -> {
                     emitGuardInt(mv, a, pc);
@@ -304,10 +349,6 @@ public final class LuaToJvmTranslator implements Opcodes {
         }
         // Fallthrough safety: never normally reached.
         emitDeopt(mv, len - 1);
-        mv.visitMaxs(0, 0);
-        mv.visitEnd();
-        cw.visitEnd();
-        return new Translation(internalName, cw.toByteArray());
     }
 
     /** Static analysis result: eligibility plus the purity flag. */
@@ -464,16 +505,17 @@ public final class LuaToJvmTranslator implements Opcodes {
      * interpreter.
      */
     private static void emitCall(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs, int pc,
-            int fusedB, int hoistSlot) {
+            int fusedB, int hoistSlot, int[] fusedBList, int fusedBCount) {
         Label done = new Label();
         if (hoistSlot >= 0) {
-            // Fast tier: entry-classified same-proto callee, no re-check.
+            // Fast tier: entry-classified self callee straight into the
+            // prologue-free inner entry (upvalues provably unchanged).
             mv.visitVarInsn(ILOAD, 9 + 2 * hoistSlot);
             Label general = new Label();
             mv.visitJumpInsn(IFEQ, general);
             mv.visitVarInsn(ALOAD, 10 + 2 * hoistSlot);
             mv.visitVarInsn(ASTORE, 8);
-            emitDirectInvoke(mv, owner, proto, a, nArgs, pc);
+            emitInnerInvoke(mv, owner, proto, a, nArgs, pc, fusedBList, fusedBCount);
             mv.visitJumpInsn(GOTO, done);
             mv.visitLabel(general);
         }
@@ -620,6 +662,61 @@ public final class LuaToJvmTranslator implements Opcodes {
         ldcInt(mv, a + 1);
         mv.visitInsn(IADD);
         mv.visitMethodInsn(INVOKESTATIC, owner, EXEC_NAME, EXEC_DESC, false);
+        mv.visitVarInsn(LSTORE, 6);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a);
+        mv.visitVarInsn(LLOAD, 6);
+        mv.visitInsn(LASTORE);
+        emitTagIntNull(mv, a);
+    }
+
+    /**
+     * Prologue-free self-recursion into {@code execInner}. The caller passes
+     * its entry-verified closures down, so the callee skips re-verification.
+     * Sound because the whole chain shares one closure (callee == self) and
+     * upvalues cannot change mid-flight.
+     */
+    private static void emitInnerInvoke(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs,
+            int pc, int[] fusedBList, int fusedBCount) {
+        // Capacity guard for the callee window.
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a + 1 + proto.maxStackSize);
+        mv.visitInsn(IADD);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitInsn(ARRAYLENGTH);
+        Label capOk = new Label();
+        mv.visitJumpInsn(IF_ICMPLT, capOk);
+        emitDeopt(mv, pc);
+        mv.visitLabel(capOk);
+        // Missing arguments are nil-filled exactly like the interpreter.
+        if (nArgs < proto.numParams) {
+            mv.visitVarInsn(ALOAD, 2);
+            mv.visitVarInsn(ALOAD, 3);
+            mv.visitVarInsn(ALOAD, 4);
+            mv.visitVarInsn(ILOAD, 5);
+            ldcInt(mv, a + 1 + nArgs);
+            mv.visitInsn(IADD);
+            mv.visitVarInsn(ILOAD, 5);
+            ldcInt(mv, a + 1 + proto.numParams);
+            mv.visitInsn(IADD);
+            mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "nilFill",
+                    "([J[B[Lorg/luava/runtime/LuaValue;II)V", false);
+        }
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
+        mv.visitInsn(DUP);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "upvals",
+                "[Lorg/luava/runtime/eval/Upvalue;");
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a + 1);
+        mv.visitInsn(IADD);
+        for (int i = 0; i < fusedBCount; i++) {
+            mv.visitVarInsn(ALOAD, 10 + 2 * i);
+        }
+        mv.visitMethodInsn(INVOKESTATIC, owner, EXEC_INNER_NAME, innerDesc(fusedBCount), false);
         mv.visitVarInsn(LSTORE, 6);
         mv.visitVarInsn(ALOAD, 2);
         emitIndex(mv, a);

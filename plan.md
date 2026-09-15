@@ -78,7 +78,7 @@
 | # | Task | Luava | LuaJ 3.0.1 | Tỷ lệ | Trạng thái |
 |---|---|---|---|---|---|
 | 01 | arith_loop | ~196ms | ~264ms | **0.74×** | THẮNG |
-| 02 | fibonacci | ~4400ms (interp) / **~400ms (JIT)** | ~2410ms | 1.82× → **0.17× THẮNG** |
+| 02 | fibonacci | ~4400ms (interp) / **~254ms (JIT)** | ~2410ms | 1.82× → **0.11× THẮNG 9.5×** |
 | 03 | table_ops | ~97ms | ~94ms | 1.04× | HÒA |
 | 04 | string_concat | ~82ms | ~46ms | 1.76× | THUA |
 | 05 | closures | ~93ms (interp) / **~66ms (JIT)** | ~55ms | 2.01× → **1.15× (sát nút)** |
@@ -200,7 +200,9 @@ Cổng chuẩn dùng chung:
    `README.md`, `docs/`.
 2. Backup harness tạm (`/tmp/opencode/prof/Bench*.java`,
    `/tmp/opencode/vs/LuaJ*`, `aggsample.py`, jars A/B, `jitspike/`) vào
-   `benchmarks/harness/` (untracked, không commit) để tái lập interleave.
+   `benchmarks/harness/` (số liệu/jar tạm không commit; riêng
+   `interleave.sh`, `Bench.java`, `LuaJBench.java`, `BASELINE.txt` được
+   track như hạ tầng đo lường).
 3. Viết script `benchmarks/harness/interleave.sh`:
    nhận 2 jar + task list → chạy 7 cặp đảo thứ tự, in median ratio.
 4. Ghi baseline hiện tại (§2.1) vào `benchmarks/harness/BASELINE.txt`.
@@ -272,8 +274,10 @@ tổng quát cho tập opcode số học.
   `JIT_HOT_THRESHOLD=1` để 21 proto trong suite thực sự compile — 4 deopt
   fallback đúng). Fuzz 20 kernel biên (float/missing/string args, pcall,
   closures) byte-identical on/off.
-- G-PERF: ✅ fib **4943ms → 402ms (12.3×)**, LuaJ 2460ms → **thắng 6×**;
-  9 task còn lại trong noise (±3%, đã xác minh lại closures/hash bằng 10 cặp).
+- G-PERF: ✅ fib **4943ms → 402ms (12.3×)** rồi **→ 254ms (19.5×)** sau
+  tối ưu `execInner` (bỏ prologue `getValue`-upvalue-mở ~28% theo
+  async-profiler leaf); LuaJ 2460ms → **thắng 9.5×**; 9 task còn lại trong
+  noise (±3%, đã xác minh lại closures/hash bằng 10 cặp).
 - G-COMPILE: ✅ async-profiler thấy `Gen$*.exec` đệ quy C2.
 - **Gate quyết định: VƯỢT** (400ms ≤ 500ms; mục tiêu 200ms còn hở — tối ưu
   GETUPVAL/CALL guard là dư địa Phase 3).
@@ -323,17 +327,24 @@ interpreter — subset không chứa chúng). G-PERF: closures hòa→thắng n�
 
 ---
 
-### Phase 4 — Hotness, tier-up, tương tác VM (3–5 ngày)
+### Phase 4 — Hotness, tier-up, tương tác VM — ✅ XONG v1 (2026-09-15, trừ default-true)
 
-**Việc:**
-1. Bộ đếm nóng trong `runLoop` cho `OP_CALL`/`OP_FORLOOP` backedge; tier-up
-   khi vượt ngưỡng.
-2. Chọn ứng viên JIT: proto ≤ 200 lệnh, không `mayYield`, không chứa lệnh
-   chưa hỗ trợ.
-3. `LuaState.ENABLE_JIT` mặc định **true** sau khi Phase 2–3 xanh; nhưng
-   vẫn cho phép tắt để so sánh.
-4. Chống JIT storm: proto deopt > K lần → đưa vào danh sách "never-JIT".
-5. Đo overhead khi bật JIT trên task không hưởng lợi (đảm bảo không regression).
+**Việc (đã làm):**
+1. Bộ đếm nóng `hotCount` trong `executeCallOp`; tier-up ở ngưỡng 50.
+2. Chọn ứng viên: `analyze()` (≤200 lệnh, không mayYield, subset thuần).
+3. `ENABLE_JIT` **giữ mặc định false** (thận trọng; §9) — bật bằng
+   `-Dluava.jit=true`. Compile **nền** (daemon `luava-jit`, queue collapse
+   trùng, `jitQueued`) để request nóng không trả phí compile;
+   `-Dluava.jit.sync=true` cho đo đạc đơn định (harness dùng).
+4. Chống JIT storm: deopt > 8 → clear + `jitDisabled`; compile fail →
+   `jitDisabled` ngay (tránh enqueue lặp); cache LRU 512.
+5. Prewarm API `JitCompiler.prewarm(closure)` cho server (compile trước
+   khi nhận traffic).
+6. Overhead khi JIT bật trên task không hưởng lợi: interleave base-vs-JIT
+   7 cặp — mọi task trong noise, không regression.
+
+**Chưa làm:** default true (chờ Phase 5–6); backedge counter cho loop
+(ít giá trị khi loop nằm ở main chunk lạnh).
 
 **Gates:** G-CORRECT (suite chạy cả 2 chế độ JIT on/off). G-PERF: không task
 nào regression > 3%.

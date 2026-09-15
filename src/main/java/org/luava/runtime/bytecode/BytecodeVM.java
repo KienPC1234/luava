@@ -973,22 +973,14 @@ public final class BytecodeVM {
             if (hot < LuaState.JIT_HOT_THRESHOLD) {
                 return false;
             }
+            // Tier-up is a request: background thread compiles (or
+            // synchronously under luava.jit.sync); this call stays interpreted.
             try {
-                jc = JitCompiler.tryCompile(proto);
+                org.luava.runtime.jit.JitCompiler.requestCompile(proto);
             } catch (Throwable t) {
                 proto.jitDisabled = true;
-                return false;
             }
-            if (jc == null) {
-                proto.jitDisabled = true;
-                if (jitDebug()) {
-                    System.err.println("[jit] not eligible: " + proto.name);
-                }
-                return false;
-            }
-            if (jitDebug()) {
-                System.err.println("[jit] compiled: " + proto.name);
-            }
+            return false;
         }
         int base = funcIdx + 1;
         if (nActualArgs < proto.numParams) {
