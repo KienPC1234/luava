@@ -81,7 +81,7 @@
 | 02 | fibonacci | ~4400ms (interp) / **~400ms (JIT)** | ~2410ms | 1.82× → **0.17× THẮNG** |
 | 03 | table_ops | ~97ms | ~94ms | 1.04× | HÒA |
 | 04 | string_concat | ~82ms | ~46ms | 1.76× | THUA |
-| 05 | closures | ~68ms | ~34ms | 2.01× | THUA (call-tax) |
+| 05 | closures | ~93ms (interp) / **~66ms (JIT)** | ~55ms | 2.01× → **1.15× (sát nút)** |
 | 06 | coroutines | ~282ms | ~4415ms | **0.06×** | THẮNG 16× |
 | 07 | hash_table | ~114ms | ~181ms | **0.63×** | THẮNG |
 | 08 | oop_metatables | ~701ms | ~594ms | 1.18× | THUA |
@@ -288,23 +288,36 @@ nghĩa. Giảm thiểu: khởi đầu chỉ int, guard dày, test fuzz. Rollback
 
 ---
 
-### Phase 3 — Call-site tổng quát: PIC & invokedynamic (1–2 tuần)
+### Phase 3 — Call-site tổng quát: PIC & invokedynamic — ✅ XONG v1 (2026-09-15, monomorphic, chưa invokedynamic)
 
-**Việc:**
-1. Call-site monomorphic: cache `MethodHandle` theo `(callerProto, pc)`.
-   Guard `callee.proto == cachedProto` → invoke handle; sai → megamorphic.
-2. Megamorphic: phát `invokedynamic` với Bootstrap Method của Luava; PIC
-   đa hình (giới hạn 4–8 entry) tới `MethodHandle` của proto tương ứng.
-   Vượt ngưỡng → fallback interpreter cho site đó.
-3. Hàm không JIT-able (yield/qua lớn) → handle trỏ về entry interpreter.
-4. Closure creation (`OP_CLOSURE`) trong code JIT: gọi helper VM tạo
-   `LuaClosure` + upvalue (không cần JIT hóa upvalue mở ở phase này).
+**Việc (đã làm):**
+1. Call-site monomorphic 3 tầng trong code JIT: hoisted self (phân loại ở
+   entry, không re-check), self-direct `INVOKESTATIC`, callee proto khác có
+   `jitCode && pure` qua `JitRuntime.invoke` helper. Callee lạ → deopt.
+   (Bài học: hoisting "mọi callee cùng proto" SAI với `add` — sửa thành
+   classify + slow path re-validate.)
+2. `SETUPVAL` leaf + lane int cho upvalue (`Upvalue.isClosedInt/
+   getClosedInt/setClosedInt`; open/non-int → generic/deopt).
+3. Sửa gốc `Upvalue.setValue` giữ tag nguyên thủy (int/float) thay vì ép
+   OBJECT — xóa cả một lớp deopt ở biên tier-up (closure tạo trước khi
+   compile).
+4. Quy tắc an toàn: proto có CALL thì phải pure; impure leaf thì
+   `numParams==0` (resume-at-pc không bị frame setup clobber).
 
-**File:** `runtime/jit/PicCallSite.java`, `CallSiteBootstrap.java`,
-`LuaToJvmTranslator.java`.
+**Kết quả:** closures **~80ms → ~65ms (thắng 1.23× nội bộ, chỉ còn thua
+LuaJ 1.15×)**; fib giữ ~400ms; 8 task còn lại trong noise. 30/30 + 111 xanh
+cả hai chế độ (ép threshold=1: 24 proto compile, deopt fallback đúng);
+fuzz 35/35 đồng nhất.
 
-**Gates:** G-CORRECT (metamethod call, __call, Java function, coroutine-safe
-fallback). G-PERF: closures ≤ 45ms (mục tiêu), oop cải thiện ≥ 20%.
+**Chưa làm (dời):** `invokedynamic` + PIC đa hình thật, megamorphic
+fallback — chỉ cần khi oop/metatable vào diện (Phase 5). TAILCALL trong JIT
+hiện từ chối conservative (compiler biến `return f()` thành TAILCALL).
+
+**File:** `runtime/jit/JitRuntime.java`, `LuaToJvmTranslator.java`,
+`Upvalue.java` (lane int).
+
+**Gates:** ✅ G-CORRECT (metamethod/`__call`/Java/coroutine đều deopt về
+interpreter — subset không chứa chúng). G-PERF: closures hòa→thắng nội bộ.
 
 **Rollback:** flag; call-site luôn có đường interpreter.
 
