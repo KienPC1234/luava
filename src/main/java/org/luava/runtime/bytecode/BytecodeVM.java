@@ -968,6 +968,9 @@ public final class BytecodeVM {
             return 0;
         }
         LuaProto proto = child.proto;
+        if (proto.mayYield) {
+            return 0;
+        }
         JitCode jc = proto.jitCode;
         if (jc == null) {
             if (proto.jitDisabled) {
@@ -1004,6 +1007,7 @@ public final class BytecodeVM {
                 ctx.pStack = pStack;
                 ctx.tStack = tStack;
                 ctx.oStack = oStack;
+                ctx.top = base + proto.numParams;
                 closeOnJitReturn(state, ctx, base);
                 if (nResults == 1) {
                     setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, r);
@@ -1029,6 +1033,9 @@ public final class BytecodeVM {
             ctx.pStack = pStack;
             ctx.tStack = tStack;
             ctx.oStack = oStack;
+            // Mirror the interpreter: after a fixed call its top is the
+            // callee flavor (pure callees never move it).
+            ctx.top = base + proto.numParams;
             closeOnJitReturn(state, ctx, base);
             if (nResults == 1) {
                 ctx.pStack[funcIdx] = r;

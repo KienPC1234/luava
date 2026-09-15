@@ -485,6 +485,9 @@ mục tiêu chỉ là "hòa call-heavy cơ bản".
 | Thử nghiệm | Kết quả | Nguyên nhân thất bại |
 |---|---|---|
 | JIT `OP_CLOSURE`/object-return (`make_counter`) | closures 66→76ms (+15%, paired 7) | body toàn allocation, helper tốn 2 ThreadLocal lookup; revert, factories ở interpreter |
+| Thứ tự shift/move sai trong TAILCALL (`a < nArgs`) | (chưa nổ: compiler luôn đặt `a ≥ nArgs`; bắt bằng review) | move func trước, shift sau; base-1 không overlap nguồn |
+| `ctx.top` stale sau frameless call | (chưa nổ: compiler luôn thiết lập lại trước open-use; bắt bằng audit) | mirror `top = base+numParams` cho giống interpreter hệt |
+| General-call arity `==` thành `>=` + nilFill | (tránh deopt-disable oan cho gọi thừa/thiếu args) | extras bỏ qua, thiếu nil-fill như interpreter |
 | SETLIST descriptor thừa 1 int | ASM verify `NegativeArraySizeException` | đếm nhầm params helper (6 không phải 7); probe dịch trực tiếp bắt ngay |
 | Cổng `JitCompiler` cấm TAILCALL từ Phase 2 | tailcall protos "not eligible" dù translator xong | quên mở cổng khi thêm op; probe chỉ ra |
 | Kỳ vọng sai trong probe (`mix`) | tưởng JIT sai (600 vs 45750) | tự tính nhẩm sai: Σ(2+n−n)=600 mới đúng; luôn assert bằng tay trước |

@@ -622,7 +622,7 @@ public final class LuaToJvmTranslator implements Opcodes {
                     }
                     int resumePc = fusedDef[pc] >= 0 ? fusedDef[pc] : pc;
                     emitTailCall(mv, owner, proto, a, b - 1, resumePc, fusedUp[pc], slot, fusedBList,
-                            fusedBCount);
+                            fusedBCount, labels);
                 }
                 case OpCode.OP_RETURN1 -> emitReturnOne(mv, a, pc, returnsInt);
                 case OpCode.OP_RETURN -> {
@@ -1112,8 +1112,23 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ALOAD, 20);
         mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "numParams", "I");
         Label arityOk = new Label();
-        mv.visitJumpInsn(IF_ICMPEQ, arityOk);
-        emitDeopt(mv, resumePc);
+        // Extra arguments are ignored (caller scratch); missing ones are
+        // nil-filled exactly like the interpreter, so neither deopts.
+        mv.visitJumpInsn(IF_ICMPGE, arityOk);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a + 1 + nArgs);
+        mv.visitInsn(IADD);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a + 1);
+        mv.visitInsn(IADD);
+        mv.visitVarInsn(ALOAD, 20);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "numParams", "I");
+        mv.visitInsn(IADD);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "nilFill",
+                "([J[B[Lorg/luava/runtime/LuaValue;II)V", false);
         mv.visitLabel(arityOk);
         // Dynamic capacity guard with the callee's own maxStack.
         mv.visitVarInsn(ILOAD, 5);
@@ -1153,6 +1168,27 @@ public final class LuaToJvmTranslator implements Opcodes {
     }
 
     /**
+     * Bulk-moves {@code count} triple-stack registers from
+     * {@code base+src} to {@code base+dst} (overlap-safe, used by TAILCALL
+     * argument shifting).
+     */
+    private static void arraycopyTriple(MethodVisitor mv, int src, int dst, int count) {
+        for (int local : new int[] {2, 3, 4}) {
+            mv.visitVarInsn(ALOAD, local);
+            mv.visitVarInsn(ILOAD, 5);
+            ldcInt(mv, src);
+            mv.visitInsn(IADD);
+            mv.visitVarInsn(ALOAD, local);
+            mv.visitVarInsn(ILOAD, 5);
+            ldcInt(mv, dst);
+            mv.visitInsn(IADD);
+            ldcInt(mv, count);
+            mv.visitMethodInsn(INVOKESTATIC, "java/lang/System", "arraycopy",
+                    "(Ljava/lang/Object;ILjava/lang/Object;II)V", false);
+        }
+    }
+
+    /**
      * Tail call: shifts the arguments down to our own window, moves the
      * function to our result slot, invokes the callee with our base, and
      * returns its single result directly. The callee must be pure (same
@@ -1160,73 +1196,35 @@ public final class LuaToJvmTranslator implements Opcodes {
      * re-executes the tail call with committed prefix state intact.
      */
     private static void emitTailCall(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs,
-            int resumePc, int fusedB, int hoistSlot, int[] fusedBList, int fusedBCount) {
-        if (nArgs > 0) {
-            // System.arraycopy for the triple stack (overlap-safe memmove).
-            mv.visitVarInsn(ALOAD, 2);
-            mv.visitVarInsn(ILOAD, 5);
-            ldcInt(mv, a + 1);
-            mv.visitInsn(IADD);
-            mv.visitVarInsn(ALOAD, 2);
-            mv.visitVarInsn(ILOAD, 5);
-            ldcInt(mv, nArgs);
-            mv.visitMethodInsn(INVOKESTATIC, "java/lang/System", "arraycopy",
-                    "(Ljava/lang/Object;ILjava/lang/Object;II)V", false);
-            mv.visitVarInsn(ALOAD, 3);
-            mv.visitVarInsn(ILOAD, 5);
-            ldcInt(mv, a + 1);
-            mv.visitInsn(IADD);
-            mv.visitVarInsn(ALOAD, 3);
-            mv.visitVarInsn(ILOAD, 5);
-            ldcInt(mv, nArgs);
-            mv.visitMethodInsn(INVOKESTATIC, "java/lang/System", "arraycopy",
-                    "(Ljava/lang/Object;ILjava/lang/Object;II)V", false);
-            mv.visitVarInsn(ALOAD, 4);
-            mv.visitVarInsn(ILOAD, 5);
-            ldcInt(mv, a + 1);
-            mv.visitInsn(IADD);
-            mv.visitVarInsn(ALOAD, 4);
-            mv.visitVarInsn(ILOAD, 5);
-            ldcInt(mv, nArgs);
-            mv.visitMethodInsn(INVOKESTATIC, "java/lang/System", "arraycopy",
-                    "(Ljava/lang/Object;ILjava/lang/Object;II)V", false);
-        }
-        // Move the function value to our result slot (base - 1).
-        mv.visitVarInsn(ALOAD, 2);
-        mv.visitVarInsn(ILOAD, 5);
-        mv.visitLdcInsn(-1);
-        mv.visitInsn(IADD);
-        mv.visitVarInsn(ALOAD, 2);
-        emitIndex(mv, a);
-        mv.visitInsn(LALOAD);
-        mv.visitInsn(LASTORE);
-        mv.visitVarInsn(ALOAD, 3);
-        mv.visitVarInsn(ILOAD, 5);
-        mv.visitLdcInsn(-1);
-        mv.visitInsn(IADD);
-        mv.visitVarInsn(ALOAD, 3);
-        emitIndex(mv, a);
-        mv.visitInsn(BALOAD);
-        mv.visitInsn(BASTORE);
-        mv.visitVarInsn(ALOAD, 4);
-        mv.visitVarInsn(ILOAD, 5);
-        mv.visitLdcInsn(-1);
-        mv.visitInsn(IADD);
-        mv.visitVarInsn(ALOAD, 4);
-        emitIndex(mv, a);
-        mv.visitInsn(AALOAD);
-        mv.visitInsn(AASTORE);
+            int resumePc, int fusedB, int hoistSlot, int[] fusedBList, int fusedBCount, Label[] labels) {
         if (hoistSlot >= 0) {
+            // Self tail recursion on the same closure: reuse our own window
+            // as a true loop (no Java stack growth), then re-enter at pc 0.
+            // Sound: identical closure, identical upvalue array, and missing
+            // params are nil-filled exactly like the interpreter.
             mv.visitVarInsn(ILOAD, 9 + 2 * hoistSlot);
             Label general = new Label();
             mv.visitJumpInsn(IFEQ, general);
-            mv.visitVarInsn(ALOAD, 10 + 2 * hoistSlot);
-            mv.visitVarInsn(ASTORE, 8);
-            emitTailInnerInvoke(mv, owner, proto, nArgs, resumePc, fusedBList, fusedBCount);
-            mv.visitInsn(LRETURN);
+            if (nArgs > 0) {
+                arraycopyTriple(mv, a + 1, 0, nArgs);
+            }
+            if (nArgs < proto.numParams) {
+                mv.visitVarInsn(ALOAD, 2);
+                mv.visitVarInsn(ALOAD, 3);
+                mv.visitVarInsn(ALOAD, 4);
+                mv.visitVarInsn(ILOAD, 5);
+                ldcInt(mv, nArgs);
+                mv.visitInsn(IADD);
+                mv.visitVarInsn(ILOAD, 5);
+                ldcInt(mv, proto.numParams);
+                mv.visitInsn(IADD);
+                mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "nilFill",
+                        "([J[B[Lorg/luava/runtime/LuaValue;II)V", false);
+            }
+            mv.visitJumpInsn(GOTO, labels[0]);
             mv.visitLabel(general);
         }
-        // Resolve from the moved slot (or straight from the upvalue).
+        // Resolve from the original slot (or straight from the upvalue).
         if (fusedB >= 0) {
             mv.visitVarInsn(ALOAD, 1);
             ldcInt(mv, fusedB);
@@ -1236,9 +1234,7 @@ public final class LuaToJvmTranslator implements Opcodes {
                     "()Lorg/luava/runtime/LuaValue;", false);
         } else {
             mv.visitVarInsn(ALOAD, 4);
-            mv.visitVarInsn(ILOAD, 5);
-            mv.visitLdcInsn(-1);
-            mv.visitInsn(IADD);
+            emitIndex(mv, a);
             mv.visitInsn(AALOAD);
         }
         mv.visitInsn(DUP);
@@ -1248,6 +1244,11 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitJumpInsn(IFNE, isClosure);
         emitDeopt(mv, resumePc);
         mv.visitLabel(isClosure);
+        // Shift arguments down onto our own window now that the callee sits
+        // safely in local 8; arraycopy is overlap-safe either way.
+        if (nArgs > 0) {
+            arraycopyTriple(mv, a + 1, 0, nArgs);
+        }
         mv.visitVarInsn(ALOAD, 8);
         mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
         mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
@@ -1294,8 +1295,21 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ALOAD, 20);
         mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "numParams", "I");
         Label arityOk = new Label();
-        mv.visitJumpInsn(IF_ICMPEQ, arityOk);
-        emitDeopt(mv, resumePc);
+        // Tail callee reuses our window: extra args ignored, missing ones
+        // nil-filled exactly like the interpreter.
+        mv.visitJumpInsn(IF_ICMPGE, arityOk);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, nArgs);
+        mv.visitInsn(IADD);
+        mv.visitVarInsn(ILOAD, 5);
+        mv.visitVarInsn(ALOAD, 20);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "numParams", "I");
+        mv.visitInsn(IADD);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "nilFill",
+                "([J[B[Lorg/luava/runtime/LuaValue;II)V", false);
         mv.visitLabel(arityOk);
         mv.visitVarInsn(ILOAD, 5);
         mv.visitVarInsn(ALOAD, 20);
@@ -1358,47 +1372,6 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ALOAD, 4);
         mv.visitVarInsn(ILOAD, 5);
         emitGuardedInvoke(mv, owner, EXEC_NAME, EXEC_DESC, resumePc);
-        mv.visitInsn(LRETURN);
-    }
-
-    /** Tail-call into the prologue-free inner entry with verified closures. */
-    private static void emitTailInnerInvoke(MethodVisitor mv, String owner, LuaProto proto, int nArgs,
-            int resumePc, int[] fusedBList, int fusedBCount) {
-        mv.visitVarInsn(ILOAD, 5);
-        ldcInt(mv, proto.maxStackSize);
-        mv.visitInsn(IADD);
-        mv.visitVarInsn(ALOAD, 2);
-        mv.visitInsn(ARRAYLENGTH);
-        Label capOk = new Label();
-        mv.visitJumpInsn(IF_ICMPLT, capOk);
-        emitDeopt(mv, resumePc);
-        mv.visitLabel(capOk);
-        if (nArgs < proto.numParams) {
-            mv.visitVarInsn(ALOAD, 2);
-            mv.visitVarInsn(ALOAD, 3);
-            mv.visitVarInsn(ALOAD, 4);
-            mv.visitVarInsn(ILOAD, 5);
-            ldcInt(mv, nArgs);
-            mv.visitInsn(IADD);
-            mv.visitVarInsn(ILOAD, 5);
-            ldcInt(mv, proto.numParams);
-            mv.visitInsn(IADD);
-            mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "nilFill",
-                    "([J[B[Lorg/luava/runtime/LuaValue;II)V", false);
-        }
-        mv.visitVarInsn(ALOAD, 8);
-        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
-        mv.visitInsn(DUP);
-        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "upvals",
-                "[Lorg/luava/runtime/eval/Upvalue;");
-        mv.visitVarInsn(ALOAD, 2);
-        mv.visitVarInsn(ALOAD, 3);
-        mv.visitVarInsn(ALOAD, 4);
-        mv.visitVarInsn(ILOAD, 5);
-        for (int i = 0; i < fusedBCount; i++) {
-            mv.visitVarInsn(ALOAD, 10 + 2 * i);
-        }
-        emitGuardedInvoke(mv, owner, EXEC_INNER_NAME, innerDesc(fusedBCount), resumePc);
         mv.visitInsn(LRETURN);
     }
 
