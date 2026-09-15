@@ -101,14 +101,15 @@ public final class LuaToJvmTranslator implements Opcodes {
                 }
             }
         }
-        // Entry prologue: verify each fused callee once per invocation.
-        // Upvalues cannot change mid-flight (no hooks, no yield, no writes
-        // in the pure subset), so hoisting is sound; any mismatch deopts
-        // before any register is touched.
+        // Entry prologue: classify each distinct fused callee once per
+        // invocation. Upvalues cannot change mid-flight (no hooks, no yield,
+        // no writes in the pure subset), so recording "is this the same
+        // proto as self" here is sound; the general path re-validates
+        // anyway. A mismatch only selects the slow path, never deopts.
         for (int i = 0; i < fusedBCount; i++) {
             int b = fusedBList[i];
-            int cloSlot = 9 + 2 * i;
-            int upSlot = 10 + 2 * i;
+            int flagSlot = 9 + 2 * i;
+            int cloSlot = 10 + 2 * i;
             mv.visitVarInsn(ALOAD, 1);
             ldcInt(mv, b);
             mv.visitInsn(AALOAD);
@@ -118,27 +119,29 @@ public final class LuaToJvmTranslator implements Opcodes {
             mv.visitInsn(DUP);
             mv.visitVarInsn(ASTORE, 8);
             mv.visitTypeInsn(INSTANCEOF, "org/luava/runtime/bytecode/LuaClosure");
-            Label isClosure = new Label();
-            mv.visitJumpInsn(IFNE, isClosure);
-            emitDeopt(mv, 0);
-            mv.visitLabel(isClosure);
+            Label notSelf = new Label();
+            Label nextB = new Label();
+            mv.visitJumpInsn(IFEQ, notSelf);
             mv.visitVarInsn(ALOAD, 8);
             mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
-            mv.visitInsn(DUP);
-            mv.visitVarInsn(ASTORE, cloSlot);
             mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
                     "Lorg/luava/runtime/bytecode/LuaProto;");
             mv.visitVarInsn(ALOAD, 0);
             mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
                     "Lorg/luava/runtime/bytecode/LuaProto;");
-            Label sameProto = new Label();
-            mv.visitJumpInsn(IF_ACMPEQ, sameProto);
-            emitDeopt(mv, 0);
-            mv.visitLabel(sameProto);
-            mv.visitVarInsn(ALOAD, cloSlot);
-            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "upvals",
-                    "[Lorg/luava/runtime/eval/Upvalue;");
-            mv.visitVarInsn(ASTORE, upSlot);
+            mv.visitJumpInsn(IF_ACMPNE, notSelf);
+            mv.visitInsn(ICONST_1);
+            mv.visitVarInsn(ISTORE, flagSlot);
+            mv.visitVarInsn(ALOAD, 8);
+            mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
+            mv.visitVarInsn(ASTORE, cloSlot);
+            mv.visitJumpInsn(GOTO, nextB);
+            mv.visitLabel(notSelf);
+            mv.visitInsn(ICONST_0);
+            mv.visitVarInsn(ISTORE, flagSlot);
+            mv.visitInsn(ACONST_NULL);
+            mv.visitVarInsn(ASTORE, cloSlot);
+            mv.visitLabel(nextB);
         }
         for (int pc = 0; pc < len; pc++) {
             mv.visitLabel(labels[pc]);
@@ -161,19 +164,61 @@ public final class LuaToJvmTranslator implements Opcodes {
                     if (skipStore[pc]) {
                         break;
                     }
-                    // o[base+a] = up[b].getValue(), tag via setLuaValue helper.
-                    mv.visitVarInsn(ALOAD, 2);
-                    mv.visitVarInsn(ALOAD, 3);
-                    mv.visitVarInsn(ALOAD, 4);
-                    emitIndex(mv, a);
+                    // Fast lane: closed integer upvalue, no boxing.
                     mv.visitVarInsn(ALOAD, 1);
                     ldcInt(mv, b);
                     mv.visitInsn(AALOAD);
                     mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/eval/Upvalue");
+                    mv.visitInsn(DUP);
+                    mv.visitVarInsn(ASTORE, 8);
+                    mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/eval/Upvalue", "isClosedInt",
+                            "()Z", false);
+                    Label generic = new Label();
+                    Label doneUv = new Label();
+                    mv.visitJumpInsn(IFEQ, generic);
+                    mv.visitVarInsn(ALOAD, 8);
+                    mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/eval/Upvalue", "getClosedInt",
+                            "()J", false);
+                    mv.visitVarInsn(LSTORE, 6);
+                    mv.visitVarInsn(ALOAD, 2);
+                    emitIndex(mv, a);
+                    mv.visitVarInsn(LLOAD, 6);
+                    mv.visitInsn(LASTORE);
+                    emitTagIntNull(mv, a);
+                    mv.visitJumpInsn(GOTO, doneUv);
+                    mv.visitLabel(generic);
+                    mv.visitVarInsn(ALOAD, 2);
+                    mv.visitVarInsn(ALOAD, 3);
+                    mv.visitVarInsn(ALOAD, 4);
+                    emitIndex(mv, a);
+                    mv.visitVarInsn(ALOAD, 8);
                     mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/eval/Upvalue", "getValue",
                             "()Lorg/luava/runtime/LuaValue;", false);
                     mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/bytecode/BytecodeVM", "setLuaValue",
                             "([J[B[Lorg/luava/runtime/LuaValue;ILorg/luava/runtime/LuaValue;)V", false);
+                    mv.visitLabel(doneUv);
+                }
+                case OpCode.OP_SETUPVAL -> {
+                    // Leaf-only (eligibility): closed-integer upvalue write.
+                    emitGuardInt(mv, a, pc);
+                    mv.visitVarInsn(ALOAD, 1);
+                    ldcInt(mv, b);
+                    mv.visitInsn(AALOAD);
+                    mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/eval/Upvalue");
+                    mv.visitInsn(DUP);
+                    mv.visitVarInsn(ASTORE, 8);
+                    mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/eval/Upvalue", "isClosedInt",
+                            "()Z", false);
+                    Label uvOk = new Label();
+                    mv.visitJumpInsn(IFNE, uvOk);
+                    emitDeopt(mv, pc);
+                    mv.visitLabel(uvOk);
+                    mv.visitVarInsn(ALOAD, 8);
+                    mv.visitVarInsn(ALOAD, 2);
+                    emitIndex(mv, a);
+                    mv.visitInsn(LALOAD);
+                    mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/eval/Upvalue", "setClosedInt",
+                            "(J)V", false);
                 }
                 case OpCode.OP_ADD -> emitArith(mv, a, b, c, pc, LADD);
                 case OpCode.OP_SUB -> emitArith(mv, a, b, c, pc, LSUB);
@@ -244,7 +289,7 @@ public final class LuaToJvmTranslator implements Opcodes {
                             }
                         }
                     }
-                    emitCall(mv, internalName, proto, a, pc, fusedUp[pc], slot);
+                    emitCall(mv, internalName, proto, a, b - 1, pc, fusedUp[pc], slot);
                 }
                 case OpCode.OP_RETURN1 -> {
                     emitGuardInt(mv, a, pc);
@@ -265,23 +310,35 @@ public final class LuaToJvmTranslator implements Opcodes {
         return new Translation(internalName, cw.toByteArray());
     }
 
-    /** Strict integer-subset eligibility; anything else stays interpreted. */
-    public static boolean eligible(LuaProto proto) {
+    /** Static analysis result: eligibility plus the purity flag. */
+    public record Info(boolean pure) {}
+
+    /**
+     * Analyzes a proto for the integer subset. Returns null when any
+     * reachable shape is unsupported. Rules preserving deopt-restart
+     * safety: a proto with calls must be pure (no upvalue writes), and an
+     * impure leaf must take no parameters (frame setup would otherwise
+     * clobber JIT state on resume-at-pc).
+     */
+    public static Info analyze(LuaProto proto) {
         if (proto.isVararg || proto.protos.length != 0) {
-            return false;
+            return null;
         }
         int[] code = proto.code;
         if (code.length == 0 || code.length > 200) {
-            return false;
+            return null;
         }
         if (proto.maxStackSize > 64 || proto.numParams > 16) {
-            return false;
+            return null;
         }
+        boolean hasCalls = false;
+        boolean hasSetupVal = false;
         for (int inst : code) {
             switch (Instruction.getOp(inst)) {
                 case OpCode.OP_MOVE,
                         OpCode.OP_LOADI,
                         OpCode.OP_GETUPVAL,
+                        OpCode.OP_SETUPVAL,
                         OpCode.OP_ADD,
                         OpCode.OP_SUB,
                         OpCode.OP_ADDI,
@@ -298,22 +355,37 @@ public final class LuaToJvmTranslator implements Opcodes {
                 case OpCode.OP_LOADK -> {
                     LuaValue kv = proto.constants[Instruction.getBx(inst)];
                     if (!(kv instanceof LuaInteger)) {
-                        return false;
+                        return null;
                     }
                 }
                 default -> {
-                    return false;
+                    return null;
                 }
             }
+            if (Instruction.getOp(inst) == OpCode.OP_SETUPVAL) {
+                hasSetupVal = true;
+            }
             if (Instruction.getOp(inst) == OpCode.OP_CALL) {
+                hasCalls = true;
                 int bb = Instruction.getB(inst);
                 int cc = Instruction.getC(inst);
-                if (bb != 2 || cc != 2) {
-                    return false;
+                if (bb < 1 || cc != 2) {
+                    return null;
                 }
             }
         }
-        return true;
+        if (hasCalls && hasSetupVal) {
+            return null;
+        }
+        if (hasSetupVal && proto.numParams != 0) {
+            return null;
+        }
+        return new Info(!hasSetupVal);
+    }
+
+    /** Strict integer-subset eligibility; anything else stays interpreted. */
+    public static boolean eligible(LuaProto proto) {
+        return analyze(proto) != null;
     }
 
     private static void emitMove(MethodVisitor mv, int a, int b) {
@@ -385,8 +457,132 @@ public final class LuaToJvmTranslator implements Opcodes {
         }
     }
 
-    private static void emitCall(MethodVisitor mv, String owner, LuaProto proto, int a, int pc, int fusedB,
-            int hoistSlot) {
+    /**
+     * Call site with three tiers: hoisted self (classified at entry),
+     * resolved self (same proto, direct INVOKESTATIC), or another pure JIT
+     * proto via the {@link JitRuntime} helper. Anything else deopts to the
+     * interpreter.
+     */
+    private static void emitCall(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs, int pc,
+            int fusedB, int hoistSlot) {
+        Label done = new Label();
+        if (hoistSlot >= 0) {
+            // Fast tier: entry-classified same-proto callee, no re-check.
+            mv.visitVarInsn(ILOAD, 9 + 2 * hoistSlot);
+            Label general = new Label();
+            mv.visitJumpInsn(IFEQ, general);
+            mv.visitVarInsn(ALOAD, 10 + 2 * hoistSlot);
+            mv.visitVarInsn(ASTORE, 8);
+            emitDirectInvoke(mv, owner, proto, a, nArgs, pc);
+            mv.visitJumpInsn(GOTO, done);
+            mv.visitLabel(general);
+        }
+        // Resolve the callee closure (fused: straight from the upvalue).
+        if (fusedB >= 0) {
+            mv.visitVarInsn(ALOAD, 1);
+            ldcInt(mv, fusedB);
+            mv.visitInsn(AALOAD);
+            mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/eval/Upvalue");
+            mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/eval/Upvalue", "getValue",
+                    "()Lorg/luava/runtime/LuaValue;", false);
+        } else {
+            mv.visitVarInsn(ALOAD, 4);
+            emitIndex(mv, a);
+            mv.visitInsn(AALOAD);
+        }
+        mv.visitInsn(DUP);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitTypeInsn(INSTANCEOF, "org/luava/runtime/bytecode/LuaClosure");
+        Label isClosure = new Label();
+        mv.visitJumpInsn(IFNE, isClosure);
+        emitDeopt(mv, pc);
+        mv.visitLabel(isClosure);
+        // Same proto -> direct INVOKESTATIC; else a pure JIT proto -> helper.
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
+                "Lorg/luava/runtime/bytecode/LuaProto;");
+        mv.visitVarInsn(ALOAD, 0);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
+                "Lorg/luava/runtime/bytecode/LuaProto;");
+        Label selfProto = new Label();
+        Label generalCall = new Label();
+        mv.visitJumpInsn(IF_ACMPNE, generalCall);
+        mv.visitLabel(selfProto);
+        emitDirectInvoke(mv, owner, proto, a, nArgs, pc);
+        mv.visitJumpInsn(GOTO, done);
+        // General monomorphic call: callee must be compiled and pure, with
+        // an exact argument-count match (missing args would read stale regs).
+        mv.visitLabel(generalCall);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
+        mv.visitInsn(DUP);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
+                "Lorg/luava/runtime/bytecode/LuaProto;");
+        mv.visitInsn(DUP);
+        mv.visitVarInsn(ASTORE, 20);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "jitCode",
+                "Lorg/luava/runtime/jit/JitCode;");
+        mv.visitInsn(DUP);
+        mv.visitVarInsn(ASTORE, 21);
+        Label hasJit = new Label();
+        mv.visitJumpInsn(IFNONNULL, hasJit);
+        emitDeopt(mv, pc);
+        mv.visitLabel(hasJit);
+        mv.visitVarInsn(ALOAD, 21);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/jit/JitCode", "pure", "Z");
+        Label isPure = new Label();
+        mv.visitJumpInsn(IFNE, isPure);
+        emitDeopt(mv, pc);
+        mv.visitLabel(isPure);
+        ldcInt(mv, nArgs);
+        mv.visitVarInsn(ALOAD, 20);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "numParams", "I");
+        Label arityOk = new Label();
+        mv.visitJumpInsn(IF_ICMPEQ, arityOk);
+        emitDeopt(mv, pc);
+        mv.visitLabel(arityOk);
+        // Dynamic capacity guard with the callee's own maxStack.
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a + 1);
+        mv.visitInsn(IADD);
+        mv.visitVarInsn(ALOAD, 20);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "maxStackSize", "I");
+        mv.visitInsn(IADD);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitInsn(ARRAYLENGTH);
+        Label capOkGen = new Label();
+        mv.visitJumpInsn(IF_ICMPLT, capOkGen);
+        emitDeopt(mv, pc);
+        mv.visitLabel(capOkGen);
+        mv.visitVarInsn(ALOAD, 21);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
+        mv.visitInsn(DUP);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "upvals",
+                "[Lorg/luava/runtime/eval/Upvalue;");
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a + 1);
+        mv.visitInsn(IADD);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "invoke",
+                "(Lorg/luava/runtime/jit/JitCode;Lorg/luava/runtime/bytecode/LuaClosure;[Ljava/lang/Object;[J[B[Lorg/luava/runtime/LuaValue;I)J",
+                false);
+        mv.visitVarInsn(LSTORE, 6);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a);
+        mv.visitVarInsn(LLOAD, 6);
+        mv.visitInsn(LASTORE);
+        emitTagIntNull(mv, a);
+        mv.visitLabel(done);
+    }
+
+    /** Direct INVOKESTATIC into this proto's own exec (self-recursion). */
+    private static void emitDirectInvoke(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs,
+            int pc) {
         // Capacity guard for the callee window.
         mv.visitVarInsn(ILOAD, 5);
         ldcInt(mv, a + 1 + proto.maxStackSize);
@@ -397,65 +593,19 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitJumpInsn(IF_ICMPLT, capOk);
         emitDeopt(mv, pc);
         mv.visitLabel(capOk);
-        if (hoistSlot >= 0) {
-            // Hoisted callee (verified once at entry): stash and share the
-            // invoke tail below.
-            mv.visitVarInsn(ALOAD, 9 + 2 * hoistSlot);
-            mv.visitVarInsn(ASTORE, 8);
-        } else if (fusedB >= 0) {
-            // Callee is upvals[fusedB].getValue(); must be a LuaClosure of
-            // the same proto (covers direct self-recursion).
-            mv.visitVarInsn(ALOAD, 1);
-            ldcInt(mv, fusedB);
-            mv.visitInsn(AALOAD);
-            mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/eval/Upvalue");
-            mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/eval/Upvalue", "getValue",
-                    "()Lorg/luava/runtime/LuaValue;", false);
-            mv.visitInsn(DUP);
-            mv.visitVarInsn(ASTORE, 8);
-            mv.visitTypeInsn(INSTANCEOF, "org/luava/runtime/bytecode/LuaClosure");
-            Label isClosure = new Label();
-            mv.visitJumpInsn(IFNE, isClosure);
-            emitDeopt(mv, pc);
-            mv.visitLabel(isClosure);
-            mv.visitVarInsn(ALOAD, 8);
-            mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
-            mv.visitInsn(DUP);
-            mv.visitVarInsn(ASTORE, 8);
-            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
-                    "Lorg/luava/runtime/bytecode/LuaProto;");
-            mv.visitVarInsn(ALOAD, 0);
-            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
-                    "Lorg/luava/runtime/bytecode/LuaProto;");
-            Label sameProto = new Label();
-            mv.visitJumpInsn(IF_ACMPEQ, sameProto);
-            emitDeopt(mv, pc);
-            mv.visitLabel(sameProto);
-        } else {
-            // Callee must be a LuaClosure of the same proto.
+        // Missing arguments are nil-filled exactly like the interpreter.
+        if (nArgs < proto.numParams) {
+            mv.visitVarInsn(ALOAD, 2);
+            mv.visitVarInsn(ALOAD, 3);
             mv.visitVarInsn(ALOAD, 4);
-            emitIndex(mv, a);
-            mv.visitInsn(AALOAD);
-            mv.visitInsn(DUP);
-            mv.visitVarInsn(ASTORE, 8);
-            mv.visitTypeInsn(INSTANCEOF, "org/luava/runtime/bytecode/LuaClosure");
-            Label isClosure = new Label();
-            mv.visitJumpInsn(IFNE, isClosure);
-            emitDeopt(mv, pc);
-            mv.visitLabel(isClosure);
-            mv.visitVarInsn(ALOAD, 8);
-            mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
-            mv.visitInsn(DUP);
-            mv.visitVarInsn(ASTORE, 8);
-            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
-                    "Lorg/luava/runtime/bytecode/LuaProto;");
-            mv.visitVarInsn(ALOAD, 0);
-            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
-                    "Lorg/luava/runtime/bytecode/LuaProto;");
-            Label sameProto = new Label();
-            mv.visitJumpInsn(IF_ACMPEQ, sameProto);
-            emitDeopt(mv, pc);
-            mv.visitLabel(sameProto);
+            mv.visitVarInsn(ILOAD, 5);
+            ldcInt(mv, a + 1 + nArgs);
+            mv.visitInsn(IADD);
+            mv.visitVarInsn(ILOAD, 5);
+            ldcInt(mv, a + 1 + proto.numParams);
+            mv.visitInsn(IADD);
+            mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "nilFill",
+                    "([J[B[Lorg/luava/runtime/LuaValue;II)V", false);
         }
         // Direct self-recursion: exec(callee, callee.upvals, p, t, o, base+a+1).
         mv.visitVarInsn(ALOAD, 8);
@@ -619,6 +769,9 @@ public final class LuaToJvmTranslator implements Opcodes {
             case OpCode.OP_GETUPVAL -> {
                 return false;
             }
+            case OpCode.OP_SETUPVAL -> {
+                return a == reg;
+            }
             default -> {
                 return a == reg || b == reg || c == reg;
             }
@@ -640,7 +793,10 @@ public final class LuaToJvmTranslator implements Opcodes {
                     OpCode.OP_CALL -> {
                 return a == reg;
             }
-            case OpCode.OP_JMP, OpCode.OP_RETURN1, OpCode.OP_RETURN0 -> {
+            case OpCode.OP_SETUPVAL,
+                    OpCode.OP_JMP,
+                    OpCode.OP_RETURN1,
+                    OpCode.OP_RETURN0 -> {
                 return false;
             }
             default -> {

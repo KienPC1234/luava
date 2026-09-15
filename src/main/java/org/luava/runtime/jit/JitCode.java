@@ -23,13 +23,18 @@ public final class JitCode {
     public final MethodHandle handle;
     public final int maxStack;
     public final int numParams;
+    /** True when the proto has no observable side effects (pure integer
+     * kernel): restart-from-entry deopt is safe and other JIT code may
+     * call it directly. */
+    public final boolean pure;
     public int deopts;
 
-    public JitCode(LuaProto proto, MethodHandle handle) {
+    public JitCode(LuaProto proto, MethodHandle handle, boolean pure) {
         this.proto = proto;
         this.handle = handle;
         this.maxStack = proto.maxStackSize;
         this.numParams = proto.numParams;
+        this.pure = pure;
         this.deopts = 0;
     }
 }

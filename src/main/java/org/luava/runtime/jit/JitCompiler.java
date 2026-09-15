@@ -36,10 +36,8 @@ public final class JitCompiler {
             return proto.jitCode;
         }
         try {
-            if (!eligible(proto)) {
-                if (Boolean.getBoolean("luava.jit.debug")) {
-                    System.err.println("[jit] eligible=false for " + proto.name);
-                }
+            LuaToJvmTranslator.Info info = LuaToJvmTranslator.analyze(proto);
+            if (info == null || !eligible(proto)) {
                 return null;
             }
             String name = "org/luava/runtime/jit/Gen$" + CLASS_SEQ.getAndIncrement();
@@ -53,7 +51,7 @@ public final class JitCompiler {
             java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "exec",
                     MethodType.methodType(long.class, LuaClosure.class, Object[].class,
                             long[].class, byte[].class, org.luava.runtime.LuaValue[].class, int.class));
-            JitCode code = new JitCode(proto, mh);
+            JitCode code = new JitCode(proto, mh, info.pure());
             proto.jitCode = code;
             CACHE.put(proto, code);
             return code;

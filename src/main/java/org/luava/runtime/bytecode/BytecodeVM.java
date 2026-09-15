@@ -1024,7 +1024,14 @@ public final class BytecodeVM {
                 proto.jitDisabled = true;
             }
             if (jitDebug()) {
-                System.err.println("[jit] deopt pc=" + d.pc + " proto=" + proto.name);
+                String extra = "";
+                try {
+                    org.luava.runtime.eval.Upvalue uv = child.upvals.length > 0 ? child.upvals[0] : null;
+                    extra = " up0tag=" + (uv == null ? "n/a"
+                            : (uv.isOpenOnStack() ? "open" : Byte.toString(uv.getTypeTag())));
+                } catch (Throwable ignore) {
+                }
+                System.err.println("[jit] deopt pc=" + d.pc + " proto=" + proto.name + extra);
             }
             return false;
         } catch (Throwable t) {
