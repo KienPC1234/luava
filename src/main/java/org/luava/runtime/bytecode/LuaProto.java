@@ -8,6 +8,7 @@
 package org.luava.runtime.bytecode;
 
 import org.luava.runtime.LuaValue;
+import org.luava.runtime.jit.JitCode;
 
 public final class LuaProto {
     public final String name;
@@ -29,6 +30,17 @@ public final class LuaProto {
     public final LocVarInfo[] locVarInfos;
     public String rawSource;
     public org.luava.frontend.ast.Statements.BlockStmt body;
+
+    // Hybrid tiered JIT state (plan.md Phase 1/2/4). The interpreter remains
+    // the default engine; these fields only accelerate hot integer kernels.
+    /** Compiled code for this proto, or null when interpreted. */
+    public volatile JitCode jitCode;
+    /** Set when compilation or guards prove the proto unsuitable for JIT. */
+    public volatile boolean jitDisabled;
+    /** Conservative yield marker; JIT-able protos are proven non-yielding. */
+    public boolean mayYield;
+    /** Interpreter-side call counter driving tier-up. */
+    public int hotCount;
 
     public String findLocalVarName(int reg, int pc) {
         if (locVarInfos == null) return null;
