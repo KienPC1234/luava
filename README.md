@@ -162,14 +162,16 @@ Luava beats LuaJ on every measured workload while implementing the newer
 language (5.4 vs 5.2). The remaining gap to C is dispatch cost; closing
 it further would need superinstructions or a JIT backend.
 
-### Hybrid tiered JIT (opt-in, `-Dluava.jit=true`)
+### Hybrid tiered JIT (on by default)
 
-The interpreter stays the default engine and fallback. Hot Lua functions
-decided by a static subset analysis (integer/table kernels, no metamethods,
-no yield) tier up to one JVM method per proto (hidden class, unboxed
-`long` flow, direct `INVOKESTATIC` self-recursion, type guards with
-interpreter resume-at-pc deopt). Coroutines, debug hooks and execution
-timeouts never touch JIT code paths.
+The interpreter stays an always-available engine and fallback. Hot Lua
+functions decided by a static subset analysis (integer/table kernels, no
+metamethods, no yield) tier up to one JVM method per proto (hidden class,
+unboxed `long` flow, direct `INVOKESTATIC` self-recursion, type guards
+with interpreter resume-at-pc deopt). Coroutines, debug hooks and
+execution timeouts never touch JIT code paths. Disable with
+`-Dluava.jit=false`; `JitCompiler.prewarm(closure)` pre-compiles for
+servers (tier-up otherwise compiles on a background thread).
 
 10-task benchmark vs LuaJ 3.0.1 (paired, pinned, median): 6 wins
 (arith 1.4×, fib **9.5×**, table 1.0×, coroutines 16×, hash 1.4×, sieve

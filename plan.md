@@ -332,8 +332,9 @@ interpreter — subset không chứa chúng). G-PERF: closures hòa→thắng n�
 **Việc (đã làm):**
 1. Bộ đếm nóng `hotCount` trong `executeCallOp`; tier-up ở ngưỡng 50.
 2. Chọn ứng viên: `analyze()` (≤200 lệnh, không mayYield, subset thuần).
-3. `ENABLE_JIT` **giữ mặc định false** (thận trọng; §9) — bật bằng
-   `-Dluava.jit=true`. Compile **nền** (daemon `luava-jit`, queue collapse
+3. `ENABLE_JIT` **mặc định true** (2026-09-15, sau khi mọi gate xanh cả
+   hai chế độ + fuzz 63/63 + stress + RSS bounded): opt-out bằng
+   `-Dluava.jit=false`. Compile **nền** (daemon `luava-jit`, queue collapse
    trùng, `jitQueued`) để request nóng không trả phí compile;
    `-Dluava.jit.sync=true` cho đo đạc đơn định (harness dùng).
 4. Chống JIT storm: deopt > 8 → clear + `jitDisabled`; compile fail →
@@ -446,9 +447,11 @@ nếu cần.
 6. Nhật ký §7 cập nhật (SETLIST descriptor, cổng TAILCALL, CLOSURE revert,
    closeUpvalues fix).
 
-**Quyết định mặc định:** `ENABLE_JIT` **giữ false** (opt-in
-`-Dluava.jit=true`). Lý do: 3 task thua cần kiến trúc bổ sung, và bật mặc
-định cho mọi embedding là cam kết lớn — lật bằng 1 dòng khi sẵn sàng.
+**Quyết định mặc định:** `ENABLE_JIT` **true từ 2026-09-15** (mọi gate
+xanh, escape hatch `-Dluava.jit=false` giữ lại). Lưu ý kiến trúc: hotness
+tính theo proto-object, nên server eval-lại-script-mỗi-request (proto
+mới mỗi lần) không bao giờ tier-up — compile một lần rồi gọi nhiều lần
+(+ `prewarm`) mới hưởng JIT; script ngắn vẫn chạy interpreter nhanh.
 
 **Gates:** G-CORRECT + G-PERF tổng thể. Nếu một task vẫn > 1.03× sau JIT →
 phân tích async-profiler trên code JIT, lặp micro-opt có đo.
