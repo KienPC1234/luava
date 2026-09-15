@@ -587,6 +587,18 @@ public final class LuaState {
     // execution path (verified 31/31 official suite + 32/32 VM files).
     public static boolean USE_BYTECODE_VM = true;
 
+    /**
+     * Hybrid tiered JIT master switch (plan.md). Default off: the
+     * interpreter is the engine and fallback. Enable with
+     * {@code -Dluava.jit=true} to accelerate hot integer kernels; any guard
+     * failure or unsupported shape transparently falls back to the
+     * interpreter with identical semantics.
+     */
+    public static volatile boolean ENABLE_JIT = Boolean.getBoolean("luava.jit");
+
+    /** Interpreter calls of one proto before a JIT compile is attempted. */
+    public static final int JIT_HOT_THRESHOLD = 50;
+
     public LuaCoroutine getCurrentThread() {
         LuaCoroutine cur = LuaCoroutine.running();
         return (cur != null) ? cur : mainThread;
