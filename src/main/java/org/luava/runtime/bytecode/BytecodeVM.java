@@ -11,6 +11,9 @@ import org.luava.runtime.*;
 import org.luava.runtime.concurrency.LuaCoroutine;
 import org.luava.runtime.eval.CallStack;
 import org.luava.runtime.eval.Upvalue;
+import org.luava.runtime.jit.DeoptSignal;
+import org.luava.runtime.jit.JitCode;
+import org.luava.runtime.jit.JitCompiler;
 
 public final class BytecodeVM {
     public static final byte TYPE_NIL = 0;
@@ -942,6 +945,109 @@ public final class BytecodeVM {
      * quality (arith_loop -40%, confirmed via {@code CompileCommand
      * dontinline} recovery), so the return bodies stay inline.
      */
+    /**
+     * Hybrid JIT fast lane (plan.md Phase 2/4). Runs a compiled integer
+     * kernel directly on the caller's register window instead of pushing an
+     * interpreter frame. Returns true when the call was fully handled.
+     * Returns false (without touching interpreter state) when the JIT is
+     * disabled, the proto is cold/unsuitable, an entry guard fails, or the
+     * compiled code deopts mid-flight; the caller then proceeds with the
+     * normal interpreter path, which re-runs the pure kernel identically.
+     */
+    private static boolean tryJitCall(LuaState state, VmContext ctx, LuaClosure child,
+            int funcIdx, int nActualArgs, int nResults) {
+        if (!LuaState.ENABLE_JIT) {
+            return false;
+        }
+        if (LuaCoroutine.HOOKS_ARMED || state.loopGuard != null) {
+            return false;
+        }
+        LuaProto proto = child.proto;
+        JitCode jc = proto.jitCode;
+        if (jc == null) {
+            if (proto.jitDisabled) {
+                return false;
+            }
+            int hot = proto.hotCount + 1;
+            proto.hotCount = hot;
+            if (hot < LuaState.JIT_HOT_THRESHOLD) {
+                return false;
+            }
+            try {
+                jc = JitCompiler.tryCompile(proto);
+            } catch (Throwable t) {
+                proto.jitDisabled = true;
+                return false;
+            }
+            if (jc == null) {
+                proto.jitDisabled = true;
+                if (jitDebug()) {
+                    System.err.println("[jit] not eligible: " + proto.name);
+                }
+                return false;
+            }
+            if (jitDebug()) {
+                System.err.println("[jit] compiled: " + proto.name);
+            }
+        }
+        int base = funcIdx + 1;
+        if (nActualArgs < proto.numParams) {
+            return false;
+        }
+        long[] pStack = ctx.pStack;
+        byte[] tStack = ctx.tStack;
+        LuaValue[] oStack = ctx.oStack;
+        for (int i = 0; i < proto.numParams; i++) {
+            if (tStack[base + i] != TYPE_INT) {
+                return false;
+            }
+        }
+        try {
+            ctx.thread.ensureStackCapacity(base + proto.maxStackSize + 64);
+            pStack = ctx.thread.getPrimitiveStack();
+            tStack = ctx.thread.getTypeStack();
+            oStack = ctx.thread.getObjectStack();
+            long r = (long) jc.handle.invokeExact(child, (Object[]) child.upvals, pStack, tStack, oStack, base);
+            ctx.pStack = pStack;
+            ctx.tStack = tStack;
+            ctx.oStack = oStack;
+            ctx.pStack[funcIdx] = r;
+            ctx.tStack[funcIdx] = TYPE_INT;
+            ctx.oStack[funcIdx] = null;
+            if (nResults < 0) {
+                ctx.top = funcIdx + 1;
+            }
+            return true;
+        } catch (DeoptSignal d) {
+            if (++jc.deopts > 8) {
+                proto.jitCode = null;
+                proto.jitDisabled = true;
+            }
+            if (jitDebug()) {
+                System.err.println("[jit] deopt pc=" + d.pc + " proto=" + proto.name);
+            }
+            return false;
+        } catch (Throwable t) {
+            if (jitDebug()) {
+                System.err.println("[jit] FAILED proto=" + proto.name + " : " + t);
+            }
+            proto.jitCode = null;
+            proto.jitDisabled = true;
+            return false;
+        }
+    }
+
+    private static boolean jitDebugLogged;
+    private static boolean jitDebug() {
+        if (!jitDebugLogged) {
+            jitDebugLogged = true;
+            if (Boolean.getBoolean("luava.jit.debug")) {
+                System.err.println("[jit] ENABLE_JIT=" + LuaState.ENABLE_JIT);
+            }
+        }
+        return Boolean.getBoolean("luava.jit.debug");
+    }
+
     private static void executeCallOp(LuaState state, VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
@@ -964,6 +1070,12 @@ public final class BytecodeVM {
         int nActualArgs = nArgs;
 
         if (func instanceof LuaClosure childClosure) {
+            // Hybrid JIT fast lane (plan.md Phase 2/4): a compiled integer
+            // kernel runs directly on the register window. Any guard failure
+            // falls through to the interpreter below with identical semantics.
+            if (tryJitCall(state, ctx, childClosure, funcIdx, nActualArgs, nResults)) {
+                return;
+            }
             CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
             if (callerFrame != null) {
                 callerFrame.pc = ctx.pc - 1;
