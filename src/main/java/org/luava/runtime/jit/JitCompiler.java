@@ -13,7 +13,6 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.luava.runtime.bytecode.LuaClosure;
 import org.luava.runtime.bytecode.LuaProto;
-import org.luava.runtime.bytecode.OpCode;
 
 /**
  * Compiles eligible Lua protos to hidden JVM classes (one method per Lua
@@ -140,10 +139,19 @@ public final class JitCompiler {
             MethodHandles.Lookup lookup = MethodHandles.lookup();
             Class<?> cls = lookup.defineHiddenClass(tr.bytes(), true,
                     MethodHandles.Lookup.ClassOption.NESTMATE).lookupClass();
-            java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "exec",
-                    MethodType.methodType(long.class, LuaClosure.class, Object[].class,
-                            long[].class, byte[].class, org.luava.runtime.LuaValue[].class, int.class));
-            JitCode code = new JitCode(proto, mh, info.pure());
+            JitCode code;
+            if (info.returnsInt()) {
+                java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "exec",
+                        MethodType.methodType(long.class, LuaClosure.class, Object[].class,
+                                long[].class, byte[].class, org.luava.runtime.LuaValue[].class, int.class));
+                code = new JitCode(proto, mh, null, info.pure(), true);
+            } else {
+                java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "execObj",
+                        MethodType.methodType(org.luava.runtime.LuaValue.class, LuaClosure.class,
+                                Object[].class, long[].class, byte[].class,
+                                org.luava.runtime.LuaValue[].class, int.class));
+                code = new JitCode(proto, null, mh, info.pure(), false);
+            }
             proto.jitCode = code;
             CACHE.put(proto, code);
             if (debug) {
@@ -163,15 +171,11 @@ public final class JitCompiler {
         if (!LuaToJvmTranslator.eligible(proto)) {
             return false;
         }
-        // Conservative yield rule for Phase 2: the integer subset has no
-        // table/global access, no varargs, no TAILCALL and no closure
-        // creation, so it can never reach coroutine.yield.
-        for (int inst : proto.code) {
-            int op = org.luava.runtime.bytecode.Instruction.getOp(inst);
-            if (op == OpCode.OP_TAILCALL) {
-                return false;
-            }
-        }
+        // Conservative yield rule: the JIT subset has no global/table
+        // writes through metamethods, no varargs and no yield-capable calls
+        // (only pure self/monomorphic targets, resolved with guards), so it
+        // can never reach coroutine.yield. TAILCALL is supported by the
+        // translator under the same purity contract as CALL.
         proto.mayYield = false;
         return true;
     }

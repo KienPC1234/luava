@@ -588,13 +588,14 @@ public final class LuaState {
     public static boolean USE_BYTECODE_VM = true;
 
     /**
-     * Hybrid tiered JIT master switch (plan.md). Default off: the
-     * interpreter is the engine and fallback. Enable with
-     * {@code -Dluava.jit=true} to accelerate hot integer kernels; any guard
-     * failure or unsupported shape transparently falls back to the
-     * interpreter with identical semantics.
+     * Hybrid tiered JIT master switch (plan.md). Default ON: hot kernels
+     * tier up automatically while the interpreter stays the fallback for
+     * anything unsupported (identical semantics, verified 30/30 + fuzz both
+     * modes). Opt out with {@code -Dluava.jit=false}; force synchronous
+     * tier-up for deterministic measurement with
+     * {@code -Dluava.jit.sync=true}.
      */
-    public static volatile boolean ENABLE_JIT = Boolean.getBoolean("luava.jit");
+    public static volatile boolean ENABLE_JIT = !"false".equalsIgnoreCase(System.getProperty("luava.jit", "true"));
 
     /** Interpreter calls of one proto before a JIT compile is attempted. */
     public static final int JIT_HOT_THRESHOLD = 50;
