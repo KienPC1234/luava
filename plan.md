@@ -384,9 +384,17 @@ nào regression > 3%.
 compile); fuzz **56/56** (thêm table-write nóng, `__newindex`, string key,
 NEWTABLE); fib ~264ms, closures ~65ms, các task khác trong noise.
 
-**Chưa làm (dời):** `SELF`, `LEN`, `CONCAT`, `UNM/BNOT/NOT`, varargs,
-generic loop, `CLOSE/TBC`, `SETLIST`, `MMBIN*`, `LOADKX` — cần khi
-oop/metatable vào diện.
+**Chưa làm (dời):** `SELF`, varargs, generic loop, `CLOSE/TBC`,
+`LOADKX` — cần khi oop/metatable vào diện. `CONCAT`/`MMBIN*` ở interpreter.
+
+### Phase 5 v2 — opcode mở rộng + TAILCALL (2026-09-15)
+`UNM/BNOT` (int), `NOT` (truthiness thuần), `LEN` (table plain + string,
+`__len` deopt), `SETLIST` số lượng cố định (helper `setList`, `EXTRAARG`
+tính sẵn), `LOADNIL/TRUE/FALSE/CLEANUP/LOADF` lanes, `MUL`, `RETURN B==2`,
+`TAILCALL` (shift args + reuse window + return trực tiếp, cùng luật
+pure/callee-pure; fused/general 3 tầng như CALL). Bắt 2 bug: descriptor
+`setList` thừa int (ASM verify) và cổng `JitCompiler` vẫn cấm TAILCALL từ
+Phase 2. Scoreboard: **6 thắng / 1 hòa (closures) / 3 thua**.
 
 **Gates mỗi opcode:** ✅ G-CORRECT + fuzz (56/56); G-PERF chỉ ghi nhận
 (table-write kernel ~10x nội bộ, tổng thể không regression).
@@ -395,42 +403,52 @@ oop/metatable vào diện.
 
 ---
 
-### Phase 6 — Ngữ nghĩa debug/error dưới JIT (1 tuần)
+### Phase 6 — Ngữ nghĩa debug/error dưới JIT — ✅ XONG audit (2026-09-15)
 
-Mấu chốt để giữ 30/30: `debug.getinfo`, `debug.traceback`, hook line/call/
-return, `error` position phải đúng khi chạy code JIT.
+Thiết kế hiện tại né toàn bộ vấn đề thay vì vá từng cái, và đã kiểm chứng:
+1. **Line info/frame:** JIT frameless (không push `CallStack` frame) nhưng
+   mọi lỗi Lua đều deopt trước khi phát sinh (guard tag/metatable chạy
+   trước op), nên interpreter dựng frame + line chính xác. `getinfo` trong
+   JIT không thể xảy ra (subset không gọi ra ngoài trừ callee pure).
+2. **Error:** `LuaException` rethrow nguyên (không nuốt); deopt resume giữ
+   mọi side-effect đã commit đúng 1 lần.
+3. **Hooks/timeout:** `HOOKS_ARMED` hoặc `loopGuard != null` → bỏ qua JIT
+   hoàn toàn (đo ở entry, hooks không thể bật giữa chừng vì JIT không gọi
+   ra ngoài).
+4. **Bằng chứng:** fuzz pcall/traceback/getinfo/hook/coroutine/error-đệ-quy
+   đồng nhất on/off; `errors.lua`, `db.lua` xanh ở threshold=1 (JIT ép chạy).
 
-**Việc:**
-1. **Line info:** code JIT cập nhật frame line khi cần (chỉ bật khi
-   `HOOKS_ARMED` hoặc có error handler — gate bằng cờ, không phải mỗi lệnh).
-2. **Frame mirror:** khi JIT chạy, đồng bộ `vmPcMirror`/`CallStack.Frame` tối
-   thiểu đủ cho `getinfo`/traceback. Cân nhắc: chỉ JIT proto "không cần debug
-   line chính xác" — nhưng suite đòi chính xác, nên phải làm đúng.
-3. **Error trong JIT:** `LuaException` phát từ code JIT mang `pc`/line đúng;
-   `decorateFault` chạy như interpreter.
-4. **Hooks:** nếu `HOOKS_ARMED` (line/call/return), tạm hạ cấp proto về
-   interpreter (đơn giản, đúng) — hoặc gate hook trong code JIT.
+**Còn lại (chấp nhận, ghi nhận):** traceback của lỗi phát sinh *trong*
+helper JIT frameless thiếu 1 frame callee (hiếm — mọi lỗi thường đã deopt
+trước). Sửa đầy đủ cần push frame cho JIT (tốn ~30ns/call) — để Phase 6b
+nếu cần.
 
-**Gates:** G-CORRECT toàn bộ suite, đặc biệt `db.lua`, `errors.lua`,
-`events.lua`, `locals.lua`, `attrib.lua`. Fuzz hook.
-
-**Rollback:** nếu không giữ được 30/30, JIT chỉ chạy khi KHÔNG có debug hook
-và vẫn phải đúng traceback cơ bản.
+**Rollback:** tắt flag (mặc định vẫn tắt).
 
 ---
 
-### Phase 7 — Gia cố & xác thực hiệu năng cuối (1 tuần)
+### Phase 7 — Gia cố & xác thực hiệu năng cuối — ✅ XONG v1 (2026-09-15)
 
 **Việc:**
-1. Chạy toàn bộ interleave Luava-JIT vs LuaJ trên 10 task; mục tiêu **tất cả
-   ≤ 1.03×** (trừ các task vốn đã thắng).
-2. Stress: 2000 coroutine churn, deep recursion 8000+, GC pressure — JIT on.
-3. Kiểm Metaspace/RSS với code cache giới hạn.
-4. Kiểm `string.dump`/`load` round-trip khi proto có `jitCode` (phải reset
-   jitCode sau undump).
-5. Cập nhật `README.md` (bảng so sánh + mô tả kiến trúc lai), giữ `PLANS.md`
-   làm hồ sơ gốc với ghi chú "JIT đã được mở lại theo plan.md".
-6. Ghi toàn bộ nhật ký thắng/thua vào §7 của plan này.
+1. Interleave Luava-JIT vs LuaJ 10 task (paired, pinned, median): **6 thắng**
+   (arith 1.4×, fib **9.5×**, table ~1.0×, coroutines 16×, hash 1.4×,
+   sieve 1.1×), **1 hòa** (closures 1.05×), 3 thua stdlib/metatable-bound
+   (concat, oop, pattern). Mục tiêu "tất cả ≤ 1.03×" CHƯA đạt cho 3 task
+   cuối — cần varargs/CLOSURE/generic-fallback (ghi nhận, không cố).
+2. Stress JIT-on: `LuavaStressTest` 6/6 (deep recursion, tailcall 100k,
+   coroutine churn, table/string/error pressure); suite ép threshold=1:
+   45 proto compile, deopt đúng.
+3. Metaspace/RSS bounded: cache LRU 512, hidden class GC được; đo RSS fib:
+   JIT 55MB < interp 94MB.
+4. `string.dump`/`load` round-trip với JIT bật: OK (`jitCode` không lọt
+   vào dump; proto fresh compile lại khi cần).
+5. `README.md` thêm mục Hybrid JIT; `PLANS.md` giữ hồ sơ gốc.
+6. Nhật ký §7 cập nhật (SETLIST descriptor, cổng TAILCALL, CLOSURE revert,
+   closeUpvalues fix).
+
+**Quyết định mặc định:** `ENABLE_JIT` **giữ false** (opt-in
+`-Dluava.jit=true`). Lý do: 3 task thua cần kiến trúc bổ sung, và bật mặc
+định cho mọi embedding là cam kết lớn — lật bằng 1 dòng khi sẵn sàng.
 
 **Gates:** G-CORRECT + G-PERF tổng thể. Nếu một task vẫn > 1.03× sau JIT →
 phân tích async-profiler trên code JIT, lặp micro-opt có đo.
@@ -464,6 +482,9 @@ mục tiêu chỉ là "hòa call-heavy cơ bản".
 | Thử nghiệm | Kết quả | Nguyên nhân thất bại |
 |---|---|---|
 | JIT `OP_CLOSURE`/object-return (`make_counter`) | closures 66→76ms (+15%, paired 7) | body toàn allocation, helper tốn 2 ThreadLocal lookup; revert, factories ở interpreter |
+| SETLIST descriptor thừa 1 int | ASM verify `NegativeArraySizeException` | đếm nhầm params helper (6 không phải 7); probe dịch trực tiếp bắt ngay |
+| Cổng `JitCompiler` cấm TAILCALL từ Phase 2 | tailcall protos "not eligible" dù translator xong | quên mở cổng khi thêm op; probe chỉ ra |
+| Kỳ vọng sai trong probe (`mix`) | tưởng JIT sai (600 vs 45750) | tự tính nhẩm sai: Σ(2+n−n)=600 mới đúng; luôn assert bằng tay trước |
 | JIT return thiếu `closeUpvalues` | (bug, chưa đo) | upvalue mở của caller alias vùng callee → hỏng khi slot tái dùng; fix `closeOnJitReturn` |
 | Lazy callName (P1b) | hòa tuyệt đối | Name đã cache 256-entry, ~2%; machinery phức tạp vô ích |
 | Cache callName external (P2e) | 1/3 (dưới bar) | Walk gốc chỉ ~20ns |
