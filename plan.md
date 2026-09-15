@@ -200,7 +200,8 @@ Cổng chuẩn dùng chung:
    `README.md`, `docs/`.
 2. Backup harness tạm (`/tmp/opencode/prof/Bench*.java`,
    `/tmp/opencode/vs/LuaJ*`, `aggsample.py`, jars A/B, `jitspike/`) vào
-   `benchmarks/harness/` (untracked, không commit) để tái lập interleave.
+   `benchmarks/harness/` (số liệu/jar tạm không commit; riêng
+   `interleave.sh` được track như hạ tầng đo lường).
 3. Viết script `benchmarks/harness/interleave.sh`:
    nhận 2 jar + task list → chạy 7 cặp đảo thứ tự, in median ratio.
 4. Ghi baseline hiện tại (§2.1) vào `benchmarks/harness/BASELINE.txt`.
