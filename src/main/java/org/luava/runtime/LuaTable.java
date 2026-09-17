@@ -21,13 +21,26 @@ public final class LuaTable extends LuaValue {
     // Cold-start hook: installed only on standard-library placeholder tables
     // (null for every ordinary table). Plain tables pay one predictable
     // null-check; the class stays final so JIT devirtualization is intact.
-    private volatile Runnable lazyFiller;
+    //
+    // Plain (non-volatile) by design: every other field here (arrayPart,
+    // hashPart, metatable, modCount) is already plain, so the table is
+    // thread-confined like the rest of the engine — the volatile bought
+    // nothing. The synchronized fill-once below preserves exactly-once
+    // filling; fillers are idempotent stdlib initializers, so even a stale
+    // re-entry is harmless.
+    private Runnable lazyFiller;
 
     public void setLazyFiller(Runnable filler) {
         this.lazyFiller = filler;
     }
 
     void ensureFilled() {
+        if (lazyFiller != null) {
+            ensureFilledSlow();
+        }
+    }
+
+    private void ensureFilledSlow() {
         Runnable f = lazyFiller;
         if (f != null) {
             synchronized (this) {
@@ -64,6 +77,20 @@ public final class LuaTable extends LuaValue {
     private boolean weakKeys = false;
     private boolean weakValues = false;
     private int weakQueryCount = 0;
+    /**
+     * Read-version counter bumped by every mutation that can change read
+     * results ({@code set}/{@code rawset}/{@code rawsetInt}/
+     * {@code setMetatable}). Powers the VM's {@code OP_GETTABUP} site cache:
+     * {@link #readVersion()} returns -1 while a metatable could affect reads
+     * (uncacheable), otherwise the counter, so any store through any path
+     * invalidates cached lookups.
+     */
+    private long modCount = 0;
+
+    /** VM site-cache guard; public for the bytecode package. */
+    public long readVersion() {
+        return metatable == null ? modCount : -1L;
+    }
     private transient Iterator<Map.Entry<LuaValue, LuaValue>> nextIterator = null;
     private transient LuaValue lastReturnedKey = null;
 
@@ -267,6 +294,7 @@ public final class LuaTable extends LuaValue {
     @Override
     public void setMetatable(LuaTable mt) {
         this.metatable = mt;
+        modCount++;
         updateWeakMode();
     }
 
@@ -290,7 +318,9 @@ public final class LuaTable extends LuaValue {
      * these when the table has no metatable (weak modes always imply one).
      */
     public LuaValue rawgetInt(long idx) {
-        ensureFilled();
+        if (lazyFiller != null) {
+            ensureFilledSlow();
+        }
         if (idx >= 1 && idx <= arrayPart.size()) {
             LuaValue val = arrayPart.get((int) (idx - 1));
             if (val instanceof WeakVal wv) {
@@ -309,9 +339,16 @@ public final class LuaTable extends LuaValue {
     }
 
     public void rawsetInt(long idx, LuaValue value) {
-        ensureFilled();
-        LuaValue toSet = (value == null || value.isNil()) ? LuaNil.NIL : value;
-        if (idx == arrayPart.size() + 1 && !toSet.isNil()) {
+        if (lazyFiller != null) {
+            ensureFilledSlow();
+        }
+        // No version bump: integer writes never change string-key reads (the
+        // only shape the VM site-caches), and only drop integer shadows from
+        // the hash part. The rawset() fallthrough below bumps as usual.
+        // Reference-compare nil first: the virtual isNil() is pure overhead
+        // for the 99.99% of values that are neither null nor exotic-nil.
+        LuaValue toSet = (value == null || value == LuaNil.NIL || value.isNil()) ? LuaNil.NIL : value;
+        if (idx == arrayPart.size() + 1 && toSet != LuaNil.NIL) {
             arrayPart.add(toSet);
             if (!hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
             return;
@@ -378,6 +415,7 @@ public final class LuaTable extends LuaValue {
 
     public void rawset(LuaValue key, LuaValue value) {
         ensureFilled();
+        modCount++;
         lastReturnedKey = null;
         nextIterator = null;
         key = normalizeKey(key);

@@ -23,7 +23,7 @@ public final class Expressions {
 
     public record StringLiteral(String value, int line, int column, org.luava.runtime.LuaString luaString) implements Expression {
         public StringLiteral(String value, int line, int column) {
-            this(value, line, column, org.luava.runtime.LuaString.valueOf(value));
+            this(value, line, column, org.luava.runtime.LuaString.interned(value));
         }
     }
 

@@ -22,15 +22,32 @@ import java.util.List;
 public final class StringLib {
     private StringLib() {}
 
+    /**
+     * Shared stateless {@code string.gmatch} builtin (see
+     * {@code BaseLib.TOSTRING}): one JVM-wide instance so the VM can
+     * recognize and inline it on hot paths.
+     */
+    public static final LuaFunction GMATCH = LuaFunction.of(StringLib::gmatchImpl);
+
+    static LuaValue gmatchImpl(LuaValue[] args) {
+        if (args.length == 0 || (!args[0].isString() && !args[0].isNumber())) {
+            throw LuaValue.argError(1, "gmatch", "string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
+        }
+        if (args.length < 2 || (!args[1].isString() && !args[1].isNumber())) {
+            throw LuaValue.argError(2, "gmatch", "string expected, got " + (args.length < 2 ? "no value" : args[1].typeName()));
+        }
+        return LuaPattern.gmatch(args[0], args[1], args.length > 2 ? args[2] : null);
+    }
+
     public static void open(LuaTable globals) {
         LuaTable stringTable = new LuaTable();
         fillInto(stringTable, globals);
-        globals.rawset(LuaString.valueOf("string"), stringTable);
+        globals.rawset(LuaString.interned("string"), stringTable);
     }
 
     public static void fillInto(LuaTable stringTable, LuaTable globals) {
 
-        stringTable.rawset(LuaString.valueOf("len"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("len"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'string.len'");
             if (args[0] instanceof LuaString ls) {
                 return LuaInteger.valueOf(ls.value().length());
@@ -38,29 +55,29 @@ public final class StringLib {
             return LuaInteger.valueOf(args[0].toLuaString().length());
         }));
 
-        stringTable.rawset(LuaString.valueOf("lower"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("lower"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'string.lower'");
             return LuaString.valueOf(args[0].toLuaString().toLowerCase());
         }));
 
-        stringTable.rawset(LuaString.valueOf("upper"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("upper"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'string.upper'");
             return LuaString.valueOf(args[0].toLuaString().toUpperCase());
         }));
 
-        stringTable.rawset(LuaString.valueOf("reverse"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("reverse"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'string.reverse'");
             return LuaString.valueOf(new StringBuilder(args[0].toLuaString()).reverse().toString());
         }));
 
-        stringTable.rawset(LuaString.valueOf("rep"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("rep"), LuaFunction.of(args -> {
             if (args.length < 2) throw new LuaException("bad argument to 'string.rep'");
             String s = args[0].toLuaString();
             LuaInteger nVal = args[1].toLuaInteger();
             if (nVal == null) throw new LuaException("bad argument #2 to 'string.rep' (number has no integer representation)");
             long n = nVal.toLong();
             String sep = (args.length > 2 && !args[2].isNil()) ? args[2].toLuaString() : "";
-            if (n <= 0) return LuaString.valueOf("");
+            if (n <= 0) return LuaString.interned("");
             long l = s.length();
             long lsep = sep.length();
             if (n > 1) {
@@ -88,7 +105,7 @@ public final class StringLib {
             return LuaString.valueOf(sb.toString());
         }));
 
-        stringTable.rawset(LuaString.valueOf("sub"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("sub"), LuaFunction.of(args -> {
             if (args.length == 0 || (!args[0].isString() && !args[0].isNumber())) {
                 throw LuaValue.argError(1, "sub", "string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
@@ -109,11 +126,11 @@ public final class StringLib {
             if (start < 1) start = 1;
             if (end > len) end = len;
 
-            if (start > end) return LuaString.valueOf("");
+            if (start > end) return LuaString.interned("");
             return LuaString.valueOf(s.substring((int) start - 1, (int) end));
         }));
 
-        stringTable.rawset(LuaString.valueOf("byte"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("byte"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'string.byte'");
             String s = (args[0] instanceof LuaString ls) ? ls.value() : args[0].toLuaString();
             int len = s.length();
@@ -138,7 +155,7 @@ public final class StringLib {
             return Varargs.of(bytes);
         }));
 
-        stringTable.rawset(LuaString.valueOf("char"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("char"), LuaFunction.of(args -> {
             int n = args.length;
             if (n == 0) return LuaString.EMPTY;
             if (n == 1) {
@@ -167,7 +184,7 @@ public final class StringLib {
             return LuaString.valueOf(new String(chars));
         }));
 
-        stringTable.rawset(LuaString.valueOf("format"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("format"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument #1 to 'string.format' (string expected, got no value)");
             String fmt = args[0].toLuaString();
             StringBuilder b = new StringBuilder();
@@ -261,7 +278,11 @@ public final class StringLib {
                         }
                         case 'p' -> {
                             checkFormat(form, "-", false);
-                            String res = (v.isNil() || v.isBoolean() || v.isNumber()) ? "(null)" : "0x" + Long.toHexString(System.identityHashCode(v));
+                            // Strings canonicalize first: equal short strings
+                            // share one object, so their pointers compare
+                            // equal (LuaString interning is lazy).
+                            LuaValue id = (v instanceof LuaString ls) ? LuaString.intern(ls) : v;
+                            String res = (v.isNil() || v.isBoolean() || v.isNumber()) ? "(null)" : "0x" + Long.toHexString(System.identityHashCode(id));
                             if (width > res.length()) {
                                 if (flags.contains("-")) res = res + " ".repeat(width - res.length());
                                 else res = " ".repeat(width - res.length()) + res;
@@ -320,18 +341,18 @@ public final class StringLib {
             return LuaString.valueOf(b.toString());
         }));
 
-        stringTable.rawset(LuaString.valueOf("packsize"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("packsize"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'string.packsize'");
             return LuaInteger.valueOf(StringPacker.packsize(args[0].toLuaString()));
         }));
 
-        stringTable.rawset(LuaString.valueOf("pack"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("pack"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'string.pack'");
             byte[] packed = StringPacker.pack(args[0].toLuaString(), args, 1);
             return LuaString.valueOf(new String(packed, java.nio.charset.StandardCharsets.ISO_8859_1));
         }));
 
-        stringTable.rawset(LuaString.valueOf("unpack"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("unpack"), LuaFunction.of(args -> {
             if (args.length < 2) throw new LuaException("bad argument to 'string.unpack'");
             String fmt = args[0].toLuaString();
             String s = args[1].toLuaString();
@@ -340,7 +361,7 @@ public final class StringLib {
             return StringPacker.unpack(fmt, data, pos);
         }));
 
-        stringTable.rawset(LuaString.valueOf("find"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("find"), LuaFunction.of(args -> {
             if (args.length == 0 || (!args[0].isString() && !args[0].isNumber())) {
                 throw LuaValue.argError(1, "find", "string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
@@ -351,7 +372,7 @@ public final class StringLib {
             return LuaPattern.find(args[0], args[1], args.length > 2 ? args[2] : null, plain);
         }));
 
-        stringTable.rawset(LuaString.valueOf("match"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("match"), LuaFunction.of(args -> {
             if (args.length == 0 || (!args[0].isString() && !args[0].isNumber())) {
                 throw LuaValue.argError(1, "match", "string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
@@ -361,7 +382,7 @@ public final class StringLib {
             return LuaPattern.match(args[0], args[1], args.length > 2 ? args[2] : null);
         }));
 
-        stringTable.rawset(LuaString.valueOf("gsub"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("gsub"), LuaFunction.of(args -> {
             if (args.length == 0 || (!args[0].isString() && !args[0].isNumber())) {
                 throw LuaValue.argError(1, "gsub", "string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
@@ -372,17 +393,9 @@ public final class StringLib {
             return LuaPattern.gsub(args[0], args[1], args[2], args.length > 3 ? args[3] : null);
         }));
 
-        stringTable.rawset(LuaString.valueOf("gmatch"), LuaFunction.of(args -> {
-            if (args.length == 0 || (!args[0].isString() && !args[0].isNumber())) {
-                throw LuaValue.argError(1, "gmatch", "string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
-            }
-            if (args.length < 2 || (!args[1].isString() && !args[1].isNumber())) {
-                throw LuaValue.argError(2, "gmatch", "string expected, got " + (args.length < 2 ? "no value" : args[1].typeName()));
-            }
-            return LuaPattern.gmatch(args[0], args[1], args.length > 2 ? args[2] : null);
-        }));
+        stringTable.rawset(LuaString.interned("gmatch"), GMATCH);
 
-        stringTable.rawset(LuaString.valueOf("dump"), LuaFunction.of(args -> {
+        stringTable.rawset(LuaString.interned("dump"), LuaFunction.of(args -> {
             if (args.length == 0 || !(args[0] instanceof LuaFunction fn)) {
                 throw new LuaException("bad argument #1 to 'string.dump' (function expected)");
             }
@@ -396,9 +409,67 @@ public final class StringLib {
     // __index target is the (possibly still lazy) string library table, so
     // ("x"):upper() works and fills the library on first use.
     public static void installMetatable(LuaTable stringTable) {
+        LuaString.setStringMetatable(newStringMetatable(stringTable));
+    }
+
+    public static LuaTable newStringMetatable(LuaTable stringTable) {
         LuaTable stringMt = new LuaTable();
-        stringMt.rawset(LuaString.valueOf("__index"), stringTable);
-        LuaString.setStringMetatable(stringMt);
+        stringMt.rawset(LuaString.interned("__index"), stringTable);
+        // Lua 5.4 (lstrlib.c): strings carry default arithmetic metamethods
+        // that coerce numerical strings, and are fully overridable/removable.
+        // Without these, `"10" + 1` bypasses the string metatable entirely and
+        // a user-installed `__add` is silently ignored.
+        stringMt.rawset(org.luava.runtime.LuaValue.Meta.ADD, arithMm("add", org.luava.runtime.LuaValue.Meta.ADD));
+        stringMt.rawset(org.luava.runtime.LuaValue.Meta.SUB, arithMm("sub", org.luava.runtime.LuaValue.Meta.SUB));
+        stringMt.rawset(org.luava.runtime.LuaValue.Meta.MUL, arithMm("mul", org.luava.runtime.LuaValue.Meta.MUL));
+        stringMt.rawset(org.luava.runtime.LuaValue.Meta.DIV, arithMm("div", org.luava.runtime.LuaValue.Meta.DIV));
+        stringMt.rawset(org.luava.runtime.LuaValue.Meta.IDIV, arithMm("idiv", org.luava.runtime.LuaValue.Meta.IDIV));
+        stringMt.rawset(org.luava.runtime.LuaValue.Meta.MOD, arithMm("mod", org.luava.runtime.LuaValue.Meta.MOD));
+        stringMt.rawset(org.luava.runtime.LuaValue.Meta.POW, arithMm("pow", org.luava.runtime.LuaValue.Meta.POW));
+        stringMt.rawset(org.luava.runtime.LuaValue.Meta.UNM, arithMm("unm", org.luava.runtime.LuaValue.Meta.UNM));
+        return stringMt;
+    }
+
+    /**
+     * One default string-metatable arithmetic metamethod, mirroring PUC
+     * {@code lstrlib.c} {@code arith}/{@code trymt}: coerce both operands to
+     * numbers and apply the raw operation; otherwise delegate to the second
+     * operand's metamethod (unless it is a string, which would recurse);
+     * otherwise report {@code "attempt to <op> a '<t1>' with a '<t2>'"}.
+     */
+    private static LuaFunction arithMm(String op, org.luava.runtime.LuaString key) {
+        return LuaFunction.of(args -> {
+            LuaValue a = args.length > 0 ? args[0] : LuaNil.NIL;
+            LuaValue b = args.length > 1 ? args[1] : LuaNil.NIL;
+            LuaValue na = toArithNumber(a);
+            LuaValue nb = toArithNumber(b);
+            if (na != null && nb != null) {
+                switch (op) {
+                    case "add": return na.add(nb);
+                    case "sub": return na.sub(nb);
+                    case "mul": return na.mul(nb);
+                    case "div": return na.div(nb);
+                    case "idiv": return na.idiv(nb);
+                    case "mod": return na.mod(nb);
+                    case "pow": return na.pow(nb);
+                    default: return na.unm();
+                }
+            }
+            if (!b.isString()) {
+                LuaTable mt = b.getMetatable();
+                LuaValue mm = (mt != null) ? mt.rawget(key) : null;
+                if (mm != null && !mm.isNil()) {
+                    return mm.call(a, b);
+                }
+            }
+            throw new LuaException("attempt to " + op + " a '" + a.typeName() + "' with a '" + b.typeName() + "'");
+        });
+    }
+
+    /** PUC {@code tonum}: an actual number, or a fully numerical string. */
+    private static LuaValue toArithNumber(LuaValue v) {
+        if (v.isNumber()) return v;
+        return v.isString() ? v.toLuaNumber() : null;
     }
 
 

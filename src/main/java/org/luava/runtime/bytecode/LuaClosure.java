@@ -39,12 +39,12 @@ public final class LuaClosure extends LuaFunction {
         this.upvalues = null;
         this.rawSource = proto.rawSource;
         this.body = proto.body;
-        if (proto.locVarInfos != null && proto.numParams > 0) {
-            this.params = new java.util.ArrayList<>(proto.numParams);
-            for (int i = 0; i < proto.numParams && i < proto.locVarInfos.length; i++) {
-                this.params.add(proto.locVarInfos[i].name());
-            }
-        }
+        // Do NOT eagerly build the params name list: closure creation is a
+        // hot path (100k+ allocations in closure benchmarks) and debug/
+        // serialization rarely read it. Nulled like upvalues; getParams()
+        // materializes lazily from the proto. setParams() keeps working by
+        // materializing first (lazily-created list replaces null).
+        this.params = null;
         if (proto.name != null) {
             this.setName(proto.name);
         }
@@ -74,6 +74,31 @@ public final class LuaClosure extends LuaFunction {
         getUpvalues().set(index, uv);
     }
 
+    /**
+     * Lazily materializes the parameter-name list from the proto (see
+     * constructor): hot-path closure creation never allocates it.
+     */
+    @Override
+    public java.util.List<String> getParams() {
+        java.util.List<String> p = super.params;
+        if (p == null) {
+            p = new java.util.ArrayList<>(proto.numParams);
+            if (proto.locVarInfos != null) {
+                for (int i = 0; i < proto.numParams && i < proto.locVarInfos.length; i++) {
+                    p.add(proto.locVarInfos[i].name());
+                }
+            }
+            super.params = p;
+        }
+        return p;
+    }
+
+    @Override
+    public void setParams(java.util.List<String> params) {
+        getParams();
+        super.setParams(params);
+    }
+
     public LuaClosure(LuaProto proto, Upvalue[] upvals, LuaTable env) {
         this(proto, upvals, env, null);
     }
@@ -91,12 +116,17 @@ public final class LuaClosure extends LuaFunction {
         if (state == null) {
             state = new LuaState();
         }
-        LuaValue[] res = BytecodeVM.execute(state, this, args);
-        // Lua 5.4: bare 'return' yields zero values (not one nil).
-        // Mirror AST InterpretedLuaFunction which returns Varargs.EMPTY.
-        if (res == null || res.length == 0) return org.luava.runtime.Varargs.EMPTY;
-        if (res.length == 1) return res[0];
-        return org.luava.runtime.Varargs.of(res);
+        LuaState previous = LuaValue.pushBasicState(state);
+        try {
+            LuaValue[] res = BytecodeVM.execute(state, this, args);
+            // Lua 5.4: bare 'return' yields zero values (not one nil).
+            // Mirror AST InterpretedLuaFunction which returns Varargs.EMPTY.
+            if (res == null || res.length == 0) return org.luava.runtime.Varargs.EMPTY;
+            if (res.length == 1) return res[0];
+            return org.luava.runtime.Varargs.of(res);
+        } finally {
+            LuaValue.popBasicState(previous);
+        }
     }
 
     @Override

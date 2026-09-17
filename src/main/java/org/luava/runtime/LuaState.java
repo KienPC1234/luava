@@ -33,22 +33,37 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
+/**
+ * A Lua universe: globals, registry, main thread, allocator caps, security
+ * policy, and value-type metatables.
+ *
+ * <p>One state supports many coroutines and nested calls, but concurrent
+ * top-level {@code eval} calls on the same state from different host threads
+ * are not supported. Use one {@code LuaState} per host thread/tenant for
+ * concurrent servers; states do not share globals, security policy, value
+ * metatables, or explicit finalizer ownership.
+ */
 public final class LuaState {
+    private static final AtomicLong NEXT_GC_OWNER_ID = new AtomicLong(1);
+    private final long gcOwnerId = NEXT_GC_OWNER_ID.getAndIncrement();
     private final LuaTable globals = new LuaTable();
     private final LuaTable registry = new LuaTable();
     private final LuaCoroutine mainThread = LuaCoroutine.createMainThread();
+    private final EnumMap<LuaType, LuaTable> basicMetatables = new EnumMap<>(LuaType.class);
     private final Environment rootEnvironment;
     private final List<ModuleBinder.ModuleInfo> registeredModules = new ArrayList<>();
     private LuaValue savedLoadfile;
@@ -77,7 +92,9 @@ public final class LuaState {
         private long remaining;
         private long deadline;
         private int countdown;
-        private boolean tripped;
+        private volatile boolean tripped;
+        private volatile boolean cancelRequested;
+        private volatile String cancelMessage = "execution timed out";
 
         Guard(long maxInstr, long timeoutNanos) {
             this.maxInstr = maxInstr;
@@ -88,13 +105,25 @@ public final class LuaState {
             this.remaining = maxInstr;
             this.deadline = timeoutNanos > 0 ? System.nanoTime() + timeoutNanos : 0;
             this.countdown = 4096;
-            this.tripped = false;
+            // Preserve an explicit cancellation: a re-arm by a nested/racing
+            // eval must not revive a chunk its caller already abandoned.
+            if (!cancelRequested) {
+                this.tripped = false;
+            }
+        }
+
+        /** Forces the next {@link #tick()} to fail. Used to cancel a runaway
+         * eval whose caller already gave up, so no worker keeps spinning. */
+        void cancel() {
+            this.tripped = true;
+            this.cancelRequested = true;
+            this.cancelMessage = "execution timed out";
         }
 
         @Override
         public void tick() {
             if (tripped) {
-                throw new LuaException("instruction limit exceeded");
+                throw new LuaException(cancelRequested ? cancelMessage : "instruction limit exceeded");
             }
             if (maxInstr > 0 && --remaining < 0) {
                 tripped = true;
@@ -136,8 +165,17 @@ public final class LuaState {
      */
     private static final ThreadLocal<Long> ACTIVE_MAX_ALLOC = new ThreadLocal<>();
 
+    /**
+     * True once any state asked for an allocation cap. Keeps the concat hot
+     * path free of a ThreadLocal lookup in the default (uncapped) case.
+     */
+    private static volatile boolean ANY_MAX_ALLOC = false;
+
     public LuaState maxAllocationBytes(long bytes) {
         this.maxAllocBytes = bytes;
+        if (bytes > 0) {
+            ANY_MAX_ALLOC = true;
+        }
         return this;
     }
 
@@ -174,6 +212,7 @@ public final class LuaState {
 
     /** Effective per-allocation cap for the currently running chunk. */
     public static long allocationLimit() {
+        if (!ANY_MAX_ALLOC) return Integer.MAX_VALUE - 8;
         Long l = ACTIVE_MAX_ALLOC.get();
         if (l != null && l > 0) return l;
         return Integer.MAX_VALUE - 8;
@@ -187,21 +226,40 @@ public final class LuaState {
     }
 
     public LuaState() {
-        LuaValue.resetBasicMetatables();
+        // Force-initialize the core value classes here, at a shallow call
+        // depth, before any script runs. Class initialization can allocate
+        // (static caches) and thus can throw StackOverflowError if it first
+        // happens at the recursion limit — after which the JVM permanently
+        // poisons the class ("Could not initialize class ..."). The PUC
+        // suite deliberately overflows the C stack while running error
+        // handlers, so this must be settled up front.
+        initValueClasses();
         registry.rawset(LuaInteger.valueOf(1), mainThread);
         registry.rawset(LuaInteger.valueOf(2), globals);
         this.rootEnvironment = new Environment(null, globals);
         org.luava.runtime.eval.GCManager.registerState(this);
         openStandardLibraries();
-        savedLoadfile = globals.rawget(LuaString.valueOf("loadfile"));
-        savedDofile = globals.rawget(LuaString.valueOf("dofile"));
+        savedLoadfile = globals.rawget(LuaString.interned("loadfile"));
+        savedDofile = globals.rawget(LuaString.interned("dofile"));
+    }
+
+    /** Touches each core value class so its {@code <clinit>} runs early. */
+    private static void initValueClasses() {
+        LuaValue[] probe = {
+            LuaNil.NIL, LuaBoolean.TRUE, LuaBoolean.FALSE,
+            LuaInteger.valueOf(0), LuaFloat.valueOf(0.0),
+            LuaString.EMPTY, Varargs.EMPTY,
+        };
+        if (probe.length == 0) {
+            throw new IllegalStateException();
+        }
     }
 
     private void openStandardLibraries() {
         BaseLib.open(this, globals);
         lazyLib("math", t -> MathLib.fillInto(t, globals));
         LuaTable stringLib = lazyLib("string", t -> StringLib.fillInto(t, globals));
-        StringLib.installMetatable(stringLib);
+        installStringMetatable(stringLib);
         lazyLib("table", t -> TableLib.fillInto(t, globals));
         lazyLib("coroutine", t -> CoroutineLib.fillInto(t, globals, mainThread));
         lazyLib("utf8", t -> Utf8Lib.fillInto(t, globals));
@@ -210,12 +268,12 @@ public final class LuaState {
         lazyLib("debug", t -> DebugLib.fillInto(t, this, globals));
         LuaTable pkgLib = lazyLib("package", t -> PackageLib.fillInto(t, this, globals));
         LuaTable javaLib = lazyLib("java", t -> org.luava.binding.JavaInteropLib.fillInto(t, globals));
-        globals.rawset(LuaString.valueOf("luajava"), javaLib);
+        globals.rawset(LuaString.interned("luajava"), javaLib);
         // Bare-global require: stub fills package lib on first call, then
         // delegates to the real implementation (which overwrites this stub).
-        globals.rawset(LuaString.valueOf("require"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("require"), LuaFunction.of(args -> {
             pkgLib.ensureFilled();
-            LuaValue real = globals.rawget(LuaString.valueOf("require"));
+            LuaValue real = globals.rawget(LuaString.interned("require"));
             return ((LuaFunction) real).call(args);
         }));
         LuaTable argTable = new LuaTable();
@@ -224,7 +282,7 @@ public final class LuaState {
         // CLI-oriented suite files test PUC Lua, not Luava).
         String progName = System.getProperty("lua.prog", "luava");
         argTable.rawset(LuaInteger.valueOf(0), LuaString.valueOf(progName));
-        globals.rawset(LuaString.valueOf("arg"), argTable);
+        globals.rawset(LuaString.interned("arg"), argTable);
     }
 
     private LuaTable lazyLib(String name, java.util.function.Consumer<LuaTable> filler) {
@@ -268,7 +326,7 @@ public final class LuaState {
             case "math" -> lazyLib("math", t -> MathLib.fillInto(t, globals));
             case "string" -> {
                 LuaTable stringLib = lazyLib("string", t -> StringLib.fillInto(t, globals));
-                StringLib.installMetatable(stringLib);
+                installStringMetatable(stringLib);
             }
             case "table" -> lazyLib("table", t -> TableLib.fillInto(t, globals));
             case "coroutine" -> lazyLib("coroutine", t -> CoroutineLib.fillInto(t, globals, mainThread));
@@ -278,7 +336,7 @@ public final class LuaState {
             case "debug" -> lazyLib("debug", t -> DebugLib.fillInto(t, this, globals));
             case "java" -> {
                 LuaTable javaLib = lazyLib("java", t -> org.luava.binding.JavaInteropLib.fillInto(t, globals));
-                globals.rawset(LuaString.valueOf("luajava"), javaLib);
+                globals.rawset(LuaString.interned("luajava"), javaLib);
             }
             case "package" -> installPackage();
             default -> throw new LuaException("unknown library: " + name);
@@ -287,21 +345,50 @@ public final class LuaState {
     }
 
     private void installPackage() {        LuaTable pkgLib = lazyLib("package", t -> PackageLib.fillInto(t, this, globals));
-        globals.rawset(LuaString.valueOf("require"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("require"), LuaFunction.of(args -> {
             pkgLib.ensureFilled();
-            LuaValue real = globals.rawget(LuaString.valueOf("require"));
+            LuaValue real = globals.rawget(LuaString.interned("require"));
             return ((LuaFunction) real).call(args);
         }));
         if (savedLoadfile != null) {
-            globals.rawset(LuaString.valueOf("loadfile"), savedLoadfile);
+            globals.rawset(LuaString.interned("loadfile"), savedLoadfile);
         }
         if (savedDofile != null) {
-            globals.rawset(LuaString.valueOf("dofile"), savedDofile);
+            globals.rawset(LuaString.interned("dofile"), savedDofile);
         }
     }
 
     public LuaTable getRegistry() {
         return registry;
+    }
+
+    public long gcOwnerId() {
+        return gcOwnerId;
+    }
+
+    EnumMap<LuaType, LuaTable> basicMetatables() {
+        return basicMetatables;
+    }
+
+    /**
+     * This state's basic metatable for {@code type} (null when unset).
+     * Hot-path alternative to {@code LuaValue.getBasicMetatable}: the VM
+     * already holds the executing state, so this skips the ThreadLocal
+     * lookup. Only valid while this state is the active basic scope, which
+     * always holds inside its own {@code execute()}.
+     */
+    public LuaTable basicMetatable(LuaType type) {
+        return basicMetatables.get(type);
+    }
+
+    private void installStringMetatable(LuaTable stringLib) {
+        LuaTable stringMetatable = StringLib.newStringMetatable(stringLib);
+        basicMetatables.put(LuaType.STRING, stringMetatable);
+        synchronized (LuaValue.class) {
+            if (LuaValue.getBasicMetatable(LuaType.STRING) == null) {
+                LuaValue.setBasicMetatable(LuaType.STRING, stringMetatable);
+            }
+        }
     }
 
     public LuaTable getGlobals() {
@@ -377,9 +464,9 @@ public final class LuaState {
         String modName = result.info().name();
         globals.rawset(LuaString.valueOf(modName), result.table());
 
-        LuaValue pkgVal = globals.rawget(LuaString.valueOf("package"));
+        LuaValue pkgVal = globals.rawget(LuaString.interned("package"));
         if (pkgVal instanceof LuaTable pkg) {
-            LuaValue loadedVal = pkg.rawget(LuaString.valueOf("loaded"));
+            LuaValue loadedVal = pkg.rawget(LuaString.interned("loaded"));
             if (loadedVal instanceof LuaTable loaded) {
                 loaded.rawset(LuaString.valueOf(modName), result.table());
             }
@@ -391,9 +478,9 @@ public final class LuaState {
         configurator.accept(table);
         globals.rawset(LuaString.valueOf(moduleName), table);
 
-        LuaValue pkgVal = globals.rawget(LuaString.valueOf("package"));
+        LuaValue pkgVal = globals.rawget(LuaString.interned("package"));
         if (pkgVal instanceof LuaTable pkg) {
-            LuaValue loadedVal = pkg.rawget(LuaString.valueOf("loaded"));
+            LuaValue loadedVal = pkg.rawget(LuaString.interned("loaded"));
             if (loadedVal instanceof LuaTable loaded) {
                 loaded.rawset(LuaString.valueOf(moduleName), table);
             }
@@ -461,8 +548,16 @@ public final class LuaState {
     }
 
     public LuaValue evalWithTimeout(String luaSource, Duration timeout) throws TimeoutException {
+        // A private hard guard makes the worker self-terminate on timeout
+        // instead of leaking a virtual thread that spins forever. The guard
+        // is installed before the worker starts and removed once the worker
+        // has unwound, so the state is reusable afterwards.
+        Guard guard = new Guard(0, timeout.toNanos());
+        guard.arm();
+        LoopGuard prevGuard = loopGuard;
+        loopGuard = guard;
         CompletableFuture<LuaValue> future = new CompletableFuture<>();
-        Thread.ofVirtual().name("lua-timeout-task").start(() -> {
+        Thread worker = Thread.ofVirtual().name("lua-timeout-task").start(() -> {
             try {
                 LuaValue result = eval(luaSource);
                 future.complete(result);
@@ -475,11 +570,28 @@ public final class LuaState {
             return future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            guard.cancel();
+            try {
+                worker.join(2000);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
             throw new LuaException("Execution interrupted");
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof RuntimeException re) throw re;
             throw new LuaException("Error during execution: " + cause.getMessage());
+        } catch (TimeoutException e) {
+            guard.cancel();
+            future.cancel(false);
+            try {
+                worker.join(2000);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            throw e;
+        } finally {
+            loopGuard = prevGuard;
         }
     }
 
@@ -594,11 +706,38 @@ public final class LuaState {
      * modes). Opt out with {@code -Dluava.jit=false}; force synchronous
      * tier-up for deterministic measurement with
      * {@code -Dluava.jit.sync=true}.
+     *
+     * <p>This is the process-wide default; per-state control is
+     * {@link #jitEnabled(boolean)} / {@link #isJitEnabled()}. A state's own
+     * setting wins over this field.
      */
     public static volatile boolean ENABLE_JIT = !"false".equalsIgnoreCase(System.getProperty("luava.jit", "true"));
 
     /** Interpreter calls of one proto before a JIT compile is attempted. */
     public static final int JIT_HOT_THRESHOLD = 50;
+
+    /**
+     * Per-state JIT override. {@code null} means "follow the global
+     * {@link #ENABLE_JIT}"; true/false pins this state only, so a server can
+     * keep JIT on for trusted tenants and off for others in the same JVM.
+     */
+    private volatile Boolean jitEnabledOverride;
+
+    /**
+     * Enables or disables tiered JIT for this state only, independent of
+     * {@link #ENABLE_JIT} and other states. Thread-safe; may be flipped at
+     * runtime. Pass {@code null} to fall back to the global default.
+     */
+    public LuaState jitEnabled(Boolean enabled) {
+        this.jitEnabledOverride = enabled;
+        return this;
+    }
+
+    /** Whether this state currently uses the JIT (its override or the global default). */
+    public boolean isJitEnabled() {
+        Boolean o = jitEnabledOverride;
+        return o != null ? o : ENABLE_JIT;
+    }
 
     public LuaCoroutine getCurrentThread() {
         LuaCoroutine cur = LuaCoroutine.running();

@@ -41,7 +41,9 @@ public final class LuaPattern {
         int matchdepth;
         int level;
         int matchTicks;
-        final Capture[] capture = new Capture[LUA_MAXCAPTURES];
+        // Allocated on first capture use: capture-less patterns (the common
+        // case, e.g. gmatch("%a+")) never pay for the 32-slot array.
+        Capture[] capture;
 
         MatchState(byte[] src, byte[] p) {
             this.src = src;
@@ -88,6 +90,37 @@ public final class LuaPattern {
     }
 
     private static boolean match_class(int c, int cl) {
+        // ASCII fast lane: the 12 magic classes over ASCII input resolve to
+        // plain range tests. Character.toLowerCase/isLowerCase cost ~10ns per
+        // char and dominate gmatch loops (millions of singlematch calls).
+        // For ASCII, toLowerCase == ASCII-lower and isLowerCase == a-z
+        // exactly; anything else keeps the original semantics below.
+        if (c >= 0 && c < 128) {
+            // Only the 24 class letters take the fast lane; anything else
+            // (e.g. "%.") falls through to the original early-return below.
+            boolean isClass = switch (cl | 32) {
+                case 'a', 'c', 'd', 'g', 'l', 'p', 's', 'u', 'w', 'x', 'z' -> true;
+                default -> false;
+            };
+            if (isClass) {
+                boolean res = switch (cl | 32) {
+                    case 'a' -> (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+                    case 'c' -> (c < 32 || c == 127);
+                    case 'd' -> (c >= '0' && c <= '9');
+                    case 'g' -> (c >= 33 && c <= 126);
+                    case 'l' -> (c >= 'a' && c <= 'z');
+                    case 'p' -> (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+                    case 's' -> (c == ' ' || (c >= 9 && c <= 13));
+                    case 'u' -> (c >= 'A' && c <= 'Z');
+                    case 'w' -> (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+                    case 'x' -> (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+                    default -> (c == 0);
+                };
+                // Uppercase class letters are complements; for ASCII letters
+                // Character.isLowerCase(cl) == (cl is a-z) exactly.
+                return (cl >= 'a' && cl <= 'z') ? res : !res;
+            }
+        }
         boolean res;
         int lowerCl = Character.toLowerCase(cl);
         switch (lowerCl) {
@@ -367,10 +400,15 @@ public final class LuaPattern {
     /** Lazy capture slot: capture-less patterns (the common case) never pay
      * for the 32 Capture objects a MatchState would otherwise allocate. */
     private static Capture capAt(MatchState ms, int i) {
-        Capture c = ms.capture[i];
+        Capture[] slots = ms.capture;
+        if (slots == null) {
+            slots = new Capture[LUA_MAXCAPTURES];
+            ms.capture = slots;
+        }
+        Capture c = slots[i];
         if (c == null) {
             c = new Capture();
-            ms.capture[i] = c;
+            slots[i] = c;
         }
         return c;
     }
@@ -440,8 +478,8 @@ public final class LuaPattern {
     }
 
     public static Varargs find(LuaValue sVal, LuaValue pVal, LuaValue initVal, boolean plain) {
-        byte[] src = sVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
-        byte[] p = pVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
+        byte[] src = bytes(sVal);
+        byte[] p = bytes(pVal);
         long initArg = (initVal != null && !initVal.isNil()) ? initVal.toLong() : 1;
         int init = posrelat(initArg, src.length);
 
@@ -475,8 +513,8 @@ public final class LuaPattern {
     }
 
     public static Varargs match(LuaValue sVal, LuaValue pVal, LuaValue initVal) {
-        byte[] src = sVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
-        byte[] p = pVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
+        byte[] src = bytes(sVal);
+        byte[] p = bytes(pVal);
         long initArg = (initVal != null && !initVal.isNil()) ? initVal.toLong() : 1;
         int init = posrelat(initArg, src.length);
 
@@ -496,8 +534,8 @@ public final class LuaPattern {
     }
 
     public static Varargs gsub(LuaValue sVal, LuaValue pVal, LuaValue replVal, LuaValue maxVal) {
-        byte[] src = sVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
-        byte[] p = pVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
+        byte[] src = bytes(sVal);
+        byte[] p = bytes(pVal);
         long max_s = (maxVal != null && !maxVal.isNil()) ? maxVal.toLong() : Long.MAX_VALUE;
 
         boolean anchor = p.length > 0 && p[0] == '^';
@@ -551,7 +589,7 @@ public final class LuaPattern {
             } else if (!res.isString() && !res.isNumber()) {
                 throw new LuaException("invalid replacement value (a " + res.typeName() + ")");
             } else {
-                byte[] bytes = res.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
+                byte[] bytes = bytes(res);
                 b.write(bytes, 0, bytes.length);
                 return true;
             }
@@ -571,12 +609,12 @@ public final class LuaPattern {
             } else if (!res.isString() && !res.isNumber()) {
                 throw new LuaException("invalid replacement value (a " + res.typeName() + ")");
             } else {
-                byte[] bytes = res.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
+                byte[] bytes = bytes(res);
                 b.write(bytes, 0, bytes.length);
                 return true;
             }
         } else if (tr.isString() || tr.isNumber()) {
-            byte[] repl = tr.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
+            byte[] repl = bytes(tr);
             add_s(ms, b, s, e, repl);
             return true;
         } else {
@@ -601,7 +639,7 @@ public final class LuaPattern {
                 } else if (next == '0') {
                     b.write(ms.src, s, e - s);
                 } else if (next >= '1' && next <= '9') {
-                    byte[] bytes = pushOneCapture(ms, next - '1', s, e).toLuaString().getBytes(StandardCharsets.ISO_8859_1);
+                    byte[] bytes = bytes(pushOneCapture(ms, next - '1', s, e));
                     b.write(bytes, 0, bytes.length);
                 } else {
                     throw new LuaException("invalid use of '%' in replacement string");
@@ -610,31 +648,189 @@ public final class LuaPattern {
         }
     }
 
-    public static LuaFunction gmatch(LuaValue sVal, LuaValue pVal, LuaValue initVal) {
-        byte[] src = sVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
-        byte[] p = pVal.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
-        long initArg = (initVal != null && !initVal.isNil()) ? initVal.toLong() : 1;
-        int init = posrelat(initArg, src.length);
+    /**
+     * Raw pattern-matching bytes for a value. Lua strings carry a cached
+     * Latin-1 encoding, so repeated matches over the same subject/pattern
+     * (the classic {@code for w in s:gmatch(p)} loop) never re-copy.
+     */
+    static byte[] bytes(LuaValue v) {
+        if (v instanceof LuaString ls) {
+            return ls.latin1Bytes();
+        }
+        return v.toLuaString().getBytes(StandardCharsets.ISO_8859_1);
+    }
 
-        MatchState ms = new MatchState(src, p);
-        int[] state = new int[]{init, -1};
+    /**
+     * Dedicated {@code gmatch} iterator: holds the match state inline
+     * instead of a lambda closing over a {@code MatchState} plus two
+     * upvalues. Saves ~7 small allocations per {@code gmatch} call and
+     * returns single captures without a {@code Varargs} wrapper.
+     */
+    public static final class GmatchIterator extends LuaFunction {
+        private final byte[] src;
+        private final int srcLen;
+        private final byte[] pat;
+        private final LuaValue srcVal;
+        private final LuaValue patVal;
+        private MatchState ms;
+        private int pos;
+        private int lastmatch;
+        private boolean upvaluesBuilt;
+        /**
+         * Simple-pattern fast lane: when the pattern is exactly
+         * {@code %<class><quant>} ({@code %a+}, {@code %d*}, ...), the
+         * general backtracking engine is replaced by a direct scan that
+         * produces the identical (s, e) sequence (verified against
+         * {@code match}/{@code max_expand}/{@code min_expand} for the
+         * four quantifiers). 0 = general engine.
+         */
+        private final char simpleQuant;
+        private final int simpleClass;
 
-        LuaFunction iterFn = LuaFunction.of(iterArgs -> {
-            int s = state[0];
-            int lastmatch = state[1];
-            for (; s <= src.length; s++) {
+        private static boolean isSimpleClass(int cl) {
+            return switch (cl | 32) {
+                case 'a', 'c', 'd', 'g', 'l', 'p', 's', 'u', 'w', 'x', 'z' -> true;
+                default -> false;
+            };
+        }
+
+        GmatchIterator(LuaValue sVal, LuaValue pVal, byte[] src, byte[] p, int init) {
+            this.src = src;
+            this.srcLen = src.length;
+            this.pat = p;
+            this.srcVal = sVal;
+            this.patVal = pVal;
+            // The general engine state is allocated lazily: simple patterns
+            // (%a+, %d*, ...) scan directly and never need it.
+            this.ms = null;
+            this.pos = init;
+            this.lastmatch = -1;
+            this.upvaluesBuilt = false;
+            // Upvalues are materialized lazily (see getUpvalues): the hot path
+            // never pays for them, while debug.getupvalue/upvalueid keep
+            // working (PUC closure.lua/db.lua assert on them).
+            if (p.length == 3 && p[0] == '%' && isSimpleClass(p[1] & 0xFF)
+                    && (p[2] == '+' || p[2] == '*' || p[2] == '-' || p[2] == '?')) {
+                this.simpleQuant = (char) p[2];
+                this.simpleClass = p[1] & 0xFF;
+            } else {
+                this.simpleQuant = 0;
+                this.simpleClass = 0;
+            }
+            setWhat("C");
+            setSource("=[C]");
+            setLineDefined(-1);
+            setLastLineDefined(-1);
+        }
+
+        /** Direct step without varargs boxing (VM fast path). */
+        public LuaValue next() {
+            if (simpleQuant != 0) {
+                return nextSimple();
+            }
+            MatchState ms = this.ms;
+            if (ms == null) {
+                ms = new MatchState(src, pat);
+                this.ms = ms;
+            }
+            int s = pos;
+            int last = lastmatch;
+            int srcLen = ms.srcLen;
+            for (; s <= srcLen; s++) {
                 ms.reprepstate();
                 int e = match(ms, s, 0);
-                if (e != -1 && e != lastmatch) {
-                    state[0] = state[1] = e;
-                    return Varargs.of(pushCaptures(ms, s, e));
+                if (e != -1 && e != last) {
+                    pos = e;
+                    lastmatch = e;
+                    LuaValue[] out = pushCaptures(ms, s, e);
+                    return out.length == 1 ? out[0] : Varargs.of(out);
                 }
             }
-            state[0] = src.length + 1;
+            pos = srcLen + 1;
             return LuaNil.NIL;
-        });
-        iterFn.getUpvalues().add(new org.luava.runtime.eval.Upvalue("s", new org.luava.runtime.eval.Environment.VariableSlot(sVal, false, false)));
-        iterFn.getUpvalues().add(new org.luava.runtime.eval.Upvalue("pattern", new org.luava.runtime.eval.Environment.VariableSlot(pVal, false, false)));
-        return iterFn;
+        }
+
+        private LuaValue nextSimple() {
+            byte[] src = this.src;
+            int srcLen = this.srcLen;
+            int s = pos;
+            int last = lastmatch;
+            int ticks = 0;
+            for (; s <= srcLen; s++) {
+                int e;
+                switch (simpleQuant) {
+                    case '+' -> {
+                        if (s >= srcLen || !match_class(src[s] & 0xFF, simpleClass)) {
+                            continue;
+                        }
+                        e = s + 1;
+                        while (e < srcLen && match_class(src[e] & 0xFF, simpleClass)) {
+                            if ((++ticks & 0xFF) == 0) {
+                                org.luava.runtime.LuaState.checkGuard();
+                            }
+                            e++;
+                        }
+                    }
+                    case '*' -> {
+                        e = s;
+                        while (e < srcLen && match_class(src[e] & 0xFF, simpleClass)) {
+                            if ((++ticks & 0xFF) == 0) {
+                                org.luava.runtime.LuaState.checkGuard();
+                            }
+                            e++;
+                        }
+                    }
+                    case '-' -> e = s;
+                    default -> e = (s < srcLen && match_class(src[s] & 0xFF, simpleClass)) ? s + 1 : s;
+                }
+                if (e != last) {
+                    pos = e;
+                    lastmatch = e;
+                    return LuaString.valueOf(new String(src, s, e - s, StandardCharsets.ISO_8859_1));
+                }
+            }
+            pos = srcLen + 1;
+            return LuaNil.NIL;
+        }
+
+        @Override
+        public LuaValue invoke(LuaValue... args) {
+            return next();
+        }
+
+        /**
+         * Observable upvalues ("s", "pattern"), built on first debug access
+         * exactly like the closure this iterator replaces. Closed snapshots
+         * (no VariableSlot): s/p never change, so sharing live storage buys
+         * nothing. The base-class list stays empty until then, so the hot
+         * path allocates nothing here.
+         */
+        @Override
+        public java.util.List<org.luava.runtime.eval.Upvalue> getUpvalues() {
+            if (!upvaluesBuilt) {
+                upvaluesBuilt = true;
+                super.upvalues.add(new org.luava.runtime.eval.Upvalue("s", srcVal));
+                super.upvalues.add(new org.luava.runtime.eval.Upvalue("pattern", patVal));
+            }
+            return super.upvalues;
+        }
+
+        @Override
+        public void replaceUpvalue(int index, org.luava.runtime.eval.Upvalue uv) {
+            getUpvalues().set(index, uv);
+        }
+
+        @Override
+        public String toLuaString() {
+            return "function: builtin@0x" + Integer.toHexString(System.identityHashCode(this));
+        }
+    }
+
+    public static LuaFunction gmatch(LuaValue sVal, LuaValue pVal, LuaValue initVal) {
+        byte[] src = bytes(sVal);
+        byte[] p = bytes(pVal);
+        long initArg = (initVal != null && !initVal.isNil()) ? initVal.toLong() : 1;
+        int init = posrelat(initArg, src.length);
+        return new GmatchIterator(sVal, pVal, src, p, init);
     }
 }

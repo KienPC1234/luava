@@ -7,6 +7,8 @@
  */
 package org.luava.runtime;
 
+import java.util.EnumMap;
+
 public abstract class LuaValue {
     public static final LuaValue[] EMPTY_ARRAY = new LuaValue[0];
 
@@ -18,35 +20,35 @@ public abstract class LuaValue {
      * dispatch uses them directly.
      */
     public static final class Meta {
-        public static final LuaString INDEX = LuaString.valueOf("__index");
-        public static final LuaString NEWINDEX = LuaString.valueOf("__newindex");
-        public static final LuaString CALL = LuaString.valueOf("__call");
-        public static final LuaString LEN = LuaString.valueOf("__len");
-        public static final LuaString TOSTRING = LuaString.valueOf("__tostring");
-        public static final LuaString NAME = LuaString.valueOf("__name");
-        public static final LuaString MODE = LuaString.valueOf("__mode");
-        public static final LuaString METATABLE = LuaString.valueOf("__metatable");
-        public static final LuaString EQ = LuaString.valueOf("__eq");
-        public static final LuaString LT = LuaString.valueOf("__lt");
-        public static final LuaString LE = LuaString.valueOf("__le");
-        public static final LuaString CONCAT = LuaString.valueOf("__concat");
-        public static final LuaString CLOSE = LuaString.valueOf("__close");
-        public static final LuaString GC = LuaString.valueOf("__gc");
-        public static final LuaString PAIRS = LuaString.valueOf("__pairs");
-        public static final LuaString UNM = LuaString.valueOf("__unm");
-        public static final LuaString BNOT = LuaString.valueOf("__bnot");
-        public static final LuaString ADD = LuaString.valueOf("__add");
-        public static final LuaString SUB = LuaString.valueOf("__sub");
-        public static final LuaString MUL = LuaString.valueOf("__mul");
-        public static final LuaString DIV = LuaString.valueOf("__div");
-        public static final LuaString IDIV = LuaString.valueOf("__idiv");
-        public static final LuaString MOD = LuaString.valueOf("__mod");
-        public static final LuaString POW = LuaString.valueOf("__pow");
-        public static final LuaString BAND = LuaString.valueOf("__band");
-        public static final LuaString BOR = LuaString.valueOf("__bor");
-        public static final LuaString BXOR = LuaString.valueOf("__bxor");
-        public static final LuaString SHL = LuaString.valueOf("__shl");
-        public static final LuaString SHR = LuaString.valueOf("__shr");
+        public static final LuaString INDEX = LuaString.interned("__index");
+        public static final LuaString NEWINDEX = LuaString.interned("__newindex");
+        public static final LuaString CALL = LuaString.interned("__call");
+        public static final LuaString LEN = LuaString.interned("__len");
+        public static final LuaString TOSTRING = LuaString.interned("__tostring");
+        public static final LuaString NAME = LuaString.interned("__name");
+        public static final LuaString MODE = LuaString.interned("__mode");
+        public static final LuaString METATABLE = LuaString.interned("__metatable");
+        public static final LuaString EQ = LuaString.interned("__eq");
+        public static final LuaString LT = LuaString.interned("__lt");
+        public static final LuaString LE = LuaString.interned("__le");
+        public static final LuaString CONCAT = LuaString.interned("__concat");
+        public static final LuaString CLOSE = LuaString.interned("__close");
+        public static final LuaString GC = LuaString.interned("__gc");
+        public static final LuaString PAIRS = LuaString.interned("__pairs");
+        public static final LuaString UNM = LuaString.interned("__unm");
+        public static final LuaString BNOT = LuaString.interned("__bnot");
+        public static final LuaString ADD = LuaString.interned("__add");
+        public static final LuaString SUB = LuaString.interned("__sub");
+        public static final LuaString MUL = LuaString.interned("__mul");
+        public static final LuaString DIV = LuaString.interned("__div");
+        public static final LuaString IDIV = LuaString.interned("__idiv");
+        public static final LuaString MOD = LuaString.interned("__mod");
+        public static final LuaString POW = LuaString.interned("__pow");
+        public static final LuaString BAND = LuaString.interned("__band");
+        public static final LuaString BOR = LuaString.interned("__bor");
+        public static final LuaString BXOR = LuaString.interned("__bxor");
+        public static final LuaString SHL = LuaString.interned("__shl");
+        public static final LuaString SHR = LuaString.interned("__shr");
 
         private Meta() {}
     }
@@ -150,15 +152,56 @@ public abstract class LuaValue {
     }
 
     private static final LuaTable[] BASIC_METATABLES = new LuaTable[LuaType.values().length];
+    private static final ThreadLocal<LuaState> ACTIVE_BASIC_STATE = new ThreadLocal<>();
+
+    public static LuaState pushBasicState(LuaState state) {
+        LuaState previous = ACTIVE_BASIC_STATE.get();
+        ACTIVE_BASIC_STATE.set(state);
+        return previous;
+    }
+
+    public static void popBasicState(LuaState previous) {
+        if (previous == null) {
+            ACTIVE_BASIC_STATE.remove();
+        } else {
+            ACTIVE_BASIC_STATE.set(previous);
+        }
+    }
+
+    public static LuaState activeBasicState() {
+        return ACTIVE_BASIC_STATE.get();
+    }
 
     public static LuaTable getBasicMetatable(LuaType type) {
+        LuaState active = ACTIVE_BASIC_STATE.get();
+        if (active != null) {
+            LuaTable scoped = active.basicMetatables().get(type);
+            if (scoped != null) {
+                return scoped;
+            }
+        }
         return BASIC_METATABLES[type.ordinal()];
     }
 
     public static void setBasicMetatable(LuaType type, LuaTable mt) {
+        LuaState active = ACTIVE_BASIC_STATE.get();
+        if (active != null) {
+            if (mt == null) {
+                active.basicMetatables().remove(type);
+            } else {
+                active.basicMetatables().put(type, mt);
+            }
+            return;
+        }
         BASIC_METATABLES[type.ordinal()] = mt;
     }
 
+    /**
+     * Clears JVM-wide default basic metatables. This intentionally does not
+     * touch the isolated per-state registries used while Lua code executes.
+     * It is retained for compatibility and test setup; production states do
+     * not call it when they are constructed.
+     */
     public static void resetBasicMetatables() {
         for (int i = 0; i < BASIC_METATABLES.length; i++) {
             if (i != LuaType.STRING.ordinal()) {
@@ -168,7 +211,7 @@ public abstract class LuaValue {
     }
 
     public LuaTable getMetatable() {
-        return BASIC_METATABLES[type().ordinal()];
+        return getBasicMetatable(type());
     }
 
     public void setMetatable(LuaTable metatable) {
@@ -293,14 +336,6 @@ public abstract class LuaValue {
         if (this.isNumber() && other.isNumber()) {
             return LuaFloat.valueOf(this.toDouble() + other.toDouble());
         }
-        LuaValue a = this.isNumber() ? this : this.toLuaNumber();
-        LuaValue b = other.isNumber() ? other : other.toLuaNumber();
-        if (a != null && b != null) {
-            if (a.isInteger() && b.isInteger()) {
-                return LuaInteger.valueOf(a.toLong() + b.toLong());
-            }
-            return LuaFloat.valueOf(a.toDouble() + b.toDouble());
-        }
         return dispatchBinaryMetamethod(this, other, "__add", "perform arithmetic on");
     }
 
@@ -310,14 +345,6 @@ public abstract class LuaValue {
         }
         if (this.isNumber() && other.isNumber()) {
             return LuaFloat.valueOf(this.toDouble() - other.toDouble());
-        }
-        LuaValue a = this.isNumber() ? this : this.toLuaNumber();
-        LuaValue b = other.isNumber() ? other : other.toLuaNumber();
-        if (a != null && b != null) {
-            if (a.isInteger() && b.isInteger()) {
-                return LuaInteger.valueOf(a.toLong() - b.toLong());
-            }
-            return LuaFloat.valueOf(a.toDouble() - b.toDouble());
         }
         return dispatchBinaryMetamethod(this, other, "__sub", "perform arithmetic on");
     }
@@ -329,14 +356,6 @@ public abstract class LuaValue {
         if (this.isNumber() && other.isNumber()) {
             return LuaFloat.valueOf(this.toDouble() * other.toDouble());
         }
-        LuaValue a = this.isNumber() ? this : this.toLuaNumber();
-        LuaValue b = other.isNumber() ? other : other.toLuaNumber();
-        if (a != null && b != null) {
-            if (a.isInteger() && b.isInteger()) {
-                return LuaInteger.valueOf(a.toLong() * b.toLong());
-            }
-            return LuaFloat.valueOf(a.toDouble() * b.toDouble());
-        }
         return dispatchBinaryMetamethod(this, other, "__mul", "perform arithmetic on");
     }
 
@@ -344,11 +363,6 @@ public abstract class LuaValue {
         // Lua 5.4: float division always returns float
         if (this.isNumber() && other.isNumber()) {
             return LuaFloat.valueOf(this.toDouble() / other.toDouble());
-        }
-        LuaValue a = this.isNumber() ? this : this.toLuaNumber();
-        LuaValue b = other.isNumber() ? other : other.toLuaNumber();
-        if (a != null && b != null) {
-            return LuaFloat.valueOf(a.toDouble() / b.toDouble());
         }
         return dispatchBinaryMetamethod(this, other, "__div", "perform arithmetic on");
     }
@@ -365,18 +379,6 @@ public abstract class LuaValue {
         if (this.isNumber() && other.isNumber()) {
             return LuaFloat.valueOf(Math.floor(this.toDouble() / other.toDouble()));
         }
-        LuaValue a = this.isNumber() ? this : this.toLuaNumber();
-        LuaValue b = other.isNumber() ? other : other.toLuaNumber();
-        if (a != null && b != null) {
-            if (a.isInteger() && b.isInteger()) {
-                long bVal = b.toLong();
-                if (bVal == 0) {
-                    throw new LuaException("attempt to divide by zero");
-                }
-                return LuaInteger.valueOf(Math.floorDiv(a.toLong(), bVal));
-            }
-            return LuaFloat.valueOf(Math.floor(a.toDouble() / b.toDouble()));
-        }
         return dispatchBinaryMetamethod(this, other, "__idiv", "perform arithmetic on");
     }
 
@@ -389,28 +391,12 @@ public abstract class LuaValue {
             return LuaInteger.valueOf(Math.floorMod(this.toLong(), b));
         }
         if (this.isNumber() && other.isNumber()) {
-            double a = this.toDouble();
-            double b = other.toDouble();
-            return LuaFloat.valueOf(luaFloatMod(a, b));
-        }
-        LuaValue a = this.isNumber() ? this : this.toLuaNumber();
-        LuaValue b = other.isNumber() ? other : other.toLuaNumber();
-        if (a != null && b != null) {
-            if (a.isInteger() && b.isInteger()) {
-                long bVal = b.toLong();
-                if (bVal == 0) {
-                    throw new LuaException("attempt to perform 'n%0'");
-                }
-                return LuaInteger.valueOf(Math.floorMod(a.toLong(), bVal));
-            }
-            double aD = a.toDouble();
-            double bD = b.toDouble();
-            return LuaFloat.valueOf(luaFloatMod(aD, bD));
+            return LuaFloat.valueOf(luaFloatMod(this.toDouble(), other.toDouble()));
         }
         return dispatchBinaryMetamethod(this, other, "__mod", "perform arithmetic on");
     }
 
-    private static double luaFloatMod(double a, double b) {
+    static double luaFloatMod(double a, double b) {
         double m = a % b;
         if (m > 0 ? b < 0 : (m < 0 && b > 0)) {
             m += b;
@@ -422,11 +408,6 @@ public abstract class LuaValue {
         if (this.isNumber() && other.isNumber()) {
             return LuaFloat.valueOf(Math.pow(this.toDouble(), other.toDouble()));
         }
-        LuaValue a = this.isNumber() ? this : this.toLuaNumber();
-        LuaValue b = other.isNumber() ? other : other.toLuaNumber();
-        if (a != null && b != null) {
-            return LuaFloat.valueOf(Math.pow(a.toDouble(), b.toDouble()));
-        }
         return dispatchBinaryMetamethod(this, other, "__pow", "perform arithmetic on");
     }
 
@@ -437,20 +418,7 @@ public abstract class LuaValue {
         if (this.isFloat()) {
             return LuaFloat.valueOf(-this.toDouble());
         }
-        LuaValue a = this.toLuaNumber();
-        if (a != null) {
-            if (a.isInteger()) return LuaInteger.valueOf(-a.toLong());
-            return LuaFloat.valueOf(-a.toDouble());
-        }
-        LuaTable mt = getMetatable();
-        if (mt != null) {
-            LuaValue handler = mt.rawget(Meta.UNM);
-            if (!handler.isNil()) {
-                org.luava.runtime.eval.CallStack.setNextCall("unm", true);
-                return handler.call(this, this);
-            }
-        }
-        throw new LuaException("attempt to perform arithmetic on a " + typeName() + " value");
+        return dispatchBinaryMetamethod(this, this, "__unm", "perform arithmetic on");
     }
 
     public LuaValue toLuaNumber() {
@@ -665,7 +633,16 @@ public abstract class LuaValue {
 
     public LuaValue concat(LuaValue other) {
         if ((this.isString() || this.isNumber()) && (other.isString() || other.isNumber())) {
-            return LuaString.valueOf(this.toLuaString() + other.toLuaString());
+            // A single `..` can double the operand size, so a long chain
+            // (x = x..x) is a classic host-OOM vector. Honor the host's
+            // per-allocation cap the same way string.rep/pack do.
+            String left = this.toLuaString();
+            String right = other.toLuaString();
+            long resultLen = (long) left.length() + right.length();
+            if (resultLen > org.luava.runtime.LuaState.allocationLimit()) {
+                throw new LuaException("string length overflow");
+            }
+            return LuaString.valueOf(left + right);
         }
         return dispatchBinaryMetamethod(this, other, "__concat", "concatenate");
     }
@@ -858,7 +835,10 @@ public abstract class LuaValue {
                 throw new LuaException("number has no integer representation");
             }
         }
-        LuaValue bad = (!a.isNumber() && !a.isString()) ? a : b;
+        // C luaG_opinterror: blame the first operand unless it is a number,
+        // in which case blame the second. (A numeric-looking string is still
+        // a string here, so `"3" & 1` blames the string, as in PUC Lua.)
+        LuaValue bad = !a.isNumber() ? a : b;
         throw new LuaException("attempt to " + opDesc + " a " + bad.typeName() + " value");
     }
 

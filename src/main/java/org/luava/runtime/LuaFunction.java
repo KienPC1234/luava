@@ -77,15 +77,12 @@ public abstract class LuaFunction extends LuaValue {
     }
 
     public static LuaFunction of(LuaInvokable invokable) {
+        // No toLuaString override: PUC Lua renders C functions exactly like
+        // Lua ones ("function: 0xADDR"), so inherit the base method.
         LuaFunction fn = new LuaFunction() {
             @Override
             public LuaValue invoke(LuaValue... args) {
                 return invokable.invoke(args);
-            }
-
-            @Override
-            public String toLuaString() {
-                return "function: builtin@0x" + Integer.toHexString(System.identityHashCode(this));
             }
         };
         fn.setWhat("C");
@@ -119,11 +116,6 @@ public abstract class LuaFunction extends LuaValue {
                     String msg = t.getMessage() != null ? t.getMessage() : t.toString();
                     throw new LuaException("Java error in host function: " + msg);
                 }
-            }
-
-            @Override
-            public String toLuaString() {
-                return "function: builtin@0x" + Integer.toHexString(System.identityHashCode(this));
             }
         };
         fn.setWhat("C");

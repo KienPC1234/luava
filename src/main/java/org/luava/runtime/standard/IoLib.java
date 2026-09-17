@@ -164,7 +164,7 @@ public final class IoLib {
                     int c = readByte();
                     if (c == -1) return LuaNil.NIL;
                     unreadByte(c);
-                    return LuaString.valueOf("");
+                    return LuaString.interned("");
                 }
                 byte[] buf = new byte[(int) n];
                 int read = readBytes(buf, 0, (int) n);
@@ -418,7 +418,7 @@ public final class IoLib {
                     return OsTime.finishShell(new OsTime.ShellRun(process, sentinel));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    return Varargs.of(LuaNil.NIL, LuaString.valueOf("interrupted"), LuaInteger.valueOf(-1));
+                    return Varargs.of(LuaNil.NIL, LuaString.interned("interrupted"), LuaInteger.valueOf(-1));
                 } finally {
                     if (fifo != null) {
                         try {
@@ -486,7 +486,7 @@ public final class IoLib {
 
         @Override
         public LuaValue close() throws IOException {
-            return Varargs.of(LuaNil.NIL, LuaString.valueOf("cannot close standard file"));
+            return Varargs.of(LuaNil.NIL, LuaString.interned("cannot close standard file"));
         }
 
         @Override
@@ -597,23 +597,23 @@ public final class IoLib {
     public static void open(LuaTable globals) {
         LuaTable io = new LuaTable();
         fillInto(io, globals);
-        globals.rawset(LuaString.valueOf("io"), io);
+        globals.rawset(LuaString.interned("io"), io);
     }
 
     public static void fillInto(LuaTable io, LuaTable globals) {
         LuaTable fileMt = new LuaTable();
         LuaTable fileMethods = new LuaTable();
 
-        fileMt.rawset(LuaString.valueOf("__index"), fileMethods);
-        fileMt.rawset(LuaString.valueOf("__name"), LuaString.valueOf("FILE*"));
-        fileMt.rawset(LuaString.valueOf("__tostring"), LuaFunction.of(args -> {
+        fileMt.rawset(LuaString.interned("__index"), fileMethods);
+        fileMt.rawset(LuaString.interned("__name"), LuaString.interned("FILE*"));
+        fileMt.rawset(LuaString.interned("__tostring"), LuaFunction.of(args -> {
             FileHandle fh = checkFileOrClosed(args, "__tostring");
             if (fh.isClosed()) {
-                return LuaString.valueOf("file (closed)");
+                return LuaString.interned("file (closed)");
             }
             return LuaString.valueOf("file (0x" + Integer.toHexString(System.identityHashCode(fh)) + ")");
         }));
-        fileMt.rawset(LuaString.valueOf("__close"), LuaFunction.of(args -> {
+        fileMt.rawset(LuaString.interned("__close"), LuaFunction.of(args -> {
             FileHandle fh = checkFileOrClosed(args, "?");
             if (!fh.isClosed()) {
                 try {
@@ -622,10 +622,10 @@ public final class IoLib {
             }
             return LuaNil.NIL;
         }));
-        fileMt.rawset(LuaString.valueOf("__gc"), fileMt.rawget(LuaString.valueOf("__close")));
+        fileMt.rawset(LuaString.interned("__gc"), fileMt.rawget(LuaString.interned("__close")));
 
         // File handle methods
-        fileMethods.rawset(LuaString.valueOf("close"), LuaFunction.of(args -> {
+        fileMethods.rawset(LuaString.interned("close"), LuaFunction.of(args -> {
             FileHandle fh = checkFileOrClosed(args, "close");
             fh.checkOpen();
             try {
@@ -635,7 +635,7 @@ public final class IoLib {
             }
         }));
 
-        fileMethods.rawset(LuaString.valueOf("flush"), LuaFunction.of(args -> {
+        fileMethods.rawset(LuaString.interned("flush"), LuaFunction.of(args -> {
             FileHandle fh = checkFile(args, "flush");
             try {
                 fh.flush();
@@ -645,7 +645,7 @@ public final class IoLib {
             }
         }));
 
-        fileMethods.rawset(LuaString.valueOf("setvbuf"), LuaFunction.of(args -> {
+        fileMethods.rawset(LuaString.interned("setvbuf"), LuaFunction.of(args -> {
             FileHandle fh = checkFile(args, "setvbuf");
             if (args.length < 2 || !args[1].isString()) {
                 throw new LuaException("bad argument #2 to 'setvbuf' (string expected)");
@@ -669,7 +669,7 @@ public final class IoLib {
             }
         }));
 
-        fileMethods.rawset(LuaString.valueOf("write"), LuaFunction.of(args -> {
+        fileMethods.rawset(LuaString.interned("write"), LuaFunction.of(args -> {
             FileHandle fh = checkFile(args, "write");
             try {
                 for (int i = 1; i < args.length; i++) {
@@ -685,11 +685,11 @@ public final class IoLib {
             }
         }));
 
-        fileMethods.rawset(LuaString.valueOf("read"), LuaFunction.of(args -> {
+        fileMethods.rawset(LuaString.interned("read"), LuaFunction.of(args -> {
             FileHandle fh = checkFile(args, "read");
             try {
                 if (args.length <= 1) {
-                    return fh.readOne(LuaString.valueOf("l"));
+                    return fh.readOne(LuaString.interned("l"));
                 }
                 List<LuaValue> results = new ArrayList<>();
                 for (int i = 1; i < args.length; i++) {
@@ -705,7 +705,7 @@ public final class IoLib {
             }
         }));
 
-        fileMethods.rawset(LuaString.valueOf("seek"), LuaFunction.of(args -> {
+        fileMethods.rawset(LuaString.interned("seek"), LuaFunction.of(args -> {
             FileHandle fh = checkFile(args, "seek");
             String whence = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "cur";
             if (!"set".equals(whence) && !"cur".equals(whence) && !"end".equals(whence)) {
@@ -720,14 +720,14 @@ public final class IoLib {
             }
         }));
 
-        fileMethods.rawset(LuaString.valueOf("lines"), LuaFunction.of(args -> {
+        fileMethods.rawset(LuaString.interned("lines"), LuaFunction.of(args -> {
             FileHandle fh = checkFile(args, "lines");
             if (args.length - 1 > 250) {
                 throw new LuaException("bad argument #252 to 'lines' (too many arguments)");
             }
             LuaValue[] readFmts = new LuaValue[Math.max(1, args.length - 1)];
             if (args.length <= 1) {
-                readFmts[0] = LuaString.valueOf("l");
+                readFmts[0] = LuaString.interned("l");
             } else {
                 System.arraycopy(args, 1, readFmts, 0, args.length - 1);
             }
@@ -761,9 +761,9 @@ public final class IoLib {
         LuaUserdata stderrUd = new LuaUserdata(new StdFileHandle("stderr", null, System.err), 0);
         stderrUd.setMetatable(fileMt);
 
-        io.rawset(LuaString.valueOf("stdin"), stdinUd);
-        io.rawset(LuaString.valueOf("stdout"), stdoutUd);
-        io.rawset(LuaString.valueOf("stderr"), stderrUd);
+        io.rawset(LuaString.interned("stdin"), stdinUd);
+        io.rawset(LuaString.interned("stdout"), stdoutUd);
+        io.rawset(LuaString.interned("stderr"), stderrUd);
 
         final LuaUserdata[] currentIn = new LuaUserdata[]{stdinUd};
         final LuaUserdata[] currentOut = new LuaUserdata[]{stdoutUd};
@@ -773,7 +773,7 @@ public final class IoLib {
         });
 
         // io.open
-        io.rawset(LuaString.valueOf("open"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("open"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isString()) {
                 throw new LuaException("bad argument #1 to 'open' (string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }
@@ -796,7 +796,7 @@ public final class IoLib {
                 RafFileHandle fh = new RafFileHandle(raf, filename, mode);
                 LuaUserdata ud = new LuaUserdata(fh, 0);
                 ud.setMetatable(fileMt);
-                org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.valueOf("__gc")));
+                org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.interned("__gc")));
                 return ud;
             } catch (IOException e) {
                 return Varargs.of(LuaNil.NIL, LuaString.valueOf(posixMessage(filename, e)), LuaInteger.valueOf(errnoOf(e)));
@@ -804,7 +804,7 @@ public final class IoLib {
         }));
 
         // io.popen
-        io.rawset(LuaString.valueOf("popen"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("popen"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isString()) {
                 throw new LuaException("bad argument #1 to 'popen' (string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }
@@ -843,7 +843,7 @@ public final class IoLib {
                             run.process(), mode, cmd, run.sentinel(), holder[0], fifo);
                         LuaUserdata ud = new LuaUserdata(pfh, 0);
                         ud.setMetatable(fileMt);
-                        org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.valueOf("__gc")));
+                        org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.interned("__gc")));
                         return ud;
                     }
                     java.nio.file.Files.deleteIfExists(fifo);
@@ -852,18 +852,18 @@ public final class IoLib {
                 ProcessFileHandle pfh = new ProcessFileHandle(run.process(), mode, cmd, run.sentinel());
                 LuaUserdata ud = new LuaUserdata(pfh, 0);
                 ud.setMetatable(fileMt);
-                org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.valueOf("__gc")));
+                org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.interned("__gc")));
                 return ud;
             } catch (java.io.IOException e) {
                 return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()), LuaInteger.valueOf(2));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return Varargs.of(LuaNil.NIL, LuaString.valueOf("interrupted"), LuaInteger.valueOf(2));
+                return Varargs.of(LuaNil.NIL, LuaString.interned("interrupted"), LuaInteger.valueOf(2));
             }
         }));
 
         // io.type
-        io.rawset(LuaString.valueOf("type"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("type"), LuaFunction.of(args -> {
             if (args.length == 0) {
                 throw new LuaException("bad argument #1 to 'type' (value expected)");
             }
@@ -873,7 +873,7 @@ public final class IoLib {
             return LuaString.valueOf(fh.isClosed() ? "closed file" : "file");
         }));
 
-        io.rawset(LuaString.valueOf("input"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("input"), LuaFunction.of(args -> {
             if (args.length == 0 || args[0].isNil()) {
                 return currentIn[0];
             }
@@ -882,7 +882,7 @@ public final class IoLib {
                 return ud;
             }
             if (args[0].isString()) {
-                LuaValue openRes = io.rawget(LuaString.valueOf("open")).call(args[0], LuaString.valueOf("r"));
+                LuaValue openRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("r"));
                 if (openRes.isNil()) throw new LuaException("cannot open file '" + args[0].toLuaString() + "'");
                 currentIn[0] = (LuaUserdata) openRes;
                 return openRes;
@@ -890,7 +890,7 @@ public final class IoLib {
             throw new LuaException("bad argument #1 to 'input' (FILE* expected, got " + args[0].typeName() + ")");
         }));
 
-        io.rawset(LuaString.valueOf("output"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("output"), LuaFunction.of(args -> {
             if (args.length == 0 || args[0].isNil()) {
                 return currentOut[0];
             }
@@ -899,7 +899,7 @@ public final class IoLib {
                 return ud;
             }
             if (args[0].isString()) {
-                LuaValue openRes = io.rawget(LuaString.valueOf("open")).call(args[0], LuaString.valueOf("w"));
+                LuaValue openRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("w"));
                 if (openRes.isNil()) throw new LuaException("cannot open file '" + args[0].toLuaString() + "'");
                 currentOut[0] = (LuaUserdata) openRes;
                 return openRes;
@@ -908,12 +908,12 @@ public final class IoLib {
         }));
 
         // io.close, io.flush, io.read, io.write, io.lines delegating
-        io.rawset(LuaString.valueOf("close"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("close"), LuaFunction.of(args -> {
             LuaValue target = (args.length > 0 && !args[0].isNil()) ? args[0] : currentOut[0];
-            return fileMethods.rawget(LuaString.valueOf("close")).call(target);
+            return fileMethods.rawget(LuaString.interned("close")).call(target);
         }));
 
-        io.rawset(LuaString.valueOf("flush"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("flush"), LuaFunction.of(args -> {
             LuaUserdata out = currentOut[0];
             if (out == null || !(out.getUserdata() instanceof FileHandle fh)) {
                 throw new LuaException("bad argument to 'flush' (FILE* expected)");
@@ -921,10 +921,10 @@ public final class IoLib {
             if (fh.isClosed()) {
                 throw new LuaException("default output file is closed");
             }
-            return fileMethods.rawget(LuaString.valueOf("flush")).call(out);
+            return fileMethods.rawget(LuaString.interned("flush")).call(out);
         }));
 
-        io.rawset(LuaString.valueOf("read"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("read"), LuaFunction.of(args -> {
             LuaUserdata in = currentIn[0];
             if (in == null || !(in.getUserdata() instanceof FileHandle fh)) {
                 throw new LuaException("bad argument to 'read' (FILE* expected)");
@@ -935,10 +935,10 @@ public final class IoLib {
             LuaValue[] pass = new LuaValue[args.length + 1];
             pass[0] = in;
             System.arraycopy(args, 0, pass, 1, args.length);
-            return fileMethods.rawget(LuaString.valueOf("read")).call(pass);
+            return fileMethods.rawget(LuaString.interned("read")).call(pass);
         }));
 
-        io.rawset(LuaString.valueOf("write"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("write"), LuaFunction.of(args -> {
             LuaUserdata out = currentOut[0];
             if (out == null || !(out.getUserdata() instanceof FileHandle fh)) {
                 throw new LuaException("bad argument to 'write' (FILE* expected)");
@@ -960,7 +960,7 @@ public final class IoLib {
             }
         }));
 
-        io.rawset(LuaString.valueOf("lines"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("lines"), LuaFunction.of(args -> {
             if (args.length - 1 > 250) {
                 throw new LuaException("bad argument #252 to 'lines' (too many arguments)");
             }
@@ -977,9 +977,9 @@ public final class IoLib {
                 for (int i = 1; i < args.length; i++) {
                     pass[i] = args[i];
                 }
-                return fileMethods.rawget(LuaString.valueOf("lines")).call(pass);
+                return fileMethods.rawget(LuaString.interned("lines")).call(pass);
             }
-            LuaValue fileRes = io.rawget(LuaString.valueOf("open")).call(args[0], LuaString.valueOf("r"));
+            LuaValue fileRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("r"));
             if (fileRes.isNil()) {
                 throw new LuaException("cannot open file '" + args[0].toLuaString() + "'");
             }
@@ -987,7 +987,7 @@ public final class IoLib {
             FileHandle fh = (FileHandle) fileUd.getUserdata();
             LuaValue[] readFmts = new LuaValue[Math.max(1, args.length - 1)];
             if (args.length <= 1) {
-                readFmts[0] = LuaString.valueOf("l");
+                readFmts[0] = LuaString.interned("l");
             } else {
                 System.arraycopy(args, 1, readFmts, 0, args.length - 1);
             }
@@ -1024,14 +1024,14 @@ public final class IoLib {
             return Varargs.of(iterFn, LuaNil.NIL, LuaNil.NIL, fileUd);
         }));
 
-        io.rawset(LuaString.valueOf("tmpfile"), LuaFunction.of(args -> {
+        io.rawset(LuaString.interned("tmpfile"), LuaFunction.of(args -> {
             try {
                 File f = File.createTempFile("luatmp_", ".bin");
                 f.deleteOnExit();
                 RandomAccessFile raf = new RandomAccessFile(f, "rw");
                 LuaUserdata ud = new LuaUserdata(new RafFileHandle(raf, f.getAbsolutePath(), "w+b"), 0);
                 ud.setMetatable(fileMt);
-                org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.valueOf("__gc")));
+                org.luava.runtime.eval.GCManager.register(ud, fileMt.rawget(LuaString.interned("__gc")));
                 return ud;
             } catch (IOException e) {
                 return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()));

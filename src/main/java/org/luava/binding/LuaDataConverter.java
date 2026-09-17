@@ -22,6 +22,8 @@ import java.lang.reflect.Array;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -33,6 +35,47 @@ import java.util.Set;
 public final class LuaDataConverter {
     private LuaDataConverter() {}
 
+    /**
+     * Converts a host Java {@code String} (Unicode text) into a Lua string.
+     *
+     * <p>Lua strings are byte sequences, represented internally as one char
+     * per byte (ISO-8859-1). Host text is therefore UTF-8 encoded first;
+     * otherwise {@code #s}, {@code string.byte}, {@code string.sub} and
+     * {@code utf8.*} would treat one multi-byte character as one byte and
+     * silently corrupt every non-ASCII value crossing the bridge.
+     */
+    public static LuaString toLuaString(String s) {
+        if (s == null) return LuaString.EMPTY;
+        return LuaString.valueOf(new String(s.getBytes(StandardCharsets.UTF_8), StandardCharsets.ISO_8859_1));
+    }
+
+    /**
+     * Converts a Lua string (one char per byte) back into a host Java
+     * {@code String}. Valid UTF-8 is decoded so a value set from a host
+     * String round-trips exactly; binary strings that are not valid UTF-8
+     * fall back to a lossless byte-per-char mapping instead of being
+     * corrupted with replacement characters.
+     */
+    public static String toJavaString(String byteChars) {
+        if (byteChars == null) return null;
+        boolean ascii = true;
+        for (int i = 0; i < byteChars.length(); i++) {
+            char c = byteChars.charAt(i);
+            if (c > 0xFF) return byteChars; // already real chars, not bytes
+            if (c >= 0x80) ascii = false;
+        }
+        if (ascii) return byteChars;
+        byte[] bytes = byteChars.getBytes(StandardCharsets.ISO_8859_1);
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(bytes)).toString();
+        } catch (java.nio.charset.CharacterCodingException e) {
+            return byteChars; // binary data: preserve bytes one-to-one
+        }
+    }
+
     public static LuaValue toLua(Object obj) {
         if (obj == null) return LuaNil.NIL;
         if (obj instanceof LuaValue lv) return lv;
@@ -43,11 +86,11 @@ public final class LuaDataConverter {
         if (obj instanceof Byte b) return LuaInteger.valueOf(b);
         if (obj instanceof Float f) return LuaFloat.valueOf(f.doubleValue());
         if (obj instanceof Double d) return LuaFloat.valueOf(d);
-        if (obj instanceof Character c) return LuaString.valueOf(String.valueOf(c));
+        if (obj instanceof Character c) return toLuaString(String.valueOf(c));
         // Only immutable String converts to a Lua string. Mutable
         // CharSequences (StringBuilder, buffers, ...) stay live userdata so
         // object identity and chaining survive the bridge.
-        if (obj instanceof String s) return LuaString.valueOf(s);
+        if (obj instanceof String s) return toLuaString(s);
 
         if (obj instanceof Enum<?> e) {
             return LuaString.valueOf(e.name());
@@ -104,9 +147,9 @@ public final class LuaDataConverter {
         if (obj instanceof Byte b) return LuaInteger.valueOf(b);
         if (obj instanceof Float f) return LuaFloat.valueOf(f.doubleValue());
         if (obj instanceof Double d) return LuaFloat.valueOf(d);
-        if (obj instanceof Character c) return LuaString.valueOf(String.valueOf(c));
-        if (obj instanceof String s) return LuaString.valueOf(s);
-        if (obj instanceof Enum<?> e) return LuaString.valueOf(e.name());
+        if (obj instanceof Character c) return toLuaString(String.valueOf(c));
+        if (obj instanceof String s) return toLuaString(s);
+        if (obj instanceof Enum<?> e) return toLuaString(e.name());
 
         // Collections, Arrays, and arbitrary Java objects wrapped as live LuaUserdata
         return wrapLive(obj);
@@ -140,7 +183,7 @@ public final class LuaDataConverter {
                 mt = liveCollectionMetatable;
                 if (mt == null) {
                     mt = new LuaTable();
-                    mt.rawset(LuaString.valueOf("__len"), LuaFunction.ofGuarded(args -> {
+                    mt.rawset(LuaValue.Meta.LEN, LuaFunction.ofGuarded(args -> {
                         Object inst = (args.length > 0 && args[0].isUserdata())
                                 ? ((LuaUserdata) args[0]).getJavaInstance() : null;
                         if (inst instanceof List<?> l) return LuaInteger.valueOf(l.size());
@@ -187,7 +230,7 @@ public final class LuaDataConverter {
 
         // String / CharSequence
         if (targetType == String.class || targetType == CharSequence.class) {
-            return (T) val.toLuaString();
+            return (T) toJavaString(val.toLuaString());
         }
 
         // Boolean
@@ -339,7 +382,7 @@ public final class LuaDataConverter {
             if (val.isBoolean()) return (T) Boolean.valueOf(val.toBoolean());
             if (val.isInteger()) return (T) Long.valueOf(val.toLong());
             if (val.isFloat()) return (T) Double.valueOf(val.toDouble());
-            if (val.isString()) return (T) val.toLuaString();
+            if (val.isString()) return (T) toJavaString(val.toLuaString());
             if (val.isTable()) return (T) toJava(val, Map.class);
             if (val.isUserdata()) return (T) ((LuaUserdata) val).getJavaInstance();
             return (T) val;

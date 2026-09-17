@@ -33,12 +33,12 @@ public final class TableLib {
     public static void open(LuaTable globals) {
         LuaTable tableMod = new LuaTable();
         fillInto(tableMod, globals);
-        globals.rawset(LuaString.valueOf("table"), tableMod);
+        globals.rawset(LuaString.interned("table"), tableMod);
     }
 
     public static void fillInto(LuaTable tableMod, LuaTable globals) {
 
-        tableMod.rawset(LuaString.valueOf("insert"), LuaFunction.of(args -> {
+        tableMod.rawset(LuaString.interned("insert"), LuaFunction.of(args -> {
             if (args.length < 2 || args.length > 3) {
                 throw new LuaException("wrong number of arguments to 'table.insert'");
             }
@@ -66,7 +66,7 @@ public final class TableLib {
             return LuaNil.NIL;
         }));
 
-        tableMod.rawset(LuaString.valueOf("remove"), LuaFunction.of(args -> {
+        tableMod.rawset(LuaString.interned("remove"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isTable()) {
                 throw new LuaException("bad argument #1 to 'table.remove' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }
@@ -84,7 +84,7 @@ public final class TableLib {
             return removed;
         }));
 
-        tableMod.rawset(LuaString.valueOf("concat"), LuaFunction.of(args -> {
+        tableMod.rawset(LuaString.interned("concat"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isTable()) {
                 throw new LuaException("bad argument #1 to 'table.concat' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }
@@ -92,6 +92,25 @@ public final class TableLib {
             String sep = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "";
             long i = (args.length > 2 && !args[2].isNil()) ? args[2].toLong() : 1;
             long last = (args.length > 3 && !args[3].isNil()) ? args[3].toLong() : luaLen(t);
+
+            // Plain-table fast lane: no metatable means get() == rawget, so
+            // read the array part directly (no per-element key boxing, no
+            // hash probe) with a presized buffer. Falls through to the
+            // generic path for metatables or exotic ranges.
+            if (t.getMetatable() == null && i >= 1 && last >= i - 1 && last <= Integer.MAX_VALUE) {
+                long count = last - i + 1;
+                int cap = count > (1 << 20) / 8 ? (1 << 20) : (int) (count * 8);
+                StringBuilder sb = new StringBuilder(Math.max(16, cap));
+                for (long idx = i; idx <= last; idx++) {
+                    LuaValue val = t.rawgetInt(idx);
+                    if (!val.isString() && !val.isNumber()) {
+                        throw new LuaException("invalid value (" + val.typeName() + ") at index " + idx + " in table for 'concat'");
+                    }
+                    if (idx > i) sb.append(sep);
+                    sb.append(val.toLuaString());
+                }
+                return LuaString.valueOf(sb.toString());
+            }
 
             StringBuilder sb = new StringBuilder();
             for (; i < last; i++) {
@@ -111,7 +130,7 @@ public final class TableLib {
             return LuaString.valueOf(sb.toString());
         }));
 
-        tableMod.rawset(LuaString.valueOf("unpack"), LuaFunction.of(args -> {
+        tableMod.rawset(LuaString.interned("unpack"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isTable()) {
                 throw new LuaException("bad argument #1 to 'table.unpack' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }
@@ -137,16 +156,16 @@ public final class TableLib {
             return Varargs.of(result);
         }));
 
-        tableMod.rawset(LuaString.valueOf("pack"), LuaFunction.of(args -> {
+        tableMod.rawset(LuaString.interned("pack"), LuaFunction.of(args -> {
             LuaTable t = new LuaTable();
             for (int i = 0; i < args.length; i++) {
                 t.rawset(LuaInteger.valueOf(i + 1), args[i]);
             }
-            t.rawset(LuaString.valueOf("n"), LuaInteger.valueOf(args.length));
+            t.rawset(LuaString.interned("n"), LuaInteger.valueOf(args.length));
             return t;
         }));
 
-        tableMod.rawset(LuaString.valueOf("move"), LuaFunction.of(args -> {
+        tableMod.rawset(LuaString.interned("move"), LuaFunction.of(args -> {
             if (args.length < 4 || !args[0].isTable()) {
                 throw new LuaException("bad argument #1 to 'table.move' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }
@@ -187,7 +206,7 @@ public final class TableLib {
             return a2;
         }));
 
-        tableMod.rawset(LuaString.valueOf("sort"), LuaFunction.of(args -> {
+        tableMod.rawset(LuaString.interned("sort"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isTable()) {
                 throw new LuaException("bad argument #1 to 'table.sort' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }

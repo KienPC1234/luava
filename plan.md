@@ -1,7 +1,7 @@
 # Luava Roadmap — Đột phá bằng JIT lai (Hybrid Tiered JIT)
 
 > **Mục tiêu tối thượng:** đánh bại hoặc hòa LuaJ 3.0.1 trên **cả 10 benchmark**,
-> trong khi giữ **30/30 suite PUC Lua 5.4.9 + 111 unit tests xanh** và không
+> trong khi giữ **30/30 suite PUC Lua 5.4.9 + 150 unit tests xanh** và không
 > bao giờ sửa `tests/lua-5.4.9-tests/`.
 >
 > **Tài liệu này thay thế** `DIFFICULTIES.md`, `OPTIMIZATION_PLAN.md`,
@@ -38,7 +38,7 @@
 ### 1.1 Kỷ luật test (từ `AGENTS.md`)
 - **Cấm** sửa/tamper/xóa/bỏ qua bất kỳ dòng nào trong `tests/lua-5.4.9-tests/`.
 - **Cấm** hardcode kết quả giả, mock return, hay branch "để qua test".
-- Tiến độ đo bằng **số suite pass tự nhiên** (30/30) + 111 unit tests.
+- Tiến độ đo bằng **số suite pass tự nhiên** (30/30) + 150 unit tests.
 - Mọi lỗi phải truy gốc theo tầng (Lexer/Parser/AST/Bytecode/VM/Stdlib) và
   sửa tại tầng đó. Không vá ngọn.
 - Mỗi lần chạy suite phải có `timeout`; cấm `nohup` (làm `files.lua:762` fail giả).
@@ -187,7 +187,7 @@ Mỗi phase có: **việc**, **file**, **cổng (gates)**, **rủi ro/rollback**
 Cổng chuẩn dùng chung:
 - **G-SIZE:** method sinh ra / `runLoop` không vượt ngưỡng đã định; in ra log.
 - **G-COMPILE:** `-XX:+PrintCompilation` xác nhận code JIT + interpreter được C2.
-- **G-CORRECT:** 30/30 suite + 111 unit tests xanh; fuzz đối chiếu stock Lua.
+- **G-CORRECT:** 30/30 suite + 150 unit tests xanh; fuzz đối chiếu stock Lua.
 - **G-PERF:** interleave ≥7 cặp pinned, bar 3%, không regression task khác.
 
 ---
@@ -269,7 +269,7 @@ tổng quát cho tập opcode số học.
 `runtime/bytecode/LuaProto.java` (`jitCode`, `hotCount`, `mayYield`).
 
 **Gates (kết quả 2026-09-15):**
-- G-CORRECT: ✅ 30/30 suite + 111 unit tests xanh **cả hai chế độ**
+- G-CORRECT: ✅ 30/30 suite + 150 unit tests xanh **cả hai chế độ**
   (JIT-off mặc định; JIT-on qua `_JAVA_OPTIONS=-Dluava.jit=true`, và ép
   `JIT_HOT_THRESHOLD=1` để 21 proto trong suite thực sự compile — 4 deopt
   fallback đúng). Fuzz 20 kernel biên (float/missing/string args, pcall,
@@ -402,6 +402,30 @@ Phase 2. Scoreboard: **6 thắng / 1 hòa (closures) / 3 thua**.
 
 **Rollback:** cờ từng opcode trong translator (`analyze`).
 
+### Phase 5 v3 — phủ K-form + vòng lặp `for` số (2026-09-15, hậu audit)
+Audit "JIT khó dùng" phát hiện hai lỗ hổng phủ lớn:
+1. **Thiếu K-form** `ADDK/MULK/IDIVK/MODK/BANDK/BORK/BXORK` — compiler sinh
+   chúng cho `x*2`, `x//3`, `x%7`... nên đa số kernel số không JIT.
+2. **Thiếu `FORPREP`/`FORLOOP`** — mọi vòng lặp `for` số (kể cả trong hàm)
+   không JIT; main-chunk loop cũng không tăng hotness.
+
+**Đã làm:** emit `emitArithK` (LAND/LOR/LXOR/LADD/LSUB/LMUL), `emitIdivK`/
+`emitModK` (`Math.floorDiv`/`floorMod` đúng ngữ nghĩa âm), `emitForPrep`/
+`emitForLoop` (unsigned trip-count + `divideUnsigned`, mirror `doForPrep`/
+`OP_FORLOOP`; dùng thuần stack tránh `VerifyError` do tranh scratch
+local 6/8). `analyze` từ chối proto chứa K-form hằng không phải
+`LuaInteger` (và `DIVK/POWK` luôn float) → giữ subset int. Sửa luôn
+`prewarm` no-op khi state tắt JIT.
+
+**API:** `LuaState.jitEnabled(Boolean)` / `isJitEnabled()` (per-state,
+`null` = theo global `ENABLE_JIT`); `JitCompiler.prewarm(LuaFunction)`
+overload + `prewarm(closure, state)`.
+
+**Kết quả:** int for-loop và K-form kernel giờ compile (kiểm bằng cache
+size); `JitCoverageTest` 10 test so sánh JIT on/off + giá trị đối chiếu
+stock; fuzz loop 200 case byte-identical. 30/30 + 123 xanh. Float loop,
+`while`/`repeat` vẫn interpreter (chủ ý — cần generic loop state).
+
 ---
 
 ### Phase 6 — Ngữ nghĩa debug/error dưới JIT — ✅ XONG audit (2026-09-15)
@@ -436,15 +460,81 @@ nếu cần.
    sieve 1.1×), **1 hòa** (closures 1.05×), 3 thua stdlib/metatable-bound
    (concat, oop, pattern). Mục tiêu "tất cả ≤ 1.03×" CHƯA đạt cho 3 task
    cuối — cần varargs/CLOSURE/generic-fallback (ghi nhận, không cố).
-2. Stress JIT-on: `LuavaStressTest` 6/6 (deep recursion, tailcall 100k,
+2. Đo lại **2026-09-16** sau đợt tối ưu lớn (paired, order-flipped,
+   median 7-9 cặp, warm=6, iters=12, `luava.jit.sync=true`):
+   **4 thắng** (arith 1.6×, fib 9.6×, coroutines 17-19×, hash 1.6×),
+   **2 hòa** (table ~1.0×, closures ~1.0×), **4 thua nhẹ**
+   (concat 1.03×, oop 1.2×, pattern 1.1×, sieve 1.05×). Từ 5 thua
+   nặng (tới 2.8×) còn 4 thua sát ngưỡng; toàn bộ script vẫn pass
+   assert nên đây là khoảng tối ưu engine, không phải bug.
+3. Đợt tối ưu 2026-09-16 (không đổi ngữ nghĩa, 30/30 + 148 test xanh
+   cả JIT on/off):
+   - Intern chuỗi ngắn **lazy**: `valueOf` không bao giờ pool (dữ liệu
+     script không ghim bộ nhớ); key canonical (hằng số compiler,
+     metamethod, tên stdlib) giữ **định danh tham chiếu** qua
+     `interned`, nên tra bảng thôi trả `String.equals`.
+   - Inline không frame cho `tostring(x)`, `string.gmatch`,
+     `math.sqrt` (raw-bits, không cấp `LuaFloat`), `setmetatable`.
+   - Inline **closure factory** cho `make_counter`/`Vec.new` (dựng
+     closure trực tiếp từ thanh ghi, cả `OP_CALL` lẫn `OP_TAILCALL`).
+   - `gmatch` quét trực tiếp cho pattern đơn giản `%<class><quant>`.
+   - Cache theo site cho `OP_GETTABUP`/`OP_SELF`/`OP_GETFIELD` (guard
+     `readVersion()` + định danh bảng/key).
+   - Danh sách tham số closure materialize lazy; `ensureFilled` rút
+     gọn; GC tự động **giới hạn theo state** (không còn chạy finalizer
+     / dọn weak table của state khác).
+   - Hardening: `runErrorHandler` luôn reset cờ `handling` dù push
+     frame handler ném `StackOverflowError`.
+4. Đợt fix tương thích 2026-09-16 (differential fuzz đối chiếu stock Lua
+   5.4.8; 30/30 + 148 test xanh):
+   - **Số học chuỗi qua metatable**: cài `__add/__sub/__mul/__div/__idiv/
+     __mod/__pow/__unm` mặc định trên string metatable như `lstrlib.c`;
+     người dùng override/xoá được. Trước đây Luava ép kiểu trực tiếp nên
+     `"10"+1` bỏ qua metamethod của người dùng.
+   - **Blame đúng toán hạng** cho lỗi bitwise (`!isNumber ? p1 : p2`).
+   - **`kname` chỉ đặt tên cho hằng chuỗi**: hết descriptor sai
+     `number (constant '?') has no integer representation`.
+   - `pairs`/`ipairs` không kiểm tra kiểu bảng (đúng PUC); `next`/`select`/
+     `rawlen` dùng `luaL_argcheck` đúng thông điệp; `tostring` hàm C in
+     `function: 0x…` như PUC.
+   - **`collectgarbage` trả integer** cho collect/stop/restart và **thất bại
+     (nil) khi gọi trong finalizer** (chống tái nhập).
+   - `string.pack/unpack/packsize`: blame đúng số tham số.
+   - **Bug compiler `maxStackSize`**: ghi trực tiếp `freereg` bỏ qua cập
+     nhật `maxstacksize`, khiến frame nhỏ hơn số thanh ghi dùng thật → JIT
+     guard cho qua rồi index tràn mảng (lỗi ngẫu nhiên `Index N out of
+     bounds`) khi đệ quy sâu. Nay mọi thay đổi `freereg` đi qua `setFreereg`.
+   - **Khởi tạo lớp giá trị sớm**: `Varargs.<clinit>` từng chạy ở đỉnh đệ
+     quy (test tràn C-stack), ném `StackOverflowError` và khiến JVM "poison"
+     lớp vĩnh viễn (`NoClassDefFoundError`). Nay `LuaState` chạm các lớp
+     giá trị lõi lúc khởi tạo.
+5. Đợt sửa JIT 2026-09-17 (JIT từ chỗ chỉ hữu ích cho fib → 8/10 task;
+   30/30 + 150 test xanh, fuzz JIT on/off 12k case đồng nhất):
+   - **Bug `GETFIELD` deopt**: guard cũ đòi bảng **không metatable**, nên
+     mọi `self.x` trên instance OOP (có `Vec.__index`) deopt mỗi lần —
+     `Vec:dot` không bao giờ chạy JIT. Nay guard là "rawget non-nil"
+     (độc lập metatable); trường hợp `__index` (rawget nil) deopt đúng.
+   - **Thiếu lane số thực**: JIT chỉ có số nguyên, nên hàm nóng trộn
+     int/float (`dot` toàn float) deopt ngay ở `MUL`. Nay `ADD`/`SUB`/`MUL`
+     (và các dạng K) phát **numeric dispatch**: lane int không box khi cả
+     hai là int, lane float raw-bit khi còn lại; kiểu trả về suy luận
+     `T_NUM` để chọn protocol đúng.
+   - `doTailCall` thêm fast lane như `OP_CALL` (bỏ `resolveCallable` khi
+     thanh ghi đã giữ `LuaFunction`).
+   - Gate mới: đo **JIT on/off từng task**, không chỉ tổng thể — trước đây
+     lọt việc JIT làm `arith_loop` chậm đi.
+   - Còn lại: main chunk không tier-up (hotness đếm số lần **gọi hàm**),
+     subset chưa gồm generic-for/closure/metatable-call; 3 task thua còn
+     lại (oop/pattern ~1.06×, sieve ~0.99×) là throughput engine.
+6. Stress JIT-on: `LuavaStressTest` 6/6 (deep recursion, tailcall 100k,
    coroutine churn, table/string/error pressure); suite ép threshold=1:
    45 proto compile, deopt đúng.
-3. Metaspace/RSS bounded: cache LRU 512, hidden class GC được; đo RSS fib:
+4. Metaspace/RSS bounded: cache LRU 512, hidden class GC được; đo RSS fib:
    JIT 55MB < interp 94MB.
-4. `string.dump`/`load` round-trip với JIT bật: OK (`jitCode` không lọt
+5. `string.dump`/`load` round-trip với JIT bật: OK (`jitCode` không lọt
    vào dump; proto fresh compile lại khi cần).
-5. `README.md` thêm mục Hybrid JIT; `PLANS.md` giữ hồ sơ gốc.
-6. Nhật ký §7 cập nhật (SETLIST descriptor, cổng TAILCALL, CLOSURE revert,
+6. `README.md` thêm mục Hybrid JIT; `PLANS.md` giữ hồ sơ gốc.
+7. Nhật ký §7 cập nhật (SETLIST descriptor, cổng TAILCALL, CLOSURE revert,
    closeUpvalues fix).
 
 **Quyết định mặc định:** `ENABLE_JIT` **true từ 2026-09-15** (mọi gate
@@ -527,9 +617,58 @@ oop 86/94...). Mạch codegen đã cạn.
 ### 7.3 Câu hỏi mở (chưa giải, đừng tưởng đã hiểu)
 1. `closeTbc` 1.4% self ở oop dù không có tbc var — ai vào?
 2. P1a cho fib +5% không rõ cơ chế (nghi inline side-effect).
-3. `BASIC_METATABLES` static toàn JVM — ảnh hưởng đa-state? chưa đo.
-4. `LuaValue.BASIC_METATABLES` ô nhiễm giữa concurrent `LuaState`.
+3. **ĐÃ XÁC NHẬN (2026-09-15):** `BASIC_METATABLES` static toàn JVM thật sự
+   ô nhiễm đa-state. Tái hiện: state A cài `debug.setmetatable('', ...)`,
+   tạo `new LuaState()` B (constructor gọi `resetBasicMetatables()`), rồi A
+   mất metatable string (`A:foo` → `nil`). Hai state cũng tranh nhau
+   metatable string dùng chung (ai cài sau thắng).
+   **Hướng fix (chưa làm, cần redesign):** metatable string nằm trên hot
+   path `LuaString.getMetatable()`; fix đúng cần tra metatable qua state
+   hiện hành (registry) hoặc gắn state vào chuỗi intern — cả hai đụng
+   đường nóng nên phải đo lại interleave. Trước mắt: dùng một `LuaState`
+   cho mỗi tenant, tránh tạo state mới sau khi đã cài metatable tùy biến.
+4. **ĐÃ XÁC NHẬN (2026-09-15):** `GCManager` là singleton toàn JVM
+   (`STATES`/`FINALIZERS`/`WEAK_TABLES` static). `GCManager.reset()` xóa
+   finalizer/root của **mọi** state đang sống, không chỉ state gọi. Tương
+   tự #3: fix cần chuyển sang instance per-state hoặc tách mark set.
 5. `calls.lua` flake ~15% (`LuaUnwindException: null`) — pre-existing, chưa sửa.
+
+### 7.4 Bug đã sửa (2026-09-15, audit "khó dùng/bug")
+| # | Bug | Tầng | Fix |
+|---|---|---|---|
+| 1 | `evalWithTimeout` rò rỉ vthread chạy mãi sau timeout | LuaState | guard riêng + `cancel()` + join worker |
+| 2 | `SHORT_STRING_CACHE` phình vô hạn (200k entry giữ mãi) | LuaString | intern yếu (WeakHashMap + WeakReference); giữ identity (literals.lua) |
+| 3 | Chuỗi non-ASCII từ host sai `#`/`byte`/`utf8.len` | LuaDataConverter | encode UTF-8 tại biên host, decode UTF-8 khi trả về |
+| 4 | `maxAllocationBytes` bỏ qua `..` (x=x..x phình tới MB) | LuaValue.concat | áp cap, fast-path cờ `ANY_MAX_ALLOC` |
+| 5 | `ConstantFolder` dịch âm sai (`2 << -1` → 0, Lua = 1) | midend | `shiftLeft/Right` theo `luaV_shiftl` |
+| 6 | `Typer`/`ConstantFolder` là code chết (AGENTS §IV.1) | midend/bytecode | tích hợp fold vào `compileExprToReg` (choke point) |
+| 7 | Tài liệu `DEFAULT` gây hiểu nhầm chặn os/io | README | ghi rõ policy chỉ lọc cầu `java.*` |
+| 8 | Số liệu test lệch (31/31 vs 30/30) | AGENTS/PLANS | chú thích mốc lịch sử |
+| 9 | `BASIC_METATABLES` toàn cục: state mới xóa metatable state cũ | runtime | registry theo active `LuaState`, fallback toàn cục, scope lồng nhau |
+| 10 | `collectgarbage('collect')` chạy finalizer của state khác | GCManager | gắn owner theo state thực thi, lọc finalizer khi collect tường minh |
+| 11 | `GCManager.onAlloc` khóa toàn cục mỗi table/string | GCManager | đếm `AtomicLong` không khóa, chỉ khóa khi vượt ngưỡng/khi collect |
+
+### 7.5 Audit JIT (2026-09-15): phủ + API + bug hook
+Phát hiện khi soi tính năng JIT "có ổn định/dễ dùng không":
+| # | Vấn đề | Tầng | Fix |
+|---|---|---|---|
+| J1 | Thiếu `ADDK/MULK/IDIVK/MODK/BANDK/BORK/BXORK` → `x*2`, `x//3`, `x%7` không JIT | translator | `emitArithK`/`emitIdivK`/`emitModK`; `analyze` đòi hằng `LuaInteger` |
+| J2 | Thiếu `FORPREP/FORLOOP` → mọi vòng `for` số không JIT | translator | `emitForPrep/emitForLoop` mirror `doForPrep`/`OP_FORLOOP` |
+| J3 | **`HOOKS_ARMED` static toàn JVM rò vĩnh viễn**: hook đặt rồi bỏ quên (hoặc coroutine bị bỏ) → **JIT tắt cho MỌI `LuaState` về sau** | LuaCoroutine/VM | đổi thành `hooksActive` per-coroutine (đúng ngữ nghĩa Lua: hook theo thread) |
+| J4 | `ENABLE_JIT`/ngưỡng là static, không điều khiển per-state | LuaState | `jitEnabled(Boolean)`/`isJitEnabled()` |
+| J5 | `prewarm` chỉ nhận `LuaClosure`, bỏ qua `LuaFunction`; vẫn compile khi JIT tắt | JitCompiler | overload `prewarm(LuaFunction)`; `prewarm(closure,state)` no-op khi state tắt JIT |
+
+**Bằng chứng:** `JitCoverageTest` (12 test) so JIT on/off + giá trị đối chiếu stock;
+fuzz loop 200 case byte-identical; J1/J2 kiểm bằng cache/proto `jitCode`.
+Hiệu năng: fib 9.5–21×; loop nhỏ gọi nhiều lần ~6.5×; loop 30M lần đầu
+ngang interpreter (OSR/C2 chưa chín) — không hồi quy. 30/30 + 135 xanh cả
+JIT on lẫn `-Dluava.jit=false`.
+
+**Giới hạn còn lại (chủ ý):** float loop, `while`/`repeat` (generic loop
+state), `CONCAT`/`VARARG`/metamethod vẫn interpreter. Hotness đếm theo
+`OP_CALL` nên loop ở main chunk không tier-up (kể cả loop trong hàm chỉ
+hưởng nếu hàm được gọi ≥ 50 lần hoặc `prewarm`).
+
 
 ---
 

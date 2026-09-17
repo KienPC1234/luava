@@ -18,26 +18,45 @@ import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class GCManager {
     public static final class FinalizerEntry {
         public final LuaValue target;
         public final LuaValue gcHandler;
+        public final long ownerId;
 
         public FinalizerEntry(LuaValue target, LuaValue gcHandler) {
+            this(target, gcHandler, GLOBAL_OWNER_ID);
+        }
+
+        public FinalizerEntry(LuaValue target, LuaValue gcHandler, long ownerId) {
             this.target = target;
             this.gcHandler = gcHandler;
+            this.ownerId = ownerId;
         }
     }
 
+    private static final class WeakTableEntry {
+        final java.lang.ref.WeakReference<LuaTable> table;
+        final long ownerId;
+
+        WeakTableEntry(LuaTable table, long ownerId) {
+            this.table = new java.lang.ref.WeakReference<>(table);
+            this.ownerId = ownerId;
+        }
+    }
+
+    private static final long GLOBAL_OWNER_ID = 0L;
+
     private static final List<FinalizerEntry> FINALIZERS = new ArrayList<>();
-    private static final List<java.lang.ref.WeakReference<LuaTable>> WEAK_TABLES = new ArrayList<>();
+    private static final List<WeakTableEntry> WEAK_TABLES = new ArrayList<>();
     private static final List<StringRef> LARGE_STRINGS = new ArrayList<>();
-    private static long uncollectedBytes = 0;
-    private static boolean runningFinalizer = false;
+    private static final AtomicLong uncollectedBytes = new AtomicLong();
+    private static volatile boolean runningFinalizer = false;
     private static volatile boolean gcRunning = true;
     private static boolean collecting = false;
-    private static long gcThreshold = 256L * 1024;
+    private static volatile long gcThreshold = 256L * 1024;
 
     private static final class StringRef {
         final java.lang.ref.WeakReference<LuaString> ref;
@@ -71,7 +90,7 @@ public final class GCManager {
 
     public static synchronized double getMemoryKb() {
         long base = 45 * 1024;
-        long total = base + uncollectedBytes + getLargeStringsBytes();
+        long total = base + uncollectedBytes.get() + getLargeStringsBytes();
         return (double) total / 1024.0;
     }
 
@@ -79,6 +98,15 @@ public final class GCManager {
 
     public static boolean isRunning() {
         return gcRunning;
+    }
+
+    /**
+     * True while a finalizer (or a collection it triggered) is on the stack.
+     * PUC makes {@code collectgarbage} fail inside a finalizer to keep the
+     * collector non-reentrant; {@code gc.lua} asserts exactly that.
+     */
+    public static boolean inFinalizer() {
+        return runningFinalizer;
     }
 
     public static void stop() {
@@ -89,13 +117,24 @@ public final class GCManager {
         gcRunning = true;
     }
 
+    private static long currentGcOwnerId() {
+        LuaState active = LuaValue.activeBasicState();
+        return (active != null) ? active.gcOwnerId() : GLOBAL_OWNER_ID;
+    }
+
+    /**
+     * Clears all JVM-wide collector bookkeeping. This is a test-harness
+     * operation. It must not be called while unrelated live states exist,
+     * because unlike per-state collection it discards every state's pending
+     * finalizers, weak-table registrations, and roots.
+     */
     public static synchronized void reset() {
         WEAK_TABLES.clear();
         LARGE_STRINGS.clear();
         FINALIZERS.clear();
         ROOT_PROVIDERS.clear();
         STATES.clear();
-        uncollectedBytes = 0;
+        uncollectedBytes.set(0);
         gcRunning = true;
         runningFinalizer = false;
         collecting = false;
@@ -104,27 +143,41 @@ public final class GCManager {
 
     public static synchronized void register(LuaValue target, LuaValue gcHandler) {
         if (target == null || gcHandler == null || gcHandler.isNil()) return;
-        FINALIZERS.add(new FinalizerEntry(target, gcHandler));
+        FINALIZERS.add(new FinalizerEntry(target, gcHandler, currentGcOwnerId()));
     }
 
     public static synchronized void registerWeakTable(LuaTable table) {
         if (table == null) return;
-        WEAK_TABLES.add(new java.lang.ref.WeakReference<>(table));
+        WEAK_TABLES.add(new WeakTableEntry(table, currentGcOwnerId()));
     }
 
-    public static synchronized void onAlloc() {
+    public static void onAlloc() {
         onAlloc(100);
     }
 
-    public static synchronized void onAlloc(long bytes) {
+    public static void onAlloc(long bytes) {
         try {
-            uncollectedBytes += bytes;
-            if (!gcRunning) return;
-            if (uncollectedBytes >= gcThreshold) {
-                uncollectedBytes = 0;
-                if ((!FINALIZERS.isEmpty() || !WEAK_TABLES.isEmpty()) && !runningFinalizer) {
-                    collect();
-                }
+            // Allocation happens on hot paths (especially table construction),
+            // so avoid taking the collector monitor for every object. Only the
+            // thread that crosses the threshold inspects the work lists and can
+            // trigger a collection.
+            long total = uncollectedBytes.addAndGet(bytes);
+            if (!gcRunning || total < gcThreshold) {
+                return;
+            }
+            if (!uncollectedBytes.compareAndSet(total, 0)) {
+                return;
+            }
+            // Scope automatic collection to the allocating state. Running
+            // every state's finalizers / cleaning every state's weak tables
+            // from here corrupts concurrent states (one suite's GC step
+            // mutating another's live table). Host registrations with no
+            // owning state stay global.
+            LuaState active = LuaValue.activeBasicState();
+            if (active != null) {
+                collect(active);
+            } else {
+                collect();
             }
         } finally {
             allocatingString = null;
@@ -132,14 +185,31 @@ public final class GCManager {
     }
 
     public static synchronized long getUncollectedBytes() {
-        return uncollectedBytes;
+        return uncollectedBytes.get();
     }
 
     public static synchronized boolean collect() {
+        return collectInternal(null, false);
+    }
+
+    /**
+     * Runs a collection for one Lua state. Reachability is still checked
+     * across the shared allocator, but finalizers are only run for entries
+     * owned by the requesting state (as well as host registrations made
+     * outside Lua execution, which have no owning state).
+     */
+    public static synchronized boolean collect(LuaState owner) {
+        if (owner == null) {
+            return collectInternal(null, false);
+        }
+        return collectInternal(owner, true);
+    }
+
+    private static boolean collectInternal(LuaState owner, boolean ownedFinalizersOnly) {
         if (runningFinalizer || collecting) return false;
         collecting = true;
         try {
-            uncollectedBytes = 0;
+            uncollectedBytes.set(0);
 
         // 1. Mark phase from normal roots (excluding dead objects with finalizers)
         Set<LuaValue> liveNormal = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
@@ -151,24 +221,39 @@ public final class GCManager {
         drainWorklist(worklist, liveNormal, visitedNormal, ephemeronsNormal);
         convergeEphemerons(liveNormal, visitedNormal, ephemeronsNormal);
 
-        // 2. Clear weak VALUES from weak tables before separating objects to be finalized
+        // 2. Clear weak VALUES from weak tables before separating objects to
+        // be finalized. An owned collection only touches that state's weak
+        // tables: cleaning another live state's table here would mutate its
+        // data mid-execution.
         for (int i = WEAK_TABLES.size() - 1; i >= 0; i--) {
-            LuaTable tbl = WEAK_TABLES.get(i).get();
+            WeakTableEntry entry = WEAK_TABLES.get(i);
+            LuaTable tbl = entry.table.get();
             if (tbl == null) {
                 WEAK_TABLES.remove(i);
+            } else if (ownedFinalizersOnly && owner != null
+                    && entry.ownerId != GLOBAL_OWNER_ID
+                    && entry.ownerId != owner.gcOwnerId()) {
+                continue;
             } else {
                 tbl.cleanupWeakValues(liveNormal::contains);
             }
         }
 
-        // 3. Separate dead objects with finalizers
+        // 3. Separate dead objects with finalizers. An explicit request from
+        // one state must not run finalizers owned by another live state.
         List<FinalizerEntry> toRun = new ArrayList<>();
         for (int i = FINALIZERS.size() - 1; i >= 0; i--) {
             FinalizerEntry entry = FINALIZERS.get(i);
-            if (!liveNormal.contains(entry.target)) {
-                FINALIZERS.remove(i);
-                toRun.add(entry);
+            if (liveNormal.contains(entry.target)) {
+                continue;
             }
+            if (ownedFinalizersOnly && owner != null
+                    && entry.ownerId != GLOBAL_OWNER_ID
+                    && entry.ownerId != owner.gcOwnerId()) {
+                continue;
+            }
+            FINALIZERS.remove(i);
+            toRun.add(entry);
         }
 
         // 4. Resurrect objects in toRun and mark all reachable from them
@@ -187,7 +272,7 @@ public final class GCManager {
 
         // 5. Clear weak KEYS from weak tables after resurrection
         for (int i = WEAK_TABLES.size() - 1; i >= 0; i--) {
-            LuaTable tbl = WEAK_TABLES.get(i).get();
+            LuaTable tbl = WEAK_TABLES.get(i).table.get();
             if (tbl == null) {
                 WEAK_TABLES.remove(i);
             } else {
@@ -203,20 +288,25 @@ public final class GCManager {
             }
         }
 
-        // 6. Run finalizers in toRun
+        // 6. Run finalizers in toRun. When this collection was requested by a
+        // particular state, execute its finalizers under that state's basic
+        // metatable scope so __gc handlers observe the same string/number
+        // metatables as ordinary code in that state.
         if (!toRun.isEmpty()) {
             runningFinalizer = true;
+            LuaState basicScope = (ownedFinalizersOnly && owner != null) ? owner : null;
+            LuaState previousBasicScope = (basicScope != null) ? LuaValue.pushBasicState(basicScope) : null;
             try {
                 for (FinalizerEntry entry : toRun) {
                     try {
                         LuaValue handler = null;
                         if (entry.target.getMetatable() != null) {
-                            handler = entry.target.getMetatable().rawget(LuaString.valueOf("__gc"));
+                            handler = entry.target.getMetatable().rawget(org.luava.runtime.LuaValue.Meta.GC);
                         }
                         if (handler == null || handler.isNil()) {
                             handler = entry.gcHandler;
                         }
-                        if (handler != null && (handler.isFunction() || (handler.getMetatable() != null && !handler.getMetatable().rawget(LuaString.valueOf("__call")).isNil()))) {
+                        if (handler != null && (handler.isFunction() || (handler.getMetatable() != null && !handler.getMetatable().rawget(org.luava.runtime.LuaValue.Meta.CALL).isNil()))) {
                             CallStack.setNextCall("__gc", "metamethod", false, true);
                             handler.call(entry.target);
                         }
@@ -225,6 +315,9 @@ public final class GCManager {
                     }
                 }
             } finally {
+                if (basicScope != null) {
+                    LuaValue.popBasicState(previousBasicScope);
+                }
                 runningFinalizer = false;
             }
         }
@@ -242,15 +335,16 @@ public final class GCManager {
     }
 
     public static synchronized boolean step(long stepSizeKb) {
-        if (uncollectedBytes <= 0) {
+        long pending = uncollectedBytes.get();
+        if (pending <= 0) {
             return collect();
         }
         long stepBytes = (stepSizeKb <= 0) ? 1024 : stepSizeKb * 1024;
-        if (stepBytes >= uncollectedBytes) {
-            uncollectedBytes = 0;
+        if (stepBytes >= pending) {
+            uncollectedBytes.set(0);
             return collect();
         } else {
-            uncollectedBytes -= stepBytes;
+            uncollectedBytes.addAndGet(-stepBytes);
             return false;
         }
     }

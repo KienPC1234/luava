@@ -26,30 +26,30 @@ public final class PackageLib {
     public static void open(LuaState state, LuaTable globals) {
         LuaTable pkg = new LuaTable();
         fillInto(pkg, state, globals);
-        globals.rawset(LuaString.valueOf("package"), pkg);
+        globals.rawset(LuaString.interned("package"), pkg);
     }
 
     public static void fillInto(LuaTable pkg, LuaState state, LuaTable globals) {
         LuaTable loaded = new LuaTable();
         LuaTable preload = new LuaTable();
 
-        pkg.rawset(LuaString.valueOf("loaded"), loaded);
-        pkg.rawset(LuaString.valueOf("preload"), preload);
-        pkg.rawset(LuaString.valueOf("path"), LuaString.valueOf("./?.lua;./?/init.lua;tests/lua-5.4.9-tests/?.lua"));
-        pkg.rawset(LuaString.valueOf("cpath"), LuaString.valueOf("./?.so;./loadall.so"));
-        pkg.rawset(LuaString.valueOf("config"), LuaString.valueOf("/\n;\n?\n!\n-\n"));
+        pkg.rawset(LuaString.interned("loaded"), loaded);
+        pkg.rawset(LuaString.interned("preload"), preload);
+        pkg.rawset(LuaString.interned("path"), LuaString.interned("./?.lua;./?/init.lua;tests/lua-5.4.9-tests/?.lua"));
+        pkg.rawset(LuaString.interned("cpath"), LuaString.interned("./?.so;./loadall.so"));
+        pkg.rawset(LuaString.interned("config"), LuaString.valueOf("/\n;\n?\n!\n-\n"));
 
         // Register default modules in package.loaded
-        loaded.rawset(LuaString.valueOf("_G"), globals);
-        loaded.rawset(LuaString.valueOf("package"), pkg);
-        if (!globals.rawget(LuaString.valueOf("math")).isNil()) loaded.rawset(LuaString.valueOf("math"), globals.rawget(LuaString.valueOf("math")));
-        if (!globals.rawget(LuaString.valueOf("string")).isNil()) loaded.rawset(LuaString.valueOf("string"), globals.rawget(LuaString.valueOf("string")));
-        if (!globals.rawget(LuaString.valueOf("table")).isNil()) loaded.rawset(LuaString.valueOf("table"), globals.rawget(LuaString.valueOf("table")));
-        if (!globals.rawget(LuaString.valueOf("coroutine")).isNil()) loaded.rawset(LuaString.valueOf("coroutine"), globals.rawget(LuaString.valueOf("coroutine")));
-        if (!globals.rawget(LuaString.valueOf("utf8")).isNil()) loaded.rawset(LuaString.valueOf("utf8"), globals.rawget(LuaString.valueOf("utf8")));
-        if (!globals.rawget(LuaString.valueOf("os")).isNil()) loaded.rawset(LuaString.valueOf("os"), globals.rawget(LuaString.valueOf("os")));
-        if (!globals.rawget(LuaString.valueOf("io")).isNil()) loaded.rawset(LuaString.valueOf("io"), globals.rawget(LuaString.valueOf("io")));
-        if (!globals.rawget(LuaString.valueOf("debug")).isNil()) loaded.rawset(LuaString.valueOf("debug"), globals.rawget(LuaString.valueOf("debug")));
+        loaded.rawset(LuaString.interned("_G"), globals);
+        loaded.rawset(LuaString.interned("package"), pkg);
+        if (!globals.rawget(LuaString.interned("math")).isNil()) loaded.rawset(LuaString.interned("math"), globals.rawget(LuaString.interned("math")));
+        if (!globals.rawget(LuaString.interned("string")).isNil()) loaded.rawset(LuaString.interned("string"), globals.rawget(LuaString.interned("string")));
+        if (!globals.rawget(LuaString.interned("table")).isNil()) loaded.rawset(LuaString.interned("table"), globals.rawget(LuaString.interned("table")));
+        if (!globals.rawget(LuaString.interned("coroutine")).isNil()) loaded.rawset(LuaString.interned("coroutine"), globals.rawget(LuaString.interned("coroutine")));
+        if (!globals.rawget(LuaString.interned("utf8")).isNil()) loaded.rawset(LuaString.interned("utf8"), globals.rawget(LuaString.interned("utf8")));
+        if (!globals.rawget(LuaString.interned("os")).isNil()) loaded.rawset(LuaString.interned("os"), globals.rawget(LuaString.interned("os")));
+        if (!globals.rawget(LuaString.interned("io")).isNil()) loaded.rawset(LuaString.interned("io"), globals.rawget(LuaString.interned("io")));
+        if (!globals.rawget(LuaString.interned("debug")).isNil()) loaded.rawset(LuaString.interned("debug"), globals.rawget(LuaString.interned("debug")));
 
         LuaFunction searchpathFn = LuaFunction.of(args -> {
             if (args.length < 2) throw new LuaException("bad argument to 'package.searchpath'");
@@ -78,12 +78,12 @@ public final class PackageLib {
             }
             return Varargs.of(LuaNil.NIL, LuaString.valueOf(tried.toString()));
         });
-        pkg.rawset(LuaString.valueOf("searchpath"), searchpathFn);
+        pkg.rawset(LuaString.interned("searchpath"), searchpathFn);
 
         // searcher 1: preload
         LuaFunction searcherPreload = LuaFunction.of(args -> {
             LuaValue modName = args.length > 0 ? args[0] : LuaNil.NIL;
-            LuaValue preloadVal = pkg.rawget(LuaString.valueOf("preload"));
+            LuaValue preloadVal = pkg.rawget(LuaString.interned("preload"));
             if (!preloadVal.isTable()) {
                 throw new LuaException("'package.preload' must be a table");
             }
@@ -92,13 +92,13 @@ public final class PackageLib {
             if (loader.isNil()) {
                 return LuaString.valueOf("\n\tno field package.preload['" + modName.toLuaString() + "']");
             }
-            return Varargs.of(loader, LuaString.valueOf(":preload:"));
+            return Varargs.of(loader, LuaString.interned(":preload:"));
         });
 
         // searcher 2: Lua files via package.path
         LuaFunction searcherLua = LuaFunction.of(args -> {
             LuaValue modName = args.length > 0 ? args[0] : LuaNil.NIL;
-            LuaValue pathVal = pkg.rawget(LuaString.valueOf("path"));
+            LuaValue pathVal = pkg.rawget(LuaString.interned("path"));
             if (!pathVal.isString()) {
                 throw new LuaException("'package.path' must be a string");
             }
@@ -129,7 +129,7 @@ public final class PackageLib {
         // searcher 3: C files via package.cpath
         LuaFunction searcherC = LuaFunction.of(args -> {
             LuaValue modName = args.length > 0 ? args[0] : LuaNil.NIL;
-            LuaValue cpathVal = pkg.rawget(LuaString.valueOf("cpath"));
+            LuaValue cpathVal = pkg.rawget(LuaString.interned("cpath"));
             if (!cpathVal.isString()) {
                 throw new LuaException("'package.cpath' must be a string");
             }
@@ -149,7 +149,7 @@ public final class PackageLib {
                 return LuaNil.NIL;
             }
             String root = nameStr.substring(0, dot);
-            LuaValue cpathVal = pkg.rawget(LuaString.valueOf("cpath"));
+            LuaValue cpathVal = pkg.rawget(LuaString.interned("cpath"));
             if (!cpathVal.isString()) {
                 throw new LuaException("'package.cpath' must be a string");
             }
@@ -165,14 +165,14 @@ public final class PackageLib {
         searchers.rawset(org.luava.runtime.LuaInteger.valueOf(2), searcherLua);
         searchers.rawset(org.luava.runtime.LuaInteger.valueOf(3), searcherC);
         searchers.rawset(org.luava.runtime.LuaInteger.valueOf(4), searcherCroot);
-        pkg.rawset(LuaString.valueOf("searchers"), searchers);
+        pkg.rawset(LuaString.interned("searchers"), searchers);
 
-        pkg.rawset(LuaString.valueOf("loadlib"), LuaFunction.of(args -> {
-            return Varargs.of(LuaNil.NIL, LuaString.valueOf("dynamic libraries not supported"), LuaString.valueOf("absent"));
+        pkg.rawset(LuaString.interned("loadlib"), LuaFunction.of(args -> {
+            return Varargs.of(LuaNil.NIL, LuaString.interned("dynamic libraries not supported"), LuaString.interned("absent"));
         }));
 
         // require(modname)
-        globals.rawset(LuaString.valueOf("require"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("require"), LuaFunction.of(args -> {
             if (args.length == 0 || (!args[0].isString() && !args[0].isInteger() && !args[0].isFloat())) {
                 throw new LuaException("bad argument #1 to 'require' (string expected)");
             }
@@ -180,7 +180,7 @@ public final class PackageLib {
             LuaString modName = LuaString.valueOf(nameStr);
 
             // 1. Check package.loaded
-            LuaValue loadedVal = pkg.rawget(LuaString.valueOf("loaded"));
+            LuaValue loadedVal = pkg.rawget(LuaString.interned("loaded"));
             LuaTable loadedTable = (loadedVal instanceof LuaTable t) ? t : loaded;
             LuaValue cached = loadedTable.rawget(modName);
             if (!cached.isNil() && cached.toBoolean()) {
@@ -188,7 +188,7 @@ public final class PackageLib {
             }
 
             // 2. Guide by package.searchers
-            LuaValue searchersVal = pkg.rawget(LuaString.valueOf("searchers"));
+            LuaValue searchersVal = pkg.rawget(LuaString.interned("searchers"));
             if (!searchersVal.isTable()) {
                 throw new LuaException("'package.searchers' must be a table");
             }
