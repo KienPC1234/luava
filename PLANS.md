@@ -630,6 +630,9 @@ Every phase must pass ALL FOUR gates or be reverted:
 - **G3 – correct**: 31/31 official suites + 54 unit tests green
   (assertions active since `3706b5b`), plus byte-identical output on the
   3-engine complex script (`/tmp/opencode/complex.lua`).
+  *(Historical gate. The current harness excludes `all.lua`, `main.lua`
+  and `heavy.lua` by design: **30/30** runnable suites + **111** unit
+  tests — see `README.md` and `OfficialSuiteEvaluationTest`.)*
 - **G4 – faster**: warmed `bench1m.lua` ×30 vs the LuaJ mark (~70 ms).
 
 Phases:

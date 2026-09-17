@@ -21,26 +21,34 @@ import org.luava.runtime.Varargs;
 public final class MathLib {
     private MathLib() {}
 
+    /**
+     * Shared stateless {@code math.sqrt} builtin (see
+     * {@code BaseLib.TOSTRING}): one JVM-wide instance so the VM can
+     * recognize and inline it on hot paths.
+     */
+    public static final org.luava.runtime.LuaFunction SQRT =
+            org.luava.runtime.LuaFunction.of(args -> org.luava.runtime.LuaFloat.valueOf(Math.sqrt(checkNumber(args, 0, "sqrt"))));
+
     public static void open(LuaTable globals) {
         LuaTable math = new LuaTable();
         fillInto(math, globals);
-        globals.rawset(LuaString.valueOf("math"), math);
+        globals.rawset(LuaString.interned("math"), math);
     }
 
     public static void fillInto(LuaTable math, LuaTable globals) {
 
-        math.rawset(LuaString.valueOf("pi"), LuaFloat.valueOf(Math.PI));
-        math.rawset(LuaString.valueOf("huge"), LuaFloat.valueOf(Double.POSITIVE_INFINITY));
-        math.rawset(LuaString.valueOf("maxinteger"), LuaInteger.valueOf(Long.MAX_VALUE));
-        math.rawset(LuaString.valueOf("mininteger"), LuaInteger.valueOf(Long.MIN_VALUE));
+        math.rawset(LuaString.interned("pi"), LuaFloat.valueOf(Math.PI));
+        math.rawset(LuaString.interned("huge"), LuaFloat.valueOf(Double.POSITIVE_INFINITY));
+        math.rawset(LuaString.interned("maxinteger"), LuaInteger.valueOf(Long.MAX_VALUE));
+        math.rawset(LuaString.interned("mininteger"), LuaInteger.valueOf(Long.MIN_VALUE));
 
-        math.rawset(LuaString.valueOf("abs"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("abs"), LuaFunction.of(args -> {
             LuaValue v = checkNumberValue(args, 0, "abs");
             if (v.isInteger()) return LuaInteger.valueOf(Math.abs(v.toLong()));
             return LuaFloat.valueOf(Math.abs(v.toDouble()));
         }));
 
-        math.rawset(LuaString.valueOf("floor"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("floor"), LuaFunction.of(args -> {
             LuaValue v = checkNumberValue(args, 0, "floor");
             if (v.isInteger()) return v;
             double d = Math.floor(v.toDouble());
@@ -50,7 +58,7 @@ public final class MathLib {
             return LuaFloat.valueOf(d);
         }));
 
-        math.rawset(LuaString.valueOf("ceil"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("ceil"), LuaFunction.of(args -> {
             LuaValue v = checkNumberValue(args, 0, "ceil");
             if (v.isInteger()) return v;
             double d = Math.ceil(v.toDouble());
@@ -60,11 +68,11 @@ public final class MathLib {
             return LuaFloat.valueOf(d);
         }));
 
-        math.rawset(LuaString.valueOf("sqrt"), LuaFunction.of(args -> LuaFloat.valueOf(Math.sqrt(checkNumber(args, 0, "sqrt")))));
+        math.rawset(LuaString.interned("sqrt"), SQRT);
 
-        math.rawset(LuaString.valueOf("exp"), LuaFunction.of(args -> LuaFloat.valueOf(Math.exp(checkNumber(args, 0, "exp")))));
+        math.rawset(LuaString.interned("exp"), LuaFunction.of(args -> LuaFloat.valueOf(Math.exp(checkNumber(args, 0, "exp")))));
 
-        math.rawset(LuaString.valueOf("log"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("log"), LuaFunction.of(args -> {
             double val = checkNumber(args, 0, "log");
             if (args.length > 1 && !args[1].isNil()) {
                 double base = checkNumber(args, 1, "log");
@@ -73,21 +81,21 @@ public final class MathLib {
             return LuaFloat.valueOf(Math.log(val));
         }));
 
-        math.rawset(LuaString.valueOf("sin"), LuaFunction.of(args -> LuaFloat.valueOf(Math.sin(checkNumber(args, 0, "sin")))));
-        math.rawset(LuaString.valueOf("cos"), LuaFunction.of(args -> LuaFloat.valueOf(Math.cos(checkNumber(args, 0, "cos")))));
-        math.rawset(LuaString.valueOf("tan"), LuaFunction.of(args -> LuaFloat.valueOf(Math.tan(checkNumber(args, 0, "tan")))));
-        math.rawset(LuaString.valueOf("asin"), LuaFunction.of(args -> LuaFloat.valueOf(Math.asin(checkNumber(args, 0, "asin")))));
-        math.rawset(LuaString.valueOf("acos"), LuaFunction.of(args -> LuaFloat.valueOf(Math.acos(checkNumber(args, 0, "acos")))));
-        math.rawset(LuaString.valueOf("atan"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("sin"), LuaFunction.of(args -> LuaFloat.valueOf(Math.sin(checkNumber(args, 0, "sin")))));
+        math.rawset(LuaString.interned("cos"), LuaFunction.of(args -> LuaFloat.valueOf(Math.cos(checkNumber(args, 0, "cos")))));
+        math.rawset(LuaString.interned("tan"), LuaFunction.of(args -> LuaFloat.valueOf(Math.tan(checkNumber(args, 0, "tan")))));
+        math.rawset(LuaString.interned("asin"), LuaFunction.of(args -> LuaFloat.valueOf(Math.asin(checkNumber(args, 0, "asin")))));
+        math.rawset(LuaString.interned("acos"), LuaFunction.of(args -> LuaFloat.valueOf(Math.acos(checkNumber(args, 0, "acos")))));
+        math.rawset(LuaString.interned("atan"), LuaFunction.of(args -> {
             double y = checkNumber(args, 0, "atan");
             double x = (args.length > 1 && !args[1].isNil()) ? checkNumber(args, 1, "atan") : 1.0;
             return LuaFloat.valueOf(Math.atan2(y, x));
         }));
 
-        math.rawset(LuaString.valueOf("deg"), LuaFunction.of(args -> LuaFloat.valueOf(Math.toDegrees(checkNumber(args, 0, "deg")))));
-        math.rawset(LuaString.valueOf("rad"), LuaFunction.of(args -> LuaFloat.valueOf(Math.toRadians(checkNumber(args, 0, "rad")))));
+        math.rawset(LuaString.interned("deg"), LuaFunction.of(args -> LuaFloat.valueOf(Math.toDegrees(checkNumber(args, 0, "deg")))));
+        math.rawset(LuaString.interned("rad"), LuaFunction.of(args -> LuaFloat.valueOf(Math.toRadians(checkNumber(args, 0, "rad")))));
 
-        math.rawset(LuaString.valueOf("max"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("max"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument #1 to 'max' (value expected)");
             LuaValue max = args[0];
             for (int i = 1; i < args.length; i++) {
@@ -98,7 +106,7 @@ public final class MathLib {
             return max;
         }));
 
-        math.rawset(LuaString.valueOf("min"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("min"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument #1 to 'min' (value expected)");
             LuaValue min = args[0];
             for (int i = 1; i < args.length; i++) {
@@ -109,15 +117,15 @@ public final class MathLib {
             return min;
         }));
 
-        math.rawset(LuaString.valueOf("type"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("type"), LuaFunction.of(args -> {
             if (args.length == 0) return LuaNil.NIL;
             LuaValue v = args[0];
-            if (v.isInteger()) return LuaString.valueOf("integer");
-            if (v.isFloat()) return LuaString.valueOf("float");
+            if (v.isInteger()) return LuaString.interned("integer");
+            if (v.isFloat()) return LuaString.interned("float");
             return LuaNil.NIL;
         }));
 
-        math.rawset(LuaString.valueOf("tointeger"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("tointeger"), LuaFunction.of(args -> {
             if (args.length == 0) return LuaNil.NIL;
             LuaValue v = args[0];
             if (v.isInteger()) return v;
@@ -135,13 +143,13 @@ public final class MathLib {
             return LuaNil.NIL;
         }));
 
-        math.rawset(LuaString.valueOf("ult"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("ult"), LuaFunction.of(args -> {
             long m = checkInteger(args, 0, "ult");
             long n = checkInteger(args, 1, "ult");
             return LuaBoolean.valueOf(Long.compareUnsigned(m, n) < 0);
         }));
 
-        math.rawset(LuaString.valueOf("fmod"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("fmod"), LuaFunction.of(args -> {
             LuaValue xv = checkNumberValue(args, 0, "fmod");
             LuaValue yv = checkNumberValue(args, 1, "fmod");
             if (xv.isInteger() && yv.isInteger()) {
@@ -156,7 +164,7 @@ public final class MathLib {
             return LuaFloat.valueOf(x % y);
         }));
 
-        math.rawset(LuaString.valueOf("modf"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("modf"), LuaFunction.of(args -> {
             LuaValue v = checkNumberValue(args, 0, "modf");
             if (v.isInteger()) {
                 return Varargs.of(v, LuaFloat.valueOf(0.0));
@@ -184,7 +192,7 @@ public final class MathLib {
         long[] rngState = new long[4];
         setseed(rngState, System.currentTimeMillis(), System.identityHashCode(globals));
 
-        math.rawset(LuaString.valueOf("random"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("random"), LuaFunction.of(args -> {
             long rv = nextrand(rngState);
             if (args.length == 0) {
                 return LuaFloat.valueOf(I2d(rv));
@@ -209,7 +217,7 @@ public final class MathLib {
             return LuaInteger.valueOf(p + low);
         }));
 
-        math.rawset(LuaString.valueOf("randomseed"), LuaFunction.of(args -> {
+        math.rawset(LuaString.interned("randomseed"), LuaFunction.of(args -> {
             long s1, s2;
             if (args.length == 0 || args[0].isNil()) {
                 s1 = System.currentTimeMillis();

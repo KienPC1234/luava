@@ -27,19 +27,19 @@ public final class CoroutineLib {
     public static void open(LuaTable globals, LuaCoroutine mainThread) {
         LuaTable coro = new LuaTable();
         fillInto(coro, globals, mainThread);
-        globals.rawset(LuaString.valueOf("coroutine"), coro);
+        globals.rawset(LuaString.interned("coroutine"), coro);
     }
 
     public static void fillInto(LuaTable coro, LuaTable globals, LuaCoroutine mainThread) {
 
-        coro.rawset(LuaString.valueOf("create"), LuaFunction.of(args -> {
+        coro.rawset(LuaString.interned("create"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isFunction()) {
                 throw new LuaException("bad argument #1 to 'coroutine.create' (function expected)");
             }
             return new LuaCoroutine((LuaFunction) args[0]);
         }));
 
-        coro.rawset(LuaString.valueOf("resume"), LuaFunction.of(args -> {
+        coro.rawset(LuaString.interned("resume"), LuaFunction.of(args -> {
             if (args.length == 0 || !(args[0] instanceof LuaCoroutine co)) {
                 throw new LuaException("bad argument #1 to 'coroutine.resume' (thread expected)");
             }
@@ -58,21 +58,21 @@ public final class CoroutineLib {
             return Varargs.of(results);
         }));
 
-        coro.rawset(LuaString.valueOf("yield"), LuaFunction.of(args -> {
+        coro.rawset(LuaString.interned("yield"), LuaFunction.of(args -> {
             LuaValue[] yielded = LuaCoroutine.yield(args != null && args.length > 0 ? args : LuaCoroutine.EMPTY_VALUES);
             if (yielded == null || yielded.length == 0) return LuaNil.NIL;
             if (yielded.length == 1) return yielded[0];
             return Varargs.of(yielded);
         }));
 
-        coro.rawset(LuaString.valueOf("status"), LuaFunction.of(args -> {
+        coro.rawset(LuaString.interned("status"), LuaFunction.of(args -> {
             if (args.length == 0 || !(args[0] instanceof LuaCoroutine co)) {
                 throw new LuaException("bad argument #1 to 'coroutine.status' (thread expected)");
             }
             return LuaString.valueOf(co.getStatus().label());
         }));
 
-        coro.rawset(LuaString.valueOf("close"), LuaFunction.of(args -> {
+        coro.rawset(LuaString.interned("close"), LuaFunction.of(args -> {
             if (args.length == 0 || !(args[0] instanceof LuaCoroutine co)) {
                 throw new LuaException("bad argument #1 to 'coroutine.close' (thread expected)");
             }
@@ -80,7 +80,7 @@ public final class CoroutineLib {
             return Varargs.of(results);
         }));
 
-        coro.rawset(LuaString.valueOf("isyieldable"), LuaFunction.of(args -> {
+        coro.rawset(LuaString.interned("isyieldable"), LuaFunction.of(args -> {
             if (args.length > 0 && !args[0].isNil()) {
                 if (!(args[0] instanceof LuaCoroutine co)) {
                     throw new LuaException("bad argument #1 to 'coroutine.isyieldable' (thread expected)");
@@ -97,7 +97,7 @@ public final class CoroutineLib {
             return LuaBoolean.valueOf(running.isYieldableInstance());
         }));
 
-        coro.rawset(LuaString.valueOf("running"), LuaFunction.of(args -> {
+        coro.rawset(LuaString.interned("running"), LuaFunction.of(args -> {
             LuaCoroutine running = LuaCoroutine.running();
             if (running != null) {
                 boolean isMain = (running == mainThread || running.isMainThread());
@@ -106,7 +106,7 @@ public final class CoroutineLib {
             return Varargs.of(mainThread != null ? mainThread : LuaNil.NIL, LuaBoolean.TRUE);
         }));
 
-        coro.rawset(LuaString.valueOf("wrap"), LuaFunction.of(args -> {
+        coro.rawset(LuaString.interned("wrap"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isFunction()) {
                 throw new LuaException("bad argument #1 to 'coroutine.wrap' (function expected)");
             }
@@ -119,7 +119,7 @@ public final class CoroutineLib {
                             co.close();
                         } catch (Exception ignored) {}
                     }
-                    throw new LuaException(results.length > 1 ? results[1] : LuaString.valueOf("error in coroutine"));
+                    throw new LuaException(results.length > 1 ? results[1] : LuaString.interned("error in coroutine"));
                 }
                 int outLen = results.length - 1;
                 if (outLen <= 0) return Varargs.EMPTY;

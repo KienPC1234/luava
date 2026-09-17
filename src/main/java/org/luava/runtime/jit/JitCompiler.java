@@ -69,6 +69,31 @@ public final class JitCompiler {
         prewarmProto(closure.proto);
     }
 
+    /**
+     * Convenience overload for the common {@code state.compile(...)} /
+     * {@code state.eval(...)} result. A non-closure function (a Java-backed
+     * {@link org.luava.runtime.LuaFunction}) has no Lua bytecode to compile,
+     * so this is a no-op for it rather than an error.
+     */
+    public static void prewarm(org.luava.runtime.LuaFunction function) {
+        if (function instanceof LuaClosure lc) {
+            prewarm(lc);
+        }
+    }
+
+    /**
+     * Pre-compiles a whole closure tree, but only when JIT is enabled for
+     * the owning state. Prewarming while JIT is off would still allocate
+     * hidden classes, contradicting the host's opt-out; this keeps
+     * {@code -Dluava.jit=false} / {@code state.jitEnabled(false)} honest.
+     */
+    public static void prewarm(LuaClosure closure, org.luava.runtime.LuaState state) {
+        if (state != null && !state.isJitEnabled()) {
+            return;
+        }
+        prewarm(closure);
+    }
+
     private static void prewarmProto(LuaProto proto) {
         tryCompile(proto);
         for (LuaProto child : proto.protos) {

@@ -196,7 +196,11 @@ public final class CallStack {
     }
 
     public static void setNextCall(String name, String namewhat, boolean isMethod, boolean isMetamethod) {
-        CallStackState state = currentState();
+        setNextCall(currentState(), name, namewhat, isMethod, isMetamethod);
+    }
+
+    /** ThreadLocal-free {@link #setNextCall(String, String, boolean, boolean)}. */
+    public static void setNextCall(CallStackState state, String name, String namewhat, boolean isMethod, boolean isMetamethod) {
         state.nextName = name;
         state.nextNamewhat = namewhat;
         state.nextMethod = isMethod;
@@ -213,7 +217,11 @@ public final class CallStack {
      * value still equals {@code expected}, so nested legitimate values survive.
      */
     public static void clearNextCallIf(String expected) {
-        CallStackState state = currentState();
+        clearNextCallIf(currentState(), expected);
+    }
+
+    /** ThreadLocal-free {@link #clearNextCallIf(String)}. */
+    public static void clearNextCallIf(CallStackState state, String expected) {
         if (expected != null ? expected.equals(state.nextName) : state.nextName == null) {
             state.nextName = null;
             state.nextNamewhat = null;
@@ -320,15 +328,20 @@ public final class CallStack {
         if (top.handling) {
             return org.luava.runtime.LuaString.valueOf("error in error handling");
         }
-        top.handling = true;
-        // Push a frame for the handler so that debug.traceback's default level=1
-        // correctly skips the handler itself (level 0) and starts at the error site.
+        // Mark BEFORE invoking (re-entrancy guard), but the flag must be
+        // cleared even when the handler-frame push itself throws: pushing at
+        // the depth limit raises StackOverflowError, and a stuck handling=true
+        // would permanently disable error handling for this protected frame
+        // (errors.lua/calls.lua deliberately overflow inside handlers).
         boolean pushedHandlerFrame = false;
-        if (top.handler instanceof org.luava.runtime.LuaFunction fn) {
-            push(fn, fn.getName() != null ? fn.getName() : "?", "C", -1, false, false);
-            pushedHandlerFrame = true;
-        }
         try {
+            top.handling = true;
+            // Push a frame for the handler so that debug.traceback's default level=1
+            // correctly skips the handler itself (level 0) and starts at the error site.
+            if (top.handler instanceof org.luava.runtime.LuaFunction fn) {
+                push(fn, fn.getName() != null ? fn.getName() : "?", "C", -1, false, false);
+                pushedHandlerFrame = true;
+            }
             return top.handler.call(errObj);
         } catch (Throwable t) {
             return org.luava.runtime.LuaString.valueOf("error in error handling");
@@ -531,7 +544,7 @@ public final class CallStack {
         frame.state = vmState;
         frame.varargs = varargs;
         state.top = top + 1;
-        if (cur != null && LuaCoroutine.HOOKS_ARMED) {
+        if (cur != null && cur.hooksActive) {
             firePushHook(cur);
         }
     }
@@ -696,7 +709,7 @@ public final class CallStack {
      */
     public static void pop(CallStackState state, LuaCoroutine cur) {
         if (state.top > 0) {
-            if (cur != null && LuaCoroutine.HOOKS_ARMED) {
+            if (cur != null && cur.hooksActive) {
                 popReturnHook(cur);
             }
             state.top--;
@@ -720,7 +733,7 @@ public final class CallStack {
                     topFrame.varargs = null;
                 }
             }
-            if (cur != null && LuaCoroutine.HOOKS_ARMED) {
+            if (cur != null && cur.hooksActive) {
                 if (state.top > 0) {
                     cur.setLastLine(state.stack[state.top - 1].lastLine);
                 } else {

@@ -1,0 +1,40 @@
+JIT SPIKE FINDINGS (2026-09-14)
+================================
+Question: if a Lua-bytecode -> JVM-bytecode TRANSLATOR (not hand-written
+code) emits one JVM method per Lua function, how fast is fib?
+
+Setup: JitSpike.java, /tmp/opencode/jitspike, ASM 9.7 + defineHiddenClass.
+Translates the integer opcode subset (LEI/JMP/RETURN0/RETURN1/GETUPVAL/
+SUBK/ADD/CALL) of the real fib LuaProto into static long exec(...) and
+loads it as a hidden class. Recursive Lua->Lua self-call becomes a direct
+INVOKESTATIC. This is a translator, not a hand-written fib.
+
+Results (same box, taskset core 25, best-of-N):
+  interpreter fib(35): ~5300 ms
+  JIT fib(35):         ~183-199 ms   (25x faster than the interpreter)
+  LuaJ 3.0.1 fib(35):  ~2411 ms
+  C Lua 5.4.9 fib(35): ~766 ms
+=> The JIT shape beats LuaJ 13x and even C Lua 4x.
+
+Why: C2 sees a real recursive Java method with unboxed longs, so it inlines
+the recursive call and keeps everything in registers. This is exactly the
+"one method per Lua function" property the interpreter cannot have.
+
+Caveats (why this is a spike, not the feature):
+  1. Int-only specialization: no type tags/guards. Real Lua needs guards
+     (int vs float vs object) and deopt to the interpreter. Guards add cost
+     but stay far below interpreter dispatch.
+  2. No call-site polymorphism: this emits a direct self-invokestatic. The
+     real thing needs PIC/invokedynamic for general callees (tables with
+     __call, Java functions, other closures).
+  3. PLANS.md §IX non-goals remain: coroutine yield (the generated method
+     cannot yield mid-frame), Metaspace (hidden classes mitigate), 64KB
+     method limit (small funcs fine, huge funcs need splitting).
+  4. Integration: closures with open upvalues, varargs, table ops, metamethods,
+     error/traceback semantics, hooks - all still interpreter territory.
+
+Conclusion: the peak-performance argument is REAL and large (25x on fib, a
+task where the interpreter loses 1.8x to LuaJ). A hybrid (interpret cold
+functions, JIT hot integer/numeric kernels with guards) would close the
+call-heavy gap. But it is a multi-week project and must be scoped against
+the §IX non-goals (coroutine yield is the hard one).

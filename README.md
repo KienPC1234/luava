@@ -18,6 +18,9 @@ Key design points:
   floats, and booleans in arithmetic and loops.
 - **Coroutines on virtual threads**: each `LuaCoroutine` owns its stacks;
   `yield`/`resume` park and unpark carrier threads.
+- **Multi-tenant states**: use one `LuaState` per thread or tenant. States
+  do not share globals, security policy, value metatables, JIT settings, or
+  explicit finalizer ownership.
 - **Java interop**: `java.import` reflection, `@LuaModule`/`@LuaMethod`
   annotations, `state.setLive`/`registerFunction`, live collection proxies,
   and automatic Lua-function-to-SAM-interface adaptation.
@@ -76,6 +79,13 @@ checked against the active policy.
   the network (`java.net.*`), while allowing ordinary application and
   collection classes (`java.util.*`, `java.lang.Math`, `StringBuilder`,
   ...).
+- **Scope of the default policy.** `DEFAULT` filters the **Java bridge
+  only**. A fresh `LuaState` still exposes the Lua standard libraries
+  (`os`, `io`, `package`), so `os.execute`/`io.open` from a script are
+  *not* blocked by `JavaAccessPolicy.DEFAULT` — they only fail once you
+  remove those libraries. For untrusted scripts always combine
+  `sandbox()` (which drops `os`/`io`/`package`/`java`) with
+  `instructionLimit`/`timeout`.
 - `sandbox()` installs `JavaAccessPolicy.STRICT`: only the safe allowlist
   is reachable, and `allow("java")` does **not** re-open the dangerous
   classes.
@@ -113,7 +123,7 @@ and `heavy.lua` are excluded by design.
 
 - **30/30** runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass on
   Luava (`OfficialSuiteEvaluationTest`, asserts failures so the build goes
-  red on any regression; 111 unit tests green alongside, including a
+  red on any regression; 150 unit tests green alongside, including a
   byte-for-byte differential conformance suite against stock PUC Lua 5.4).
 - Test files are checksum-identical to the upstream tarball; the harness
   never edits them.
@@ -169,17 +179,79 @@ functions decided by a static subset analysis (integer/table kernels, no
 metamethods, no yield) tier up to one JVM method per proto (hidden class,
 unboxed `long` flow, direct `INVOKESTATIC` self-recursion, type guards
 with interpreter resume-at-pc deopt). Coroutines, debug hooks and
-execution timeouts never touch JIT code paths. Disable with
-`-Dluava.jit=false`; `JitCompiler.prewarm(closure)` pre-compiles for
-servers (tier-up otherwise compiles on a background thread).
+execution timeouts never touch JIT code paths.
 
-10-task benchmark vs LuaJ 3.0.1 (paired, pinned, median): 6 wins
-(arith 1.4×, fib **9.5×**, table 1.0×, coroutines 16×, hash 1.4×, sieve
-1.1×), 1 tie (closures 1.05×), 3 losses on stdlib/metatable-bound tasks
-(concat, oop, pattern). 30/30 PUC suites + 111 unit tests stay green with
-JIT both off and on; `JitCompiler.prewarm(closure)` pre-compiles for
-servers, otherwise tier-up compiles on a background thread
-(`-Dluava.jit.sync=true` for deterministic measurement).
+Coverage and configuration:
+
+- **Hotness is per proto and counts calls**, so a kernel must be *called*
+  ≥50 times to tier up. A loop in the main chunk is never JIT-compiled;
+  wrap hot code in a function (or use `prewarm`) to benefit.
+- **Numeric `for` loops are JIT-compiled** (`FORPREP`/`FORLOOP`); the
+  integer lane is unboxed and a float loop falls to the float lane.
+  `while`/`repeat` stay interpreted.
+- **Arithmetic is JIT-compiled for both int and float**: `ADD`/`SUB`/`MUL`
+  emit a runtime numeric dispatch (unboxed int lane when both operands are
+  ints, raw-bit float lane otherwise), so a mixed int/float hot function no
+  longer deopts on every call. The integer constant forms `ADDI`, `ADDK`,
+  `SUBK`, `MULK`, `IDIVK`, `MODK`, `BANDK`, `BORK`, `BXORK` carry the same
+  dispatch. `DIVK`/`POWK` yield floats and stay interpreted.
+- **Field access is metatable-aware**: `GETFIELD` fast-paths a non-nil
+  `rawget` (independent of any metatable), so `self.x` on an OOP instance
+  compiles instead of deopting; a nil raw hit (the `__index` case) deopts
+  to the interpreter.
+- **Guards disable JIT**: while `instructionLimit`/`timeout` (a
+  `LoopGuard`) or a debug hook is active, calls run on the interpreter —
+  correct, but without JIT speedup. This is the safe default for untrusted
+  scripts.
+- **Per-state control**: `state.jitEnabled(false)` (or `true`, or `null`
+  to follow the global default) toggles JIT for one state, so a server can
+  mix trusted and untrusted tenants in one JVM. The process-wide default
+  is `ENABLE_JIT`, set with `-Dluava.jit=false`.
+- **Prewarm**: `JitCompiler.prewarm(closure)` or the
+  `prewarm(LuaFunction)` overload compiles up front for servers;
+  `prewarm(closure, state)` is a no-op when that state has JIT disabled.
+  Otherwise tier-up compiles on a background thread
+  (`-Dluava.jit.sync=true` for deterministic measurement).
+- **Compiled classes are bounded** by an LRU cache (512); eviction simply
+  returns that proto to the interpreter, so Metaspace cannot leak.
+
+10-task benchmark vs LuaJ 3.0.1 (paired, order-flipped, median of
+13-25 pairs, warm=8, iters=15, `-Dluava.jit.sync=true`, re-run 2026-09-17):
+**5 wins** (arith 1.2-1.5×, fib **9.6×**, coroutines 17-19×, hash 1.5×,
+table 1.0-1.07×, closures 1.0×), **2 near-tie** (concat 1.00×, sieve 0.99×),
+**2 small losses** (oop 1.06×, pattern 1.06×). 30/30 PUC suites + 150 unit
+tests stay green with JIT both off and on.
+
+JIT effectiveness (same 10 tasks, JIT on vs off) after the 2026-09-17 JIT
+work: it now speeds up **8/10** tasks (fib 19.9×, closures 1.74×,
+concat 1.51×, arith 1.26×, oop 1.11×, hash ~1.1×, table/sieve/coroutines
+~1.0×) instead of only fib. Two engine bugs were fixed to get there: the
+`GETFIELD` guard required a metatable-free table (so every OOP `self.x`
+deopted), and the JIT had no float lane (so any mixed int/float hot
+function deopted on every call).
+
+The 2026-09-16 optimization pass closed most of the interpreter-era gaps
+without weakening semantics: lazy short-string interning (canonical keys
+stay reference-identical, so table lookups stop paying `String.equals`),
+frameless `tostring`/`gmatch`/`math.sqrt`/`setmetatable` inlines, a
+trivial-closure-factory inline for `return function() ... end` shapes, a
+direct-scan `gmatch` lane for simple patterns, per-site caches for
+`OP_GETTABUP`/`OP_SELF`/`OP_GETFIELD`, lazy closure parameter lists, and
+state-scoped automatic collection. The remaining deficits are stdlib
+engine throughput, not correctness.
+
+A differential-fuzzing pass against stock PUC Lua 5.4.8 also fixed a
+batch of conformance bugs: strings now carry the standard arithmetic
+metamethods (`"10" + 1` routes through the overridable string metatable),
+bitwise/arith errors blame the correct operand and use PUC descriptors,
+`pairs`/`ipairs` no longer over-validate, `next`/`select`/`rawlen` and
+`string.pack`/`unpack` report PUC argument errors, C functions render as
+`function: 0x…`, `collectgarbage` returns the PUC integer result and is
+non-reentrant inside a finalizer, and two engine bugs were fixed: the
+compiler under-reported `maxStackSize` (letting JIT code index past the
+shared stack array on deep recursion, an intermittent
+`Index N out of bounds`), and `Varargs` could be initialized at the
+recursion limit and permanently poisoned by a `StackOverflowError`.
 
 ## Layout
 

@@ -149,7 +149,7 @@ public final class Environment {
     public void defineLocal(String name, LuaValue value, boolean isClose, boolean isConst) {
         if (isClose && value != null && !value.isNil() && !value.equals(org.luava.runtime.LuaBoolean.FALSE)) {
             LuaTable mt = value.getMetatable();
-            if (mt == null || mt.rawget(LuaString.valueOf("__close")).isNil()) {
+            if (mt == null || mt.rawget(LuaValue.Meta.CLOSE).isNil()) {
                 throw new org.luava.runtime.LuaException("variable '" + name + "' got a non-closable value");
             }
         }
@@ -330,7 +330,7 @@ public final class Environment {
             LuaValue val = slot.get();
             if (val != null && !val.isNil() && !val.equals(org.luava.runtime.LuaBoolean.FALSE)) {
                 LuaTable mt = val.getMetatable();
-                LuaValue closeHandler = (mt != null) ? mt.rawget(LuaString.valueOf("__close")) : LuaNil.NIL;
+                LuaValue closeHandler = (mt != null) ? mt.rawget(LuaValue.Meta.CLOSE) : LuaNil.NIL;
                 try {
                     if (closeHandler.isNil()) {
                         throw new org.luava.runtime.LuaException("attempt to call a nil value (metamethod 'close')");

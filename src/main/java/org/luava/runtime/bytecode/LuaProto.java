@@ -44,6 +44,35 @@ public final class LuaProto {
     /** Interpreter-side call counter driving tier-up. */
     public int hotCount;
 
+    /**
+     * Trivial-factory descriptor: a function whose body only forwards
+     * registers/constants into one created closure and returns it (the
+     * {@code make_counter} shape). {@code OP_CALL} builds the closure
+     * framelessly from this descriptor. Null = analyzed, not a factory.
+     */
+    public volatile FactoryInfo factoryInfo;
+    /** True once {@link #factoryInfo} has been computed (benign races
+     * recompute identically). */
+    public volatile boolean factoryAnalyzed;
+
+    /** Capture source per child upvalue: 0 = caller arg, 1 = nil,
+     * 2 = constant, 3 = shared parent upvalue. */
+    public static final class FactoryInfo {
+        public final int childIdx;
+        public final int[] capKind;
+        public final int[] capArg;
+        public final LuaValue[] capConst;
+        public final int[] capUp;
+
+        public FactoryInfo(int childIdx, int[] capKind, int[] capArg, LuaValue[] capConst, int[] capUp) {
+            this.childIdx = childIdx;
+            this.capKind = capKind;
+            this.capArg = capArg;
+            this.capConst = capConst;
+            this.capUp = capUp;
+        }
+    }
+
     public String findLocalVarName(int reg, int pc) {
         if (locVarInfos == null) return null;
         for (int i = locVarInfos.length - 1; i >= 0; i--) {
