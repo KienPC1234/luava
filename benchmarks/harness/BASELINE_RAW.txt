@@ -1,0 +1,15 @@
+jarA=/tmp/opencode/harness_base.jar
+jarB=/tmp/opencode/vs/luaj-jse.jar
+pairs=3 warm=3 iters=5 core=20
+
+task                      A(ms)      B(ms)      B/A
+01_arith_loop           194.245    285.535    1.470
+02_fibonacci           5077.230   2520.180    0.496
+03_table_ops             95.360     96.695    1.014
+04_string_concat         62.605     23.440    0.374
+05_closures              93.120     58.195    0.625
+06_coroutines           287.050   4622.920   16.105
+07_hash_table           149.620    260.780    1.743
+08_oop_metatables       780.865    623.940    0.799
+09_string_pattern       141.615     78.540    0.555
+10_sieve                339.940    353.855    1.041

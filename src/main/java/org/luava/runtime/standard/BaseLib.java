@@ -26,12 +26,74 @@ import java.nio.file.Path;
 public final class BaseLib {
     private BaseLib() {}
 
-    public static void open(LuaState state, LuaTable globals) {
-        globals.rawset(LuaString.valueOf("_G"), globals);
-        globals.rawset(LuaString.valueOf("_ENV"), globals);
-        globals.rawset(LuaString.valueOf("_VERSION"), LuaString.valueOf("Lua 5.4"));
+    /**
+     * Shared stateless {@code tostring} builtin. One JVM-wide instance (not
+     * one per state) so the VM can recognize and inline it on hot paths;
+     * behavior is byte-identical to the per-state lambda it replaces.
+     */
+    public static final LuaFunction TOSTRING = LuaFunction.of(BaseLib::tostringImpl);
 
-        globals.rawset(LuaString.valueOf("print"), LuaFunction.of(args -> {
+    /**
+     * Shared stateless {@code setmetatable} builtin (see {@link #TOSTRING}).
+     */
+    public static final LuaFunction SETMETATABLE = LuaFunction.of(BaseLib::setmetatableImpl);
+
+    static LuaValue setmetatableImpl(LuaValue[] args) {
+        if (args.length == 0 || !args[0].isTable()) {
+            throw new LuaException("bad argument #1 to 'setmetatable' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
+        }
+        if (args.length < 2) {
+            throw new LuaException("bad argument #2 to 'setmetatable' (nil or table expected, got no value)");
+        }
+        LuaTable t = (LuaTable) args[0];
+        LuaValue mt = args[1];
+        LuaTable oldMt = t.getMetatable();
+        if (oldMt != null) {
+            LuaValue protectedVal = oldMt.rawget(LuaString.interned("__metatable"));
+            if (!protectedVal.isNil()) {
+                throw new LuaException("cannot change a protected metatable");
+            }
+        }
+        if (mt.isNil()) {
+            t.setMetatable(null);
+        } else if (mt.isTable()) {
+            LuaTable tableMt = (LuaTable) mt;
+            t.setMetatable(tableMt);
+            LuaValue gcHandler = tableMt.rawget(LuaString.interned("__gc"));
+            if (!gcHandler.isNil()) {
+                org.luava.runtime.eval.GCManager.register(t, gcHandler);
+            }
+        } else {
+            throw new LuaException("bad argument #2 to 'setmetatable' (nil or table expected, got " + mt.typeName() + ")");
+        }
+        return t;
+    }
+
+    static LuaValue tostringImpl(LuaValue[] args) {
+        if (args.length == 0) {
+            throw new LuaException("bad argument #1 to 'tostring' (value expected)");
+        }
+        LuaValue v = args[0];
+        LuaTable mt = v.getMetatable();
+        if (mt != null) {
+            LuaValue handler = mt.rawget(LuaString.interned("__tostring"));
+            if (!handler.isNil()) {
+                LuaValue res = handler.call(v);
+                if (!res.isString()) {
+                    throw new LuaException("'__tostring' must return a string");
+                }
+                return res;
+            }
+        }
+        return LuaString.valueOf(v.toLuaString());
+    }
+
+    public static void open(LuaState state, LuaTable globals) {
+        globals.rawset(LuaString.interned("_G"), globals);
+        globals.rawset(LuaString.interned("_ENV"), globals);
+        globals.rawset(LuaString.interned("_VERSION"), LuaString.interned("Lua 5.4"));
+
+        globals.rawset(LuaString.interned("print"), LuaFunction.of(args -> {
             // Byte fidelity: Lua strings are byte containers (Latin-1
             // preserved), so emit raw bytes instead of letting the platform
             // charset double-encode non-ASCII output.
@@ -45,33 +107,16 @@ public final class BaseLib {
             return LuaNil.NIL;
         }));
 
-        globals.rawset(LuaString.valueOf("type"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("type"), LuaFunction.of(args -> {
             if (args.length == 0) {
                 throw new LuaException("bad argument #1 to 'type' (value expected)");
             }
             return LuaString.valueOf(args[0].type().typeName());
         }));
 
-        globals.rawset(LuaString.valueOf("tostring"), LuaFunction.of(args -> {
-            if (args.length == 0) {
-                throw new LuaException("bad argument #1 to 'tostring' (value expected)");
-            }
-            LuaValue v = args[0];
-            LuaTable mt = v.getMetatable();
-            if (mt != null) {
-                LuaValue handler = mt.rawget(LuaString.valueOf("__tostring"));
-                if (!handler.isNil()) {
-                    LuaValue res = handler.call(v);
-                    if (!res.isString()) {
-                        throw new LuaException("'__tostring' must return a string");
-                    }
-                    return res;
-                }
-            }
-            return LuaString.valueOf(v.toLuaString());
-        }));
+        globals.rawset(LuaString.interned("tostring"), TOSTRING);
 
-        globals.rawset(LuaString.valueOf("tonumber"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("tonumber"), LuaFunction.of(args -> {
             if (args.length == 0) {
                 throw new LuaException("bad argument #1 to 'tonumber' (value expected)");
             }
@@ -139,12 +184,12 @@ public final class BaseLib {
             return LuaInteger.valueOf(val);
         }));
 
-        globals.rawset(LuaString.valueOf("assert"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("assert"), LuaFunction.of(args -> {
             if (args.length == 0) {
                 throw new LuaException("bad argument #1 to 'assert' (value expected)");
             }
             if (!args[0].toBoolean()) {
-                LuaValue msg = (args.length > 1) ? args[1] : LuaString.valueOf("assertion failed!");
+                LuaValue msg = (args.length > 1) ? args[1] : LuaString.interned("assertion failed!");
                 if (msg.isString()) {
                     org.luava.runtime.eval.CallStack.Frame frame = org.luava.runtime.eval.CallStack.getFrame(1);
                     if (frame != null && frame.function != null && !"C".equals(frame.function.getWhat()) && frame.line > 0) {
@@ -164,7 +209,7 @@ public final class BaseLib {
             return Varargs.of(args);
         }));
 
-        globals.rawset(LuaString.valueOf("error"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("error"), LuaFunction.of(args -> {
             LuaValue msg = args.length > 0 ? args[0] : LuaNil.NIL;
             int level = 1;
             if (args.length > 1 && !args[1].isNil()) {
@@ -208,21 +253,27 @@ public final class BaseLib {
             throw le;
         }));
 
-        globals.rawset(LuaString.valueOf("pcall"), LuaFunction.of("pcall", args -> {
+        globals.rawset(LuaString.interned("pcall"), LuaFunction.of("pcall", args -> {
             if (args.length == 0) {
-                return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("bad argument #1 to 'pcall' (value expected)"));
+                return Varargs.of(LuaBoolean.FALSE, LuaString.interned("bad argument #1 to 'pcall' (value expected)"));
             }
             LuaValue target = args[0];
             LuaValue[] fnArgs = new LuaValue[args.length - 1];
             System.arraycopy(args, 1, fnArgs, 0, fnArgs.length);
-            org.luava.runtime.eval.CallStack.pushProtectedFrame(null);
+            // The protected frame must be pushed inside the try: pushing a
+            // frame at the depth limit throws StackOverflowError, and a frame
+            // pushed outside the try would never be popped, leaving a stale
+            // handler that later lets an unwind escape past top level.
+            boolean pushedProtectedFrame = false;
             boolean pushedCFrame = false;
-            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
-                org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
-                org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
-                pushedCFrame = true;
-            }
             try {
+                org.luava.runtime.eval.CallStack.pushProtectedFrame(null);
+                pushedProtectedFrame = true;
+                if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
+                    org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
+                    org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
+                    pushedCFrame = true;
+                }
                 LuaValue result = target.call(fnArgs);
                 if (result instanceof Varargs va) {
                     LuaValue[] arr = va.toArray();
@@ -236,10 +287,12 @@ public final class BaseLib {
                 throw ccs;
             } catch (org.luava.runtime.LuaExit ex) {
                 throw ex;
+            } catch (org.luava.runtime.eval.LuaUnwindException ue) {
+                return Varargs.of(LuaBoolean.FALSE, ue.getResult());
             } catch (LuaException le) {
                 return Varargs.of(LuaBoolean.FALSE, le.getErrorObject());
             } catch (StackOverflowError soe) {
-                return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("stack overflow"));
+                return Varargs.of(LuaBoolean.FALSE, LuaString.interned("stack overflow"));
             } catch (Throwable t) {
                 String msg = t.getMessage() != null ? t.getMessage() : t.toString();
                 return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf(msg));
@@ -247,27 +300,33 @@ public final class BaseLib {
                 if (pushedCFrame) {
                     org.luava.runtime.eval.CallStack.pop();
                 }
-                org.luava.runtime.eval.CallStack.popProtectedFrame();
+                if (pushedProtectedFrame) {
+                    org.luava.runtime.eval.CallStack.popProtectedFrame();
+                }
             }
         }));
 
-        globals.rawset(LuaString.valueOf("xpcall"), LuaFunction.of("xpcall", args -> {
+        globals.rawset(LuaString.interned("xpcall"), LuaFunction.of("xpcall", args -> {
             if (args.length < 2) {
-                return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("bad arguments to 'xpcall' (value expected)"));
+                return Varargs.of(LuaBoolean.FALSE, LuaString.interned("bad arguments to 'xpcall' (value expected)"));
             }
             LuaValue target = args[0];
             LuaValue msgh = args[1];
             LuaValue[] fnArgs = new LuaValue[args.length - 2];
             System.arraycopy(args, 2, fnArgs, 0, fnArgs.length);
 
-            org.luava.runtime.eval.CallStack.pushProtectedFrame(msgh);
+            // See pcall: push the protected frame inside the try so a
+            // StackOverflowError at the depth limit cannot leak it.
+            boolean pushedProtectedFrame = false;
             boolean pushedCFrame = false;
-            if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
-                org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
-                org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
-                pushedCFrame = true;
-            }
             try {
+                org.luava.runtime.eval.CallStack.pushProtectedFrame(msgh);
+                pushedProtectedFrame = true;
+                if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
+                    org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
+                    org.luava.runtime.eval.CallStack.push(fn, fn.getName(), -1);
+                    pushedCFrame = true;
+                }
                 LuaValue result = target.call(fnArgs);
                 if (result instanceof Varargs va) {
                     LuaValue[] arr = va.toArray();
@@ -288,14 +347,14 @@ public final class BaseLib {
                     LuaValue handlerRes = msgh.call(le.getErrorObject());
                     return Varargs.of(LuaBoolean.FALSE, handlerRes);
                 } catch (Throwable t) {
-                    return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("error in error handling"));
+                    return Varargs.of(LuaBoolean.FALSE, LuaString.interned("error in error handling"));
                 }
             } catch (StackOverflowError soe) {
                 try {
-                    LuaValue handlerRes = msgh.call(LuaString.valueOf("stack overflow"));
+                    LuaValue handlerRes = msgh.call(LuaString.interned("stack overflow"));
                     return Varargs.of(LuaBoolean.FALSE, handlerRes);
                 } catch (Throwable t) {
-                    return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("error in error handling"));
+                    return Varargs.of(LuaBoolean.FALSE, LuaString.interned("error in error handling"));
                 }
             } catch (Throwable t) {
                 try {
@@ -303,27 +362,37 @@ public final class BaseLib {
                     LuaValue handlerRes = msgh.call(LuaString.valueOf(msg));
                     return Varargs.of(LuaBoolean.FALSE, handlerRes);
                 } catch (Throwable t2) {
-                    return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf("error in error handling"));
+                    return Varargs.of(LuaBoolean.FALSE, LuaString.interned("error in error handling"));
                 }
             } finally {
                 if (pushedCFrame) {
                     org.luava.runtime.eval.CallStack.pop();
                 }
-                org.luava.runtime.eval.CallStack.popProtectedFrame();
+                if (pushedProtectedFrame) {
+                    org.luava.runtime.eval.CallStack.popProtectedFrame();
+                }
             }
         }));
 
-        globals.rawset(LuaString.valueOf("select"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("select"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument #1 to 'select'");
             LuaValue selector = args[0];
             if (selector.isString() && "#".equals(selector.toLuaString())) {
                 return LuaInteger.valueOf(args.length - 1);
             }
             long idx = selector.toLong();
-            if (idx == 0 || idx < -args.length + 1) {
-                throw new LuaException("bad index to 'select'");
+            // PUC luaB_select: clamp then require 1 <= i, reporting
+            // "bad argument #1 to 'select' (index out of range)".
+            int n = args.length;
+            if (idx < 0) {
+                idx = n + idx;
+            } else if (idx > n) {
+                idx = n;
             }
-            int start = idx > 0 ? (int) idx : (int) (args.length + idx);
+            if (idx < 1) {
+                throw new LuaException("bad argument #1 to 'select' (index out of range)");
+            }
+            int start = (int) idx;
             if (start > args.length - 1) {
                 return Varargs.EMPTY;
             }
@@ -333,54 +402,25 @@ public final class BaseLib {
             return Varargs.of(sub);
         }));
 
-        globals.rawset(LuaString.valueOf("setmetatable"), LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'setmetatable' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
-            }
-            if (args.length < 2) {
-                throw new LuaException("bad argument #2 to 'setmetatable' (nil or table expected, got no value)");
-            }
-            LuaTable t = (LuaTable) args[0];
-            LuaValue mt = args[1];
-            LuaTable oldMt = t.getMetatable();
-            if (oldMt != null) {
-                LuaValue protectedVal = oldMt.rawget(LuaString.valueOf("__metatable"));
-                if (!protectedVal.isNil()) {
-                    throw new LuaException("cannot change a protected metatable");
-                }
-            }
-            if (mt.isNil()) {
-                t.setMetatable(null);
-            } else if (mt.isTable()) {
-                LuaTable tableMt = (LuaTable) mt;
-                t.setMetatable(tableMt);
-                LuaValue gcHandler = tableMt.rawget(LuaString.valueOf("__gc"));
-                if (!gcHandler.isNil()) {
-                    org.luava.runtime.eval.GCManager.register(t, gcHandler);
-                }
-            } else {
-                throw new LuaException("bad argument #2 to 'setmetatable' (nil or table expected, got " + mt.typeName() + ")");
-            }
-            return t;
-        }));
+        globals.rawset(LuaString.interned("setmetatable"), SETMETATABLE);
 
-        globals.rawset(LuaString.valueOf("getmetatable"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("getmetatable"), LuaFunction.of(args -> {
             if (args.length == 0) return LuaNil.NIL;
             LuaTable mt = args[0].getMetatable();
             if (mt == null) return LuaNil.NIL;
-            LuaValue protectedVal = mt.rawget(LuaString.valueOf("__metatable"));
+            LuaValue protectedVal = mt.rawget(LuaString.interned("__metatable"));
             if (!protectedVal.isNil()) return protectedVal;
             return mt;
         }));
 
-        globals.rawset(LuaString.valueOf("rawget"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("rawget"), LuaFunction.of(args -> {
             if (args.length < 2 || !args[0].isTable()) {
                 throw new LuaException("bad argument #1 to 'rawget' (table expected)");
             }
             return ((LuaTable) args[0]).rawget(args[1]);
         }));
 
-        globals.rawset(LuaString.valueOf("rawset"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("rawset"), LuaFunction.of(args -> {
             if (args.length < 3 || !args[0].isTable()) {
                 throw new LuaException("bad argument #1 to 'rawset' (table expected)");
             }
@@ -388,7 +428,7 @@ public final class BaseLib {
             return args[0];
         }));
 
-        globals.rawset(LuaString.valueOf("rawequal"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("rawequal"), LuaFunction.of(args -> {
             if (args.length < 2) return LuaBoolean.FALSE;
             // Lua 5.4: raw equality still compares numbers by mathematical
             // value across the integer/float subtypes (1 == 1.0), but never
@@ -398,41 +438,45 @@ public final class BaseLib {
             return LuaBoolean.valueOf(LuaValue.rawEquals(args[0], args[1]));
         }));
 
-        globals.rawset(LuaString.valueOf("rawlen"), LuaFunction.of(args -> {
-            if (args.length == 0) throw new LuaException("bad argument to 'rawlen'");
+        globals.rawset(LuaString.interned("rawlen"), LuaFunction.of(args -> {
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "rawlen", "table or string expected, got no value");
+            }
             if (args[0].isTable()) {
                 return LuaInteger.valueOf(((LuaTable) args[0]).rawlen());
             }
             if (args[0].isString()) {
                 return args[0].len();
             }
-            throw new LuaException("table or string expected in 'rawlen'");
+            throw LuaValue.argError(1, "rawlen",
+                    "table or string expected, got " + args[0].typeName());
         }));
 
-        globals.rawset(LuaString.valueOf("pairs"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("pairs"), LuaFunction.of(args -> {
             if (args.length == 0) {
                 throw new LuaException("bad argument #1 to 'pairs' (value expected)");
             }
             LuaValue target = args[0];
             LuaTable mt = target.getMetatable();
             if (mt != null) {
-                LuaValue handler = mt.rawget(LuaString.valueOf("__pairs"));
+                LuaValue handler = mt.rawget(LuaString.interned("__pairs"));
                 if (!handler.isNil()) {
                     return handler.call(target);
                 }
             }
-            if (!target.isTable()) {
-                throw new LuaException("bad argument #1 to 'pairs' (table expected)");
-            }
-            LuaTable t = (LuaTable) target;
-            LuaFunction nextFunc = (LuaFunction) globals.rawget(LuaString.valueOf("next"));
-            return Varargs.of(nextFunc, t, LuaNil.NIL);
+            // PUC luaB_pairs only requires an argument; a non-table is
+            // returned as-is (the iterator errors when actually called).
+            LuaFunction nextFunc = (LuaFunction) globals.rawget(LuaString.interned("next"));
+            return Varargs.of(nextFunc, target, LuaNil.NIL);
         }));
 
 
-        globals.rawset(LuaString.valueOf("next"), LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'next' (table expected)");
+        globals.rawset(LuaString.interned("next"), LuaFunction.of(args -> {
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "next", "table expected, got no value");
+            }
+            if (!args[0].isTable()) {
+                throw LuaValue.argError(1, "next", "table expected, got " + args[0].typeName());
             }
             LuaTable t = (LuaTable) args[0];
             LuaValue currentKey = args.length > 1 ? args[1] : LuaNil.NIL;
@@ -450,7 +494,7 @@ public final class BaseLib {
             return Varargs.of(LuaInteger.valueOf(i), val);
         });
 
-        globals.rawset(LuaString.valueOf("ipairs"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("ipairs"), LuaFunction.of(args -> {
             if (args.length == 0) {
                 throw new LuaException("bad argument #1 to 'ipairs' (value expected)");
             }
@@ -458,7 +502,7 @@ public final class BaseLib {
         }));
 
         boolean[] warningsOn = new boolean[]{false};
-        globals.rawset(LuaString.valueOf("warn"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("warn"), LuaFunction.of(args -> {
             if (args.length == 0) {
                 throw new LuaException("bad argument #1 to 'warn' (string expected, got no value)");
             }
@@ -483,9 +527,9 @@ public final class BaseLib {
             return LuaNil.NIL;
         }));
 
-        globals.rawset(LuaString.valueOf("load"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("load"), LuaFunction.of(args -> {
             if (args.length == 0) {
-                return Varargs.of(LuaNil.NIL, LuaString.valueOf("bad argument #1 to 'load'"));
+                return Varargs.of(LuaNil.NIL, LuaString.interned("bad argument #1 to 'load'"));
             }
             String code;
             if (args[0].isString()) {
@@ -507,12 +551,12 @@ public final class BaseLib {
                         if (s.isEmpty()) break;
                         sb.append(s);
                     } else {
-                        return Varargs.of(LuaNil.NIL, LuaString.valueOf("reader function must return a string"));
+                        return Varargs.of(LuaNil.NIL, LuaString.interned("reader function must return a string"));
                     }
                 }
                 code = sb.toString();
             } else {
-                return Varargs.of(LuaNil.NIL, LuaString.valueOf("string or function expected in 'load'"));
+                return Varargs.of(LuaNil.NIL, LuaString.interned("string or function expected in 'load'"));
             }
 
             String mode = (args.length >= 3 && !args[2].isNil()) ? args[2].toLuaString() : "bt";
@@ -547,7 +591,7 @@ public final class BaseLib {
             }
         }));
 
-        globals.rawset(LuaString.valueOf("loadfile"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("loadfile"), LuaFunction.of(args -> {
             String filename = (args.length > 0 && !args[0].isNil()) ? args[0].toLuaString() : null;
             String mode = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "bt";
             LuaValue envVal = (args.length > 2) ? args[2] : globals;
@@ -641,8 +685,8 @@ public final class BaseLib {
             }
         }));
 
-        globals.rawset(LuaString.valueOf("dofile"), LuaFunction.of(args -> {
-            LuaValue loadfileFunc = globals.rawget(LuaString.valueOf("loadfile"));
+        globals.rawset(LuaString.interned("dofile"), LuaFunction.of(args -> {
+            LuaValue loadfileFunc = globals.rawget(LuaString.interned("loadfile"));
             LuaValue res = loadfileFunc.call(args);
             if (res instanceof Varargs va) {
                 if (va.first().isNil()) {
@@ -659,11 +703,16 @@ public final class BaseLib {
         final String[] gcMode = new String[] { "incremental" };
         final int[] gcParams = new int[] { 200, 100 }; // pause, stepmul
 
-        globals.rawset(LuaString.valueOf("collectgarbage"), LuaFunction.of(args -> {
+        globals.rawset(LuaString.interned("collectgarbage"), LuaFunction.of(args -> {
             if (args.length > 0 && !args[0].isNil() && !args[0].isString()) {
                 throw new LuaException("bad argument #1 to 'collectgarbage' (string expected, got " + args[0].typeName() + ")");
             }
             String opt = (args.length > 0 && args[0].isString()) ? args[0].toLuaString() : "collect";
+            // PUC: collectgarbage fails (returns nil) when called re-entrantly
+            // from a finalizer; gc.lua asserts this non-reentrancy.
+            if (org.luava.runtime.eval.GCManager.inFinalizer()) {
+                return LuaNil.NIL;
+            }
             return switch (opt) {
                 case "count" -> LuaFloat.valueOf(org.luava.runtime.eval.GCManager.getMemoryKb());
                 case "isrunning" -> LuaBoolean.valueOf(org.luava.runtime.eval.GCManager.isRunning());
@@ -705,9 +754,11 @@ public final class BaseLib {
                     yield LuaInteger.valueOf(0);
                 }
                 case "collect" -> {
-                    boolean res = org.luava.runtime.eval.GCManager.collect();
+                    // PUC luaB_collectgarbage returns lua_gc's integer result
+                    // (0) for collect/stop/restart, not a boolean.
+                    org.luava.runtime.eval.GCManager.collect(state);
                     System.gc();
-                    yield LuaBoolean.valueOf(res);
+                    yield LuaInteger.valueOf(0);
                 }
                 default -> throw new LuaException("bad argument #1 to 'collectgarbage' (invalid option '" + opt + "')");
             };

@@ -56,8 +56,10 @@ public final class ConstantFolder {
                         case AMPERSAND -> new Expressions.IntegerLiteral(l & r, b.line(), b.column());
                         case PIPE -> new Expressions.IntegerLiteral(l | r, b.line(), b.column());
                         case TILDE -> new Expressions.IntegerLiteral(l ^ r, b.line(), b.column());
-                        case SHL -> new Expressions.IntegerLiteral(r >= 0 && r < 64 ? l << r : 0, b.line(), b.column());
-                        case SHR -> new Expressions.IntegerLiteral(r >= 0 && r < 64 ? l >>> r : 0, b.line(), b.column());
+                        case SHL -> new Expressions.IntegerLiteral(
+                                shiftLeft(l, r), b.line(), b.column());
+                        case SHR -> new Expressions.IntegerLiteral(
+                                shiftRight(l, r), b.line(), b.column());
                         case EQUAL_EQUAL -> new Expressions.BooleanLiteral(l == r, b.line(), b.column());
                         case TILDE_EQUAL -> new Expressions.BooleanLiteral(l != r, b.line(), b.column());
                         case LESS -> new Expressions.BooleanLiteral(l < r, b.line(), b.column());
@@ -69,14 +71,32 @@ public final class ConstantFolder {
                 } catch (ArithmeticException ignored) {}
             }
 
-            // String concatenation folding
-            if (b.operator() == TokenType.DOT_DOT && left instanceof Expressions.StringLiteral sl && right instanceof Expressions.StringLiteral sr) {
-                return new Expressions.StringLiteral(sl.value() + sr.value(), b.line(), b.column());
-            }
+            // NOTE: string concatenation is deliberately NOT folded. Lua only
+            // interns short strings; folding `"a".."b"` into one literal would
+            // make a long runtime concatenation share object identity with an
+            // equal literal, which PUC Lua does not do (literals.lua checks
+            // getadd(sd) ~= getadd(s1) for equal 50-char strings).
 
             return new Expressions.BinaryExpr(left, b.operator(), right, b.line(), b.column());
         }
 
         return expr;
+    }
+
+    // Lua 5.4 bitwise shifts: a negative displacement shifts the other way,
+    // and displacement magnitude >= 64 yields 0 (see lvm.c luaV_shiftl).
+    // The naive `l << r` was wrong for negative r (2 << -1 is 1, not 0).
+    private static long shiftLeft(long a, long n) {
+        if (n <= -64) return 0;
+        if (n < 0) return a >>> -n;
+        if (n >= 64) return 0;
+        return a << n;
+    }
+
+    private static long shiftRight(long a, long n) {
+        if (n <= -64) return 0;
+        if (n < 0) return a << -n;
+        if (n >= 64) return 0;
+        return a >>> n;
     }
 }

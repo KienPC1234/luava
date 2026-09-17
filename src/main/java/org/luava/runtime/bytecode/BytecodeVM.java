@@ -242,11 +242,10 @@ public final class BytecodeVM {
                 int op = (inst >>> Instruction.POS_OP) & Instruction.MASK_OP;
                 int a = (inst >>> Instruction.POS_A) & Instruction.MASK_A;
 
-                // Fast path: single predictable global check instead of
-                // ThreadLocal + config lookups per instruction. HOOKS_ARMED is
-                // biased to stay true (perf-only cost); hooks still verified
-                // per-coroutine inside.
-                if (LuaCoroutine.HOOKS_ARMED && co0 != null) {
+                // Fast path: single predictable per-coroutine boolean instead
+                // of ThreadLocal + config lookups per instruction. Hooks are
+                // per-thread in Lua, so this is also semantically correct.
+                if (co0 != null && co0.hooksActive) {
                     pollHooks(co0, ctx, instPc, op);
                 }
                 ctx.oldpc = instPc;
@@ -320,7 +319,7 @@ public final class BytecodeVM {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     ctx.upvals[b].setValue(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a));
                 }
-                case OpCode.OP_GETTABUP -> executeGetTabUp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.upvals, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_GETTABUP -> executeGetTabUpCached(ctx, ctx.pc, a, inst);
                 case OpCode.OP_GETTABLE -> executeGetTable(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
                 case OpCode.OP_GETI -> executeGetI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
                 case OpCode.OP_GETFIELD -> executeGetField(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
@@ -329,7 +328,7 @@ public final class BytecodeVM {
                 case OpCode.OP_SETI -> executeSetI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
                 case OpCode.OP_SETFIELD -> executeSetField(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
                 case OpCode.OP_NEWTABLE -> ctx.pc = executeNewTable(ctx.code, ctx.pc, ctx.tStack, ctx.oStack, ctx.base, a);
-                case OpCode.OP_SELF -> executeSelf(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_SELF -> executeSelfCached(ctx, state, ctx.pc, a, inst);
                 case OpCode.OP_ADD -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
@@ -656,7 +655,7 @@ public final class BytecodeVM {
                     if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.thread, ctx.base, null);
                     LuaValue[] r0;
-                    if (LuaCoroutine.HOOKS_ARMED) {
+                    if (ctx.thread.hooksActive) {
                         LuaValue[] retVals0 = new LuaValue[0];
                         stampReturnFrame(ctx, instPc, retVals0, 1, 0);
                         r0 = returnToCaller(state, ctx, retVals0);
@@ -671,7 +670,7 @@ public final class BytecodeVM {
                     if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.thread, ctx.base, null);
                     LuaValue[] r1;
-                    if (LuaCoroutine.HOOKS_ARMED) {
+                    if (ctx.thread.hooksActive) {
                         LuaValue ret = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
                         LuaValue[] retVals1 = new LuaValue[]{ret};
                         // Lua 5.4 semantics (ldo.c: rethook): ftransfer is offset of first result relative to func (1-based)
@@ -690,7 +689,7 @@ public final class BytecodeVM {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int nReturns = b > 0 ? b - 1 : (ctx.top - (ctx.base + a));
                     LuaValue[] rN;
-                    if (LuaCoroutine.HOOKS_ARMED) {
+                    if (ctx.thread.hooksActive) {
                         LuaValue[] retVals = new LuaValue[nReturns];
                         for (int i = 0; i < nReturns; i++) {
                             retVals[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + i);
@@ -744,7 +743,7 @@ public final class BytecodeVM {
                             tforCaller.line = ctx.proto.lineInfo[instPc];
                         }
                     }
-                    executeTForCall(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                    executeTForCall(ctx, inst, a);
                 }
                 case OpCode.OP_TFORLOOP -> {
                     int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
@@ -961,10 +960,10 @@ public final class BytecodeVM {
      */
     private static int tryJitCall(LuaState state, VmContext ctx, LuaClosure child,
             int funcIdx, int nActualArgs, int nResults) {
-        if (!LuaState.ENABLE_JIT) {
+        if (!state.isJitEnabled()) {
             return 0;
         }
-        if (LuaCoroutine.HOOKS_ARMED || state.loopGuard != null) {
+        if (ctx.thread.hooksActive || state.loopGuard != null) {
             return 0;
         }
         LuaProto proto = child.proto;
@@ -1147,7 +1146,57 @@ public final class BytecodeVM {
         }
         int nActualArgs = nArgs;
 
+        // Well-known-builtin inline: tostring(x) with exactly one argument is
+        // one of the hottest external calls (string building, concat loops).
+        // The frameless fast path skips args boxing, debug-frame push/pop and
+        // name resolution; it bails to the generic path whenever a
+        // __tostring metamethod, hook, or exotic shape could observe a
+        // difference.
+        if ((ctx.co == null || !ctx.co.hooksActive)) {
+            int inlined = -1;
+            if (func == org.luava.runtime.standard.BaseLib.TOSTRING && nActualArgs == 1) {
+                inlined = inlineTostring1(state, ctx, funcIdx, nResults);
+            } else if (func == org.luava.runtime.standard.StringLib.GMATCH
+                    && (nActualArgs == 2 || nActualArgs == 3)) {
+                inlined = inlineGmatch(ctx, funcIdx, nActualArgs, nResults);
+            } else if (inlineSqrtRaw(ctx, func, funcIdx, nActualArgs, funcIdx)) {
+                for (int i = 1; i < nResults; i++) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i, LuaNil.NIL);
+                }
+                inlined = funcIdx + 1;
+            } else {
+                LuaValue inlineRes = inlineBuiltinResult(ctx, func, funcIdx, nActualArgs);
+                if (inlineRes != null) {
+                    if (nResults != 0) {
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, inlineRes);
+                        for (int i = 1; i < nResults; i++) {
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i, LuaNil.NIL);
+                        }
+                    }
+                    inlined = funcIdx + 1;
+                }
+            }
+            if (inlined >= 0) {
+                if (nResults < 0) {
+                    ctx.top = inlined;
+                }
+                ctx.pStack = ctx.thread.getPrimitiveStack();
+                ctx.tStack = ctx.thread.getTypeStack();
+                ctx.oStack = ctx.thread.getObjectStack();
+                return;
+            }
+        }
+
         if (func instanceof LuaClosure childClosure) {
+            // Trivial-factory inline (make_counter shape): frameless closure
+            // construction, checked before the JIT tier (factories never JIT
+            // anyway — OP_CLOSURE is outside the subset).
+            if (callFactory(state, ctx, childClosure, funcIdx, nActualArgs, nResults)) {
+                ctx.pStack = ctx.thread.getPrimitiveStack();
+                ctx.tStack = ctx.thread.getTypeStack();
+                ctx.oStack = ctx.thread.getObjectStack();
+                return;
+            }
             // Hybrid JIT fast lane (plan.md Phase 2/4/5): a compiled kernel
             // runs framelessly on the register window. 1 = handled; 2 = run
             // the interpreter below but resume at the deopt pc instead of 0;
@@ -1255,10 +1304,33 @@ public final class BytecodeVM {
     private static LuaValue[] doTailCall(LuaState state, VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int funcIdx = ctx.base + a;
-        LuaFunction func = resolveCallable(state, ctx, funcIdx, b > 0 ? b - 1 : (ctx.top - (funcIdx + 1)), a);
-        int nActualArgs = ctx.scratch0;
+        // Fast lane mirroring OP_CALL: the register already holds a
+        // LuaFunction (the dominant case), so resolveCallable's boxing +
+        // metamethod walk is pure overhead.
+        LuaFunction func;
+        int nActualArgs;
+        if (ctx.tStack[funcIdx] == TYPE_OBJECT && ctx.oStack[funcIdx] instanceof LuaFunction direct) {
+            func = direct;
+            nActualArgs = b > 0 ? b - 1 : (ctx.top - (funcIdx + 1));
+        } else {
+            func = resolveCallable(state, ctx, funcIdx, b > 0 ? b - 1 : (ctx.top - (funcIdx + 1)), a);
+            nActualArgs = ctx.scratch0;
+        }
 
         if (func instanceof LuaClosure childClosure) {
+            // Frameless factory tailcall (e.g. `return Vec.new(x, y)` in a
+            // constructor): build the closure and unwind, exactly like the
+            // OP_CALL inline. Hooks/loop guards fall through unchanged.
+            if (ctx.co == null || !ctx.co.hooksActive) {
+                LuaClosure built = factoryBuild(state, ctx, childClosure, funcIdx, nActualArgs);
+                if (built != null) {
+                    // The tail call replaces this frame, so its locals (and any
+                    // open upvalues into them) go away exactly as in the
+                    // generic tail path.
+                    state.closeUpvalues(ctx.thread, ctx.base);
+                    return tailReturnInline(state, ctx, built);
+                }
+            }
             state.closeUpvalues(ctx.thread, ctx.base);
             CallStack.CallStackState csState = ctx.callState;
             String callName = csState.nextName;
@@ -1344,6 +1416,93 @@ public final class BytecodeVM {
                 } else {
                     resolvedName = fn.getName();
                     namewhat = "";
+                }
+            }
+            // Frameless tailcall to a single-result builtin (setmetatable in
+            // constructors, math.sqrt in numeric tails): skip args boxing,
+            // frame replace and invoke; the shared return plumbing below
+            // handles the single value identically.
+            if (ctx.co == null || !ctx.co.hooksActive) {
+                // Raw sqrt tailcall first: single float result straight into
+                // the caller's register, no LuaFloat allocation (500k+ per
+                // numeric OOP loop). Needs callDepth > 0 (top-level still
+                // boxes via the helper below — cold path).
+                if (fn == org.luava.runtime.standard.MathLib.SQRT && nActualArgs == 1
+                        && ctx.callDepth > 0
+                        && (ctx.tStack[funcIdx + 1] == TYPE_INT
+                            || ctx.tStack[funcIdx + 1] == TYPE_FLOAT)) {
+                    // Mirror the generic path's frame bookkeeping: it replaces
+                    // the callee frame then pops it (net: callee frame gone).
+                    // Skipping the pop leaks one debug frame per tailcall and
+                    // overflows the stack on loops. Hooks are gated off above.
+                    CallStack.pop(ctx.callState, ctx.co);
+                    CallInfo ci = ctx.callStack[--ctx.callDepth];
+                    int callerFunc = ci.funcIndex;
+                    ctx.base = ci.baseIndex;
+                    ctx.closure = ci.closure;
+                    ctx.proto = ctx.closure.proto;
+                    ctx.code = ctx.proto.code;
+                    ctx.k = ctx.proto.constants;
+                    ctx.upvals = ctx.closure.upvals;
+                    ctx.pc = ci.savedPc;
+                    ctx.varargs = ci.varargs;
+                    ctx.oldpc = ci.oldpc;
+                    ctx.varargPrepRan = ci.varargPrepRan;
+                    ctx.thread.ensureStackCapacity(callerFunc + (ci.expectedResults > 0 ? ci.expectedResults : 1) + 32);
+                    ctx.pStack = ctx.thread.getPrimitiveStack();
+                    ctx.tStack = ctx.thread.getTypeStack();
+                    ctx.oStack = ctx.thread.getObjectStack();
+                    if (ci.expectedResults != 0) {
+                        inlineSqrtRaw(ctx, fn, funcIdx, nActualArgs, callerFunc);
+                        if (ci.expectedResults > 1) {
+                            for (int i = 1; i < ci.expectedResults; i++) {
+                                ctx.pStack[callerFunc + i] = 0;
+                                ctx.tStack[callerFunc + i] = TYPE_NIL;
+                                ctx.oStack[callerFunc + i] = null;
+                            }
+                        } else if (ci.expectedResults < 0) {
+                            ctx.top = callerFunc + 1;
+                        }
+                    }
+                    return null;
+                }
+                LuaValue inlineRes = inlineBuiltinResult(ctx, fn, funcIdx, nActualArgs);
+                if (inlineRes != null) {
+                    // (Same frame-bookkeeping note as above.)
+                    CallStack.pop(ctx.callState, ctx.co);
+                    LuaValue[] inlineRetVals = new LuaValue[]{inlineRes};
+                    int nReturns = 1;
+                    if (ctx.callDepth > 0) {
+                        CallInfo ci = ctx.callStack[--ctx.callDepth];
+                        int callerFunc = ci.funcIndex;
+                        ctx.base = ci.baseIndex;
+                        ctx.closure = ci.closure;
+                        ctx.proto = ctx.closure.proto;
+                        ctx.code = ctx.proto.code;
+                        ctx.k = ctx.proto.constants;
+                        ctx.upvals = ctx.closure.upvals;
+                        ctx.pc = ci.savedPc;
+                        ctx.varargs = ci.varargs;
+                        ctx.oldpc = ci.oldpc;
+                        ctx.varargPrepRan = ci.varargPrepRan;
+                        ctx.thread.ensureStackCapacity(callerFunc + (ci.expectedResults > 0 ? ci.expectedResults : nReturns) + 32);
+                        ctx.pStack = ctx.thread.getPrimitiveStack();
+                        ctx.tStack = ctx.thread.getTypeStack();
+                        ctx.oStack = ctx.thread.getObjectStack();
+                        if (ci.expectedResults > 0) {
+                            for (int i = 0; i < ci.expectedResults; i++) {
+                                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc + i, (i < nReturns) ? inlineRetVals[i] : LuaNil.NIL);
+                            }
+                        } else if (ci.expectedResults < 0) {
+                            for (int i = 0; i < nReturns; i++) {
+                                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc + i, inlineRetVals[i]);
+                            }
+                            ctx.top = callerFunc + nReturns;
+                        }
+                    } else {
+                        return inlineRetVals;
+                    }
+                    return null;
                 }
             }
             LuaValue[] tailCArgs = getArgsForCall(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1, nActualArgs);
@@ -1466,8 +1625,8 @@ public final class BytecodeVM {
      * observable solely by return hooks (fired in {@code pop} before the
      * frame is discarded) and by debug readers of live frames, and a
      * normally-returned frame is popped immediately, so skipping the stamp
-     * is unobservable. Callers must use {@link #returnToCaller} whenever
-     * {@code HOOKS_ARMED} is true.
+     * is unobservable. Callers must use {@link #returnToCaller} whenever the
+     * running coroutine's {@code hooksActive} is true.
      */
     /**
      * Cold top-level boxing for {@link #returnToCallerRaw} (once per
@@ -1603,7 +1762,7 @@ public final class BytecodeVM {
             state.pushTbc(ctx.base + a, val, varName);
         } else {
             state.closeUpvalues(ctx.thread, ctx.base + a);
-            state.closeTbc(ctx.base + a, null);
+            state.closeTbc(ctx.thread, ctx.base + a, null);
         }
     }
 
@@ -1717,6 +1876,458 @@ public final class BytecodeVM {
         setLuaValue(pStack, tStack, oStack, base + a, tbl.get(k[c]));
     }
 
+    /**
+     * Frameless inline for the shared {@code tostring} builtin with exactly
+     * one argument. Returns the new top, or -1 when the generic external-call
+     * path must run instead (metatable with {@code __tostring}, non-primitive
+     * argument, or multi-result shapes the inline does not cover).
+     *
+     * <p>Semantics mirror {@code BaseLib.tostringImpl}: primitives without a
+     * basic metatable convert directly; anything else bails. The inline never
+     * throws (all covered shapes are total), never grows the stack, and never
+     * fires hooks (the caller checks {@code hooksActive}, exactly matching
+     * the generic path's gating).
+     */
+    private static int inlineTostring1(LuaState state, VmContext ctx, int funcIdx, int nResults) {
+        if (nResults > 1) {
+            return -1;
+        }
+        int argIdx = funcIdx + 1;
+        LuaValue result;
+        switch (ctx.tStack[argIdx]) {
+            case TYPE_INT -> {
+                if (state.basicMetatable(LuaType.NUMBER) != null) {
+                    return -1;
+                }
+                result = LuaString.valueOf(Long.toString(ctx.pStack[argIdx]));
+            }
+            case TYPE_FLOAT -> {
+                if (state.basicMetatable(LuaType.NUMBER) != null) {
+                    return -1;
+                }
+                result = LuaString.valueOf(
+                        LuaFloat.valueOf(Double.longBitsToDouble(ctx.pStack[argIdx])).toLuaString());
+            }
+            case TYPE_BOOLEAN -> result = LuaString.valueOf(ctx.pStack[argIdx] != 0 ? "true" : "false");
+            case TYPE_NIL -> result = LuaString.valueOf("nil");
+            case TYPE_OBJECT -> {
+                LuaValue v = ctx.oStack[argIdx];
+                if (v instanceof LuaString s && s.getMetatable() == null) {
+                    result = s;
+                } else {
+                    return -1;
+                }
+            }
+            default -> {
+                return -1;
+            }
+        }
+        if (nResults != 0) {
+            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, result);
+        }
+        return funcIdx + 1;
+    }
+
+    /**
+     * Analyzes whether {@code proto} is a trivial closure factory: leading
+     * register/constant materialization ({@code MOVE}/{@code LOADK}/
+     * {@code LOADNIL}/{@code CLEANUP}), exactly one {@code OP_CLOSURE},
+     * and a single return of the created register (dead {@code CLOSE}/
+     * {@code RETURN0} tails allowed). Returns the descriptor, or null for
+     * any other shape. Runs once per proto (cached on it).
+     */
+    private static LuaProto.FactoryInfo analyzeFactory(LuaProto proto) {
+        int[] code = proto.code;
+        if (code == null || code.length == 0 || code.length > 32 || proto.isVararg) {
+            return null;
+        }
+        int regs = Math.max(proto.maxStackSize, proto.numParams);
+        if (regs <= 0 || regs > 64) {
+            return null;
+        }
+        // Per-reg value source: 0 = caller arg (arg[i]), 1 = nil, 2 = const
+        // (konst[i]), -1 = unknown. Params start as their caller arg.
+        int[] kind = new int[regs];
+        int[] arg = new int[regs];
+        LuaValue[] konst = new LuaValue[regs];
+        for (int i = 0; i < regs; i++) {
+            if (i < proto.numParams) {
+                kind[i] = 0;
+                arg[i] = i;
+            } else {
+                kind[i] = -1;
+            }
+        }
+        int closureReg = -1;
+        int childIdx = -1;
+        boolean returned = false;
+        int[] capKind = null;
+        int[] capArg = null;
+        LuaValue[] capConst = null;
+        int[] capUp = null;
+        for (int pc = 0; pc < code.length; pc++) {
+            int inst = code[pc];
+            int op = Instruction.getOp(inst);
+            int a = Instruction.getA(inst);
+            switch (op) {
+                case OpCode.OP_MOVE -> {
+                    int b = Instruction.getB(inst);
+                    if (a < 0 || a >= regs || b < 0 || b >= regs || returned) {
+                        return null;
+                    }
+                    kind[a] = kind[b];
+                    arg[a] = arg[b];
+                    konst[a] = konst[b];
+                }
+                case OpCode.OP_LOADK -> {
+                    int bx = Instruction.getBx(inst);
+                    if (a < 0 || a >= regs || bx < 0 || bx >= proto.constants.length || returned) {
+                        return null;
+                    }
+                    kind[a] = 2;
+                    konst[a] = proto.constants[bx];
+                }
+                case OpCode.OP_LOADNIL, OpCode.OP_CLEANUP -> {
+                    int b = Instruction.getB(inst);
+                    if (a < 0 || a >= regs || returned) {
+                        return null;
+                    }
+                    for (int j = 0; j <= b && a + j < regs; j++) {
+                        kind[a + j] = 1;
+                    }
+                }
+                case OpCode.OP_CLOSURE -> {
+                    if (closureReg != -1 || returned) {
+                        return null;
+                    }
+                    int bx = Instruction.getBx(inst);
+                    if (a < 0 || a >= regs || bx < 0 || bx >= proto.protos.length) {
+                        return null;
+                    }
+                    closureReg = a;
+                    childIdx = bx;
+                    UpvalueDesc[] descs = proto.protos[bx].upvalues;
+                    capKind = new int[descs.length];
+                    capArg = new int[descs.length];
+                    capConst = new LuaValue[descs.length];
+                    capUp = new int[descs.length];
+                    // Snapshot sources at creation time (later moves must
+                    // not affect the captured values).
+                    for (int i = 0; i < descs.length; i++) {
+                        UpvalueDesc d = descs[i];
+                        if (!d.inStack) {
+                            capKind[i] = 3;
+                            capUp[i] = d.index;
+                            continue;
+                        }
+                        if (d.index < 0 || d.index >= regs || kind[d.index] == -1) {
+                            return null;
+                        }
+                        capKind[i] = kind[d.index];
+                        capArg[i] = arg[d.index];
+                        capConst[i] = konst[d.index];
+                    }
+                }
+                case OpCode.OP_RETURN1 -> {
+                    if (closureReg == -1 || returned || a != closureReg) {
+                        return null;
+                    }
+                    returned = true;
+                }
+                case OpCode.OP_RETURN -> {
+                    int b = Instruction.getB(inst);
+                    if (closureReg == -1 || returned || b != 2 || a != closureReg) {
+                        return null;
+                    }
+                    returned = true;
+                }
+                case OpCode.OP_CLOSE, OpCode.OP_RETURN0 -> {
+                    // Only valid as dead tail after the return.
+                    if (!returned) {
+                        return null;
+                    }
+                }
+                default -> {
+                    return null;
+                }
+            }
+        }
+        if (closureReg == -1 || !returned) {
+            return null;
+        }
+        return new LuaProto.FactoryInfo(childIdx, capKind, capArg, capConst, capUp);
+    }
+
+    /**
+     * Frameless trivial-factory call ({@code make_counter} shape): builds
+     * the child closure directly from caller registers — no frame, no
+     * {@code CallInfo}, no return plumbing. Captured values are closed
+     * immediately with the exact representation a normal close produces
+     * (primitive tags preserved, so the JIT int lane keeps working); no
+     * other code can observe openness because the factory body provably
+     * does nothing else. Returns false when the generic path must run
+     * (not a factory, hooks, or loop guard active).
+     */
+    private static boolean callFactory(LuaState state, VmContext ctx, LuaClosure closure,
+            int funcIdx, int nActualArgs, int nResults) {
+        LuaClosure childClosure = factoryBuild(state, ctx, closure, funcIdx, nActualArgs);
+        if (childClosure == null) {
+            return false;
+        }
+        if (nResults != 0) {
+            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, childClosure);
+            for (int i = 1; i < nResults; i++) {
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i, LuaNil.NIL);
+            }
+        }
+        if (nResults < 0) {
+            ctx.top = funcIdx + 1;
+        }
+        return true;
+    }
+
+    /**
+     * Builds the child closure for a trivial factory, or null when the
+     * generic path must run. Shared by {@code OP_CALL} and {@code OP_TAILCALL}
+     * (constructors like {@code Vec.new} are usually tail calls).
+     */
+    private static LuaClosure factoryBuild(LuaState state, VmContext ctx, LuaClosure closure,
+            int funcIdx, int nActualArgs) {
+        LuaProto proto = closure.proto;
+        LuaProto.FactoryInfo fi = proto.factoryInfo;
+        if (!proto.factoryAnalyzed) {
+            fi = analyzeFactory(proto);
+            proto.factoryInfo = fi;
+            proto.factoryAnalyzed = true;
+        }
+        if (fi == null || ctx.thread.hooksActive || state.loopGuard != null) {
+            return null;
+        }
+        LuaProto child = proto.protos[fi.childIdx];
+        Upvalue[] ups = new Upvalue[fi.capKind.length];
+        Upvalue[] parentUps = closure.upvals;
+        for (int i = 0; i < ups.length; i++) {
+            // Parent-upvalue sharing indexes the FACTORY's own upvalue array
+            // (closure.upvals), never the caller's (ctx.upvals): at f(10) the
+            // caller is the chunk (whose upvalue 0 is _ENV), while f's
+            // upvalue 0 is w. Mixing them aliases the wrong variable.
+            if (fi.capKind[i] == 3 && (fi.capUp[i] < 0 || fi.capUp[i] >= parentUps.length)) {
+                return null;
+            }
+            String name = child.upvalues[i].name;
+            switch (fi.capKind[i]) {
+                case 0 -> {
+                    int ai = fi.capArg[i];
+                    org.luava.runtime.eval.Upvalue uv =
+                            new org.luava.runtime.eval.Upvalue(name, LuaNil.NIL);
+                    if (ai < nActualArgs) {
+                        int slot = funcIdx + 1 + ai;
+                        // Unboxed int fast lane: no LuaInteger allocation,
+                        // identical representation to a normal close.
+                        if (ctx.tStack[slot] == TYPE_INT) {
+                            uv.setClosedInt(ctx.pStack[slot]);
+                        } else {
+                            uv.setValue(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, slot));
+                        }
+                    }
+                    ups[i] = uv;
+                }
+                case 1 -> ups[i] = new org.luava.runtime.eval.Upvalue(name, LuaNil.NIL);
+                case 2 -> {
+                    org.luava.runtime.eval.Upvalue uv =
+                            new org.luava.runtime.eval.Upvalue(name, LuaNil.NIL);
+                    uv.setValue(fi.capConst[i]);
+                    ups[i] = uv;
+                }
+                default -> ups[i] = parentUps[fi.capUp[i]];
+            }
+        }
+        LuaClosure childClosure = new LuaClosure(child, ups, closure.env, state);
+        if (closure.isStripped()) {
+            childClosure.setStripped(true);
+        }
+        return childClosure;
+    }
+
+    /**
+     * Unwinds a tail call that produced exactly one frameless value: pops the
+     * callee debug frame, restores the caller's frame from its {@code CallInfo},
+     * writes the value (per the caller's expected result count) and returns
+     * the top-level result array when there is no caller. Mirrors the generic
+     * tail path's net effect; hooks are gated by the callers.
+     */
+    private static LuaValue[] tailReturnInline(LuaState state, VmContext ctx, LuaValue value) {
+        CallStack.pop(ctx.callState, ctx.co);
+        if (ctx.callDepth <= 0) {
+            return new LuaValue[] {value};
+        }
+        CallInfo ci = ctx.callStack[--ctx.callDepth];
+        int callerFunc = ci.funcIndex;
+        ctx.base = ci.baseIndex;
+        ctx.closure = ci.closure;
+        ctx.proto = ctx.closure.proto;
+        ctx.code = ctx.proto.code;
+        ctx.k = ctx.proto.constants;
+        ctx.upvals = ctx.closure.upvals;
+        ctx.pc = ci.savedPc;
+        ctx.varargs = ci.varargs;
+        ctx.oldpc = ci.oldpc;
+        ctx.varargPrepRan = ci.varargPrepRan;
+        ctx.thread.ensureStackCapacity(callerFunc + (ci.expectedResults > 0 ? ci.expectedResults : 1) + 32);
+        ctx.pStack = ctx.thread.getPrimitiveStack();
+        ctx.tStack = ctx.thread.getTypeStack();
+        ctx.oStack = ctx.thread.getObjectStack();
+        if (ci.expectedResults > 0) {
+            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc, value);
+            for (int i = 1; i < ci.expectedResults; i++) {
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc + i, LuaNil.NIL);
+            }
+        } else if (ci.expectedResults < 0) {
+            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc, value);
+            ctx.top = callerFunc + 1;
+        }
+        return null;
+    }
+
+    /**
+     * Frameless single-result builtins ({@code setmetatable/2} on a fresh
+     * table, {@code math.sqrt/1} on a number). Returns the result, or null
+     * when the generic path must run (bad argument types, protected
+     * metatable, {@code __gc} handler, hooks, or any other exotic shape —
+     * the generic path then produces the exact specified behavior/error).
+     */
+    private static LuaValue inlineBuiltinResult(VmContext ctx, LuaFunction fn, int funcIdx, int nArgs) {
+        if (fn == org.luava.runtime.standard.BaseLib.SETMETATABLE && nArgs == 2) {
+            LuaValue tVal = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1);
+            LuaValue mtVal = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 2);
+            if (!(tVal instanceof LuaTable tbl) || tbl.getMetatable() != null) {
+                return null;
+            }
+            if (mtVal.isNil()) {
+                tbl.setMetatable(null);
+                return tbl;
+            }
+            if (mtVal instanceof LuaTable tableMt
+                    && tableMt.rawget(LuaValue.Meta.GC).isNil()) {
+                tbl.setMetatable(tableMt);
+                return tbl;
+            }
+            return null;
+        }
+        if (fn == org.luava.runtime.standard.MathLib.SQRT && nArgs == 1) {
+            int argIdx = funcIdx + 1;
+            double d;
+            if (ctx.tStack[argIdx] == TYPE_INT) {
+                d = (double) ctx.pStack[argIdx];
+            } else if (ctx.tStack[argIdx] == TYPE_FLOAT) {
+                d = Double.longBitsToDouble(ctx.pStack[argIdx]);
+            } else {
+                return null;
+            }
+            return LuaFloat.valueOf(Math.sqrt(d));
+        }
+        return null;
+    }
+
+    /**
+     * Raw-bits variant of the {@code math.sqrt/1} inline: stores the result
+     * directly into the caller's register (no {@code LuaFloat} allocation —
+     * 500k+ of them in numeric OOP loops). Returns false when the generic
+     * path must run. The stored shape (TYPE_FLOAT + raw bits) is exactly
+     * what the generic path's {@code setLuaValue} would write.
+     */
+    private static boolean inlineSqrtRaw(VmContext ctx, LuaFunction fn, int funcIdx, int nArgs, int destIdx) {
+        if (fn != org.luava.runtime.standard.MathLib.SQRT || nArgs != 1) {
+            return false;
+        }
+        int argIdx = funcIdx + 1;
+        double d;
+        if (ctx.tStack[argIdx] == TYPE_INT) {
+            d = (double) ctx.pStack[argIdx];
+        } else if (ctx.tStack[argIdx] == TYPE_FLOAT) {
+            d = Double.longBitsToDouble(ctx.pStack[argIdx]);
+        } else {
+            return false;
+        }
+        ctx.pStack[destIdx] = Double.doubleToRawLongBits(Math.sqrt(d));
+        ctx.tStack[destIdx] = TYPE_FLOAT;
+        ctx.oStack[destIdx] = null;
+        return true;
+    }
+
+    /**
+     * Frameless inline for the shared {@code string.gmatch} builtin.
+     * Same contract as {@link #inlineTostring1}: returns the new top, or -1
+     * to run the generic path (bad argument types or exotic result shapes,
+     * preserving the exact arg-error behavior).
+     */
+    private static int inlineGmatch(VmContext ctx, int funcIdx, int nArgs, int nResults) {
+        if (nResults > 1) {
+            return -1;
+        }
+        LuaValue s = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1);
+        LuaValue p = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 2);
+        if ((!s.isString() && !s.isNumber()) || (!p.isString() && !p.isNumber())) {
+            return -1;
+        }
+        LuaValue init = LuaNil.NIL;
+        if (nArgs > 2) {
+            LuaValue initArg = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 3);
+            // Only the total shapes inline; anything exotic keeps the generic
+            // path (and its identical error) so tracebacks never lose a frame.
+            if (!initArg.isNil() && !(initArg instanceof LuaInteger)) {
+                return -1;
+            }
+            init = initArg;
+        }
+        LuaValue it = org.luava.runtime.standard.LuaPattern.gmatch(s, p, init);
+        if (nResults != 0) {
+            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, it);
+        }
+        return funcIdx + 1;
+    }
+
+    /**
+     * {@code OP_GETTABUP} with a ctx-local site cache for the string-key
+     * shape (global-variable reads). The guard is the table's
+     * {@code readVersion()}: -1 while a metatable could affect reads (then
+     * the entry is never stored), otherwise a counter bumped by every table
+     * mutation on any path — so stale reads are impossible, including
+     * {@code rawset(_G)}, host {@code setLive}, or swapped upvalues (table
+     * identity is part of the guard).
+     */
+    private static void executeGetTabUpCached(VmContext ctx, int pc, int a, int inst) {
+        int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
+        int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+        LuaValue key = ctx.k[c];
+        LuaValue uv = ctx.upvals[b].getValue();
+        if (key instanceof LuaString && uv instanceof LuaTable tbl) {
+            int idx = (System.identityHashCode(tbl) ^ (pc * 33) ^ System.identityHashCode(key))
+                    & (VmContext.GLOBAL_CACHE_SIZE - 1);
+            if (ctx.gcProto[idx] == ctx.proto && ctx.gcPc[idx] == pc
+                    && ctx.gcTable[idx] == tbl && ctx.gcKey[idx] == key) {
+                long ver = tbl.readVersion();
+                if (ver != -1L && ver == ctx.gcVersion[idx]) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValue[idx]);
+                    return;
+                }
+            }
+            LuaValue val = tbl.get(key);
+            long ver = tbl.readVersion();
+            if (ver != -1L) {
+                ctx.gcProto[idx] = ctx.proto;
+                ctx.gcPc[idx] = pc;
+                ctx.gcTable[idx] = tbl;
+                ctx.gcKey[idx] = key;
+                ctx.gcVersion[idx] = ver;
+                ctx.gcValue[idx] = val;
+            }
+            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, val);
+            return;
+        }
+        executeGetTabUp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.upvals, ctx.k, ctx.base, a, inst);
+    }
+
     private static void executeGetTable(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
@@ -1748,7 +2359,18 @@ public final class BytecodeVM {
     private static void executeGetField(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + b);
+        int tb = base + b;
+        // Fast lane: the field exists directly on a table instance (the
+        // dominant `self.x` shape). Skips the virtual get() loop and the
+        // metatable walk; a miss falls through with identical semantics.
+        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt) {
+            LuaValue val = lt.rawget(k[c]);
+            if (val != LuaNil.NIL) {
+                setLuaValue(pStack, tStack, oStack, base + a, val);
+                return;
+            }
+        }
+        LuaValue tbl = getLuaValue(pStack, tStack, oStack, tb);
         setLuaValue(pStack, tStack, oStack, base + a, tbl.get(k[c]));
     }
 
@@ -1813,6 +2435,96 @@ public final class BytecodeVM {
         LuaValue key = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
         setLuaValue(pStack, tStack, oStack, base + a + 1, tbl);
         setLuaValue(pStack, tStack, oStack, base + a, tbl.get(key));
+    }
+
+    /**
+     * {@code OP_SELF} fast lane for {@code str:method} with a constant method
+     * name (the dominant string-library call shape). String methods resolve
+     * as metatable {@code __index} (the string library table) + raw field;
+     * both hops are cached per (proto, pc, key) guarded by the library
+     * table's identity and {@code readVersion()}, so {@code string.foo = ..}
+     * reassignment or metatable swaps safely miss. Anything exotic (no
+     * metatable, function {@code __index}, missing method) falls through to
+     * the generic path with identical semantics.
+     */
+    private static void executeSelfCached(VmContext ctx, LuaState state, int pc, int a, int inst) {
+        int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
+        int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+        int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
+        int regB = ctx.base + b;
+        LuaValue key = flagK == 1 ? ctx.k[c] : getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c);
+        if (flagK == 1 && key instanceof LuaString ks) {
+            if (ctx.tStack[regB] == TYPE_OBJECT && ctx.oStack[regB] instanceof LuaTable tbl) {
+                // `obj:method` on a table missing the field: resolve through
+                // metatable __index once per (proto, pc, metatable, key),
+                // guarded by the index table's readVersion(). OOP loops reuse
+                // one metatable for millions of fresh instances, so this turns
+                // 2-3 hash probes per method call into a handful of compares.
+                LuaValue own = tbl.rawget(ks);
+                if (!own.isNil()) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, own);
+                    return;
+                }
+                LuaTable mt = tbl.getMetatable();
+                LuaValue handler = (mt != null) ? mt.rawget(LuaValue.Meta.INDEX) : null;
+                if (handler instanceof LuaTable idx) {
+                    int id = (System.identityHashCode(mt) ^ System.identityHashCode(idx) ^ (pc * 33)
+                            ^ System.identityHashCode(ks)) & (VmContext.GLOBAL_CACHE_SIZE - 1);
+                    if (ctx.gcProto[id] == ctx.proto && ctx.gcPc[id] == pc
+                            && ctx.gcTable[id] == idx && ctx.gcKey[id] == ks) {
+                        long ver = idx.readVersion();
+                        if (ver != -1L && ver == ctx.gcVersion[id]) {
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValue[id]);
+                            return;
+                        }
+                    }
+                    LuaValue m = idx.rawget(ks);
+                    long ver = idx.readVersion();
+                    if (ver != -1L && !m.isNil()) {
+                        ctx.gcProto[id] = ctx.proto;
+                        ctx.gcPc[id] = pc;
+                        ctx.gcTable[id] = idx;
+                        ctx.gcKey[id] = ks;
+                        ctx.gcVersion[id] = ver;
+                        ctx.gcValue[id] = m;
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, m);
+                        return;
+                    }
+                }
+            }
+            LuaTable mt = state.basicMetatable(LuaType.STRING);
+            LuaValue handler = (mt != null) ? mt.rawget(LuaValue.Meta.INDEX) : null;
+            if (handler instanceof LuaTable idx) {
+                int id = (System.identityHashCode(idx) ^ (pc * 33) ^ System.identityHashCode(ks))
+                        & (VmContext.GLOBAL_CACHE_SIZE - 1);
+                if (ctx.gcProto[id] == ctx.proto && ctx.gcPc[id] == pc
+                        && ctx.gcTable[id] == idx && ctx.gcKey[id] == ks) {
+                    long ver = idx.readVersion();
+                    if (ver != -1L && ver == ctx.gcVersion[id]) {
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValue[id]);
+                        return;
+                    }
+                }
+                LuaValue m = idx.rawget(ks);
+                long ver = idx.readVersion();
+                if (ver != -1L && !m.isNil()) {
+                    ctx.gcProto[id] = ctx.proto;
+                    ctx.gcPc[id] = pc;
+                    ctx.gcTable[id] = idx;
+                    ctx.gcKey[id] = ks;
+                    ctx.gcVersion[id] = ver;
+                    ctx.gcValue[id] = m;
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, m);
+                    return;
+                }
+            }
+        }
+        executeSelf(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
     }
 
     private static void executeSlowAdd(long[] pStack, byte[] tStack, LuaValue[] oStack, int regA, int regB, int regC) {
@@ -2103,13 +2815,25 @@ public final class BytecodeVM {
     }
 
     private static String kname(LuaProto p, int index) {
+        String n = knameOrNull(p, index);
+        return n != null ? n : "?";
+    }
+
+    /**
+     * PUC {@code kname}: only a string constant has a name. A non-string
+     * constant (number, boolean, ...) yields no symbolic name, so
+     * {@code basicgetobjname} must report "unknown" rather than
+     * {@code "constant '?'"} — the latter produced bogus descriptors like
+     * {@code number (constant '?') has no integer representation}.
+     */
+    private static String knameOrNull(LuaProto p, int index) {
         if (p.constants != null && index >= 0 && index < p.constants.length) {
             LuaValue kv = p.constants[index];
             if (kv instanceof LuaString ls) {
                 return ls.value();
             }
         }
-        return "?";
+        return null;
     }
 
     private static String basicgetobjname(LuaProto p, int[] ppc, int reg, String[] name) {
@@ -2138,14 +2862,22 @@ public final class BytecodeVM {
                 }
                 case OpCode.OP_LOADK -> {
                     int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
-                    name[0] = kname(p, bx);
+                    String cName = knameOrNull(p, bx);
+                    if (cName == null) {
+                        return null;  // non-string constant: no symbolic name
+                    }
+                    name[0] = cName;
                     return "constant";
                 }
                 case OpCode.OP_LOADKX -> {
                     if (pc + 1 < p.code.length) {
                         int nextInst = p.code[pc + 1];
                         int ax = (nextInst >>> Instruction.POS_Ax) & Instruction.MASK_Ax;
-                        name[0] = kname(p, ax);
+                        String cName = knameOrNull(p, ax);
+                        if (cName == null) {
+                            return null;
+                        }
+                        name[0] = cName;
                         return "constant";
                     }
                 }
@@ -2260,8 +2992,10 @@ public final class BytecodeVM {
         csState.nextMetamethod = false;
         csState.nextMethod = false;
         if (resolvedName == null) {
-            // Introspect bytecode opcode to determine accurate namewhat ('global', 'local', 'field', 'method')
-            String[] info = getobjname(proto, pc - 1, funcIdx - base);
+            // Introspect bytecode opcode to determine accurate namewhat ('global', 'local', 'field', 'method').
+            // Memoized per (proto, pc, reg): hot call sites (e.g. tostring in
+            // a loop) otherwise re-scan bytecode on every single call.
+            String[] info = callName(ctx, proto, pc - 1, funcIdx - base);
             if (info != null) {
                 resolvedName = info[0];
                 namewhat = info[1];
@@ -2441,21 +3175,45 @@ public final class BytecodeVM {
         return null;
     }
 
-    private static void executeTForCall(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeTForCall(VmContext ctx, int inst, int a) {
+        long[] pStack = ctx.pStack;
+        byte[] tStack = ctx.tStack;
+        LuaValue[] oStack = ctx.oStack;
+        int base = ctx.base;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         LuaValue f = getLuaValue(pStack, tStack, oStack, base + a);
+        // Fast lane: gmatch iterators ignore (state, control) and expose a
+        // direct step. Skips two args boxing, the varargs array and double
+        // virtual dispatch per iteration (500k+/s in gmatch loops).
+        if (f instanceof org.luava.runtime.standard.LuaPattern.GmatchIterator gi) {
+            LuaValue res = gi.next();
+            int nVars = Math.max(1, c);
+            if (res instanceof Varargs va) {
+                LuaValue[] vals = va.getValuesUnsafe();
+                for (int i = 0; i < nVars; i++) {
+                    setLuaValue(pStack, tStack, oStack, base + a + 4 + i, (i < vals.length) ? vals[i] : LuaNil.NIL);
+                }
+            } else {
+                setLuaValue(pStack, tStack, oStack, base + a + 4, res != null ? res : LuaNil.NIL);
+                for (int i = 1; i < nVars; i++) {
+                    setLuaValue(pStack, tStack, oStack, base + a + 4 + i, LuaNil.NIL);
+                }
+            }
+            return;
+        }
         LuaValue s = getLuaValue(pStack, tStack, oStack, base + a + 1);
         LuaValue var = getLuaValue(pStack, tStack, oStack, base + a + 2);
         // C Lua: iterator calls report name/namewhat "for iterator".
         // Lua closures consume this via the initial push; Java callables push
         // no frame, so clear afterwards (try-finally: also on throw) to avoid
-        // leaking the name into unrelated later calls.
-        org.luava.runtime.eval.CallStack.setNextCall("for iterator", "for iterator", false, false);
+        // leaking the name into unrelated later calls. Staged on the
+        // ctx-local call state (no ThreadLocal) — this runs per iteration.
+        org.luava.runtime.eval.CallStack.setNextCall(ctx.callState, "for iterator", "for iterator", false, false);
         LuaValue res;
         try {
             res = f.call(s, var);
         } finally {
-            org.luava.runtime.eval.CallStack.clearNextCallIf("for iterator");
+            org.luava.runtime.eval.CallStack.clearNextCallIf(ctx.callState, "for iterator");
         }
         int nVars = Math.max(1, c);
         if (res instanceof Varargs va) {

@@ -32,19 +32,19 @@ public final class DebugLib {
     public static void open(org.luava.runtime.LuaState luaState, LuaTable globals) {
         LuaTable debug = new LuaTable();
         fillInto(debug, luaState, globals);
-        globals.rawset(LuaString.valueOf("debug"), debug);
+        globals.rawset(LuaString.interned("debug"), debug);
     }
 
     public static void fillInto(LuaTable debug, org.luava.runtime.LuaState luaState, LuaTable globals) {
         LuaTable registry = luaState != null ? luaState.getRegistry() : new LuaTable();
         LuaTable hookTable = new LuaTable();
-        hookTable.rawset(LuaString.valueOf("__mode"), LuaString.valueOf("k"));
+        hookTable.rawset(LuaString.interned("__mode"), LuaString.interned("k"));
         hookTable.setMetatable(hookTable);
-        registry.rawset(LuaString.valueOf("_HOOKKEY"), hookTable);
+        registry.rawset(LuaString.interned("_HOOKKEY"), hookTable);
 
-        debug.rawset(LuaString.valueOf("getregistry"), LuaFunction.of(args -> registry));
+        debug.rawset(LuaString.interned("getregistry"), LuaFunction.of(args -> registry));
 
-        debug.rawset(LuaString.valueOf("getinfo"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("getinfo"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'debug.getinfo'");
             LuaCoroutine targetCoro = null;
             int argIdx = 0;
@@ -99,8 +99,8 @@ public final class DebugLib {
             LuaTable info = new LuaTable();
 
             if (what.contains("n")) {
-                info.rawset(LuaString.valueOf("name"), fnName != null ? LuaString.valueOf(fnName) : LuaNil.NIL);
-                info.rawset(LuaString.valueOf("namewhat"), LuaString.valueOf(namewhat));
+                info.rawset(LuaString.interned("name"), fnName != null ? LuaString.valueOf(fnName) : LuaNil.NIL);
+                info.rawset(LuaString.interned("namewhat"), LuaString.valueOf(namewhat));
             }
 
             if (what.contains("S")) {
@@ -131,51 +131,51 @@ public final class DebugLib {
                     lastLineDef = -1;
                 }
 
-                info.rawset(LuaString.valueOf("source"), LuaString.valueOf(src));
-                info.rawset(LuaString.valueOf("short_src"), LuaString.valueOf(shortSrc));
-                info.rawset(LuaString.valueOf("linedefined"), LuaInteger.valueOf(lineDef));
-                info.rawset(LuaString.valueOf("lastlinedefined"), LuaInteger.valueOf(lastLineDef));
-                info.rawset(LuaString.valueOf("what"), LuaString.valueOf(whatType));
+                info.rawset(LuaString.interned("source"), LuaString.valueOf(src));
+                info.rawset(LuaString.interned("short_src"), LuaString.valueOf(shortSrc));
+                info.rawset(LuaString.interned("linedefined"), LuaInteger.valueOf(lineDef));
+                info.rawset(LuaString.interned("lastlinedefined"), LuaInteger.valueOf(lastLineDef));
+                info.rawset(LuaString.interned("what"), LuaString.valueOf(whatType));
             }
 
             if (what.contains("l")) {
                 int cl = (fn != null && (fn.isStripped() || (!(fn instanceof org.luava.runtime.bytecode.LuaClosure)))) ? -1 : currentLine;
-                info.rawset(LuaString.valueOf("currentline"), LuaInteger.valueOf(cl));
+                info.rawset(LuaString.interned("currentline"), LuaInteger.valueOf(cl));
             }
 
             if (what.contains("u")) {
                 int numParams = fn != null ? fn.getNparams() : 0;
                 int nups = fn != null ? fn.getUpvalues().size() : 0;
                 boolean vararg = fn == null || fn.isVararg();
-                info.rawset(LuaString.valueOf("nups"), LuaInteger.valueOf(nups));
-                info.rawset(LuaString.valueOf("nparams"), LuaInteger.valueOf(numParams));
-                info.rawset(LuaString.valueOf("isvararg"), LuaBoolean.valueOf(vararg));
+                info.rawset(LuaString.interned("nups"), LuaInteger.valueOf(nups));
+                info.rawset(LuaString.interned("nparams"), LuaInteger.valueOf(numParams));
+                info.rawset(LuaString.interned("isvararg"), LuaBoolean.valueOf(vararg));
             }
 
             if (what.contains("t")) {
-                info.rawset(LuaString.valueOf("istailcall"), LuaBoolean.valueOf(frame != null && frame.isTailCall));
+                info.rawset(LuaString.interned("istailcall"), LuaBoolean.valueOf(frame != null && frame.isTailCall));
             }
 
             if (what.contains("f")) {
-                info.rawset(LuaString.valueOf("func"), fn != null ? fn : LuaNil.NIL);
+                info.rawset(LuaString.interned("func"), fn != null ? fn : LuaNil.NIL);
             }
 
             if (what.contains("r")) {
-                info.rawset(LuaString.valueOf("ftransfer"), LuaInteger.valueOf(frame != null ? frame.ftransfer : 0));
-                info.rawset(LuaString.valueOf("ntransfer"), LuaInteger.valueOf(frame != null ? frame.ntransfer : 0));
+                info.rawset(LuaString.interned("ftransfer"), LuaInteger.valueOf(frame != null ? frame.ftransfer : 0));
+                info.rawset(LuaString.interned("ntransfer"), LuaInteger.valueOf(frame != null ? frame.ntransfer : 0));
             }
 
             if (what.contains("L")) {
                 LuaTable activelines = (fn != null && fn.isStripped()) ? new LuaTable() : collectActiveLines(fn);
                 if (activelines != null) {
-                    info.rawset(LuaString.valueOf("activelines"), activelines);
+                    info.rawset(LuaString.interned("activelines"), activelines);
                 }
             }
 
             return info;
         }));
 
-        debug.rawset(LuaString.valueOf("traceback"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("traceback"), LuaFunction.of(args -> {
             String msg = null;
             LuaCoroutine targetCoro = null;
             int argIdx = 0;
@@ -234,13 +234,13 @@ public final class DebugLib {
             return LuaString.valueOf(sb.toString());
         }));
 
-        debug.rawset(LuaString.valueOf("getmetatable"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("getmetatable"), LuaFunction.of(args -> {
             if (args.length == 0) throw new LuaException("bad argument to 'debug.getmetatable'");
             LuaTable mt = args[0].getMetatable();
             return (mt != null) ? mt : LuaNil.NIL;
         }));
 
-        debug.rawset(LuaString.valueOf("setmetatable"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("setmetatable"), LuaFunction.of(args -> {
             if (args.length < 2) throw new LuaException("bad argument to 'debug.setmetatable'");
             LuaValue target = args[0];
             LuaTable mt = (args[1] instanceof LuaTable t) ? t : null;
@@ -248,7 +248,7 @@ public final class DebugLib {
             return target;
         }));
 
-        debug.rawset(LuaString.valueOf("getuservalue"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("getuservalue"), LuaFunction.of(args -> {
             if (args.length == 0 || !(args[0] instanceof LuaUserdata ud) || ud.isLightUserdata()) {
                 return LuaNil.NIL;
             }
@@ -260,7 +260,7 @@ public final class DebugLib {
             return LuaNil.NIL;
         }));
 
-        debug.rawset(LuaString.valueOf("setuservalue"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("setuservalue"), LuaFunction.of(args -> {
             if (args.length < 1 || !args[0].isUserdata()) {
                 String got = args.length > 0 ? args[0].typeName() : "no value";
                 throw new LuaException("bad argument #1 to 'setuservalue' (userdata expected, got " + got + ")");
@@ -277,7 +277,7 @@ public final class DebugLib {
             return ud;
         }));
 
-        debug.rawset(LuaString.valueOf("getupvalue"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("getupvalue"), LuaFunction.of(args -> {
             if (args.length < 2 || !(args[0] instanceof LuaFunction fn)) {
                 return LuaNil.NIL;
             }
@@ -292,7 +292,7 @@ public final class DebugLib {
             return LuaNil.NIL;
         }));
 
-        debug.rawset(LuaString.valueOf("setupvalue"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("setupvalue"), LuaFunction.of(args -> {
             if (args.length < 3 || !(args[0] instanceof LuaFunction fn)) {
                 return LuaNil.NIL;
             }
@@ -309,7 +309,7 @@ public final class DebugLib {
             return LuaNil.NIL;
         }));
 
-        debug.rawset(LuaString.valueOf("upvalueid"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("upvalueid"), LuaFunction.of(args -> {
             if (args.length < 2 || !(args[0] instanceof LuaFunction fn)) {
                 return LuaNil.NIL;
             }
@@ -321,7 +321,7 @@ public final class DebugLib {
             return LuaNil.NIL;
         }));
 
-        debug.rawset(LuaString.valueOf("upvaluejoin"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("upvaluejoin"), LuaFunction.of(args -> {
             if (args.length < 4 || !(args[0] instanceof LuaFunction f1) || !(args[2] instanceof LuaFunction f2)) {
                 throw new LuaException("bad argument to 'debug.upvaluejoin'");
             }
@@ -346,7 +346,7 @@ public final class DebugLib {
             return LuaNil.NIL;
         }));
 
-        debug.rawset(LuaString.valueOf("getlocal"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("getlocal"), LuaFunction.of(args -> {
             LuaCoroutine target = LuaCoroutine.running();
             int argOffset = 0;
             if (args.length > 0 && args[0] instanceof LuaCoroutine co) {
@@ -410,7 +410,7 @@ public final class DebugLib {
                 if (nvar < 0) {
                     int idx = -nvar;
                     if (frame.varargs != null && idx >= 1 && idx <= frame.varargs.length) {
-                        return Varargs.of(LuaString.valueOf("(vararg)"), frame.varargs[idx - 1]);
+                        return Varargs.of(LuaString.interned("(vararg)"), frame.varargs[idx - 1]);
                     }
                     return LuaNil.NIL;
                 } else if (nvar > 0) {
@@ -454,7 +454,7 @@ public final class DebugLib {
                                     target.getObjectStack(),
                                     reg
                             );
-                            return Varargs.of(LuaString.valueOf("(temporary)"), val);
+                            return Varargs.of(LuaString.interned("(temporary)"), val);
                         }
                     }
                     return LuaNil.NIL;
@@ -467,7 +467,7 @@ public final class DebugLib {
                 if (env != null && env.getVarargsArray() != null) {
                     LuaValue[] extra = env.getVarargsArray();
                     if (idx >= 1 && idx <= extra.length) {
-                        return Varargs.of(LuaString.valueOf("(vararg)"), extra[idx - 1]);
+                        return Varargs.of(LuaString.interned("(vararg)"), extra[idx - 1]);
                     }
                 }
                 return LuaNil.NIL;
@@ -487,16 +487,16 @@ public final class DebugLib {
                     } else {
                         int tempIdx = nvar - allLocals.size() - 1;
                         if (tempIdx >= 0 && tempIdx < frame.temps.size()) {
-                            return Varargs.of(LuaString.valueOf("(temporary)"), frame.temps.get(tempIdx));
+                            return Varargs.of(LuaString.interned("(temporary)"), frame.temps.get(tempIdx));
                         }
                     }
                 } else if (frame.cArgs != null) {
                     if (nvar >= 1 && nvar <= frame.cArgs.length) {
-                        return Varargs.of(LuaString.valueOf("(C temporary)"), frame.cArgs[nvar - 1]);
+                        return Varargs.of(LuaString.interned("(C temporary)"), frame.cArgs[nvar - 1]);
                     }
                 } else if (actualLevel == 0 && target == LuaCoroutine.running()) {
                     if (nvar >= 1 && nvar <= args.length) {
-                        return Varargs.of(LuaString.valueOf("(C temporary)"), args[nvar - 1]);
+                        return Varargs.of(LuaString.interned("(C temporary)"), args[nvar - 1]);
                     }
                 }
                 return LuaNil.NIL;
@@ -504,7 +504,7 @@ public final class DebugLib {
             return LuaNil.NIL;
         }));
 
-        debug.rawset(LuaString.valueOf("setlocal"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("setlocal"), LuaFunction.of(args -> {
             LuaCoroutine target = LuaCoroutine.running();
             int argOffset = 0;
             if (args.length > 0 && args[0] instanceof LuaCoroutine co) {
@@ -549,7 +549,7 @@ public final class DebugLib {
                     int idx = -nvar;
                     if (frame.varargs != null && idx >= 1 && idx <= frame.varargs.length) {
                         frame.varargs[idx - 1] = val;
-                        return LuaString.valueOf("(vararg)");
+                        return LuaString.interned("(vararg)");
                     }
                     return LuaNil.NIL;
                 } else if (nvar > 0) {
@@ -595,7 +595,7 @@ public final class DebugLib {
                                     reg,
                                     val
                             );
-                            return LuaString.valueOf("(temporary)");
+                            return LuaString.interned("(temporary)");
                         }
                     }
                     return LuaNil.NIL;
@@ -610,7 +610,7 @@ public final class DebugLib {
                     if (idx >= 1 && idx <= extra.length) {
                         extra[idx - 1] = val;
                         env.defineLocal("...", Varargs.of(extra), false, false);
-                        return LuaString.valueOf("(vararg)");
+                        return LuaString.interned("(vararg)");
                     }
                 }
                 return LuaNil.NIL;
@@ -633,18 +633,18 @@ public final class DebugLib {
                         int tempIdx = nvar - allLocals.size() - 1;
                         if (tempIdx >= 0 && tempIdx < frame.temps.size()) {
                             frame.temps.set(tempIdx, val);
-                            return LuaString.valueOf("(temporary)");
+                            return LuaString.interned("(temporary)");
                         }
                     }
                 } else if (frame.cArgs != null) {
                     if (nvar >= 1 && nvar <= frame.cArgs.length) {
                         frame.cArgs[nvar - 1] = val;
-                        return LuaString.valueOf("(C temporary)");
+                        return LuaString.interned("(C temporary)");
                     }
                 } else if (actualLevel == 0 && target == LuaCoroutine.running()) {
                     if (nvar >= 1 && nvar <= args.length) {
                         args[nvar - 1] = val;
-                        return LuaString.valueOf("(C temporary)");
+                        return LuaString.interned("(C temporary)");
                     }
                 }
                 return LuaNil.NIL;
@@ -652,7 +652,7 @@ public final class DebugLib {
             return LuaNil.NIL;
         }));
 
-        debug.rawset(LuaString.valueOf("gethook"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("gethook"), LuaFunction.of(args -> {
             LuaCoroutine target = LuaCoroutine.running();
             if (args.length > 0 && args[0] instanceof LuaCoroutine co) {
                 target = co;
@@ -660,7 +660,7 @@ public final class DebugLib {
             if (target == null || !target.hasHook()) return LuaNil.NIL;
             LuaCoroutine.HookConfig cfg = target.getHookConfig();
             LuaValue hookVal = cfg.hook;
-            LuaValue hkVal = registry.rawget(LuaString.valueOf("_HOOKKEY"));
+            LuaValue hkVal = registry.rawget(LuaString.interned("_HOOKKEY"));
             if (hkVal instanceof LuaTable hkT) {
                 LuaValue stored = hkT.rawget(target);
                 if (!stored.isNil()) hookVal = stored;
@@ -668,7 +668,7 @@ public final class DebugLib {
             return Varargs.of(hookVal, LuaString.valueOf(cfg.mask), LuaInteger.valueOf(cfg.count));
         }));
 
-        debug.rawset(LuaString.valueOf("sethook"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("sethook"), LuaFunction.of(args -> {
             LuaCoroutine target = LuaCoroutine.running();
             int argOffset = 0;
             if (args.length > 0 && args[0] instanceof LuaCoroutine co) {
@@ -676,7 +676,7 @@ public final class DebugLib {
                 argOffset = 1;
             }
             if (target == null) return LuaNil.NIL;
-            LuaValue hkVal = registry.rawget(LuaString.valueOf("_HOOKKEY"));
+            LuaValue hkVal = registry.rawget(LuaString.interned("_HOOKKEY"));
             LuaTable hkT = (hkVal instanceof LuaTable t) ? t : null;
             if (args.length <= argOffset || args[argOffset].isNil()) {
                 target.clearHook();
@@ -694,14 +694,14 @@ public final class DebugLib {
         // debug.debug: an interactive prompt reading from stdin. An embedded
         // server has no terminal to drive, so this is a no-op that returns
         // immediately (matching a non-interactive stdin).
-        debug.rawset(LuaString.valueOf("debug"), LuaFunction.of(args -> LuaNil.NIL));
+        debug.rawset(LuaString.interned("debug"), LuaFunction.of(args -> LuaNil.NIL));
 
         // debug.setcstacklimit: Lua 5.4 lets the host cap C-stack recursion.
         // Java frames live on the heap, so the limit is accepted and ignored;
         // the previous limit is returned per the 5.4 API (Lua's default is
         // 200). A non-number argument raises the usual Lua error.
         int[] cstackLimit = {200};
-        debug.rawset(LuaString.valueOf("setcstacklimit"), LuaFunction.of(args -> {
+        debug.rawset(LuaString.interned("setcstacklimit"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isNumber()) {
                 throw new LuaException("bad argument #1 to 'setcstacklimit' (number expected, got "
                         + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
@@ -803,9 +803,9 @@ public final class DebugLib {
             }
         }
 
-        LuaValue pkgVal = globals.rawget(LuaString.valueOf("package"));
+        LuaValue pkgVal = globals.rawget(LuaString.interned("package"));
         if (pkgVal instanceof LuaTable pkg) {
-            LuaValue loadedVal = pkg.rawget(LuaString.valueOf("loaded"));
+            LuaValue loadedVal = pkg.rawget(LuaString.interned("loaded"));
             if (loadedVal instanceof LuaTable loaded) {
                 for (LuaValue modKey : loaded.keys()) {
                     LuaValue modVal = loaded.rawget(modKey);

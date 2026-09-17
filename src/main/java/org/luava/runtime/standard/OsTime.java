@@ -579,26 +579,26 @@ final class OsTime {
         if (sentinelCode != null) {
             if (sentinelCode == 0) {
                 return org.luava.runtime.Varargs.of(org.luava.runtime.LuaBoolean.TRUE,
-                        org.luava.runtime.LuaString.valueOf("exit"),
+                        org.luava.runtime.LuaString.interned("exit"),
                         org.luava.runtime.LuaInteger.valueOf(0));
             }
             return org.luava.runtime.Varargs.of(org.luava.runtime.LuaNil.NIL,
-                    org.luava.runtime.LuaString.valueOf("exit"),
+                    org.luava.runtime.LuaString.interned("exit"),
                     org.luava.runtime.LuaInteger.valueOf(sentinelCode));
         }
         // No sentinel: died by signal (or exec'd away). Windows has no wrapper.
         if (code == 0) {
             return org.luava.runtime.Varargs.of(org.luava.runtime.LuaBoolean.TRUE,
-                    org.luava.runtime.LuaString.valueOf("exit"),
+                    org.luava.runtime.LuaString.interned("exit"),
                     org.luava.runtime.LuaInteger.valueOf(0));
         }
         if (!isWindows() && code > 128 && code - 128 <= 64) {
             return org.luava.runtime.Varargs.of(org.luava.runtime.LuaNil.NIL,
-                    org.luava.runtime.LuaString.valueOf("signal"),
+                    org.luava.runtime.LuaString.interned("signal"),
                     org.luava.runtime.LuaInteger.valueOf(code - 128));
         }
         return org.luava.runtime.Varargs.of(org.luava.runtime.LuaNil.NIL,
-                org.luava.runtime.LuaString.valueOf("exit"),
+                org.luava.runtime.LuaString.interned("exit"),
                 org.luava.runtime.LuaInteger.valueOf(code));
     }
 }

@@ -74,36 +74,20 @@ public final class LuaCoroutine extends LuaValue {
     private static final long HANDOFF_SPIN_NANOS = 50_000L;
 
     /**
-     * Global hook-armed flag for the VM hot path. True when at least one
-     * coroutine has an active hook. The interpreter loop checks this single
-     * predictable field instead of ThreadLocal + config per instruction.
-     * Biased to stay true (only perf cost); never false while a hook exists.
+     * Per-coroutine "a hook is active" flag for the VM hot path. Hooks in
+     * Lua are per-thread: {@code debug.sethook(co, ...)} only arms {@code co}.
+     * This used to be a process-global static counter, which leaked — a hook
+     * set on a coroutine that was never resumed/closed (or on a main thread
+     * whose state was abandoned) left the global true forever, permanently
+     * disabling JIT for every later {@code LuaState}. Reading a boolean on
+     * the already-hoisted running coroutine costs the same as the old global
+     * read, and is correct per Lua semantics.
      */
-    public static volatile boolean HOOKS_ARMED = false;
-    private static int hookArmedCount = 0;
-    private boolean hookArmedCounted = false;
+    public volatile boolean hooksActive = false;
 
-    private static void updateHookArmed(boolean wasActive, boolean nowActive) {
-        if (wasActive == nowActive) return;
-        synchronized (LuaCoroutine.class) {
-            if (nowActive) {
-                hookArmedCount++;
-            } else if (hookArmedCount > 0) {
-                hookArmedCount--;
-            }
-            HOOKS_ARMED = hookArmedCount > 0;
-        }
-    }
-
-    /** Disarm hook counting (idempotent; safe to call on death/close). */
-    private void disarmHookCounted() {
-        if (hookArmedCounted) {
-            hookArmedCounted = false;
-            synchronized (LuaCoroutine.class) {
-                if (hookArmedCount > 0) hookArmedCount--;
-                HOOKS_ARMED = hookArmedCount > 0;
-            }
-        }
+    /** Disarm this coroutine's hook (idempotent; safe to call on death/close). */
+    private void disarmHook() {
+        hooksActive = false;
     }
 
     /**
@@ -204,7 +188,7 @@ public final class LuaCoroutine extends LuaValue {
             org.luava.runtime.LuaValue val = entry.value;
             org.luava.runtime.LuaTable mt = val.getMetatable();
             org.luava.runtime.LuaValue closeMth = mt != null
-                    ? mt.rawget(org.luava.runtime.LuaString.valueOf("__close")) : org.luava.runtime.LuaNil.NIL;
+                    ? mt.rawget(org.luava.runtime.LuaValue.Meta.CLOSE) : org.luava.runtime.LuaNil.NIL;
             try {
                 if (!closeMth.isNil()) {
                     org.luava.runtime.eval.CallStack.setNextCall("close", "metamethod", false, true);
@@ -263,7 +247,6 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public void setHook(LuaValue hook, String mask, int count) {
-        boolean wasActive = hookArmedCounted;
         hookConfig.hook = (hook != null && !hook.isNil()) ? hook : LuaNil.NIL;
         hookConfig.mask = mask != null ? mask : "";
         hookConfig.count = Math.max(0, count);
@@ -272,10 +255,8 @@ public final class LuaCoroutine extends LuaValue {
         hookConfig.hookLine = hookConfig.mask.contains("l");
         hookConfig.countSoFar = 0;
         hookConfig.lastLine = -1;
-        boolean nowActive = !hookConfig.hook.isNil()
+        hooksActive = !hookConfig.hook.isNil()
                 && (hookConfig.hookCall || hookConfig.hookReturn || hookConfig.hookLine || hookConfig.count > 0);
-        hookArmedCounted = nowActive;
-        updateHookArmed(wasActive, nowActive);
 
         CallStack.CallStackState state = getCallStackState();
         if (state != null && state.top > 1) {
@@ -287,7 +268,7 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public void clearHook() {
-        disarmHookCounted();
+        disarmHook();
         hookConfig.hook = LuaNil.NIL;
         hookConfig.mask = "";
         hookConfig.count = 0;
@@ -561,7 +542,7 @@ public final class LuaCoroutine extends LuaValue {
                         handoffResult = new LuaValue[]{errVal};
                         status = Status.DEAD;
                     } finally {
-                        disarmHookCounted();
+                        disarmHook();
                         CURRENT_COROUTINE.remove();
                         yieldSeq++;
                         LockSupport.unpark(resumerThread);
@@ -683,7 +664,7 @@ public final class LuaCoroutine extends LuaValue {
 
             if (virtualThread == null) {
                 status = Status.DEAD;
-                disarmHookCounted();
+                disarmHook();
                 return new LuaValue[]{LuaValue.valueOf(true)};
             }
 

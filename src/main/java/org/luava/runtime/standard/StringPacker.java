@@ -91,7 +91,7 @@ public final class StringPacker {
                 }
                 case 'X' -> {
                     if (indexRef[0] >= len) {
-                        throw new LuaException("invalid next option for option 'X'");
+                        throw LuaValue.argError(1, "string.pack", "invalid next option for option 'X'");
                     }
                     char next = fmt.charAt(indexRef[0]++);
                     int a;
@@ -110,7 +110,7 @@ public final class StringPacker {
                             }
                             a = getalign(size, maxalign);
                         }
-                        default -> throw new LuaException("invalid next option for option 'X'");
+                        default -> throw LuaValue.argError(1, "string.pack", "invalid next option for option 'X'");
                     }
                     opt.align = a;
                     opt.size = 0; // X only contributes alignment padding
@@ -229,14 +229,14 @@ public final class StringPacker {
             if (opt.code == 'X') {
                 int pad = getpadding(total, opt.align);
                 if ((long) total + pad > Integer.MAX_VALUE) {
-                    throw new LuaException("bad argument #1 to 'string.packsize' (format result too large)");
+                    throw LuaValue.argError(1, "string.packsize", "format result too large");
                 }
                 total += pad;
                 continue;
             }
             int pad = getpadding(total, opt.align);
             if ((long) total + pad + opt.size > Integer.MAX_VALUE) {
-                throw new LuaException("bad argument #1 to 'string.packsize' (format result too large)");
+                throw LuaValue.argError(1, "string.packsize", "format result too large");
             }
             total += pad + opt.size;
         }
@@ -244,16 +244,25 @@ public final class StringPacker {
     }
 
     private static void packInt(ByteArrayOutputStream out, long val, ByteOrder order, int size, boolean isSigned) {
+        packInt(out, val, order, size, isSigned, -1);
+    }
+
+    /**
+     * @param argNum 1-based Lua argument index to blame on overflow, or -1
+     *               for internal uses (string length prefixes) that PUC does
+     *               not attribute to an argument.
+     */
+    private static void packInt(ByteArrayOutputStream out, long val, ByteOrder order, int size, boolean isSigned, int argNum) {
         if (size < 8) {
             if (isSigned) {
                 long max = (1L << (size * 8 - 1)) - 1;
                 long min = -(1L << (size * 8 - 1));
                 if (val < min || val > max) {
-                    throw new LuaException("bad argument to 'string.pack' (integer overflow)");
+                    throw LuaValue.argError(argNum, "string.pack", "integer overflow");
                 }
             } else {
                 if (val < 0 || (val >>> (size * 8)) != 0) {
-                    throw new LuaException("bad argument to 'string.pack' (unsigned overflow)");
+                    throw LuaValue.argError(argNum, "string.pack", "unsigned overflow");
                 }
             }
         }
@@ -308,7 +317,7 @@ public final class StringPacker {
             int pad = getpadding(out.size(), opt.align);
             long cap = org.luava.runtime.LuaState.allocationLimit();
             if ((long) out.size() + pad + (opt.size > 0 ? opt.size : 0) > cap) {
-                throw new LuaException("bad argument to 'string.pack' (format result too large)");
+                throw LuaValue.argError(1, "string.pack", "format result too large");
             }
             for (int p = 0; p < pad; p++) out.write(0);
 
@@ -319,20 +328,20 @@ public final class StringPacker {
             switch (opt.code) {
                 case 'b', 'B' -> {
                     long val = packArg(args, argIdx++, "number").toLong();
-                    packInt(out, val, order, 1, opt.isSigned);
+                    packInt(out, val, order, 1, opt.isSigned, argIdx);
                 }
                 case 'x' -> out.write(0);
                 case 'h', 'H' -> {
                     long val = packArg(args, argIdx++, "number").toLong();
-                    packInt(out, val, order, 2, opt.isSigned);
+                    packInt(out, val, order, 2, opt.isSigned, argIdx);
                 }
                 case 'l', 'L', 'j', 'J', 'T' -> {
                     long val = packArg(args, argIdx++, "number").toLong();
-                    packInt(out, val, order, 8, opt.isSigned);
+                    packInt(out, val, order, 8, opt.isSigned, argIdx);
                 }
                 case 'i', 'I' -> {
                     long val = packArg(args, argIdx++, "number").toLong();
-                    packInt(out, val, order, opt.size, opt.isSigned);
+                    packInt(out, val, order, opt.size, opt.isSigned, argIdx);
                 }
                 case 'f' -> {
                     float f = (float) packArg(args, argIdx++, "number").toDouble();
@@ -348,7 +357,7 @@ public final class StringPacker {
                     String str = packArg(args, argIdx++, "string").toLuaString();
                     byte[] bytes = str.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
                     if (bytes.length > opt.size) {
-                        throw new LuaException("bad argument to 'string.pack' (string longer than given size)");
+                        throw LuaValue.argError(argIdx, "string.pack", "string longer than given size");
                     }
                     out.writeBytes(bytes);
                     for (int k = bytes.length; k < opt.size; k++) {
@@ -359,7 +368,7 @@ public final class StringPacker {
                     String str = packArg(args, argIdx++, "string").toLuaString();
                     byte[] bytes = str.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
                     if (opt.size < 8 && bytes.length >= (1L << (opt.size * 8))) {
-                        throw new LuaException("bad argument to 'string.pack' (string length does not fit in given size)");
+                        throw LuaValue.argError(argIdx, "string.pack", "string length does not fit in given size");
                     }
                     packInt(out, bytes.length, order, opt.size, false);
                     out.writeBytes(bytes);
@@ -367,7 +376,7 @@ public final class StringPacker {
                 case 'z' -> {
                     String str = packArg(args, argIdx++, "string").toLuaString();
                     if (str.indexOf('\0') >= 0) {
-                        throw new LuaException("bad argument to 'string.pack' (string contains zeros)");
+                        throw LuaValue.argError(argIdx, "string.pack", "string contains zeros");
                     }
                     out.writeBytes(str.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
                     out.write(0);
@@ -378,9 +387,14 @@ public final class StringPacker {
         return out.toByteArray();
     }
 
+    /** PUC luaL_argcheck(..., 2, "data string too short") from string.unpack. */
+    private static LuaException tooShort() {
+        return LuaValue.argError(2, "string.unpack", "data string too short");
+    }
+
     private static long unpackInt(byte[] data, int pos, ByteOrder order, int size, boolean isSigned) {
         if (pos + size > data.length) {
-            throw new LuaException("data string too short");
+            throw tooShort();
         }
         int limit = Math.min(size, 8);
         long res = 0;
@@ -423,7 +437,7 @@ public final class StringPacker {
             startPos1Based = 1;
         }
         if (startPos1Based > data.length + 1) {
-            throw new LuaException("bad argument #3 to 'string.unpack' (initial position out of string)");
+            throw LuaValue.argError(3, "string.unpack", "initial position out of string");
         }
         ByteOrder order = ByteOrder.nativeOrder();
         int maxalign = 1;
@@ -442,7 +456,7 @@ public final class StringPacker {
 
             int pad = getpadding(pos, opt.align);
             if ((long) pos + pad + (opt.size > 0 ? opt.size : 0) > Integer.MAX_VALUE) {
-                throw new LuaException("bad argument to 'string.unpack' (format result too large)");
+                throw LuaValue.argError(1, "string.unpack", "format result too large");
             }
             pos += pad;
 
@@ -457,7 +471,7 @@ public final class StringPacker {
                     pos += 1;
                 }
                 case 'x' -> {
-                    if (pos + 1 > data.length) throw new LuaException("data string too short");
+                    if (pos + 1 > data.length) throw tooShort();
                     pos += 1;
                 }
                 case 'h', 'H' -> {
@@ -476,19 +490,19 @@ public final class StringPacker {
                     pos += opt.size;
                 }
                 case 'f' -> {
-                    if (pos + 4 > data.length) throw new LuaException("data string too short");
+                    if (pos + 4 > data.length) throw tooShort();
                     ByteBuffer bb = ByteBuffer.wrap(data, pos, 4).order(order);
                     values.add(LuaFloat.valueOf(bb.getFloat()));
                     pos += 4;
                 }
                 case 'd', 'n' -> {
-                    if (pos + 8 > data.length) throw new LuaException("data string too short");
+                    if (pos + 8 > data.length) throw tooShort();
                     ByteBuffer bb = ByteBuffer.wrap(data, pos, 8).order(order);
                     values.add(LuaFloat.valueOf(bb.getDouble()));
                     pos += 8;
                 }
                 case 'c' -> {
-                    if (pos + opt.size > data.length) throw new LuaException("data string too short");
+                    if (pos + opt.size > data.length) throw tooShort();
                     String s = new String(data, pos, opt.size, java.nio.charset.StandardCharsets.ISO_8859_1);
                     values.add(LuaString.valueOf(s));
                     pos += opt.size;
@@ -497,7 +511,7 @@ public final class StringPacker {
                     long strLen = unpackInt(data, pos, order, opt.size, false);
                     pos += opt.size;
                     if (strLen < 0 || pos + strLen > data.length) {
-                        throw new LuaException("data string too short");
+                        throw tooShort();
                     }
                     String s = new String(data, pos, (int) strLen, java.nio.charset.StandardCharsets.ISO_8859_1);
                     values.add(LuaString.valueOf(s));
@@ -507,7 +521,7 @@ public final class StringPacker {
                     int end = pos;
                     while (end < data.length && data[end] != 0) end++;
                     if (end >= data.length) {
-                        throw new LuaException("unfinished string for format 'z'");
+                        throw LuaValue.argError(2, "string.unpack", "unfinished string for format 'z'");
                     }
                     String s = new String(data, pos, end - pos, java.nio.charset.StandardCharsets.ISO_8859_1);
                     values.add(LuaString.valueOf(s));

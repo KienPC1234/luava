@@ -259,7 +259,7 @@ public final class Parser {
     private final Map<String, org.luava.runtime.LuaString> stringConstants = new HashMap<>();
 
     private Expressions.StringLiteral makeStringLiteral(String value, int line, int column) {
-        org.luava.runtime.LuaString ls = stringConstants.computeIfAbsent(value, org.luava.runtime.LuaString::newString);
+        org.luava.runtime.LuaString ls = stringConstants.computeIfAbsent(value, org.luava.runtime.LuaString::interned);
         return new Expressions.StringLiteral(value, line, column, ls);
     }
 

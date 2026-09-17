@@ -215,6 +215,22 @@ public final class BytecodeCompiler {
         }
 
         /**
+         * Moves the free-register watermark, growing {@code maxstacksize} to
+         * cover it. Direct {@code freereg = ...} writes used to skip that
+         * bookkeeping, so a function could use registers beyond its reported
+         * {@code maxStackSize} (e.g. a call whose args live at funcReg+1..N
+         * after {@code allocReg} only reserved up to funcReg+1). The frame is
+         * then too small for the JIT capacity guard, which let generated code
+         * index past the shared stack array.
+         */
+        void setFreereg(int r) {
+            if (r > maxstacksize) {
+                maxstacksize = r;
+            }
+            freereg = r;
+        }
+
+        /**
          * Clear dead slots once at loop entry ([freereg, maxstacksize)).
          * At statement boundaries no live temps exist above freereg and live
          * vars are below it, so clearing is safe. This releases stranded heap
@@ -729,7 +745,7 @@ public final class BytecodeCompiler {
                 }
                 // Assign to global via _ENV
                 LocalVar envLocal = findLocal("_ENV");
-                int kKey = addConst(LuaString.valueOf(ve.name()));
+                int kKey = addConst(LuaString.interned(ve.name()));
                 if (envLocal != null) {
                     if (kKey <= 255) {
                         emit(Instruction.encodeABC(OpCode.OP_SETFIELD, envLocal.reg, kKey, valReg, 0), line);
@@ -1279,6 +1295,12 @@ public final class BytecodeCompiler {
         }
 
         void compileExprToReg(Expression expr, int targetReg, String inferredName, int lineOverride) {
+            // Fold pure constant subexpressions (`3+4` -> `7`, `'a'..'b'` ->
+            // `'ab'`) once, before opcode selection. The folder only rewrites
+            // nodes whose operands are literals, so side effects and control
+            // flow are untouched; folding at this single choke point covers
+            // every expression context.
+            expr = org.luava.midend.optimizer.ConstantFolder.fold(expr);
             int effectiveLine = lineOverride > 0 ? lineOverride : (expr != null ? expr.line() : 1);
             if (expr instanceof Expressions.NilLiteral nl) {
                 emit(Instruction.encodeABC(OpCode.OP_LOADNIL, targetReg, 0, 0), effectiveLine);
@@ -1311,7 +1333,7 @@ public final class BytecodeCompiler {
                     return;
                 }
                 LocalVar envLocal = findLocal("_ENV");
-                int kKey = addConst(LuaString.valueOf(ve.name()));
+                int kKey = addConst(LuaString.interned(ve.name()));
                 if (envLocal != null) {
                     if (kKey <= 255) {
                         emit(Instruction.encodeABC(OpCode.OP_GETFIELD, targetReg, envLocal.reg, kKey, 0), effectiveLine);
@@ -1434,11 +1456,11 @@ public final class BytecodeCompiler {
 
         void compileFunctionCall(Expressions.FunctionCallExpr fce, int funcReg, int nResults, boolean isTailCall) {
             int saveFreereg = freereg;
-            freereg = funcReg + 1;
+            setFreereg(funcReg + 1);
 
             if (fce.methodName() != null) {
                 int tblReg = compileExprToAnyReg(fce.target());
-                int kMethod = addConst(LuaString.valueOf(fce.methodName()));
+                int kMethod = addConst(LuaString.interned(fce.methodName()));
                 // In Lua 5.4 (lcode.c: exp2RK), if constant index exceeds 8-bit argC (255),
                 // load the method name into a register and emit OP_SELF with k=0.
                 if (kMethod <= Instruction.MASK_C) {
@@ -1466,13 +1488,13 @@ public final class BytecodeCompiler {
 
                 for (int i = 0; i < nArgs - 1; i++) {
                     int argReg = argStart + i;
-                    freereg = argReg + 1;
+                    setFreereg(argReg + 1);
                     compileExprToReg(fce.arguments().get(i), argReg);
                 }
 
                 if (lastIsCall || lastIsVararg) {
                     int lastArgReg = argStart + (nArgs - 1);
-                    freereg = lastArgReg + 1;
+                    setFreereg(lastArgReg + 1);
                     if (lastIsCall) {
                         compileFunctionCall((Expressions.FunctionCallExpr) lastArg, lastArgReg, -1);
                     } else {
@@ -1481,14 +1503,14 @@ public final class BytecodeCompiler {
                     emit(Instruction.encodeABC(callOp, funcReg, 0, isTailCall ? 0 : nResults + 1), fce.line());
                 } else {
                     int lastArgReg = argStart + (nArgs - 1);
-                    freereg = lastArgReg + 1;
+                    setFreereg(lastArgReg + 1);
                     compileExprToReg(lastArg, lastArgReg);
                     int actualArgs = fce.methodName() != null ? nArgs + 1 : nArgs;
                     emit(Instruction.encodeABC(callOp, funcReg, actualArgs + 1, isTailCall ? 0 : nResults + 1), fce.line());
                 }
             }
             int targetFreereg = Math.max(saveFreereg, funcReg + (nResults == -1 ? 1 : nResults));
-            freereg = Math.max(targetFreereg, minFreereg());
+            setFreereg(Math.max(targetFreereg, minFreereg()));
         }
 
         void compileBinaryExpr(Expressions.BinaryExpr be, int targetReg) {
@@ -1568,7 +1590,7 @@ public final class BytecodeCompiler {
             if (be.operator() == TokenType.DOT_DOT) {
                 int save = freereg;
                 compileExprToReg(be.left(), targetReg, null, be.line());
-                freereg = targetReg + 2;
+                setFreereg(targetReg + 2);
                 compileExprToReg(be.right(), targetReg + 1);
                 emit(Instruction.encodeABC(OpCode.OP_CONCAT, targetReg, 2, 0), be.line());
                 freeRegs(save);
@@ -1581,7 +1603,7 @@ public final class BytecodeCompiler {
                 // Evaluate left operand directly into targetReg when targetReg is an unreserved temporary slot.
                 compileExprToReg(be.left(), targetReg, null, be.line());
                 b = targetReg;
-                freereg = Math.max(freereg, targetReg + 1);
+                setFreereg(Math.max(freereg, targetReg + 1));
             } else {
                 b = compileExprToAnyReg(be.left(), be.line());
             }
@@ -1714,7 +1736,7 @@ public final class BytecodeCompiler {
                         pendingList.clear();
 
                         int nextReg = targetReg + 1;
-                        freereg = nextReg;
+                        setFreereg(nextReg);
                         if (tf.value() instanceof Expressions.FunctionCallExpr fce) {
                             compileFunctionCall(fce, nextReg, -1);
                         } else {
@@ -1743,13 +1765,13 @@ public final class BytecodeCompiler {
             if (list.isEmpty()) return;
             int n = list.size();
             int baseReg = targetReg + 1;
-            freereg = baseReg;
+            setFreereg(baseReg);
             for (int i = 0; i < n; i++) {
                 int r = allocReg();
                 compileExprToReg(list.get(i).value(), r);
             }
             emitSetList(targetReg, n, arrayIdx, line);
-            freereg = baseReg;
+            setFreereg(baseReg);
         }
 
         void emitSetList(int targetReg, int tostore, int nelems, int line) {

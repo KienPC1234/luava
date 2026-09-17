@@ -83,17 +83,17 @@ public final class OsLib {
     public static void open(LuaTable globals) {
         LuaTable os = new LuaTable();
         fillInto(os, globals);
-        globals.rawset(LuaString.valueOf("os"), os);
+        globals.rawset(LuaString.interned("os"), os);
     }
 
     public static void fillInto(LuaTable os, LuaTable globals) {
 
-        os.rawset(LuaString.valueOf("clock"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("clock"), LuaFunction.of(args -> {
             double secs = (System.nanoTime() - START_NANO) / 1_000_000_000.0;
             return LuaFloat.valueOf(secs);
         }));
 
-        os.rawset(LuaString.valueOf("time"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("time"), LuaFunction.of(args -> {
             if (args.length == 0 || args[0].isNil()) {
                 return LuaInteger.valueOf(System.currentTimeMillis() / 1000L);
             }
@@ -111,27 +111,27 @@ public final class OsLib {
 
             long[] r = OsTime.mktime(ZoneId.systemDefault(), year + 1900L, month,
                     day, hour, min, sec, isdst);
-            t.rawset(LuaString.valueOf("year"), LuaInteger.valueOf(r[1]));
-            t.rawset(LuaString.valueOf("month"), LuaInteger.valueOf(r[2] + 1));
-            t.rawset(LuaString.valueOf("day"), LuaInteger.valueOf(r[3]));
-            t.rawset(LuaString.valueOf("hour"), LuaInteger.valueOf(r[4]));
-            t.rawset(LuaString.valueOf("min"), LuaInteger.valueOf(r[5]));
-            t.rawset(LuaString.valueOf("sec"), LuaInteger.valueOf(r[6]));
+            t.rawset(LuaString.interned("year"), LuaInteger.valueOf(r[1]));
+            t.rawset(LuaString.interned("month"), LuaInteger.valueOf(r[2] + 1));
+            t.rawset(LuaString.interned("day"), LuaInteger.valueOf(r[3]));
+            t.rawset(LuaString.interned("hour"), LuaInteger.valueOf(r[4]));
+            t.rawset(LuaString.interned("min"), LuaInteger.valueOf(r[5]));
+            t.rawset(LuaString.interned("sec"), LuaInteger.valueOf(r[6]));
             long rdays = OsTime.daysFromCivil(r[1], r[2] + 1, r[3]);
-            t.rawset(LuaString.valueOf("yday"), LuaInteger.valueOf(OsTime.dayOfYear(r[1], r[2] + 1, r[3])));
-            t.rawset(LuaString.valueOf("wday"), LuaInteger.valueOf(OsTime.dayOfWeek(rdays) % 7 + 1));
-            t.rawset(LuaString.valueOf("isdst"), LuaBoolean.valueOf(r[7] > 0));
+            t.rawset(LuaString.interned("yday"), LuaInteger.valueOf(OsTime.dayOfYear(r[1], r[2] + 1, r[3])));
+            t.rawset(LuaString.interned("wday"), LuaInteger.valueOf(OsTime.dayOfWeek(rdays) % 7 + 1));
+            t.rawset(LuaString.interned("isdst"), LuaBoolean.valueOf(r[7] > 0));
             return LuaInteger.valueOf(r[0]);
         }));
 
-        os.rawset(LuaString.valueOf("difftime"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("difftime"), LuaFunction.of(args -> {
             if (args.length < 2) throw new LuaException("bad argument to 'os.difftime'");
             double t1 = args[0].toDouble();
             double t2 = args[1].toDouble();
             return LuaFloat.valueOf(t1 - t2);
         }));
 
-        os.rawset(LuaString.valueOf("date"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("date"), LuaFunction.of(args -> {
             String fmt = "%c";
             if (args.length > 0 && !args[0].isNil()) {
                 if (!args[0].isString()) {
@@ -173,15 +173,15 @@ public final class OsLib {
 
             if (fmt.startsWith("*t", sIdx) && fmt.length() == sIdx + 2) {
                 LuaTable t = new LuaTable();
-                t.rawset(LuaString.valueOf("year"), LuaInteger.valueOf(dispYear));
-                t.rawset(LuaString.valueOf("month"), LuaInteger.valueOf(f[1]));
-                t.rawset(LuaString.valueOf("day"), LuaInteger.valueOf(f[2]));
-                t.rawset(LuaString.valueOf("hour"), LuaInteger.valueOf(f[3]));
-                t.rawset(LuaString.valueOf("min"), LuaInteger.valueOf(f[4]));
-                t.rawset(LuaString.valueOf("sec"), LuaInteger.valueOf(f[5]));
-                t.rawset(LuaString.valueOf("wday"), LuaInteger.valueOf(OsTime.dayOfWeek(f[6]) % 7 + 1));
-                t.rawset(LuaString.valueOf("yday"), LuaInteger.valueOf(OsTime.dayOfYear(f[0], f[1], f[2])));
-                t.rawset(LuaString.valueOf("isdst"), LuaBoolean.valueOf(dst));
+                t.rawset(LuaString.interned("year"), LuaInteger.valueOf(dispYear));
+                t.rawset(LuaString.interned("month"), LuaInteger.valueOf(f[1]));
+                t.rawset(LuaString.interned("day"), LuaInteger.valueOf(f[2]));
+                t.rawset(LuaString.interned("hour"), LuaInteger.valueOf(f[3]));
+                t.rawset(LuaString.interned("min"), LuaInteger.valueOf(f[4]));
+                t.rawset(LuaString.interned("sec"), LuaInteger.valueOf(f[5]));
+                t.rawset(LuaString.interned("wday"), LuaInteger.valueOf(OsTime.dayOfWeek(f[6]) % 7 + 1));
+                t.rawset(LuaString.interned("yday"), LuaInteger.valueOf(OsTime.dayOfYear(f[0], f[1], f[2])));
+                t.rawset(LuaString.interned("isdst"), LuaBoolean.valueOf(dst));
                 return t;
             }
 
@@ -221,13 +221,13 @@ public final class OsLib {
             return LuaString.valueOf(b.toString());
         }));
 
-        os.rawset(LuaString.valueOf("getenv"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("getenv"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isString()) return LuaNil.NIL;
             String val = System.getenv(args[0].toLuaString());
             return (val != null) ? LuaString.valueOf(val) : LuaNil.NIL;
         }));
 
-        os.rawset(LuaString.valueOf("execute"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("execute"), LuaFunction.of(args -> {
             if (args.length == 0 || args[0].isNil()) {
                 return LuaBoolean.TRUE;
             }
@@ -238,14 +238,14 @@ public final class OsLib {
                     return OsTime.finishShell(run);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    return Varargs.of(LuaNil.NIL, LuaString.valueOf("interrupted"));
+                    return Varargs.of(LuaNil.NIL, LuaString.interned("interrupted"));
                 }
             } catch (Exception e) {
                 return Varargs.of(LuaNil.NIL, LuaString.valueOf(e.getMessage()));
             }
         }));
 
-        os.rawset(LuaString.valueOf("exit"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("exit"), LuaFunction.of(args -> {
             int code;
             LuaValue first = (args.length > 0) ? args[0] : LuaNil.NIL;
             if (first.isBoolean()) {
@@ -264,7 +264,7 @@ public final class OsLib {
             throw new org.luava.runtime.LuaExit(code);
         }));
 
-        os.rawset(LuaString.valueOf("remove"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("remove"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isString()) {
                 throw new LuaException("bad argument #1 to 'os.remove' (string expected)");
             }
@@ -278,7 +278,7 @@ public final class OsLib {
             }
         }));
 
-        os.rawset(LuaString.valueOf("rename"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("rename"), LuaFunction.of(args -> {
             if (args.length < 2) throw new LuaException("bad argument to 'os.rename'");
             String oldName = args[0].toLuaString();
             String newName = args[1].toLuaString();
@@ -292,7 +292,7 @@ public final class OsLib {
             }
         }));
 
-        os.rawset(LuaString.valueOf("tmpname"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("tmpname"), LuaFunction.of(args -> {
             try {
                 Path p = Files.createTempFile("lua_", "");
                 return LuaString.valueOf(p.toAbsolutePath().toString());
@@ -301,7 +301,7 @@ public final class OsLib {
             }
         }));
 
-        os.rawset(LuaString.valueOf("setlocale"), LuaFunction.of(args -> {
+        os.rawset(LuaString.interned("setlocale"), LuaFunction.of(args -> {
             String loc = (args.length > 0 && !args[0].isNil()) ? args[0].toLuaString() : null;
             String catStr = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "all";
             boolean knownCat = false;
@@ -315,7 +315,7 @@ public final class OsLib {
                 throw new LuaException("bad argument #2 to 'os.setlocale' (invalid option '" + catStr + "')");
             }
             if (loc == null || "C".equals(loc) || "".equals(loc) || "POSIX".equalsIgnoreCase(loc)) {
-                return LuaString.valueOf("C");
+                return LuaString.interned("C");
             }
             return LuaNil.NIL;
         }));

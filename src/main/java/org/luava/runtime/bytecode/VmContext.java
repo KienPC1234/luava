@@ -89,4 +89,21 @@ public final class VmContext {
     public final int[] ncReg = new int[NAME_CACHE_SIZE];
     public final String[][] ncInfo = new String[NAME_CACHE_SIZE][];
     public final boolean[] ncFilled = new boolean[NAME_CACHE_SIZE];
+
+    /**
+     * Direct-mapped site cache for {@code OP_GETTABUP} with string keys
+     * (the global-variable read shape). The guard is the table's
+     * {@code readVersion()} (-1 whenever a metatable could affect reads),
+     * which every table mutation bumps, so any store through any path
+     * ({@code SETTABUP}, {@code rawset(_G)}, host {@code setLive}, ...)
+     * invalidates the entry. Keyed by (proto, pc) plus table/key identity,
+     * so swapped upvalues or re-pointed {@code ctx} entries safely miss.
+     */
+    public static final int GLOBAL_CACHE_SIZE = 64;
+    public final LuaProto[] gcProto = new LuaProto[GLOBAL_CACHE_SIZE];
+    public final int[] gcPc = new int[GLOBAL_CACHE_SIZE];
+    public final org.luava.runtime.LuaTable[] gcTable = new org.luava.runtime.LuaTable[GLOBAL_CACHE_SIZE];
+    public final LuaValue[] gcKey = new LuaValue[GLOBAL_CACHE_SIZE];
+    public final long[] gcVersion = new long[GLOBAL_CACHE_SIZE];
+    public final LuaValue[] gcValue = new LuaValue[GLOBAL_CACHE_SIZE];
 }
