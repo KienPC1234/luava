@@ -70,6 +70,28 @@ public final class LuaState {
     private LuaValue savedDofile;
 
     /**
+     * Bounded cache of compiled {@code LuaProto} trees keyed by
+     * {@code chunkName + '\0' + source}. A server that evaluates the same
+     * script on every request otherwise rebuilds a fresh proto each time, so
+     * its hot functions can never reach the JIT tier-up threshold (the
+     * documented "eval again per request never tiers up" limitation).
+     * Reusing the proto tree lets hotness accumulate across evaluations.
+     *
+     * <p>Per-state (no cross-tenant sharing) and LRU-bounded so script data
+     * cannot grow it without limit. Protos are immutable after compilation
+     * except for JIT state, which is exactly what must persist.
+     */
+    private final Map<String, org.luava.runtime.bytecode.LuaProto> protoCache =
+            new java.util.LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, org.luava.runtime.bytecode.LuaProto> eldest) {
+                    return size() > PROTO_CACHE_MAX;
+                }
+            };
+
+    private static final int PROTO_CACHE_MAX = 256;
+
+    /**
      * Cooperative VM guard, checked once per instruction while non-null.
      * Set via {@link #instructionLimit(long)} / {@link #timeout(Duration)}
      * to stop runaway scripts ({@code while true do end}) from hanging the
@@ -676,23 +698,37 @@ public final class LuaState {
             return fn;
         }
 
-        try {
-            boolean isFile = chunkName != null && chunkName.startsWith("@");
-            Lexer lexer = new Lexer(luaSource, isFile);
-            List<Token> tokens = lexer.scanTokens();
-            Parser parser = new Parser(tokens);
-            Statements.BlockStmt block = parser.parse();
-
-            if (USE_BYTECODE_VM) {
-                org.luava.runtime.bytecode.LuaProto proto = org.luava.runtime.bytecode.BytecodeCompiler.compile(block, chunkName);
-                org.luava.runtime.eval.Upvalue envUpval = new org.luava.runtime.eval.Upvalue("_ENV", chunkEnvVal);
-                return new org.luava.runtime.bytecode.LuaClosure(proto, new org.luava.runtime.eval.Upvalue[]{envUpval}, chunkGlobals, this);
-            }
-
+        if (!USE_BYTECODE_VM) {
             throw new LuaException("AST interpreter retired; bytecode VM is the only execution path");
-        } catch (org.luava.frontend.parser.ParseException pe) {
-            throw new LuaException(pe.format(chunkName != null ? chunkName : luaSource));
         }
+        // Reuse the compiled proto tree for a repeated chunk. The proto is
+        // immutable after compilation (only JIT tier-up state mutates), and
+        // each call still gets a fresh closure with its own _ENV upvalue, so
+        // sharing is semantically transparent. This is what lets a server
+        // that eval's the same script per request accumulate JIT hotness
+        // instead of rebuilding a cold proto every time.
+        String key = (chunkName != null ? chunkName : "chunk") + '\0' + luaSource;
+        org.luava.runtime.bytecode.LuaProto proto;
+        synchronized (protoCache) {
+            proto = protoCache.get(key);
+        }
+        if (proto == null) {
+            try {
+                boolean isFile = chunkName != null && chunkName.startsWith("@");
+                Lexer lexer = new Lexer(luaSource, isFile);
+                List<Token> tokens = lexer.scanTokens();
+                Parser parser = new Parser(tokens);
+                Statements.BlockStmt block = parser.parse();
+                proto = org.luava.runtime.bytecode.BytecodeCompiler.compile(block, chunkName);
+            } catch (org.luava.frontend.parser.ParseException pe) {
+                throw new LuaException(pe.format(chunkName != null ? chunkName : luaSource));
+            }
+            synchronized (protoCache) {
+                protoCache.put(key, proto);
+            }
+        }
+        org.luava.runtime.eval.Upvalue envUpval = new org.luava.runtime.eval.Upvalue("_ENV", chunkEnvVal);
+        return new org.luava.runtime.bytecode.LuaClosure(proto, new org.luava.runtime.eval.Upvalue[]{envUpval}, chunkGlobals, this);
     }
 
     // AST interpreter retired: the register-based bytecode VM is the only

@@ -1,7 +1,7 @@
 # Luava Roadmap — Đột phá bằng JIT lai (Hybrid Tiered JIT)
 
 > **Mục tiêu tối thượng:** đánh bại hoặc hòa LuaJ 3.0.1 trên **cả 10 benchmark**,
-> trong khi giữ **30/30 suite PUC Lua 5.4.9 + 150 unit tests xanh** và không
+> trong khi giữ **30/30 suite PUC Lua 5.4.9 + 156 unit tests xanh** và không
 > bao giờ sửa `tests/lua-5.4.9-tests/`.
 >
 > **Tài liệu này thay thế** `DIFFICULTIES.md`, `OPTIMIZATION_PLAN.md`,
@@ -38,7 +38,7 @@
 ### 1.1 Kỷ luật test (từ `AGENTS.md`)
 - **Cấm** sửa/tamper/xóa/bỏ qua bất kỳ dòng nào trong `tests/lua-5.4.9-tests/`.
 - **Cấm** hardcode kết quả giả, mock return, hay branch "để qua test".
-- Tiến độ đo bằng **số suite pass tự nhiên** (30/30) + 150 unit tests.
+- Tiến độ đo bằng **số suite pass tự nhiên** (30/30) + 156 unit tests.
 - Mọi lỗi phải truy gốc theo tầng (Lexer/Parser/AST/Bytecode/VM/Stdlib) và
   sửa tại tầng đó. Không vá ngọn.
 - Mỗi lần chạy suite phải có `timeout`; cấm `nohup` (làm `files.lua:762` fail giả).
@@ -187,7 +187,7 @@ Mỗi phase có: **việc**, **file**, **cổng (gates)**, **rủi ro/rollback**
 Cổng chuẩn dùng chung:
 - **G-SIZE:** method sinh ra / `runLoop` không vượt ngưỡng đã định; in ra log.
 - **G-COMPILE:** `-XX:+PrintCompilation` xác nhận code JIT + interpreter được C2.
-- **G-CORRECT:** 30/30 suite + 150 unit tests xanh; fuzz đối chiếu stock Lua.
+- **G-CORRECT:** 30/30 suite + 156 unit tests xanh; fuzz đối chiếu stock Lua.
 - **G-PERF:** interleave ≥7 cặp pinned, bar 3%, không regression task khác.
 
 ---
@@ -269,7 +269,7 @@ tổng quát cho tập opcode số học.
 `runtime/bytecode/LuaProto.java` (`jitCode`, `hotCount`, `mayYield`).
 
 **Gates (kết quả 2026-09-15):**
-- G-CORRECT: ✅ 30/30 suite + 150 unit tests xanh **cả hai chế độ**
+- G-CORRECT: ✅ 30/30 suite + 156 unit tests xanh **cả hai chế độ**
   (JIT-off mặc định; JIT-on qua `_JAVA_OPTIONS=-Dluava.jit=true`, và ép
   `JIT_HOT_THRESHOLD=1` để 21 proto trong suite thực sự compile — 4 deopt
   fallback đúng). Fuzz 20 kernel biên (float/missing/string args, pcall,
@@ -526,6 +526,41 @@ nếu cần.
    - Còn lại: main chunk không tier-up (hotness đếm số lần **gọi hàm**),
      subset chưa gồm generic-for/closure/metatable-call; 3 task thua còn
      lại (oop/pattern ~1.06×, sieve ~0.99×) là throughput engine.
+7. Đợt JIT 2026-09-18 (30/30 + 152 test xanh; fuzz JIT on/off 15k case):
+   - **Proto cache theo state** (LRU 256, key chunkName+source): eval cùng
+     script lặp lại dùng chung proto → hotness tích lũy qua request, gỡ
+     đúng giới hạn "eval lại mỗi request không tier-up". Mỗi lần vẫn tạo
+     closure mới với `_ENV` riêng nên ngữ nghĩa không đổi.
+   - **Fix `OP_TAILCALL` không bao giờ tier-up**: hotness chỉ đếm ở
+     `executeCallOp` (OP_CALL), nên hàm nóng gọi kiểu `return f(...)`
+     không bao giờ compile — dạng phổ biến của hàm entry. Nay đếm và chạy
+     kernel JIT ở cả tail call, có snapshot tham số để deopt an toàn.
+   - **Fix bug đúng/sai lane float**: kết quả float lưu bằng `D2L` (cắt
+     thành số nguyên) thay vì raw IEEE-754 bits → trả về denormal rác
+     (`4.94e-320` thay vì `50005000.0`). Sửa bằng `doubleToRawLongBits`.
+     Test regression cũ vô hiệu vì constant-folding gấp biểu thức literal;
+     đã viết lại dùng tham số + vòng lặp để thực sự chạy phép toán.
+   - Hiệu quả JIT on/off: fib 20.6×, closures 2.4×, oop 1.21× (trước chỉ
+     fib/closures).
+8. Đợt JIT 2026-09-19 (30/30 + 156 test xanh; fuzz sqrt 4.5k + tổng hợp 3.2k
+   case JIT on/off đồng nhất):
+   - **Intrinsic `math.sqrt` trong JIT**: `return math.sqrt(x)` và
+     `local r = math.sqrt(x)` compile thẳng thành `Math.sqrt`, guard bằng
+     so sánh identity với singleton `MathLib.SQRT` (gán lại `math.sqrt` hoặc
+     shadow `math` → deopt về interpreter, ngữ nghĩa y hệt). Trước đây call
+     builtin nằm ngoài subset nên cả proto bị loại — `Vec:length()` (gọi
+     `math.sqrt`) phải chạy interpreter dù thân hàm hoàn toàn trong subset,
+     đo được **2× chậm hơn** bản compile. Tail form box `LuaFloat` ở object
+     mode; call form giữ nguyên lane float raw-bit để feed số học tiếp.
+   - Đo lại task oop: **thắng LuaJ 1.12×** (trước thua 1.02×); JIT on/off
+     trên oop **1.30×** (trước 1.21×). Không đụng `BytecodeVM`/`LuaTable` —
+     thay đổi gọn trong `LuaToJvmTranslator` + test.
+   - Differential: 4500 case sqrt (gán lại/shadow/NaN/-0.0/int/1e300/bad
+     arg) và 2400 case tổng hợp JIT on/off đều khớp interpreter.
+   - Bảng mới vs LuaJ (7 cặp, warm=4, iters=8): **6 thắng** (fib 10.4×,
+     coroutines 18.5×, hash 1.55×, arith 1.45×, closures 1.25×, oop 1.12×),
+     **2 sát nút** (table 1.06×, concat 1.00×), **2 thua nhẹ** (pattern
+     1.08×, sieve 1.03×) — hai task này là throughput engine/main-chunk loop.
 6. Stress JIT-on: `LuavaStressTest` 6/6 (deep recursion, tailcall 100k,
    coroutine churn, table/string/error pressure); suite ép threshold=1:
    45 proto compile, deopt đúng.
@@ -539,9 +574,9 @@ nếu cần.
 
 **Quyết định mặc định:** `ENABLE_JIT` **true từ 2026-09-15** (mọi gate
 xanh, escape hatch `-Dluava.jit=false` giữ lại). Lưu ý kiến trúc: hotness
-tính theo proto-object, nên server eval-lại-script-mỗi-request (proto
-mới mỗi lần) không bao giờ tier-up — compile một lần rồi gọi nhiều lần
-(+ `prewarm`) mới hưởng JIT; script ngắn vẫn chạy interpreter nhanh.
+tính theo proto-object; từ 2026-09-18 state có **proto cache** nên
+eval-lại-cùng-script dùng chung proto và hotness tích lũy được. Script
+ngắn vẫn chạy interpreter nhanh.
 
 **Gates:** G-CORRECT + G-PERF tổng thể. Nếu một task vẫn > 1.03× sau JIT →
 phân tích async-profiler trên code JIT, lặp micro-opt có đo.

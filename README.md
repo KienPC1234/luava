@@ -123,7 +123,7 @@ and `heavy.lua` are excluded by design.
 
 - **30/30** runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass on
   Luava (`OfficialSuiteEvaluationTest`, asserts failures so the build goes
-  red on any regression; 150 unit tests green alongside, including a
+  red on any regression; 156 unit tests green alongside, including a
   byte-for-byte differential conformance suite against stock PUC Lua 5.4).
 - Test files are checksum-identical to the upstream tarball; the harness
   never edits them.
@@ -184,8 +184,13 @@ execution timeouts never touch JIT code paths.
 Coverage and configuration:
 
 - **Hotness is per proto and counts calls**, so a kernel must be *called*
-  ≥50 times to tier up. A loop in the main chunk is never JIT-compiled;
-  wrap hot code in a function (or use `prewarm`) to benefit.
+  ≥50 times to tier up, whether via `OP_CALL` or `OP_TAILCALL` (`return
+  f(...)`). A loop in the main chunk is never JIT-compiled; wrap hot code in
+  a function (or use `prewarm`) to benefit.
+- **Repeated evaluation reuses bytecode**: `LuaState` keeps a bounded LRU of
+  compiled proto trees keyed by chunk name + source, so a server that
+  `eval`s the same script per request shares one proto and its JIT hotness
+  accumulates across requests (each call still gets a fresh closure/_ENV).
 - **Numeric `for` loops are JIT-compiled** (`FORPREP`/`FORLOOP`); the
   integer lane is unboxed and a float loop falls to the float lane.
   `while`/`repeat` stay interpreted.
@@ -199,6 +204,13 @@ Coverage and configuration:
   `rawget` (independent of any metatable), so `self.x` on an OOP instance
   compiles instead of deopting; a nil raw hit (the `__index` case) deopts
   to the interpreter.
+- **`math.sqrt` is an intrinsic**: `return math.sqrt(x)` and
+  `local r = math.sqrt(x)` compile inline to `Math.sqrt` behind an identity
+  guard on the shared `MathLib.SQRT` singleton (reassigning `math.sqrt` or
+  shadowing `math` deopts to the interpreter, preserving exact semantics).
+  A float-returning method such as `Vec:length()` therefore now JIT-compiles
+  even though it calls a builtin; before, the builtin call fell outside the
+  subset and the whole method stayed interpreted.
 - **Guards disable JIT**: while `instructionLimit`/`timeout` (a
   `LoopGuard`) or a debug hook is active, calls run on the interpreter —
   correct, but without JIT speedup. This is the safe default for untrusted
@@ -215,20 +227,28 @@ Coverage and configuration:
 - **Compiled classes are bounded** by an LRU cache (512); eviction simply
   returns that proto to the interpreter, so Metaspace cannot leak.
 
-10-task benchmark vs LuaJ 3.0.1 (paired, order-flipped, median of
-13-25 pairs, warm=8, iters=15, `-Dluava.jit.sync=true`, re-run 2026-09-17):
-**5 wins** (arith 1.2-1.5×, fib **9.6×**, coroutines 17-19×, hash 1.5×,
-table 1.0-1.07×, closures 1.0×), **2 near-tie** (concat 1.00×, sieve 0.99×),
-**2 small losses** (oop 1.06×, pattern 1.06×). 30/30 PUC suites + 150 unit
+10-task benchmark vs LuaJ 3.0.1 (paired, order-flipped, median, warm=4,
+iters=8, `-Dluava.jit.sync=true`, re-run 2026-09-19):
+**6 wins** (fib **10.4×**, coroutines 18.5×, hash 1.55×, arith 1.45×,
+closures 1.25×, oop **1.12×**), **2 near-ties** (table 1.06×, concat 1.00×),
+**2 small losses** (pattern 1.08×, sieve 1.03×). 30/30 PUC suites + 156 unit
 tests stay green with JIT both off and on.
 
-JIT effectiveness (same 10 tasks, JIT on vs off) after the 2026-09-17 JIT
-work: it now speeds up **8/10** tasks (fib 19.9×, closures 1.74×,
-concat 1.51×, arith 1.26×, oop 1.11×, hash ~1.1×, table/sieve/coroutines
-~1.0×) instead of only fib. Two engine bugs were fixed to get there: the
-`GETFIELD` guard required a metatable-free table (so every OOP `self.x`
-deopted), and the JIT had no float lane (so any mixed int/float hot
-function deopted on every call).
+JIT effectiveness (same tasks, JIT on vs off) now covers **5/10** tasks:
+fib 19.2×, closures 2.3×, oop 1.30×, arith 1.29×, sieve 1.02×, with
+table/coroutines/concat/pattern within noise. This pass added the
+`math.sqrt` intrinsic: a float-returning method such as `Vec:length()`
+calls a builtin, and builtin calls used to force the whole proto out of the
+JIT subset, so it stayed interpreted (measured 2× slower than its
+compiled equivalent). The intrinsic is guarded by an identity check on
+`MathLib.SQRT`, so reassigning or shadowing still deopts to the
+interpreter. Earlier passes fixed the `GETFIELD` guard (metatable-free
+requirement made every OOP `self.x` deopt), the missing float lane, and
+`OP_TAILCALL` hotness counting. The float lane also stored its result with
+a truncating `D2L` instead of raw IEEE-754 bits (a correctness bug pinned
+by a regression test). The remaining gap is interpreter-loop cost in the
+main chunk (the dispatch loop is C2-compiled, but there is no OSR into a
+compiled Lua kernel for a script's top-level loop).
 
 The 2026-09-16 optimization pass closed most of the interpreter-era gaps
 without weakening semantics: lazy short-string interning (canonical keys
