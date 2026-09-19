@@ -284,10 +284,12 @@ public class JitCoverageTest {
     @Test
     void prewarmAcceptsLuaFunctionOverload() {
         LuaState state = new LuaState();
-        LuaFunction fn = (LuaFunction) state.eval("local function h(x) return x + 1 end return h");
-        int before = org.luava.runtime.jit.JitCompiler.cacheSize();
-        org.luava.runtime.jit.JitCompiler.prewarm(fn);
-        assertTrue(org.luava.runtime.jit.JitCompiler.cacheSize() > before,
+        LuaClosure fn = (LuaClosure) state.eval("local function h(x) return x + 1 end return h");
+        // Assert on this proto's compiled state, not the shared LRU size:
+        // the cache is process-wide and bounded (512), so once it is full a
+        // successful compile no longer grows it.
+        org.luava.runtime.jit.JitCompiler.prewarm((LuaFunction) fn);
+        assertTrue(fn.proto.jitCode != null,
                 "prewarm(LuaFunction) should compile an eligible closure");
     }
 
@@ -295,9 +297,8 @@ public class JitCoverageTest {
     void prewarmRespectsStateJitOff() {
         LuaState off = new LuaState().jitEnabled(false);
         LuaClosure cl = (LuaClosure) off.eval("local function k(x) return x + 1 end return k");
-        int before = org.luava.runtime.jit.JitCompiler.cacheSize();
         org.luava.runtime.jit.JitCompiler.prewarm(cl, off);
-        assertEquals(before, org.luava.runtime.jit.JitCompiler.cacheSize(),
+        assertEquals(null, cl.proto.jitCode,
                 "prewarm must be a no-op when the state has JIT disabled");
     }
 

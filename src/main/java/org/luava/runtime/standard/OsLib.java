@@ -126,15 +126,25 @@ public final class OsLib {
 
         os.rawset(LuaString.interned("difftime"), LuaFunction.of(args -> {
             if (args.length < 2) throw new LuaException("bad argument to 'os.difftime'");
-            double t1 = args[0].toDouble();
-            double t2 = args[1].toDouble();
-            return LuaFloat.valueOf(t1 - t2);
+            // l_checktime -> luaL_checkinteger: both operands coerce numeric
+            // strings and blame their argument index on failure.
+            LuaInteger i1 = args[0].toLuaIntegerCoercingStrings();
+            if (i1 == null) {
+                throw new LuaException("bad argument #1 to 'difftime' (" + args[0].integerConversionError() + ")");
+            }
+            LuaInteger i2 = args[1].toLuaIntegerCoercingStrings();
+            if (i2 == null) {
+                throw new LuaException("bad argument #2 to 'difftime' (" + args[1].integerConversionError() + ")");
+            }
+            return LuaFloat.valueOf((double) (i1.toLong() - i2.toLong()));
         }));
 
         os.rawset(LuaString.interned("date"), LuaFunction.of(args -> {
             String fmt = "%c";
             if (args.length > 0 && !args[0].isNil()) {
-                if (!args[0].isString()) {
+                // luaL_optlstring: a number is coerced to its Lua string form,
+                // so os.date(123) formats the string "123".
+                if (!args[0].isString() && !args[0].isNumber()) {
                     throw new LuaException("bad argument #1 to 'os.date' (string expected, got " + args[0].typeName() + ")");
                 }
                 fmt = args[0].toLuaString();
@@ -142,10 +152,13 @@ public final class OsLib {
 
             long epochSec;
             if (args.length > 1 && !args[1].isNil()) {
-                if (!args[1].isInteger() && !args[1].isFloat()) {
-                    throw new LuaException("bad argument #2 to 'os.date' (number expected, got " + args[1].typeName() + ")");
+                // l_checktime -> luaL_checkinteger: coerces a numeric string
+                // and blames argument #2 with the integer-representation text.
+                org.luava.runtime.LuaInteger i = args[1].toLuaIntegerCoercingStrings();
+                if (i == null) {
+                    throw new LuaException("bad argument #2 to 'date' (" + args[1].integerConversionError() + ")");
                 }
-                epochSec = args[1].toLong();
+                epochSec = i.toLong();
             } else {
                 epochSec = System.currentTimeMillis() / 1000L;
             }

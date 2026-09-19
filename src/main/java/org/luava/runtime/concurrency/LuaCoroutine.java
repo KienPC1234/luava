@@ -255,8 +255,18 @@ public final class LuaCoroutine extends LuaValue {
         hookConfig.hookLine = hookConfig.mask.contains("l");
         hookConfig.countSoFar = 0;
         hookConfig.lastLine = -1;
-        hooksActive = !hookConfig.hook.isNil()
+        boolean active = !hookConfig.hook.isNil()
                 && (hookConfig.hookCall || hookConfig.hookReturn || hookConfig.hookLine || hookConfig.count > 0);
+        // lua_sethook (lstate.c): "if (func == NULL || mask == 0) turn off
+        // hooks". A function with a mask that selects no event (e.g. "3") and
+        // no count is therefore equivalent to clearing the hook, and
+        // debug.gethook() must report nil afterwards.
+        if (!active) {
+            hookConfig.hook = LuaNil.NIL;
+            hookConfig.mask = "";
+            hookConfig.count = 0;
+        }
+        hooksActive = active;
 
         CallStack.CallStackState state = getCallStackState();
         if (state != null && state.top > 1) {

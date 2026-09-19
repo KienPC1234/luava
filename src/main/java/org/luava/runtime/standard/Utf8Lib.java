@@ -31,6 +31,34 @@ public final class Utf8Lib {
         return (b & 0xC0) == 0x80;
     }
 
+    /**
+     * {@code luaL_checklstring} coercion: a number is accepted and converted
+     * to its Lua string form, exactly as PUC's utf8 library does for its
+     * string arguments. Returns null when the value is neither a string nor
+     * a number.
+     */
+    private static LuaString checkString(LuaValue v, int arg, String func) {
+        if (v.isString() || v.isNumber()) {
+            return v.isString() ? (LuaString) v : LuaString.valueOf(v.toLuaString());
+        }
+        throw new LuaException("bad argument #" + arg + " to 'utf8." + func
+                + "' (string expected, got " + (v.isNil() ? "no value" : v.typeName()) + ")");
+    }
+
+    /**
+     * {@code luaL_checkinteger} for utf8 positions: coerces a numeric string
+     * (lua_tointegerx) and reports the argument index and PUC function name.
+     */
+    private static long checkInteger(LuaValue[] args, int idx, String func) {
+        if (idx >= args.length || args[idx].isNil()) {
+            throw LuaValue.argError(idx + 1, func, "number expected, got " + (idx >= args.length ? "no value" : "nil"));
+        }
+        LuaValue v = args[idx];
+        LuaInteger i = v.toLuaIntegerCoercingStrings();
+        if (i != null) return i.toLong();
+        throw LuaValue.argError(idx + 1, func, v.integerConversionError());
+    }
+
     private static int utf8Decode(byte[] bytes, int pos, int max, long[] val, boolean strict) {
         if (pos >= max) return -1;
         int c = bytes[pos] & 0xFF;
@@ -109,11 +137,11 @@ public final class Utf8Lib {
         }));
 
         utf8.rawset(LuaString.interned("len"), LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'utf8.len' (string expected)");
-            byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+            if (args.length == 0) throw new LuaException("bad argument #1 to 'utf8.len' (string expected, got no value)");
+            byte[] bytes = checkString(args[0], 1, "len").toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
-            long posi = posRelat((args.length > 1 && !args[1].isNil()) ? args[1].toLong() : 1, len);
-            long posj = posRelat((args.length > 2 && !args[2].isNil()) ? args[2].toLong() : -1, len);
+            long posi = posRelat((args.length > 1 && !args[1].isNil()) ? checkInteger(args, 1, "len") : 1, len);
+            long posj = posRelat((args.length > 2 && !args[2].isNil()) ? checkInteger(args, 2, "len") : -1, len);
             boolean lax = args.length > 3 && args[3].toBoolean();
             if (1 > posi || posi > len + 1) {
                 throw new LuaException("bad argument #2 to 'utf8.len' (initial position out of bounds)");
@@ -136,11 +164,11 @@ public final class Utf8Lib {
         }));
 
         utf8.rawset(LuaString.interned("codepoint"), LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'utf8.codepoint' (string expected)");
-            byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+            if (args.length == 0) throw new LuaException("bad argument #1 to 'utf8.codepoint' (string expected, got no value)");
+            byte[] bytes = checkString(args[0], 1, "codepoint").toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
-            long posi = posRelat((args.length > 1 && !args[1].isNil()) ? args[1].toLong() : 1, len);
-            long pose = posRelat((args.length > 2 && !args[2].isNil()) ? args[2].toLong() : posi, len);
+            long posi = posRelat((args.length > 1 && !args[1].isNil()) ? checkInteger(args, 1, "codepoint") : 1, len);
+            long pose = posRelat((args.length > 2 && !args[2].isNil()) ? checkInteger(args, 2, "codepoint") : posi, len);
             boolean lax = args.length > 3 && args[3].toBoolean();
             if (posi < 1) throw new LuaException("bad argument #2 to 'utf8.codepoint' (out of bounds)");
             if (pose > len) throw new LuaException("bad argument #3 to 'utf8.codepoint' (out of bounds)");
@@ -164,10 +192,10 @@ public final class Utf8Lib {
             if (args.length < 2) throw new LuaException("bad argument to 'utf8.offset'");
             byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
-            long n = args[1].toLong();
+            long n = checkInteger(args, 1, "offset");
             long posi = (n >= 0) ? 1 : len + 1;
             if (args.length > 2 && !args[2].isNil()) {
-                posi = posRelat(args[2].toLong(), len);
+                posi = posRelat(checkInteger(args, 2, "offset"), len);
             }
             if (posi < 1 || posi > len + 1) {
                 throw new LuaException("bad argument #3 to 'utf8.offset' (position out of bounds)");
@@ -208,8 +236,8 @@ public final class Utf8Lib {
         }));
 
         LuaFunction iterAuxStrict = LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'utf8.codes' iterator (string expected)");
-            byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+            if (args.length == 0) throw new LuaException("bad argument #1 to 'utf8.codes' iterator (string expected, got no value)");
+            byte[] bytes = checkString(args[0], 1, "codes").toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
             long n = args.length > 1 ? args[1].toLong() : 0;
             int pos = (int) n;
@@ -227,8 +255,8 @@ public final class Utf8Lib {
         });
 
         LuaFunction iterAuxLax = LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'utf8.codes' iterator (string expected)");
-            byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+            if (args.length == 0) throw new LuaException("bad argument #1 to 'utf8.codes' iterator (string expected, got no value)");
+            byte[] bytes = checkString(args[0], 1, "codes").toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
             long n = args.length > 1 ? args[1].toLong() : 0;
             int pos = (int) n;
@@ -246,13 +274,14 @@ public final class Utf8Lib {
         });
 
         utf8.rawset(LuaString.interned("codes"), LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isString()) throw new LuaException("bad argument #1 to 'utf8.codes' (string expected)");
+            if (args.length == 0) throw new LuaException("bad argument #1 to 'utf8.codes' (string expected, got no value)");
             boolean lax = args.length > 1 && args[1].toBoolean();
-            byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+            LuaString str = checkString(args[0], 1, "codes");
+            byte[] bytes = str.toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             if (bytes.length > 0 && isCont(bytes[0])) {
                 throw new LuaException("invalid UTF-8 code");
             }
-            return Varargs.of(lax ? iterAuxLax : iterAuxStrict, args[0], LuaInteger.valueOf(0));
+            return Varargs.of(lax ? iterAuxLax : iterAuxStrict, str, LuaInteger.valueOf(0));
         }));
     }
 }

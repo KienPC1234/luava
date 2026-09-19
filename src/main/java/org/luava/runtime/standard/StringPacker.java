@@ -289,14 +289,45 @@ public final class StringPacker {
         out.writeBytes(buf);
     }
 
-    // C luaL_checkinteger/checknumber/checklstring: a missing value is a Lua
-    // argument error, never a Java ArrayIndexOutOfBoundsException.
-    private static LuaValue packArg(LuaValue[] args, int argIdx, String what) {
-        if (argIdx >= args.length) {
-            throw new LuaException("bad argument #" + (argIdx + 1)
-                    + " to 'string.pack' (" + what + " expected, got nil)");
+    /**
+     * {@code luaL_checkinteger} for string.pack/unpack: a non-integer number
+     * is reported as {@code bad argument #N ... (number has no integer
+     * representation)}, and a non-number as {@code (number expected)}. The
+     * bare {@link LuaFloat#toLong()} message lacks the argument context.
+     */
+    private static long checkInteger(LuaValue[] args, int argIdx, String func) {
+        LuaValue v = (argIdx < args.length) ? args[argIdx] : org.luava.runtime.LuaNil.NIL;
+        org.luava.runtime.LuaInteger i = v.toLuaIntegerCoercingStrings();
+        if (i != null) return i.toLong();
+        throw new LuaException("bad argument #" + (argIdx + 1)
+                + " to '" + func + "' (" + v.integerConversionError() + ")");
+    }
+
+    /** {@code luaL_checknumber}: rejects non-numbers with the PUC message. */
+    private static double checkNumber(LuaValue[] args, int argIdx, String func) {
+        LuaValue v = (argIdx < args.length) ? args[argIdx] : org.luava.runtime.LuaNil.NIL;
+        if (v.isNumber()) return v.toDouble();
+        if (v.isString()) {
+            LuaValue n = LuaValue.parseNumber(v.toLuaString());
+            if (n != null) return n.toDouble();
         }
-        return args[argIdx];
+        throw new LuaException("bad argument #" + (argIdx + 1)
+                + " to '" + func + "' (number expected, got "
+                + v.typeName() + ")");
+    }
+
+    /** Public {@code luaL_checkinteger} for string.unpack's optional position. */
+    public static long checkIntegerArg(LuaValue[] args, int argIdx, String func) {
+        return checkInteger(args, argIdx, func);
+    }
+
+    /** {@code luaL_checklstring}: a number coerces to its string form. */
+    private static String checkLString(LuaValue[] args, int argIdx, String func) {
+        LuaValue v = (argIdx < args.length) ? args[argIdx] : org.luava.runtime.LuaNil.NIL;
+        if (v.isString() || v.isNumber()) return v.toLuaString();
+        throw new LuaException("bad argument #" + (argIdx + 1)
+                + " to '" + func + "' (string expected, got "
+                + v.typeName() + ")");
     }
 
     public static byte[] pack(String fmt, LuaValue[] args, int argOffset) {
@@ -327,34 +358,34 @@ public final class StringPacker {
 
             switch (opt.code) {
                 case 'b', 'B' -> {
-                    long val = packArg(args, argIdx++, "number").toLong();
+                    long val = checkInteger(args, argIdx++, "string.pack");
                     packInt(out, val, order, 1, opt.isSigned, argIdx);
                 }
                 case 'x' -> out.write(0);
                 case 'h', 'H' -> {
-                    long val = packArg(args, argIdx++, "number").toLong();
+                    long val = checkInteger(args, argIdx++, "string.pack");
                     packInt(out, val, order, 2, opt.isSigned, argIdx);
                 }
                 case 'l', 'L', 'j', 'J', 'T' -> {
-                    long val = packArg(args, argIdx++, "number").toLong();
+                    long val = checkInteger(args, argIdx++, "string.pack");
                     packInt(out, val, order, 8, opt.isSigned, argIdx);
                 }
                 case 'i', 'I' -> {
-                    long val = packArg(args, argIdx++, "number").toLong();
+                    long val = checkInteger(args, argIdx++, "string.pack");
                     packInt(out, val, order, opt.size, opt.isSigned, argIdx);
                 }
                 case 'f' -> {
-                    float f = (float) packArg(args, argIdx++, "number").toDouble();
+                    float f = (float) checkNumber(args, argIdx++, "string.pack");
                     ByteBuffer bb = ByteBuffer.allocate(4).order(order).putFloat(f);
                     out.writeBytes(bb.array());
                 }
                 case 'd', 'n' -> {
-                    double d = packArg(args, argIdx++, "number").toDouble();
+                    double d = checkNumber(args, argIdx++, "string.pack");
                     ByteBuffer bb = ByteBuffer.allocate(8).order(order).putDouble(d);
                     out.writeBytes(bb.array());
                 }
                 case 'c' -> {
-                    String str = packArg(args, argIdx++, "string").toLuaString();
+                    String str = checkLString(args, argIdx++, "string.pack");
                     byte[] bytes = str.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
                     if (bytes.length > opt.size) {
                         throw LuaValue.argError(argIdx, "string.pack", "string longer than given size");
@@ -365,7 +396,7 @@ public final class StringPacker {
                     }
                 }
                 case 's' -> {
-                    String str = packArg(args, argIdx++, "string").toLuaString();
+                    String str = checkLString(args, argIdx++, "string.pack");
                     byte[] bytes = str.getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
                     if (opt.size < 8 && bytes.length >= (1L << (opt.size * 8))) {
                         throw LuaValue.argError(argIdx, "string.pack", "string length does not fit in given size");
@@ -374,7 +405,7 @@ public final class StringPacker {
                     out.writeBytes(bytes);
                 }
                 case 'z' -> {
-                    String str = packArg(args, argIdx++, "string").toLuaString();
+                    String str = checkLString(args, argIdx++, "string.pack");
                     if (str.indexOf('\0') >= 0) {
                         throw LuaValue.argError(argIdx, "string.pack", "string contains zeros");
                     }

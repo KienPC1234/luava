@@ -123,7 +123,7 @@ and `heavy.lua` are excluded by design.
 
 - **30/30** runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass on
   Luava (`OfficialSuiteEvaluationTest`, asserts failures so the build goes
-  red on any regression; 156 unit tests green alongside, including a
+  red on any regression; 170 unit tests green alongside, including a
   byte-for-byte differential conformance suite against stock PUC Lua 5.4).
 - Test files are checksum-identical to the upstream tarball; the harness
   never edits them.
@@ -231,7 +231,7 @@ Coverage and configuration:
 iters=8, `-Dluava.jit.sync=true`, re-run 2026-09-19):
 **6 wins** (fib **10.4×**, coroutines 18.5×, hash 1.55×, arith 1.45×,
 closures 1.25×, oop **1.12×**), **2 near-ties** (table 1.06×, concat 1.00×),
-**2 small losses** (pattern 1.08×, sieve 1.03×). 30/30 PUC suites + 156 unit
+**2 small losses** (pattern 1.08×, sieve 1.03×). 30/30 PUC suites + 161 unit
 tests stay green with JIT both off and on.
 
 JIT effectiveness (same tasks, JIT on vs off) now covers **5/10** tasks:
@@ -272,6 +272,70 @@ compiler under-reported `maxStackSize` (letting JIT code index past the
 shared stack array on deep recursion, an intermittent
 `Index N out of bounds`), and `Varargs` could be initialized at the
 recursion limit and permanently poisoned by a `StackOverflowError`.
+
+A second differential-fuzzing pass against stock PUC Lua 5.4.9 fixed a
+further batch of conformance bugs:
+
+- **Table-constructor register layout**: list fields were emitted with
+  `allocReg()`, but compiling an element that allocates its own temporaries
+  (e.g. a global read `math.maxinteger` allocates a register for the table
+  before the `GETFIELD`) scattered the values across non-consecutive
+  registers, while `SETLIST` reads `R[a+1 .. a+n]`. So
+  `{math.maxinteger, math.maxinteger, math.maxinteger}` stored the `math`
+  table at index 2. Elements now land in explicit consecutive slots.
+- **Zero-value returns**: `print`, `table.sort`, `table.insert`,
+  `debug.sethook`, `debug.upvaluejoin`, `debug.getupvalue` (out of range)
+  returned one `nil`; PUC returns zero values, observable via
+  `select('#', ...)` and multi-value contexts.
+- **C tail calls**: PUC does *not* reuse the caller's frame for a tail call
+  to a C function (`luaD_pretailcall` only reuses it for Lua callees), so
+  `debug.getlocal`/`getinfo`/return hooks must still see the Lua caller.
+  Luava replaced the frame, corrupting frame levels and return-hook counts.
+- **`debug.sethook` validation**: mask is checked first (a number coerces,
+  missing/nil is an error), then the hook must be a function, then the
+  optional count; a function with an empty mask turns hooks off, so
+  `debug.gethook()` reports `nil` afterwards.
+- **`debug.getlocal`**: out-of-range indices returned extra values instead
+  of nothing, and tail-called Lua functions reported the wrong frame.
+- **Error messages**: `debug.upvaluejoin` now uses the PUC
+  `bad argument #N ... (invalid upvalue index)` form.
+
+A third differential pass (operator matrices, integer boundaries, a 57,600-case
+`string.format` matrix, pattern/metatable fuzzing, numeric-string coercion)
+fixed:
+
+- **Numeric-string coercion** (`lua_tointegerx`): `string.char/rep/sub/byte/
+  find/match/gsub/unpack`, `table.insert/remove/concat/unpack/move`,
+  `utf8.len/codepoint/offset`, `os.date/difftime`, `select`,
+  `debug.getinfo` and `string.pack` now accept numeric strings (`"120"`,
+  `"0x10"`, `" 9 "`) exactly like PUC. The VM's arithmetic and bitwise
+  operators deliberately keep the stricter `luaV_tointeger` that does *not*
+  coerce strings.
+- **`math.abs("120")` is a float** (PUC tests `lua_isinteger` on the raw
+  argument, so a string takes the float path).
+- **`string.format`**: `%#o` on zero prints `"0"`; and the numeric argument is
+  converted *before* the format is validated for `d/i/u/o/x/X/f/e/g/a` (but
+  after, for `c/s/p/q`), matching PUC's check order.
+- **C99 `pow`**: `pow(1, y) == 1` for any `y` including NaN/±inf, and
+  `pow(-1, ±inf) == 1`; Java's `Math.pow` returns NaN for these.
+- **Concat error blame**: C `luaG_concaterror` blames the *second* operand
+  when the first is concatenable, unlike arithmetic's `luaG_opinterror`.
+- **`string.pack`/`unpack` argument errors**: correct argument index, and a
+  missing packed value reads as `nil` (PUC pushes a nil marker), not
+  "no value".
+- **`io`**: `io.read` blames the format argument at the right index
+  (`#1` for `io.read`, `#2` for `file:read`); `io.input/output/lines` include
+  the OS reason in "cannot open file" errors.
+- **`utf8`/`os.date`**: numeric arguments are coerced to strings like PUC's
+  `luaL_checklstring`.
+- **`package`**: `package.searchpath` builds its "no file" error exactly like
+  PUC's `pusherrornotfound` (no leading separator, every path segment listed),
+  and `require` prefixes each searcher's message with `\n\t` the way PUC's
+  `findloader` does.
+
+Only the function-name qualification inside error text (`bad argument #N to
+'floor'` vs `'math.floor'`) is still engine-context-dependent; PUC resolves it
+from the live call frame, which the Java implementation does not track.
 
 ## Layout
 

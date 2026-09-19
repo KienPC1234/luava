@@ -104,7 +104,9 @@ public final class BaseLib {
             }
             System.out.write('\n');
             System.out.flush();
-            return LuaNil.NIL;
+            // PUC's print returns zero values, not one nil (observable via
+            // select('#', print()) and multi-value contexts).
+            return Varargs.EMPTY;
         }));
 
         globals.rawset(LuaString.interned("type"), LuaFunction.of(args -> {
@@ -380,7 +382,13 @@ public final class BaseLib {
             if (selector.isString() && "#".equals(selector.toLuaString())) {
                 return LuaInteger.valueOf(args.length - 1);
             }
-            long idx = selector.toLong();
+            // luaL_checkinteger: coerces a numeric string, and blames
+            // argument #1 with the integer-representation text otherwise.
+            LuaInteger selInt = selector.toLuaIntegerCoercingStrings();
+            if (selInt == null) {
+                throw new LuaException("bad argument #1 to 'select' (" + selector.integerConversionError() + ")");
+            }
+            long idx = selInt.toLong();
             // PUC luaB_select: clamp then require 1 <= i, reporting
             // "bad argument #1 to 'select' (index out of range)".
             int n = args.length;

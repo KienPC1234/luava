@@ -365,4 +365,251 @@ public class BytecodeVMTest {
         """);
         assertEquals(150, res.toLong()); // 10 + 20 + 30 + 40 + 50 = 150
     }
+
+    @Test
+    void tableConstructorListValuesStayContiguous() {
+        // Regression: list fields were compiled with allocReg(), but an
+        // element that allocates its own temporaries (e.g. a global read like
+        // `math.maxinteger` allocates a register for the table before the
+        // GETFIELD) scattered the values across non-consecutive registers,
+        // while SETLIST reads R[target+1 .. target+n]. That made
+        // `{math.maxinteger, math.maxinteger, math.maxinteger}` store the
+        // math table at index 2. Every element must land in its own slot.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local t = {math.maxinteger, math.maxinteger, math.maxinteger}
+            return t[1] == math.maxinteger and t[2] == math.maxinteger
+               and t[3] == math.maxinteger and #t == 3
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void tableConstructorMixesFieldsAndListValues() {
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local g = {x = 7}
+            local t = {g.x, 1 + 1, ("abc"):len(), g.x, 9}
+            return t[1] == 7 and t[2] == 2 and t[3] == 3 and t[4] == 7 and t[5] == 9 and #t == 5
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void builtinsReturnZeroValuesLikePuc() {
+        // PUC's print/table.sort/table.insert/debug.sethook/debug.getupvalue
+        // return zero values, observable via select('#', ...).
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local a = select('#', print())
+            local b = select('#', table.sort({3, 1, 2}))
+            local c = select('#', table.insert({}, 1))
+            local d = select('#', debug.sethook())
+            local e = select('#', debug.getupvalue(print, 99))
+            local t = {print()}
+            return a + b + c + d + e + #t
+        """);
+        assertEquals(0, res.toLong());
+    }
+
+    @Test
+    void cTailCallKeepsCallerFrameVisible() {
+        // PUC does not tail-call C functions: the Lua caller's frame survives
+        // the C call, so a C builtin tail-called from f() still sees f() at
+        // debug level 1. Regression: Luava used to replace the frame, making
+        // debug.getlocal/getinfo report the wrong function.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local function f()
+                local marker = 7
+                return debug.getlocal(1, 1)
+            end
+            local name, value = f()
+            local function g() local x = 11 return debug.getinfo(1, "f").func end
+            return name == "marker" and value == 7 and g() == g
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void cTailCallReturnHookStillFires() {
+        // PUC emits return hooks for the C tail call, the enclosing Lua frame,
+        // and the chunk frame (three returns for `local r = g()`).
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local function g() return tostring(5) end
+            local log = {}
+            debug.sethook(function(ev) log[#log+1] = ev end, "r")
+            local r = g()
+            debug.sethook()
+            local count = 0
+            for _ = 1, #log do count = count + 1 end
+            return r == "5" and count == 3
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void utf8AndOsDateCoerceNumbersLikePuc() {
+        // PUC uses luaL_checklstring / luaL_optlstring, so a number is accepted
+        // where a string is expected: utf8.len(123) == 3, os.date(123) formats
+        // the string "123". Regression: these used to raise a type error.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local a = utf8.len(123)
+            local b = utf8.codepoint(123)
+            local c = os.date(123, 0)
+            local ok = pcall(utf8.len, {})
+            return a == 3 and b == 49 and c == "123" and not ok
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void stringPackArgumentErrorsMatchPuc() {
+        // luaL_checkinteger blames the argument index and reports a
+        // non-integral number distinctly from a wrong type; a missing packed
+        // argument reads as nil (PUC pushes a nil marker), not "no value".
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local m1 = select(2, pcall(string.pack, "<i2", 3.5))
+            local m2 = select(2, pcall(string.pack, "<i4", "x"))
+            local m3 = select(2, pcall(string.pack, "<i4"))
+            return m1:find("bad argument #2", 1, true) ~= nil
+               and m1:find("number has no integer representation", 1, true) ~= nil
+               and m2:find("number expected, got string", 1, true) ~= nil
+               and m3:find("number expected, got nil", 1, true) ~= nil
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void ioReadBlamesFormatArgumentIndex() {
+        // PUC g_read: `io.read('x')` blames #1, while `f:read('x')` blames #2
+        // (self is #1). Regression: both reported a bare message.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local m1 = select(2, pcall(io.read, "x"))
+            local f = io.open("/tmp/luava_io_read_test.txt", "w")
+            f:write("line\\n")
+            f:close()
+            local g = io.open("/tmp/luava_io_read_test.txt", "r")
+            local m2 = select(2, pcall(g.read, g, "x"))
+            g:close()
+            os.remove("/tmp/luava_io_read_test.txt")
+            return m1:find("bad argument #1", 1, true) ~= nil
+               and m2:find("bad argument #2", 1, true) ~= nil
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void ioOpenFailureMessagesIncludeOsReason() {
+        // PUC's opencheck raises "cannot open file '<name>' (<strerror>)";
+        // io.input/io.lines must include the OS reason, not just the name.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local m = select(2, pcall(io.lines, "/nonexistent/luava_x"))
+            return m:find("cannot open file", 1, true) ~= nil
+               and m:find("No such file or directory", 1, true) ~= nil
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void stringFormatOctalAndCheckOrderMatchPuc() {
+        // %#o on zero prints "0" (C does not add a second zero). PUC also
+        // converts the numeric argument before validating the format, so a
+        // non-integral value blames the argument even for an invalid
+        // specifier such as %#d.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local a = string.format("%#o", 0)
+            local b = string.format("%#o", 8)
+            local m1 = select(2, pcall(string.format, "%#d", 3.5))
+            local m2 = select(2, pcall(string.format, "%#d", 5))
+            return a == "0" and b == "010"
+               and m1:find("number has no integer representation", 1, true) ~= nil
+               and m2:find("invalid conversion specification", 1, true) ~= nil
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void powerSpecialCasesFollowC99() {
+        // PUC uses libm pow, which follows C99 Annex F: pow(1, y) == 1 for any
+        // y (including NaN and infinities) and pow(-1, ±inf) == 1. Java's
+        // Math.pow returns NaN for these, so the runtime special-cases them.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local inf = math.huge
+            local nan = 0/0
+            return (1 ^ inf) == 1 and (1 ^ -inf) == 1 and (1 ^ nan) == 1
+               and ((-1) ^ inf) == 1 and ((-1) ^ -inf) == 1
+               and (1.0 ^ nan) == 1
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void concatBlamesSecondOperandLikePuc() {
+        // C luaG_concaterror blames the second operand when the first is
+        // concatenable; arithmetic uses a different rule (luaG_opinterror).
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local m1 = select(2, pcall(function() return "abc" .. {} end))
+            local m2 = select(2, pcall(function() return "abc" .. nil end))
+            local m3 = select(2, pcall(function() return {} .. "abc" end))
+            return m1:find("concatenate a table value", 1, true) ~= nil
+               and m2:find("concatenate a nil value", 1, true) ~= nil
+               and m3:find("concatenate a table value", 1, true) ~= nil
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void numericStringsCoerceForCheckIntegerLikePuc() {
+        // luaL_checkinteger (lua_tointegerx) coerces numeric strings, but the
+        // VM's arithmetic/bitwise operators do not. Regression: string.char
+        // and string.rep rejected numeric strings, and math.abs kept the
+        // integer subtype where PUC yields a float.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local a = string.char("120")
+            local b = string.rep("x", "3")
+            local c = math.abs("120")
+            local d = string.sub("abcd", "2", "3")
+            local e = string.format("%d", "0x10")
+            local f = table.concat({1, 2}, "-", "1", "2")
+            local g = select("2", "a", "b", "c")
+            local bits = pcall(function() return "3" & 1 end)
+            return a == "x" and b == "xxx" and math.type(c) == "float" and c == 120.0
+               and d == "bc" and e == "16" and f == "1-2" and g == "b"
+               and not bits
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void packageSearchpathAndRequireMessagesMatchPuc() {
+        // PUC pusherrornotfound joins path segments as "'\n\tno file '"
+        // starting with "no file" (no leading separator); findloader adds the
+        // "\n\t" prefix per searcher. Regression: Luava emitted a leading
+        // separator in searchpath and concatenated require searcher messages
+        // without separators.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local _, sp = package.searchpath("x", "./?.lua")
+            local oldPath, oldCpath = package.path, package.cpath
+            package.path = "?.lua;?/?"
+            package.cpath = "?.so;?/init"
+            local _, msg = pcall(require, "XXX_NOT_PRESENT")
+            package.path, package.cpath = oldPath, oldCpath
+            return sp == "no file './x.lua'" and msg ==
+                "module 'XXX_NOT_PRESENT' not found:\\n\\tno field package.preload['XXX_NOT_PRESENT']"
+                .. "\\n\\tno file 'XXX_NOT_PRESENT.lua'\\n\\tno file 'XXX_NOT_PRESENT/XXX_NOT_PRESENT'"
+                .. "\\n\\tno file 'XXX_NOT_PRESENT.so'\\n\\tno file 'XXX_NOT_PRESENT/init'"
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
 }

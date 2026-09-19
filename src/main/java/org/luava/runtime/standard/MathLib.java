@@ -248,11 +248,18 @@ public final class MathLib {
             throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number expected, got " + (args.length <= index ? "no value" : "nil") + ")");
         }
         LuaValue v = args[index];
+        if (v.isInteger() || v.isFloat()) {
+            return v;
+        }
+        // luaL_checknumber parses a numeric string into a lua_Number (float).
+        // PUC's math_abs/floor/ceil first test lua_isinteger on the raw
+        // argument, which is false for a string, so they take the float path
+        // (e.g. math.abs("120") == 120.0, a float).
         LuaValue num = v.toLuaNumber();
         if (num == null) {
             throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number expected, got " + v.typeName() + ")");
         }
-        return num;
+        return LuaFloat.valueOf(num.toDouble());
     }
 
     private static long checkInteger(LuaValue[] args, int index, String funcName) {

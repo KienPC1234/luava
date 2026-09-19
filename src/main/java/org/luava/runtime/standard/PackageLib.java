@@ -63,8 +63,13 @@ public final class PackageLib {
                 name = name.replace(sep, rep);
             }
 
-            StringBuilder tried = new StringBuilder();
-            for (String template : path.split(";")) {
+            // PUC replaces '?' in the whole path first, then builds the error
+            // from every path segment (including empty ones produced by ";;")
+            // via pusherrornotfound: separators become "'\n\tno file '".
+            // Search skips empty segments (getnextfilename) but the message
+            // still lists them.
+            String[] segments = path.split(";", -1);
+            for (String template : segments) {
                 if (template.isEmpty()) continue;
                 String candidate = template.replace("?", name);
                 try {
@@ -74,7 +79,11 @@ public final class PackageLib {
                     }
                 } catch (Exception ignored) {
                 }
-                tried.append("\n\tno file '").append(candidate).append("'");
+            }
+            StringBuilder tried = new StringBuilder();
+            for (int i = 0; i < segments.length; i++) {
+                if (i > 0) tried.append("\n\t");
+                tried.append("no file '").append(segments[i].replace("?", name)).append("'");
             }
             return Varargs.of(LuaNil.NIL, LuaString.valueOf(tried.toString()));
         });
@@ -90,7 +99,7 @@ public final class PackageLib {
             LuaTable preloadTable = (LuaTable) preloadVal;
             LuaValue loader = preloadTable.rawget(modName);
             if (loader.isNil()) {
-                return LuaString.valueOf("\n\tno field package.preload['" + modName.toLuaString() + "']");
+                return LuaString.valueOf("no field package.preload['" + modName.toLuaString() + "']");
             }
             return Varargs.of(loader, LuaString.interned(":preload:"));
         });
@@ -198,6 +207,10 @@ public final class PackageLib {
             LuaValue loaderData = LuaNil.NIL;
 
             for (long i = 1; ; i++) {
+                // PUC findloader prefixes every searcher's contribution with
+                // "\n\t"; a searcher that returns no error message drops the
+                // prefix again. The searchers themselves return bare messages
+                // ("no file '...'", "no field package.preload[...]").
                 LuaValue searcher = searchersTable.get(org.luava.runtime.LuaInteger.valueOf(i));
                 if (searcher.isNil()) {
                     break;
@@ -210,20 +223,19 @@ public final class PackageLib {
                         loaderData = v.arg(2);
                         break;
                     } else if (first.isString()) {
-                        msg.append(first.toLuaString());
+                        msg.append("\n\t").append(first.toLuaString());
                     }
                 } else if (res.isFunction() || res instanceof org.luava.runtime.LuaUserdata) {
                     loader = res;
                     break;
                 } else if (res.isString()) {
-                    msg.append(res.toLuaString());
+                    msg.append("\n\t").append(res.toLuaString());
                 }
             }
 
             if (loader.isNil()) {
                 throw new LuaException("module '" + nameStr + "' not found:" + msg.toString());
             }
-
             LuaValue result = loader.call(modName, loaderData);
             LuaValue toCache;
             if (!result.isNil()) {
