@@ -1,7 +1,7 @@
 # Luava Roadmap — Đột phá bằng JIT lai (Hybrid Tiered JIT)
 
 > **Mục tiêu tối thượng:** đánh bại hoặc hòa LuaJ 3.0.1 trên **cả 10 benchmark**,
-> trong khi giữ **30/30 suite PUC Lua 5.4.9 + 156 unit tests xanh** và không
+> trong khi giữ **30/30 suite PUC Lua 5.4.9 + 170 unit tests xanh** và không
 > bao giờ sửa `tests/lua-5.4.9-tests/`.
 >
 > **Tài liệu này thay thế** `DIFFICULTIES.md`, `OPTIMIZATION_PLAN.md`,
@@ -38,7 +38,7 @@
 ### 1.1 Kỷ luật test (từ `AGENTS.md`)
 - **Cấm** sửa/tamper/xóa/bỏ qua bất kỳ dòng nào trong `tests/lua-5.4.9-tests/`.
 - **Cấm** hardcode kết quả giả, mock return, hay branch "để qua test".
-- Tiến độ đo bằng **số suite pass tự nhiên** (30/30) + 156 unit tests.
+- Tiến độ đo bằng **số suite pass tự nhiên** (30/30) + 170 unit tests.
 - Mọi lỗi phải truy gốc theo tầng (Lexer/Parser/AST/Bytecode/VM/Stdlib) và
   sửa tại tầng đó. Không vá ngọn.
 - Mỗi lần chạy suite phải có `timeout`; cấm `nohup` (làm `files.lua:762` fail giả).
@@ -187,7 +187,7 @@ Mỗi phase có: **việc**, **file**, **cổng (gates)**, **rủi ro/rollback**
 Cổng chuẩn dùng chung:
 - **G-SIZE:** method sinh ra / `runLoop` không vượt ngưỡng đã định; in ra log.
 - **G-COMPILE:** `-XX:+PrintCompilation` xác nhận code JIT + interpreter được C2.
-- **G-CORRECT:** 30/30 suite + 156 unit tests xanh; fuzz đối chiếu stock Lua.
+- **G-CORRECT:** 30/30 suite + 170 unit tests xanh; fuzz đối chiếu stock Lua.
 - **G-PERF:** interleave ≥7 cặp pinned, bar 3%, không regression task khác.
 
 ---
@@ -269,7 +269,7 @@ tổng quát cho tập opcode số học.
 `runtime/bytecode/LuaProto.java` (`jitCode`, `hotCount`, `mayYield`).
 
 **Gates (kết quả 2026-09-15):**
-- G-CORRECT: ✅ 30/30 suite + 156 unit tests xanh **cả hai chế độ**
+- G-CORRECT: ✅ 30/30 suite + 170 unit tests xanh **cả hai chế độ**
   (JIT-off mặc định; JIT-on qua `_JAVA_OPTIONS=-Dluava.jit=true`, và ép
   `JIT_HOT_THRESHOLD=1` để 21 proto trong suite thực sự compile — 4 deopt
   fallback đúng). Fuzz 20 kernel biên (float/missing/string args, pcall,
@@ -542,7 +542,7 @@ nếu cần.
      đã viết lại dùng tham số + vòng lặp để thực sự chạy phép toán.
    - Hiệu quả JIT on/off: fib 20.6×, closures 2.4×, oop 1.21× (trước chỉ
      fib/closures).
-8. Đợt JIT 2026-09-19 (30/30 + 156 test xanh; fuzz sqrt 4.5k + tổng hợp 3.2k
+8. Đợt JIT 2026-09-19 (30/30 + 170 test xanh; fuzz sqrt 4.5k + tổng hợp 3.2k
    case JIT on/off đồng nhất):
    - **Intrinsic `math.sqrt` trong JIT**: `return math.sqrt(x)` và
      `local r = math.sqrt(x)` compile thẳng thành `Math.sqrt`, guard bằng
@@ -561,6 +561,66 @@ nếu cần.
      coroutines 18.5×, hash 1.55×, arith 1.45×, closures 1.25×, oop 1.12×),
      **2 sát nút** (table 1.06×, concat 1.00×), **2 thua nhẹ** (pattern
      1.08×, sieve 1.03×) — hai task này là throughput engine/main-chunk loop.
+9. Đợt audit conformance 2026-09-19 (30/30 + 170 test xanh; differential
+   PUC 5.4.9: ~7k case stdlib/table-ctor/JIT, JIT on/off đồng nhất):
+   - **Bug nghiêm trọng — table constructor sai register**: `flushListFields`
+     dùng `allocReg()` cho từng list field, nhưng element tự cấp temp (đọc
+     global `math.maxinteger` cấp register cho bảng trước `GETFIELD`) nên các
+     giá trị rải ra R1,R3,R5 trong khi `SETLIST` đọc R1,R2,R3 →
+     `{math.maxinteger, math.maxinteger, math.maxinteger}` lưu chính bảng
+     `math` vào index 2 (sai cả khi JIT off). Sửa: đặt element vào đúng slot
+     liền kề, reserve slot trên cho temp. Fuzzer table-ctor bắt được bug 3/3
+     seed khi revert fix → guard thật.
+   - **Zero-value return**: `print`/`table.sort`/`table.insert`/
+     `debug.sethook`/`debug.upvaluejoin`/`debug.getupvalue` (oob) trả 1 `nil`
+     thay vì 0 giá trị. PUC trả 0 giá trị (quan sát qua `select('#', ...)` và
+     ngữ cảnh multret).
+   - **C tail call**: PUC KHÔNG tái dùng frame caller khi tail-call hàm C
+     (`ldo.c luaD_pretailcall` chỉ trả -1 để "startfunc" với LUA_VLCL; C
+     closure/function đi qua `precallC` rồi `luaD_poscall`). Luava thay frame
+     caller → `debug.getlocal`/`getinfo`/return hook mất frame Lua. Sửa:
+     push frame C lên trên, giữ frame Lua, pop cả hai; return hook C tailcall
+     giờ khớp PUC (3 return cho `local r = g()`).
+   - **`debug.sethook` validation**: PUC check mask trước (number coerce,
+     nil/missing là lỗi), rồi hook phải là function, rồi count optional;
+     function với mask rỗng = tắt hook (gethook trả nil). Luava bỏ qua hết.
+   - **`debug.getlocal`**: index ngoài range trả thừa giá trị; hàm Lua tail
+     call báo sai frame.
+   - **Thông báo lỗi**: `debug.upvaluejoin` theo dạng PUC
+     `bad argument #N ... (invalid upvalue index)`.
+   - **Không sửa**: dấu NaN từ `%` khác glibc là không portable — chính suite
+     PUC dùng `isNaN`/`^%-?nan` chấp nhận cả hai.
+    - Gate: threshold=1 → 30/30 suite (big.lua excluded by design), fuzz
+      JIT on/off đồng nhất; `mvn test` 3 lần liên tiếp 170 test xanh.
+10. Đợt audit conformance 2026-09-19 (tiếp; 30/30 + 170 test xanh; differential
+    PUC 5.4.9: operator ma trận 4800 case, integer boundary, numeric-string
+    coercion, stdlib format 57.6k case, pattern/metatable):
+    - **`string.format`**: `%#o` với 0 in "0" (C không thêm số 0 thứ hai); thứ
+      tự kiểm tra đối số-trước-format (PUC `luaL_checkinteger` chạy trước
+      `checkformat` cho d/i/u/o/x/X/f/e/g/a, nhưng `checkformat` trước cho
+      c/s/p/q). Ma trận 57.6k case khớp tuyệt đối.
+    - **`pow` theo C99**: `pow(1, y) == 1` cho mọi y (kể cả NaN/±inf) và
+      `pow(-1, ±inf) == 1`; Java `Math.pow` trả NaN cho các ca này → thêm
+      `luaNumPow`.
+    - **Blame operand khi concat**: `luaG_concaterror` blame toán hạng thứ hai
+      khi toán hạng đầu ghép được (khác `luaG_opinterror` của số học).
+    - **Coercion chuỗi số (`lua_tointegerx`)**: `string.char/rep/sub/byte/find/
+      match/gsub/unpack`, `table.insert/remove/concat/unpack/move`,
+      `utf8.len/codepoint/offset`, `os.date/difftime`, `select`,
+      `debug.getinfo`, `string.pack` giờ nhận chuỗi số ("120", "0x10", " 9 ")
+      như PUC. Tách `toLuaIntegerCoercingStrings()` khỏi `toLuaInteger()`
+      (toán tử bitwise/số học vẫn KHÔNG coerce chuỗi, đúng PUC).
+    - **Subtype math**: `math.abs("120")` trả float (PUC test `lua_isinteger`
+      trên đối số thô, chuỗi → false → nhánh float).
+    - **`debug.sethook`**: mask kiểm tra trước (number coerce), rồi hook phải
+      function, rồi count; mask rỗng = tắt hook.
+    - **`package`**: `searchpath` dựng lỗi "no file" đúng `pusherrornotfound`
+      (không có separator mở đầu, liệt kê mọi segment kể cả rỗng); `require`
+      thêm tiền tố `\n\t` cho mỗi searcher như `findloader`.
+    - **Không sửa**: dấu zero của `x - 0` (PUC compile `x - <int const>` thành
+      `x + (-const)` qua ADDI → `-0.0 - 0` = +0.0) — dấu zero không được đặc
+      tả bởi manual và không suite nào test; fuzzer chuẩn hoá.
+    - Gate: threshold=1 → 30/30; fuzz JIT on/off đồng nhất; 170 test xanh.
 6. Stress JIT-on: `LuavaStressTest` 6/6 (deep recursion, tailcall 100k,
    coroutine churn, table/string/error pressure); suite ép threshold=1:
    45 proto compile, deopt đúng.

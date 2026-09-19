@@ -79,8 +79,16 @@ public final class DebugLib {
                 fnName = null;
                 namewhat = "";
                 currentLine = -1;
-            } else if (fnOrLevel.isInteger() || fnOrLevel.isNumber()) {
-                int level = (int) fnOrLevel.toLong();
+            } else {
+                // luaL_checkinteger: a numeric string is accepted as the
+                // level; anything not convertible to a number is a type
+                // error (PUC reports it through the argument-error form).
+                org.luava.runtime.LuaInteger lvl = fnOrLevel.toLuaIntegerCoercingStrings();
+                if (lvl == null) {
+                    throw new LuaException("bad argument #" + (argIdx + 1)
+                            + " to 'getinfo' (" + fnOrLevel.integerConversionError() + ")");
+                }
+                int level = (int) lvl.toLong();
                 if (level < 0) {
                     return LuaNil.NIL;
                 }
@@ -92,8 +100,6 @@ public final class DebugLib {
                 fnName = frame.name != null ? frame.name : (fn != null ? fn.getName() : null);
                 namewhat = frame.namewhat != null ? frame.namewhat : (fnName != null ? "global" : "");
                 currentLine = frame.line;
-            } else {
-                throw new LuaException("bad argument #1 to 'getinfo' (function or level expected)");
             }
 
             LuaTable info = new LuaTable();
@@ -289,7 +295,8 @@ public final class DebugLib {
                 if (fn.isStripped() || name == null) name = "(no name)";
                 return Varargs.of(LuaString.valueOf(name), up.getValue());
             }
-            return LuaNil.NIL;
+            // Out-of-range index: PUC returns zero values.
+            return org.luava.runtime.Varargs.EMPTY;
         }));
 
         debug.rawset(LuaString.interned("setupvalue"), LuaFunction.of(args -> {
@@ -306,7 +313,8 @@ public final class DebugLib {
                 if (fn.isStripped() || name == null) name = "(no name)";
                 return LuaString.valueOf(name);
             }
-            return LuaNil.NIL;
+            // Out-of-range index: PUC returns zero values.
+            return org.luava.runtime.Varargs.EMPTY;
         }));
 
         debug.rawset(LuaString.interned("upvalueid"), LuaFunction.of(args -> {
@@ -328,10 +336,10 @@ public final class DebugLib {
             int n1 = (int) args[1].toLong();
             int n2 = (int) args[3].toLong();
             if (n1 < 1 || n1 > f1.getUpvalues().size()) {
-                throw new LuaException("invalid upvalue index 1 to 'debug.upvaluejoin'");
+                throw new LuaException("bad argument #2 to 'upvaluejoin' (invalid upvalue index)");
             }
             if (n2 < 1 || n2 > f2.getUpvalues().size()) {
-                throw new LuaException("invalid upvalue index 2 to 'debug.upvaluejoin'");
+                throw new LuaException("bad argument #4 to 'upvaluejoin' (invalid upvalue index)");
             }
             // C lua_upvaluejoin: f1.upvals[n1] = f2.upvals[n2] (re-point, not merge).
             // Replace with an alias that keeps f1's upvalue name (AST resolves by
@@ -343,7 +351,8 @@ public final class DebugLib {
             // replaceUpvalue syncs both the list and VM's array (LuaClosure).
             f1.replaceUpvalue(n1 - 1,
                     org.luava.runtime.eval.Upvalue.joinedAlias(up1.getName(), up2));
-            return LuaNil.NIL;
+            // PUC's debug.upvaluejoin returns zero values.
+            return org.luava.runtime.Varargs.EMPTY;
         }));
 
         debug.rawset(LuaString.interned("getlocal"), LuaFunction.of(args -> {
@@ -678,23 +687,46 @@ public final class DebugLib {
             if (target == null) return LuaNil.NIL;
             LuaValue hkVal = registry.rawget(LuaString.interned("_HOOKKEY"));
             LuaTable hkT = (hkVal instanceof LuaTable t) ? t : null;
-            if (args.length <= argOffset || args[argOffset].isNil()) {
+            LuaValue hookArg = (args.length > argOffset) ? args[argOffset] : LuaNil.NIL;
+            if (hookArg.isNil()) {
+                // PUC (db_sethook): no hook => turn hooks off. Extra args are
+                // ignored entirely in this branch.
                 target.clearHook();
                 if (hkT != null) hkT.rawset(target, LuaNil.NIL);
-                return LuaNil.NIL;
+                // PUC's debug.sethook returns zero values.
+                return org.luava.runtime.Varargs.EMPTY;
             }
-            LuaValue hook = args[argOffset];
-            String mask = (args.length > argOffset + 1 && !args[argOffset + 1].isNil()) ? args[argOffset + 1].toLuaString() : "";
-            int count = (args.length > argOffset + 2 && !args[argOffset + 2].isNil()) ? (int) args[argOffset + 2].toLong() : 0;
-            target.setHook(hook, mask, count);
-            if (hkT != null) hkT.rawset(target, hook);
-            return LuaNil.NIL;
+            // PUC validates in this exact order: mask is checked first
+            // (string expected; numbers coerce, nil/missing is an error), then
+            // the hook must be a function, then the optional count.
+            LuaValue maskArg = (args.length > argOffset + 1) ? args[argOffset + 1] : LuaNil.NIL;
+            if (!maskArg.isString() && !maskArg.isNumber()) {
+                throw new LuaException("bad argument #" + (argOffset + 2)
+                        + " to 'sethook' (string expected, got "
+                        + (args.length <= argOffset + 1 ? "no value" : maskArg.typeName()) + ")");
+            }
+            if (!hookArg.isFunction()) {
+                throw new LuaException("bad argument #" + (argOffset + 1)
+                        + " to 'sethook' (function expected, got " + hookArg.typeName() + ")");
+            }
+            String mask = maskArg.toLuaString();
+            LuaValue countArg = (args.length > argOffset + 2) ? args[argOffset + 2] : LuaNil.NIL;
+            if (!countArg.isNil() && !countArg.isNumber()) {
+                throw new LuaException("bad argument #" + (argOffset + 3)
+                        + " to 'sethook' (number expected, got " + countArg.typeName() + ")");
+            }
+            int count = countArg.isNil() ? 0 : (int) countArg.toLong();
+            target.setHook(hookArg, mask, count);
+            if (hkT != null) hkT.rawset(target, hookArg);
+            // PUC's debug.sethook returns zero values.
+            return org.luava.runtime.Varargs.EMPTY;
         }));
 
         // debug.debug: an interactive prompt reading from stdin. An embedded
         // server has no terminal to drive, so this is a no-op that returns
-        // immediately (matching a non-interactive stdin).
-        debug.rawset(LuaString.interned("debug"), LuaFunction.of(args -> LuaNil.NIL));
+        // immediately (matching a non-interactive stdin). PUC returns zero
+        // values.
+        debug.rawset(LuaString.interned("debug"), LuaFunction.of(args -> org.luava.runtime.Varargs.EMPTY));
 
         // debug.setcstacklimit: Lua 5.4 lets the host cap C-stack recursion.
         // Java frames live on the heap, so the limit is accepted and ignored;

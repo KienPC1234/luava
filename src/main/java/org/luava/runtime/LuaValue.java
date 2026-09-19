@@ -406,9 +406,25 @@ public abstract class LuaValue {
 
     public LuaValue pow(LuaValue other) {
         if (this.isNumber() && other.isNumber()) {
-            return LuaFloat.valueOf(Math.pow(this.toDouble(), other.toDouble()));
+            return LuaFloat.valueOf(luaNumPow(this.toDouble(), other.toDouble()));
         }
         return dispatchBinaryMetamethod(this, other, "__pow", "perform arithmetic on");
+    }
+
+    /**
+     * C99 {@code pow} (Annex F), which PUC Lua uses via libm. Java's
+     * {@link Math#pow} follows a different convention for two cases: it
+     * returns NaN for {@code pow(1, y)} when y is NaN/±infinity, and for
+     * {@code pow(-1, ±infinity)}. C99 mandates 1.0 for all of these.
+     */
+    static double luaNumPow(double base, double exp) {
+        if (base == 1.0) {
+            return 1.0;
+        }
+        if (base == -1.0 && (exp == Double.POSITIVE_INFINITY || exp == Double.NEGATIVE_INFINITY)) {
+            return 1.0;
+        }
+        return Math.pow(base, exp);
     }
 
     public LuaValue unm() {
@@ -556,6 +572,39 @@ public abstract class LuaValue {
             }
         }
         return null;
+    }
+
+    /**
+     * {@code lua_tointegerx}: like {@link #toLuaInteger()} but also coerces a
+     * numeric string ("120", "0x10", " 3 "). This is the C-API conversion used
+     * by {@code luaL_checkinteger}; the VM's arithmetic and bitwise operators
+     * deliberately use the stricter {@code luaV_tointeger}, which does not
+     * coerce strings.
+     */
+    public LuaInteger toLuaIntegerCoercingStrings() {
+        LuaInteger i = toLuaInteger();
+        if (i != null) return i;
+        if (isString()) {
+            LuaValue n = parseNumber(toLuaString());
+            if (n != null && n != this) {
+                return n.toLuaInteger();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * {@code luaL_checkinteger} error for a value that failed integer
+     * conversion: a value convertible to a number (including a numeric string
+     * like "3.5") reports the integer-representation error; anything else
+     * reports a type error. Callers build the
+     * {@code bad argument #N to '<func>'} prefix.
+     */
+    public String integerConversionError() {
+        if (toLuaNumber() != null) {
+            return "number has no integer representation";
+        }
+        return "number expected, got " + typeName();
     }
 
     public LuaValue bnot() {
@@ -835,10 +884,18 @@ public abstract class LuaValue {
                 throw new LuaException("number has no integer representation");
             }
         }
-        // C luaG_opinterror: blame the first operand unless it is a number,
-        // in which case blame the second. (A numeric-looking string is still
-        // a string here, so `"3" & 1` blames the string, as in PUC Lua.)
-        LuaValue bad = !a.isNumber() ? a : b;
+        LuaValue bad;
+        if ("concatenate".equals(opDesc)) {
+            // C luaG_concaterror: blame the second operand unless the first is
+            // itself non-concatenable (a numeric-looking string is still a
+            // string, so `"3" .. {}` blames the table).
+            bad = (a.isString() || a.isNumber()) ? b : a;
+        } else {
+            // C luaG_opinterror: blame the first operand unless it is a
+            // number, in which case blame the second. (A numeric-looking
+            // string is still a string here, so `"3" & 1` blames the string.)
+            bad = !a.isNumber() ? a : b;
+        }
         throw new LuaException("attempt to " + opDesc + " a " + bad.typeName() + " value");
     }
 

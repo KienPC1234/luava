@@ -154,11 +154,21 @@ public final class IoLib {
         }
 
         public LuaValue readOne(LuaValue fmt) throws IOException {
+            return readOne(fmt, -1);
+        }
+
+        /**
+         * @param argIndex 1-based index of this format argument in the caller
+         *                 (for the PUC {@code bad argument #N} message), or -1
+         *                 when the caller does not know it.
+         */
+        public LuaValue readOne(LuaValue fmt, int argIndex) throws IOException {
             checkOpen();
+            String argErr = argIndex > 0 ? "#" + argIndex : "";
             if (fmt.isInteger() || fmt.isFloat()) {
                 long n = fmt.toLong();
                 if (n < 0) {
-                    throw new LuaException("bad argument to 'read' (invalid format)");
+                    throw new LuaException("bad argument " + argErr + " to 'read' (invalid format)");
                 }
                 if (n == 0) {
                     int c = readByte();
@@ -188,7 +198,7 @@ public final class IoLib {
                     yield line != null ? LuaString.valueOf(line) : LuaNil.NIL;
                 }
                 case 'n' -> readNumber();
-                default -> throw new LuaException("bad argument to 'read' (invalid format)");
+                default -> throw new LuaException("bad argument " + argErr + " to 'read' (invalid format)");
             };
         }
 
@@ -582,6 +592,47 @@ public final class IoLib {
     }
 
     /**
+     * PUC's {@code opencheck} helper (liolib.c): raises
+     * {@code cannot open file '<name>' (<strerror>)} — the OS message that
+     * {@code io.open}'s failure tuple already carries as its second value.
+     * Used by io.input/output/lines, which call io.open internally and only
+     * observe the nil first result.
+     */
+    static LuaException cannotOpen(String filename, LuaValue openResult) {
+        String osMsg = null;
+        if (openResult instanceof Varargs va) {
+            LuaValue m = va.arg(2);
+            if (!m.isNil()) osMsg = m.toLuaString();
+        }
+        if (osMsg == null) {
+            return new LuaException("cannot open file '" + filename + "'");
+        }
+        return new LuaException("cannot open file '" + filename + "' (" + osMsg + ")");
+    }
+
+    /**
+     * Shared {@code io.read} / {@code file:read} format loop (PUC g_read).
+     * {@code argBase} is the 1-based Lua argument index of the first format
+     * argument (1 for io.read, 2 for file:read), so a bad format blames the
+     * argument the script actually wrote.
+     */
+    static LuaValue readFormats(FileHandle fh, LuaValue[] args, int argBase, int firstLuaArg) throws IOException {
+        if (args.length <= argBase) {
+            // No formats: read one line, blamed at the first format slot.
+            return fh.readOne(LuaString.interned("l"), firstLuaArg);
+        }
+        List<LuaValue> results = new ArrayList<>();
+        for (int i = argBase; i < args.length; i++) {
+            LuaValue res = fh.readOne(args[i], firstLuaArg + (i - argBase));
+            results.add(res);
+            if (res.isNil()) {
+                break;
+            }
+        }
+        return Varargs.of(results.toArray(new LuaValue[0]));
+    }
+
+    /**
      * {@code io.write} formats a float with the raw C {@code %.14g}
      * ({@code LUA_NUMBER_FMT}), so {@code io.write(1.0)} emits {@code 1} —
      * unlike {@code tostring}, which appends {@code .0}. Integers and
@@ -688,18 +739,8 @@ public final class IoLib {
         fileMethods.rawset(LuaString.interned("read"), LuaFunction.of(args -> {
             FileHandle fh = checkFile(args, "read");
             try {
-                if (args.length <= 1) {
-                    return fh.readOne(LuaString.interned("l"));
-                }
-                List<LuaValue> results = new ArrayList<>();
-                for (int i = 1; i < args.length; i++) {
-                    LuaValue res = fh.readOne(args[i]);
-                    results.add(res);
-                    if (res.isNil()) {
-                        break;
-                    }
-                }
-                return Varargs.of(results.toArray(new LuaValue[0]));
+                // file:read format arguments are #2..#n (argument #1 is self).
+                return readFormats(fh, args, 1, 2);
             } catch (IOException e) {
                 return fileResultError(e.getMessage(), null, 5);
             }
@@ -883,7 +924,7 @@ public final class IoLib {
             }
             if (args[0].isString()) {
                 LuaValue openRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("r"));
-                if (openRes.isNil()) throw new LuaException("cannot open file '" + args[0].toLuaString() + "'");
+                if (openRes.isNil()) throw cannotOpen(args[0].toLuaString(), openRes);
                 currentIn[0] = (LuaUserdata) openRes;
                 return openRes;
             }
@@ -900,7 +941,7 @@ public final class IoLib {
             }
             if (args[0].isString()) {
                 LuaValue openRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("w"));
-                if (openRes.isNil()) throw new LuaException("cannot open file '" + args[0].toLuaString() + "'");
+                if (openRes.isNil()) throw cannotOpen(args[0].toLuaString(), openRes);
                 currentOut[0] = (LuaUserdata) openRes;
                 return openRes;
             }
@@ -932,10 +973,13 @@ public final class IoLib {
             if (fh.isClosed()) {
                 throw new LuaException("default input file is closed");
             }
-            LuaValue[] pass = new LuaValue[args.length + 1];
-            pass[0] = in;
-            System.arraycopy(args, 0, pass, 1, args.length);
-            return fileMethods.rawget(LuaString.interned("read")).call(pass);
+            // io.read reports format arguments starting at #1, whereas the
+            // file:read method (which shares the reading logic) starts at #2.
+            try {
+                return readFormats(fh, args, 0, 1);
+            } catch (IOException e) {
+                return fileResultError(e.getMessage(), null, 5);
+            }
         }));
 
         io.rawset(LuaString.interned("write"), LuaFunction.of(args -> {
@@ -981,7 +1025,7 @@ public final class IoLib {
             }
             LuaValue fileRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("r"));
             if (fileRes.isNil()) {
-                throw new LuaException("cannot open file '" + args[0].toLuaString() + "'");
+                throw cannotOpen(args[0].toLuaString(), fileRes);
             }
             LuaUserdata fileUd = (LuaUserdata) fileRes;
             FileHandle fh = (FileHandle) fileUd.getUserdata();

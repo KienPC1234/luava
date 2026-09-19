@@ -1765,9 +1765,16 @@ public final class BytecodeCompiler {
             if (list.isEmpty()) return;
             int n = list.size();
             int baseReg = targetReg + 1;
-            setFreereg(baseReg);
+            // Each element must land in a consecutive register: SETLIST reads
+            // R[targetReg+1 .. targetReg+n]. Compiling an element allocates
+            // its own temporaries (e.g. a global read `math.maxinteger`
+            // allocates a register for the table before the GETFIELD); those
+            // start at freereg and are not always freed. Position each element
+            // explicitly and reserve the slot above it so temporaries can
+            // never clobber the destination or scatter the values.
             for (int i = 0; i < n; i++) {
-                int r = allocReg();
+                int r = baseReg + i;
+                setFreereg(r + 1);
                 compileExprToReg(list.get(i).value(), r);
             }
             emitSetList(targetReg, n, arrayIdx, line);

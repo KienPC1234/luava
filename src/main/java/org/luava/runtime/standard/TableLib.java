@@ -30,6 +30,21 @@ public final class TableLib {
         return l.toLong();
     }
 
+    /**
+     * {@code luaL_checkinteger} for the table library: coerces a numeric
+     * string (lua_tointegerx) and reports the argument index and PUC function
+     * name. {@code func} is the unqualified name (e.g. "concat", "unpack").
+     */
+    static long checkInteger(LuaValue[] args, int idx, String func) {
+        if (idx >= args.length || args[idx].isNil()) {
+            throw LuaValue.argError(idx + 1, func, "number expected, got " + (idx >= args.length ? "no value" : "nil"));
+        }
+        LuaValue v = args[idx];
+        LuaInteger i = v.toLuaIntegerCoercingStrings();
+        if (i != null) return i.toLong();
+        throw LuaValue.argError(idx + 1, func, v.integerConversionError());
+    }
+
     public static void open(LuaTable globals) {
         LuaTable tableMod = new LuaTable();
         fillInto(tableMod, globals);
@@ -53,7 +68,7 @@ public final class TableLib {
                 pos = len + 1;
                 val = args[1];
             } else {
-                pos = args[1].toLong();
+                pos = checkInteger(args, 1, "insert");
                 if (pos < 1 || pos > len + 1) {
                     throw new LuaException("bad argument #2 to 'table.insert' (position out of bounds)");
                 }
@@ -63,7 +78,8 @@ public final class TableLib {
                 }
             }
             t.set(LuaInteger.valueOf(pos), val);
-            return LuaNil.NIL;
+            // PUC's table.insert returns zero values.
+            return org.luava.runtime.Varargs.EMPTY;
         }));
 
         tableMod.rawset(LuaString.interned("remove"), LuaFunction.of(args -> {
@@ -72,7 +88,7 @@ public final class TableLib {
             }
             LuaTable t = (LuaTable) args[0];
             long len = luaLen(t);
-            long pos = (args.length > 1 && !args[1].isNil()) ? args[1].toLong() : len;
+            long pos = (args.length > 1 && !args[1].isNil()) ? checkInteger(args, 1, "remove") : len;
             if (pos != len && (pos < 1 || pos > len + 1)) {
                 throw new LuaException("bad argument #2 to 'table.remove' (position out of bounds)");
             }
@@ -90,8 +106,8 @@ public final class TableLib {
             }
             LuaTable t = (LuaTable) args[0];
             String sep = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "";
-            long i = (args.length > 2 && !args[2].isNil()) ? args[2].toLong() : 1;
-            long last = (args.length > 3 && !args[3].isNil()) ? args[3].toLong() : luaLen(t);
+            long i = (args.length > 2 && !args[2].isNil()) ? checkInteger(args, 2, "concat") : 1;
+            long last = (args.length > 3 && !args[3].isNil()) ? checkInteger(args, 3, "concat") : luaLen(t);
 
             // Plain-table fast lane: no metatable means get() == rawget, so
             // read the array part directly (no per-element key boxing, no
@@ -135,8 +151,8 @@ public final class TableLib {
                 throw new LuaException("bad argument #1 to 'table.unpack' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }
             LuaTable t = (LuaTable) args[0];
-            long start = (args.length > 1 && !args[1].isNil()) ? args[1].toLong() : 1;
-            long end = (args.length > 2 && !args[2].isNil()) ? args[2].toLong() : luaLen(t);
+            long start = (args.length > 1 && !args[1].isNil()) ? checkInteger(args, 1, "unpack") : 1;
+            long end = (args.length > 2 && !args[2].isNil()) ? checkInteger(args, 2, "unpack") : luaLen(t);
 
             if (start > end) return Varargs.EMPTY;
             long count;
@@ -170,9 +186,9 @@ public final class TableLib {
                 throw new LuaException("bad argument #1 to 'table.move' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
             }
             LuaTable a1 = (LuaTable) args[0];
-            long f = args[1].toLong();
-            long e = args[2].toLong();
-            long t = args[3].toLong();
+            long f = checkInteger(args, 1, "move");
+            long e = checkInteger(args, 2, "move");
+            long t = checkInteger(args, 3, "move");
             LuaTable a2;
             if (args.length > 4 && !args[4].isNil()) {
                 if (!args[4].isTable()) {
@@ -218,7 +234,8 @@ public final class TableLib {
             LuaFunction comp = (args.length > 1 && !args[1].isNil()) ? (LuaFunction) args[1] : null;
             long lenLong = luaLen(t);
             if (lenLong <= 1) {
-                return LuaNil.NIL;
+                // PUC's table.sort returns zero values.
+                return org.luava.runtime.Varargs.EMPTY;
             }
             if (lenLong > Integer.MAX_VALUE - 2) {
                 throw new LuaException("bad argument #1 to 'table.sort' (array too big)");
@@ -242,7 +259,8 @@ public final class TableLib {
             for (int i = 0; i < len; i++) {
                 t.set(LuaInteger.valueOf(i + 1), items.get(i));
             }
-            return LuaNil.NIL;
+            // PUC's table.sort returns zero values.
+            return org.luava.runtime.Varargs.EMPTY;
         }));
     }
 

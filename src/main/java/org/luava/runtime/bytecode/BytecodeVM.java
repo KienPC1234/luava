@@ -1590,7 +1590,16 @@ public final class BytecodeVM {
             LuaValue[] tailCArgs = getArgsForCall(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1, nActualArgs);
             CallStack.setNextTransfer(ctx.callState, 1, nActualArgs, tailCArgs);
             CallStack.setNextVmFrame(ctx.callState, state, ctx.base, ctx.base - 1, null, -1);
-            CallStack.replaceTailCall(fn, resolvedName, namewhat != null ? namewhat : "", callLine, isMethod, isMeta, ctx.callState, ctx.co);
+            // PUC does NOT reuse the caller's frame for a C tail call
+            // (ldo.c luaD_pretailcall: only LUA_VLCL returns -1 to "startfunc";
+            // C closures/functions go through precallC and the caller is then
+            // finished by luaD_poscall). So the C function gets its own frame
+            // on top of ours, and our frame must remain visible to debug
+            // readers (debug.getlocal/getinfo, traceback) for the duration of
+            // the C call. Replacing our frame (as before) made the caller's
+            // locals invisible and corrupted frame levels.
+            CallStack.push(fn, resolvedName, namewhat != null ? namewhat : "", callLine, isMethod, isMeta,
+                    ctx.callState, ctx.co);
             int origTop = ctx.thread.getStackTop();
             ctx.thread.setStackTop(funcIdx + nActualArgs + 1);
             LuaValue res = null;
@@ -1605,6 +1614,10 @@ public final class BytecodeVM {
                     f.ftransfer = 1;
                     f.ntransfer = retVals.length;
                 }
+                // Pop the C frame, then our own frame: the C call returns to
+                // us and we immediately return its results to our caller
+                // (equivalent to PUC's precallC + luaD_poscall + ret).
+                CallStack.pop(ctx.callState, ctx.co);
                 CallStack.pop(ctx.callState, ctx.co);
             }
             LuaValue[] retVals = (res instanceof Varargs va) ? va.getValuesUnsafe() : (res != null ? new LuaValue[]{res} : new LuaValue[0]);
