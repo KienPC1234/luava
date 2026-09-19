@@ -1114,6 +1114,68 @@ public final class BytecodeVM {
         }
     }
 
+    /**
+     * JIT path for {@code OP_TAILCALL}. Returns 1 when the compiled kernel
+     * produced the single result (now in {@code funcIdx}), 0 when the caller
+     * must run the generic tail path, or 2 after a deopt with the argument
+     * registers restored. The kernel is invoked on the callee register
+     * window, so arguments must be snapshotted first: a deopt mid-kernel may
+     * have overwritten them. Snapshotting only happens once the proto has a
+     * compiled kernel (steady state), so cold calls pay nothing.
+     */
+    private static int tryJitTailCall(LuaState state, VmContext ctx, LuaClosure child,
+            int funcIdx, int nActualArgs) {
+        if (!state.isJitEnabled()) {
+            return 0;
+        }
+        if (ctx.thread.hooksActive || state.loopGuard != null) {
+            return 0;
+        }
+        LuaProto proto = child.proto;
+        if (proto.mayYield) {
+            return 0;
+        }
+        JitCode jc = proto.jitCode;
+        if (jc == null) {
+            if (proto.jitDisabled) {
+                return 0;
+            }
+            int hot = proto.hotCount + 1;
+            proto.hotCount = hot;
+            if (hot < LuaState.JIT_HOT_THRESHOLD) {
+                return 0;
+            }
+            try {
+                org.luava.runtime.jit.JitCompiler.requestCompile(proto);
+            } catch (Throwable t) {
+                proto.jitDisabled = true;
+            }
+            return 0;
+        }
+        if (nActualArgs < proto.numParams) {
+            return 0;
+        }
+        // Snapshot the caller-provided arguments (as LuaValue, exact for any
+        // type) so a deopt can restore them before the generic tail path.
+        LuaValue[] snapshot = new LuaValue[nActualArgs];
+        for (int i = 0; i < nActualArgs; i++) {
+            snapshot[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1 + i);
+        }
+        int r = tryJitCall(state, ctx, child, funcIdx, nActualArgs, 1);
+        if (r == 1) {
+            return 1;
+        }
+        if (r == 2) {
+            // Deopt left the register window partially written; restore the
+            // original arguments so the interpreter tail call is correct.
+            for (int i = 0; i < nActualArgs; i++) {
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1 + i, snapshot[i]);
+            }
+            return 2;
+        }
+        return 0;
+    }
+
     private static boolean jitDebugLogged;
     private static boolean jitDebug() {
         if (!jitDebugLogged) {
@@ -1329,6 +1391,26 @@ public final class BytecodeVM {
                     // generic tail path.
                     state.closeUpvalues(ctx.thread, ctx.base);
                     return tailReturnInline(state, ctx, built);
+                }
+                // JIT tail call. Tier-up counting used to live only in
+                // executeCallOp (OP_CALL), so a hot function reached via
+                // `return f(...)` (TAILCALL) never compiled — the common
+                // shape for a script's hot entry function. Count here too,
+                // and run the compiled kernel framelessly when available.
+                int jit = tryJitTailCall(state, ctx, childClosure, funcIdx, nActualArgs);
+                if (jit == 1) {
+                    LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx);
+                    // The tail call replaces this frame, so its locals (and
+                    // any open upvalues into them) go away exactly as in the
+                    // generic tail path.
+                    state.closeUpvalues(ctx.thread, ctx.base);
+                    return tailReturnInline(state, ctx, res);
+                }
+                if (jit == 2) {
+                    // Deopt: run the generic tail path from a clean state.
+                    ctx.pStack = ctx.thread.getPrimitiveStack();
+                    ctx.tStack = ctx.thread.getTypeStack();
+                    ctx.oStack = ctx.thread.getObjectStack();
                 }
             }
             state.closeUpvalues(ctx.thread, ctx.base);
