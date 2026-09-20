@@ -819,11 +819,6 @@ public final class LuaPattern {
         public void replaceUpvalue(int index, org.luava.runtime.eval.Upvalue uv) {
             getUpvalues().set(index, uv);
         }
-
-        @Override
-        public String toLuaString() {
-            return "function: builtin@0x" + Integer.toHexString(System.identityHashCode(this));
-        }
     }
 
     public static LuaFunction gmatch(LuaValue sVal, LuaValue pVal, LuaValue initVal) {

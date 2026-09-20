@@ -116,7 +116,7 @@ public final class LuaState {
         private int countdown;
         private volatile boolean tripped;
         private volatile boolean cancelRequested;
-        private volatile String cancelMessage = "execution timed out";
+        private volatile boolean timeoutTrip;
 
         Guard(long maxInstr, long timeoutNanos) {
             this.maxInstr = maxInstr;
@@ -131,33 +131,54 @@ public final class LuaState {
             // eval must not revive a chunk its caller already abandoned.
             if (!cancelRequested) {
                 this.tripped = false;
+                this.timeoutTrip = false;
             }
         }
 
         /** Forces the next {@link #tick()} to fail. Used to cancel a runaway
          * eval whose caller already gave up, so no worker keeps spinning. */
         void cancel() {
-            this.tripped = true;
+            this.timeoutTrip = true;
             this.cancelRequested = true;
-            this.cancelMessage = "execution timed out";
+            this.tripped = true;
         }
 
         @Override
         public void tick() {
             if (tripped) {
-                throw new LuaException(cancelRequested ? cancelMessage : "instruction limit exceeded");
+                throw trip();
             }
             if (maxInstr > 0 && --remaining < 0) {
                 tripped = true;
-                throw new LuaException("instruction limit exceeded");
+                timeoutTrip = false;
+                throw trip();
             }
             if (timeoutNanos > 0 && --countdown <= 0) {
                 countdown = 4096;
                 if (System.nanoTime() - deadline >= 0) {
                     tripped = true;
-                    throw new LuaException("execution timed out");
+                    timeoutTrip = true;
+                    throw trip();
                 }
             }
+        }
+
+        private LuaException trip() {
+            return timeoutTrip
+                    ? new GuardTimeout("execution timed out")
+                    : new LuaException("instruction limit exceeded");
+        }
+    }
+
+    /**
+     * A {@link Guard} budget exhaustion caused by wall-clock timeout (rather
+     * than an instruction limit). Lets {@link #evalWithTimeout} translate the
+     * worker's failure into the declared {@link TimeoutException} even when
+     * the self-terminating guard wins the race against the waiting caller.
+     */
+    static final class GuardTimeout extends LuaException {
+        GuardTimeout(String message) {
+            super(message);
         }
     }
 
@@ -601,6 +622,13 @@ public final class LuaState {
             throw new LuaException("Execution interrupted");
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
+            // The self-terminating guard uses the same deadline as the
+            // waiting caller, so it can win the race and fail the worker
+            // with a timeout error before future.get() raises its own.
+            // Surface that uniformly as the declared TimeoutException.
+            if (cause instanceof GuardTimeout) {
+                throw new TimeoutException(cause.getMessage());
+            }
             if (cause instanceof RuntimeException re) throw re;
             throw new LuaException("Error during execution: " + cause.getMessage());
         } catch (TimeoutException e) {

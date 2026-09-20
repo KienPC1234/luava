@@ -612,4 +612,55 @@ public class BytecodeVMTest {
         """);
         assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
     }
+
+    @Test
+    void tonumberWithBaseRejectsHexPrefix() {
+        // PUC's b_str2int never accepts a "0x" prefix when a base is given;
+        // "0x10" with base 16 is not a valid numeral.
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            return tonumber("0x10", 16) == nil and tonumber("0X10", 16) == nil
+               and tonumber("0x10") == 16 and tonumber("10", 16) == 16
+               and tonumber("ff", 16) == 255
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void stringPacksizeVariableLengthErrorMatchesPuc() {
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local _, e = pcall(string.packsize, "z")
+            return e:find("bad argument #1", 1, true) ~= nil
+               and e:find("variable-length format", 1, true) ~= nil
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void gmatchIteratorRendersLikeAPlainFunction() {
+        // PUC renders every function value as "function: 0x..."; the gmatch
+        // iterator used to print "function: builtin@0x...".
+        LuaState state = new LuaState();
+        LuaValue res = state.eval("""
+            local s = tostring(string.gmatch("a", "a"))
+            return s:sub(1, 10) == "function: "
+               and s:find("builtin", 1, true) == nil
+        """);
+        assertEquals(org.luava.runtime.LuaBoolean.TRUE, res);
+    }
+
+    @Test
+    void debugSetmetatableCanRemoveStringMetatablePerState() {
+        // debug.setmetatable("", nil) must actually clear the string
+        // metatable (PUC), and the change must stay local to that state.
+        LuaState s1 = new LuaState();
+        assertEquals("true", s1.eval("return tostring(getmetatable('') ~= nil)").toLuaString());
+        s1.eval("debug.setmetatable('', nil)");
+        assertEquals("nil", s1.eval("return tostring(getmetatable(''))").toLuaString());
+        // A fresh state is unaffected.
+        LuaState s2 = new LuaState();
+        assertEquals("true", s2.eval("return tostring(getmetatable('') ~= nil)").toLuaString());
+        assertEquals("ABC", s2.eval("return ('abc'):upper()").toLuaString());
+    }
 }

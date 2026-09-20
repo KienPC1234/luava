@@ -224,7 +224,7 @@ public final class StringPacker {
                 continue;
             }
             if (opt.code == 's' || opt.code == 'z') {
-                throw new LuaException("variable-length format in 'string.packsize'");
+                throw LuaValue.argError(1, "string.packsize", "variable-length format");
             }
             if (opt.code == 'X') {
                 int pad = getpadding(total, opt.align);

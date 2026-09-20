@@ -163,10 +163,6 @@ public final class BaseLib {
                 idx++;
             }
             if (idx >= s.length()) return LuaNil.NIL;
-            if (base == 16 && s.length() >= idx + 2 && (s.charAt(idx) == '0' && (s.charAt(idx + 1) == 'x' || s.charAt(idx + 1) == 'X'))) {
-                idx += 2;
-            }
-            if (idx >= s.length()) return LuaNil.NIL;
             long val = 0;
             boolean hasDigits = false;
             while (idx < s.length()) {

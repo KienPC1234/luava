@@ -175,10 +175,13 @@ public abstract class LuaValue {
     public static LuaTable getBasicMetatable(LuaType type) {
         LuaState active = ACTIVE_BASIC_STATE.get();
         if (active != null) {
-            LuaTable scoped = active.basicMetatables().get(type);
-            if (scoped != null) {
-                return scoped;
-            }
+            // Inside a running state, the per-state map is authoritative: a
+            // missing entry means "no metatable" (e.g. after
+            // debug.setmetatable("", nil)). Falling back to the JVM-wide
+            // default here would make the metatable impossible to remove,
+            // unlike PUC. Every state installs its own string metatable in
+            // its constructor, so nothing else is lost.
+            return active.basicMetatables().get(type);
         }
         return BASIC_METATABLES[type.ordinal()];
     }
