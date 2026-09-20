@@ -426,12 +426,25 @@ public final class LuaToJvmTranslator implements Opcodes {
                 case OpCode.OP_ADD -> emitArithNum(mv, a, b, c, pc, LADD, DADD);
                 case OpCode.OP_SUB -> emitArithNum(mv, a, b, c, pc, LSUB, DSUB);
                 case OpCode.OP_MUL -> emitArithNum(mv, a, b, c, pc, LMUL, DMUL);
+                case OpCode.OP_DIV -> emitDivNum(mv, a, b, c, pc);
+                case OpCode.OP_POW -> emitPowNum(mv, a, b, c, pc);
+                case OpCode.OP_IDIV -> emitIdivNum(mv, a, b, c, pc);
+                case OpCode.OP_MOD -> emitModNum(mv, a, b, c, pc);
+                case OpCode.OP_BAND -> emitBitwiseNum(mv, a, b, c, pc, LAND, "and");
+                case OpCode.OP_BOR -> emitBitwiseNum(mv, a, b, c, pc, LOR, "or");
+                case OpCode.OP_BXOR -> emitBitwiseNum(mv, a, b, c, pc, LXOR, "xor");
+                case OpCode.OP_SHL -> emitShiftNum(mv, a, b, c, pc, true);
+                case OpCode.OP_SHR -> emitShiftNum(mv, a, b, c, pc, false);
+                case OpCode.OP_SHLI -> emitShiftImm(mv, a, b, Instruction.getsC(inst), pc, true);
+                case OpCode.OP_SHRI -> emitShiftImm(mv, a, b, Instruction.getsC(inst), pc, false);
                 // Integer-only constant forms. analyze() already rejected any
                 // proto containing a K-form whose constant is not a LuaInteger
                 // (and rejected DIVK/POWK outright, since `/` and `^` always
                 // yield float). So kc is a compile-time integer operand here.
                 case OpCode.OP_ADDK -> emitArithKNum(mv, proto, a, b, c, pc, LADD, DADD);
                 case OpCode.OP_MULK -> emitArithKNum(mv, proto, a, b, c, pc, LMUL, DMUL);
+                case OpCode.OP_DIVK -> emitDivK(mv, proto, a, b, c, pc);
+                case OpCode.OP_POWK -> emitPowK(mv, proto, a, b, c, pc);
                 case OpCode.OP_IDIVK -> emitIdivK(mv, proto, a, b, c, pc);
                 case OpCode.OP_MODK -> emitModK(mv, proto, a, b, c, pc);
                 case OpCode.OP_BANDK -> emitArithKNum(mv, proto, a, b, c, pc, LAND, -1);
@@ -548,6 +561,42 @@ public final class LuaToJvmTranslator implements Opcodes {
                     mv.visitInsn(LASTORE);
                     emitTagIntNull(mv, a);
                 }
+                case OpCode.OP_CONCAT -> {
+                    // R[A] = R[A] .. ... .. R[A+B-1]. The helper returns null
+                    // when an operand is not a plain string/number (a
+                    // metatable __concat could run code), so we deopt then.
+                    mv.visitVarInsn(ALOAD, 2);
+                    mv.visitVarInsn(ALOAD, 3);
+                    mv.visitVarInsn(ALOAD, 4);
+                    mv.visitVarInsn(ILOAD, 5);
+                    ldcInt(mv, a);
+                    mv.visitInsn(IADD);
+                    mv.visitVarInsn(ILOAD, 5);
+                    ldcInt(mv, a + b);
+                    mv.visitInsn(IADD);
+                    mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "concatRange",
+                            "([J[B[Lorg/luava/runtime/LuaValue;II)Lorg/luava/runtime/LuaValue;", false);
+                    mv.visitInsn(DUP);
+                    Label concatOk = new Label();
+                    mv.visitJumpInsn(IFNONNULL, concatOk);
+                    mv.visitInsn(POP);
+                    emitDeopt(mv, pc);
+                    mv.visitLabel(concatOk);
+                    // Stack: [result]. Store it as an object register.
+                    mv.visitVarInsn(ASTORE, 8);
+                    mv.visitVarInsn(ALOAD, 4);
+                    emitIndex(mv, a);
+                    mv.visitVarInsn(ALOAD, 8);
+                    mv.visitInsn(AASTORE);
+                    mv.visitVarInsn(ALOAD, 2);
+                    emitIndex(mv, a);
+                    mv.visitInsn(LCONST_0);
+                    mv.visitInsn(LASTORE);
+                    mv.visitVarInsn(ALOAD, 3);
+                    emitIndex(mv, a);
+                    ldcInt(mv, TYPE_OBJECT);
+                    mv.visitInsn(BASTORE);
+                }
                 case OpCode.OP_ADDI -> {
                     int sc = Instruction.getsC(inst);
                     emitGuardInt(mv, b, pc);
@@ -588,6 +637,28 @@ public final class LuaToJvmTranslator implements Opcodes {
                     } else {
                         mv.visitJumpInsn(GOTO, labels[pc + 2]);
                     }
+                }
+                case OpCode.OP_LT -> emitCmpRR(mv, a, b, Instruction.getk(inst), pc, labels, false);
+                case OpCode.OP_LE -> emitCmpRR(mv, a, b, Instruction.getk(inst), pc, labels, true);
+                case OpCode.OP_EQ -> emitEqRR(mv, proto, a, b, Instruction.getk(inst), pc, labels);
+                case OpCode.OP_EQK -> emitEqK(mv, proto, a, b, Instruction.getk(inst), pc, labels);
+                case OpCode.OP_TEST -> emitTest(mv, a, Instruction.getk(inst), pc, labels);
+                case OpCode.OP_TESTSET -> emitTestSet(mv, a, b, Instruction.getk(inst), pc, labels);
+                case OpCode.OP_LFALSESKIP -> {
+                    mv.visitVarInsn(ALOAD, 2);
+                    emitIndex(mv, a);
+                    mv.visitInsn(LCONST_0);
+                    mv.visitInsn(LASTORE);
+                    mv.visitVarInsn(ALOAD, 3);
+                    emitIndex(mv, a);
+                    ldcInt(mv, TYPE_BOOLEAN);
+                    mv.visitInsn(BASTORE);
+                    mv.visitVarInsn(ALOAD, 4);
+                    emitIndex(mv, a);
+                    mv.visitInsn(ACONST_NULL);
+                    mv.visitInsn(AASTORE);
+                    // Unconditional skip of the next instruction.
+                    mv.visitJumpInsn(GOTO, labels[pc + 2]);
                 }
                 case OpCode.OP_JMP -> {
                     int sj = Instruction.getsJ(inst);
@@ -703,9 +774,11 @@ public final class LuaToJvmTranslator implements Opcodes {
      * results cannot feed the integer call protocol).
      */
     public static Info analyze(LuaProto proto) {
-        if (proto.isVararg) {
-            return null;
-        }
+        // A vararg proto is only rejected when it actually reads `...`: the
+        // `VARARG`/`VARARGPREP` opcodes are outside the allow-list below, so
+        // they reject the proto there. A vararg signature that never uses
+        // `...` is indistinguishable from a fixed-arity one (extra args are
+        // ignored, missing ones nil-filled) and is safe to compile.
         int[] code = proto.code;
         if (code.length == 0 || code.length > 200) {
             return null;
@@ -745,14 +818,28 @@ public final class LuaToJvmTranslator implements Opcodes {
                         OpCode.OP_BNOT,
                         OpCode.OP_NOT,
                         OpCode.OP_LEN,
+                        OpCode.OP_CONCAT,
                         OpCode.OP_SETLIST,
                         OpCode.OP_ADD,
                         OpCode.OP_SUB,
                         OpCode.OP_MUL,
+                        OpCode.OP_DIV,
+                        OpCode.OP_MOD,
+                        OpCode.OP_POW,
+                        OpCode.OP_IDIV,
+                        OpCode.OP_BAND,
+                        OpCode.OP_BOR,
+                        OpCode.OP_BXOR,
+                        OpCode.OP_SHL,
+                        OpCode.OP_SHR,
+                        OpCode.OP_SHLI,
+                        OpCode.OP_SHRI,
                         OpCode.OP_ADDI,
                         OpCode.OP_ADDK,
                         OpCode.OP_SUBK,
                         OpCode.OP_MULK,
+                        OpCode.OP_DIVK,
+                        OpCode.OP_POWK,
                         OpCode.OP_IDIVK,
                         OpCode.OP_MODK,
                         OpCode.OP_BANDK,
@@ -763,6 +850,13 @@ public final class LuaToJvmTranslator implements Opcodes {
                         OpCode.OP_GTI,
                         OpCode.OP_GEI,
                         OpCode.OP_EQI,
+                        OpCode.OP_EQ,
+                        OpCode.OP_EQK,
+                        OpCode.OP_LT,
+                        OpCode.OP_LE,
+                        OpCode.OP_TEST,
+                        OpCode.OP_TESTSET,
+                        OpCode.OP_LFALSESKIP,
                         OpCode.OP_JMP,
                         OpCode.OP_FORPREP,
                         OpCode.OP_FORLOOP,
@@ -811,10 +905,9 @@ public final class LuaToJvmTranslator implements Opcodes {
             if (Instruction.getOp(inst) == OpCode.OP_SETLIST && Instruction.getB(inst) == 0) {
                 return null;
             }
-            // Integer-constant arithmetic forms. Only an integer constant can
-            // stay in the unboxed long world; a float constant (or DIVK/POWK,
-            // which are always float-producing and have no integer variant)
-            // would change the result type, so reject the whole proto.
+            // Integer-constant arithmetic forms: the constant must be a
+            // LuaInteger so the unboxed long world stays exact. DIVK/POWK are
+            // always float-producing, so their constant may be any number.
             switch (Instruction.getOp(inst)) {
                 case OpCode.OP_ADDK,
                         OpCode.OP_SUBK,
@@ -825,6 +918,12 @@ public final class LuaToJvmTranslator implements Opcodes {
                         OpCode.OP_BORK,
                         OpCode.OP_BXORK -> {
                     if (!(proto.constants[Instruction.getC(inst)] instanceof LuaInteger)) {
+                        return null;
+                    }
+                }
+                case OpCode.OP_DIVK, OpCode.OP_POWK -> {
+                    LuaValue k = proto.constants[Instruction.getC(inst)];
+                    if (!(k instanceof LuaInteger) && !(k instanceof org.luava.runtime.LuaFloat)) {
                         return null;
                     }
                 }
@@ -876,11 +975,13 @@ public final class LuaToJvmTranslator implements Opcodes {
                     }
                     for (int r = 0; r < regs; r++) {
                         if (out[r] != T_UNKNOWN) {
-                            if (in[s][r] == T_UNKNOWN) {
-                                in[s][r] = out[r];
-                                changed = true;
-                            } else if (in[s][r] != out[r]) {
+                            int merged = mergeTy(in[s][r], out[r]);
+                            if (merged < 0) {
                                 return null;
+                            }
+                            if (merged != in[s][r]) {
+                                in[s][r] = merged;
+                                changed = true;
                             }
                         }
                     }
@@ -975,12 +1076,22 @@ public final class LuaToJvmTranslator implements Opcodes {
             int bx = Instruction.getBx(code[pc]);
             return new int[] {pc + 1, pc + 1 - bx};
         }
+        if (op == OpCode.OP_LFALSESKIP) {
+            // Unconditional skip of the next instruction.
+            return new int[] {pc + 2};
+        }
         switch (op) {
             case OpCode.OP_LEI,
                     OpCode.OP_LTI,
                     OpCode.OP_GTI,
                     OpCode.OP_GEI,
                     OpCode.OP_EQI,
+                    OpCode.OP_EQ,
+                    OpCode.OP_EQK,
+                    OpCode.OP_LT,
+                    OpCode.OP_LE,
+                    OpCode.OP_TEST,
+                    OpCode.OP_TESTSET,
                     OpCode.OP_RETURN0,
                     OpCode.OP_RETURN1,
                     OpCode.OP_RETURN,
@@ -1076,9 +1187,56 @@ public final class LuaToJvmTranslator implements Opcodes {
                 }
                 setTy(out, regs, a, T_INT);
             }
+            case OpCode.OP_DIV, OpCode.OP_POW, OpCode.OP_DIVK, OpCode.OP_POWK -> {
+                // `/` and `^` always yield a float.
+                if (in[b] == T_OBJ) {
+                    return false;
+                }
+                setTy(out, regs, a, T_NUM);
+            }
+            case OpCode.OP_MOD, OpCode.OP_IDIV -> {
+                if (in[b] == T_OBJ || in[c] == T_OBJ) {
+                    return false;
+                }
+                setTy(out, regs, a, (in[b] == T_INT && in[c] == T_INT) ? T_INT : T_NUM);
+            }
+            case OpCode.OP_BAND, OpCode.OP_BOR, OpCode.OP_BXOR,
+                    OpCode.OP_SHL, OpCode.OP_SHR, OpCode.OP_SHLI, OpCode.OP_SHRI -> {
+                // Bitwise ops are integer-only in this lane; a float operand
+                // would raise in the interpreter, so guard-int is correct.
+                if ((op == OpCode.OP_BAND || op == OpCode.OP_BOR || op == OpCode.OP_BXOR
+                        || op == OpCode.OP_SHL || op == OpCode.OP_SHR)
+                        && (in[b] == T_OBJ || in[c] == T_OBJ)) {
+                    return false;
+                }
+                if ((op == OpCode.OP_SHLI || op == OpCode.OP_SHRI) && in[b] == T_OBJ) {
+                    return false;
+                }
+                setTy(out, regs, a, T_INT);
+            }
             case OpCode.OP_LEI, OpCode.OP_LTI, OpCode.OP_GTI, OpCode.OP_GEI, OpCode.OP_EQI -> {
                 return in[a] != T_OBJ;
             }
+            case OpCode.OP_LT, OpCode.OP_LE -> {
+                // Numeric comparison is guarded at runtime; a statically
+                // object-typed operand can never pass (it would need the
+                // metamethod path), so reject the proto instead of deopting.
+                return in[a] != T_OBJ && in[b] != T_OBJ;
+            }
+            case OpCode.OP_EQ, OpCode.OP_EQK -> {
+                // Equality is defined for every type (identity/metamethod),
+                // but the compiled form only handles number/boolean/nil
+                // operands and deopts otherwise, so it is never unsound.
+            }
+            case OpCode.OP_TEST -> {
+                // Truthiness is defined for every type and emitted as a
+                // runtime check, so no static restriction is needed.
+            }
+            case OpCode.OP_TESTSET -> {
+                // Copies R[B] into R[A] on the fallthrough edge.
+                setTy(out, regs, a, in[b]);
+            }
+            case OpCode.OP_LFALSESKIP -> setTy(out, regs, a, T_OBJ);
             case OpCode.OP_FORPREP -> {
                 // Integer loop only. A statically object-typed init/limit/step
                 // (e.g. a float loop) can never pass the runtime guard, so the
@@ -1095,7 +1253,7 @@ public final class LuaToJvmTranslator implements Opcodes {
                 setTy(out, regs, a, T_INT);
                 setTy(out, regs, a + 3, T_INT);
             }
-            case OpCode.OP_CLOSURE, OpCode.OP_NEWTABLE -> setTy(out, regs, a, T_OBJ);
+            case OpCode.OP_CLOSURE, OpCode.OP_NEWTABLE, OpCode.OP_CONCAT -> setTy(out, regs, a, T_OBJ);
             case OpCode.OP_CALL -> {
                 // A recognized sqrt intrinsic yields a float; any other call
                 // yields an integer under the JIT call protocol.
@@ -1113,6 +1271,23 @@ public final class LuaToJvmTranslator implements Opcodes {
         if (r >= 0 && r < regs) {
             row[r] = t;
         }
+    }
+
+    /**
+     * Joins two abstract types at a control-flow merge. {@code T_INT} and
+     * {@code T_NUM} join to {@code T_NUM}: every numeric use already emits a
+     * runtime int/float dispatch, so a wider static type only costs a guard,
+     * never correctness. Only an object/unknown collision is a real conflict
+     * (the object protocol differs). Returns {@code -1} on conflict.
+     */
+    private static int mergeTy(int a, int b) {
+        if (a == b) return a;
+        if (a == T_UNKNOWN) return b;
+        if (b == T_UNKNOWN) return a;
+        if ((a == T_INT || a == T_NUM) && (b == T_INT || b == T_NUM)) {
+            return T_NUM;
+        }
+        return -1;
     }
 
     /** Strict integer-subset eligibility; anything else stays interpreted. */
@@ -1147,6 +1322,207 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitLdcInsn(v);
         mv.visitInsn(LASTORE);
         emitTagIntNull(mv, a);
+    }
+
+    /**
+     * Emits {@code R[A] = <double result>} storing raw IEEE-754 bits and
+     * tagging the register {@code TYPE_FLOAT} (never {@code D2L}, which would
+     * truncate). Expects a double on the JVM stack.
+     */
+    private static void emitStoreFloatFromStack(MethodVisitor mv, int a) {
+        mv.visitMethodInsn(INVOKESTATIC, "java/lang/Double", "doubleToRawLongBits", "(D)J", false);
+        mv.visitVarInsn(LSTORE, 6);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a);
+        mv.visitVarInsn(LLOAD, 6);
+        mv.visitInsn(LASTORE);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, a);
+        ldcInt(mv, TYPE_FLOAT);
+        mv.visitInsn(BASTORE);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitInsn(ACONST_NULL);
+        mv.visitInsn(AASTORE);
+    }
+
+    /** {@code R[A] = R[B] / R[C]}; always float, Lua coerces ints to double. */
+    private static void emitDivNum(MethodVisitor mv, int a, int b, int c, int pc) {
+        emitGuardNumber(mv, b, pc);
+        emitGuardNumber(mv, c, pc);
+        emitLoadDouble(mv, b);
+        emitLoadDouble(mv, c);
+        mv.visitInsn(DDIV);
+        emitStoreFloatFromStack(mv, a);
+    }
+
+    /** {@code R[A] = R[B] ^ R[C]}; always float, uses C99 pow semantics. */
+    private static void emitPowNum(MethodVisitor mv, int a, int b, int c, int pc) {
+        emitGuardNumber(mv, b, pc);
+        emitGuardNumber(mv, c, pc);
+        emitLoadDouble(mv, b);
+        emitLoadDouble(mv, c);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/LuaValue", "luaNumPow", "(DD)D", false);
+        emitStoreFloatFromStack(mv, a);
+    }
+
+    /** {@code R[A] = R[B] // R[C]}: int floor-div, or float floor for numbers. */
+    private static void emitIdivNum(MethodVisitor mv, int a, int b, int c, int pc) {
+        emitGuardNumber(mv, b, pc);
+        emitGuardNumber(mv, c, pc);
+        Label floatLane = new Label();
+        Label done = new Label();
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, b);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_INT);
+        mv.visitJumpInsn(IF_ICMPNE, floatLane);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, c);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_INT);
+        mv.visitJumpInsn(IF_ICMPNE, floatLane);
+        // int lane: guard /0 (interpreter raises), then floorDiv.
+        emitLoadP(mv, c);
+        mv.visitInsn(LCONST_0);
+        mv.visitInsn(LCMP);
+        Label divOk = new Label();
+        mv.visitJumpInsn(IFNE, divOk);
+        emitDeopt(mv, pc);
+        mv.visitLabel(divOk);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a);
+        emitLoadP(mv, b);
+        emitLoadP(mv, c);
+        mv.visitMethodInsn(INVOKESTATIC, "java/lang/Math", "floorDiv", "(JJ)J", false);
+        mv.visitInsn(LASTORE);
+        emitTagIntNull(mv, a);
+        mv.visitJumpInsn(GOTO, done);
+        mv.visitLabel(floatLane);
+        emitLoadDouble(mv, b);
+        emitLoadDouble(mv, c);
+        mv.visitInsn(DDIV);
+        mv.visitMethodInsn(INVOKESTATIC, "java/lang/Math", "floor", "(D)D", false);
+        emitStoreFloatFromStack(mv, a);
+        mv.visitLabel(done);
+    }
+
+    /** {@code R[A] = R[B] % R[C]}: int floor-mod, or Lua float mod. */
+    private static void emitModNum(MethodVisitor mv, int a, int b, int c, int pc) {
+        emitGuardNumber(mv, b, pc);
+        emitGuardNumber(mv, c, pc);
+        Label floatLane = new Label();
+        Label done = new Label();
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, b);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_INT);
+        mv.visitJumpInsn(IF_ICMPNE, floatLane);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, c);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_INT);
+        mv.visitJumpInsn(IF_ICMPNE, floatLane);
+        // int lane: n%0 raises in the interpreter.
+        emitLoadP(mv, c);
+        mv.visitInsn(LCONST_0);
+        mv.visitInsn(LCMP);
+        Label modOk = new Label();
+        mv.visitJumpInsn(IFNE, modOk);
+        emitDeopt(mv, pc);
+        mv.visitLabel(modOk);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a);
+        emitLoadP(mv, b);
+        emitLoadP(mv, c);
+        mv.visitMethodInsn(INVOKESTATIC, "java/lang/Math", "floorMod", "(JJ)J", false);
+        mv.visitInsn(LASTORE);
+        emitTagIntNull(mv, a);
+        mv.visitJumpInsn(GOTO, done);
+        mv.visitLabel(floatLane);
+        emitLoadDouble(mv, b);
+        emitLoadDouble(mv, c);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/LuaValue", "luaFloatMod", "(DD)D", false);
+        emitStoreFloatFromStack(mv, a);
+        mv.visitLabel(done);
+    }
+
+    /**
+     * Two-register integer bitwise op ({@code BAND/BOR/BXOR}). Guards both
+     * operands as integers (a float would raise in the interpreter, so the
+     * deopt produces the same error).
+     */
+    private static void emitBitwiseNum(MethodVisitor mv, int a, int b, int c, int pc,
+            int jvmIntOp, String kind) {
+        emitGuardInt(mv, b, pc);
+        emitGuardInt(mv, c, pc);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a);
+        emitLoadP(mv, b);
+        emitLoadP(mv, c);
+        mv.visitInsn(jvmIntOp);
+        mv.visitInsn(LASTORE);
+        emitTagIntNull(mv, a);
+    }
+
+    /**
+     * Two-register shift ({@code SHL}/{@code SHR}) with Lua's negative-count
+     * semantics: a negative shift reverses direction, |count| >= 64 yields 0.
+     * Implemented as a helper call to keep the emitted method small.
+     */
+    private static void emitShiftNum(MethodVisitor mv, int a, int b, int c, int pc, boolean left) {
+        emitGuardInt(mv, b, pc);
+        emitGuardInt(mv, c, pc);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a);
+        emitLoadP(mv, b);
+        emitLoadP(mv, c);
+        String name = left ? "shiftLeft" : "shiftRight";
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", name, "(JJ)J", false);
+        mv.visitInsn(LASTORE);
+        emitTagIntNull(mv, a);
+    }
+
+    /** Immediate shift with Lua's negative-count semantics (SHLI/SHRI). */
+    private static void emitShiftImm(MethodVisitor mv, int a, int b, int sc, int pc, boolean left) {
+        emitGuardInt(mv, b, pc);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a);
+        emitLoadP(mv, b);
+        mv.visitLdcInsn((long) sc);
+        String name = left ? "shiftLeft" : "shiftRight";
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", name, "(JJ)J", false);
+        mv.visitInsn(LASTORE);
+        emitTagIntNull(mv, a);
+    }
+
+    /** {@code R[A] = R[B] / K[C]}; always float (K may be int or float). */
+    private static void emitDivK(MethodVisitor mv, LuaProto proto, int a, int b, int c, int pc) {
+        double kv = ((Number) numericConstant(proto, c)).doubleValue();
+        emitGuardNumber(mv, b, pc);
+        emitLoadDouble(mv, b);
+        mv.visitLdcInsn(kv);
+        mv.visitInsn(DDIV);
+        emitStoreFloatFromStack(mv, a);
+    }
+
+    /** {@code R[A] = R[B] ^ K[C]}; always float with C99 pow semantics. */
+    private static void emitPowK(MethodVisitor mv, LuaProto proto, int a, int b, int c, int pc) {
+        double kv = ((Number) numericConstant(proto, c)).doubleValue();
+        emitGuardNumber(mv, b, pc);
+        emitLoadDouble(mv, b);
+        mv.visitLdcInsn(kv);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/LuaValue", "luaNumPow", "(DD)D", false);
+        emitStoreFloatFromStack(mv, a);
+    }
+
+    /** Extracts an integer/float constant as a {@link Number}. */
+    private static Number numericConstant(LuaProto proto, int idx) {
+        LuaValue k = proto.constants[idx];
+        if (k instanceof LuaInteger li) {
+            return li.toLong();
+        }
+        return ((org.luava.runtime.LuaFloat) k).toDouble();
     }
 
     /**
@@ -1554,6 +1930,347 @@ public final class LuaToJvmTranslator implements Opcodes {
             mv.visitJumpInsn(GOTO, labels[pc + 1]);
         } else {
             mv.visitJumpInsn(GOTO, labels[pc + 2]);
+        }
+    }
+
+    /**
+     * Two-register numeric comparison ({@code LT}/{@code LE}), with a mixed
+     * int/float runtime lane and a deopt for any non-number. Mirrors the
+     * interpreter's {@code luaV_lessthan}/{@code luaV_lessequal} numeric
+     * fast path; the mixed cases use {@code BytecodeVM}'s exact helpers so
+     * NaN/±0 ordering matches bit-for-bit. On success jumps to
+     * {@code pc+1}/{@code pc+2} per the {@code k} skip flag.
+     */
+    private static void emitCmpRR(MethodVisitor mv, int a, int b, int k, int pc, Label[] labels,
+            boolean orEqual) {
+        emitGuardNumber(mv, a, pc);
+        emitGuardNumber(mv, b, pc);
+        // condition = R[A] < R[B] (or <= when orEqual). DCMPG pushes +1 for
+        // NaN so both IFLT and IFLE are false (matches Lua NaN ordering).
+        int cmpOp = orEqual ? IFLE : IFLT;
+        Label intLane = new Label();
+        Label doneTrue = new Label();
+        Label doneFalse = new Label();
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, a);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_INT);
+        mv.visitJumpInsn(IF_ICMPEQ, intLane);
+        // Float lane: promote both to double.
+        emitLoadDouble(mv, a);
+        emitLoadDouble(mv, b);
+        mv.visitInsn(DCMPG);
+        mv.visitJumpInsn(cmpOp, doneTrue);
+        mv.visitJumpInsn(GOTO, doneFalse);
+        mv.visitLabel(intLane);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, b);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_INT);
+        Label intInt = new Label();
+        mv.visitJumpInsn(IF_ICMPEQ, intInt);
+        // R[A] int, R[B] float.
+        emitLoadP(mv, a);
+        mv.visitInsn(L2D);
+        emitLoadDouble(mv, b);
+        mv.visitInsn(DCMPG);
+        mv.visitJumpInsn(cmpOp, doneTrue);
+        mv.visitJumpInsn(GOTO, doneFalse);
+        mv.visitLabel(intInt);
+        emitLoadP(mv, a);
+        emitLoadP(mv, b);
+        mv.visitInsn(LCMP);
+        mv.visitJumpInsn(cmpOp, doneTrue);
+        mv.visitLabel(doneFalse);
+        if (k == 1) {
+            mv.visitJumpInsn(GOTO, labels[pc + 2]);
+        } else {
+            mv.visitJumpInsn(GOTO, labels[pc + 1]);
+        }
+        mv.visitLabel(doneTrue);
+        if (k == 1) {
+            mv.visitJumpInsn(GOTO, labels[pc + 1]);
+        } else {
+            mv.visitJumpInsn(GOTO, labels[pc + 2]);
+        }
+    }
+
+    /**
+     * Two-register equality ({@code EQ}). Handles int/float/boolean/nil
+     * directly; anything else (tables, strings with metamethods, functions)
+     * deopts to the interpreter's full {@code luaEquals}. Note the mixed
+     * int/float compare must treat {@code 1 == 1.0} as true, so a float lane
+     * promotes both operands.
+     */
+    private static void emitEqRR(MethodVisitor mv, LuaProto proto, int a, int b, int k, int pc,
+            Label[] labels) {
+        Label boolLane = new Label();
+        Label nilLane = new Label();
+        Label doneTrue = new Label();
+        Label doneFalse = new Label();
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, a);
+        mv.visitInsn(BALOAD);
+        mv.visitVarInsn(ISTORE, 7);
+        // Numbers (int or float) compare by value with promotion so that
+        // 1 == 1.0 holds. Any int/float mix with a non-number is unequal.
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_INT);
+        Label aIsInt = new Label();
+        mv.visitJumpInsn(IF_ICMPEQ, aIsInt);
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_FLOAT);
+        Label aIsFloat = new Label();
+        mv.visitJumpInsn(IF_ICMPEQ, aIsFloat);
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_BOOLEAN);
+        mv.visitJumpInsn(IF_ICMPEQ, boolLane);
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_NIL);
+        mv.visitJumpInsn(IF_ICMPEQ, nilLane);
+        emitDeopt(mv, pc);
+        // --- R[A] is INT ---
+        mv.visitLabel(aIsInt);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, b);
+        mv.visitInsn(BALOAD);
+        mv.visitVarInsn(ISTORE, 7);
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_INT);
+        Label bInt = new Label();
+        mv.visitJumpInsn(IF_ICMPEQ, bInt);
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_FLOAT);
+        mv.visitJumpInsn(IF_ICMPNE, doneFalse);
+        emitLoadDouble(mv, a);
+        emitLoadDouble(mv, b);
+        mv.visitInsn(DCMPL);
+        mv.visitJumpInsn(IFEQ, doneTrue);
+        mv.visitJumpInsn(GOTO, doneFalse);
+        mv.visitLabel(bInt);
+        emitLoadP(mv, a);
+        emitLoadP(mv, b);
+        mv.visitInsn(LCMP);
+        mv.visitJumpInsn(IFEQ, doneTrue);
+        mv.visitJumpInsn(GOTO, doneFalse);
+        // --- R[A] is FLOAT: R[B] must be numeric; promote both ---
+        mv.visitLabel(aIsFloat);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, b);
+        mv.visitInsn(BALOAD);
+        mv.visitVarInsn(ISTORE, 7);
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_INT);
+        Label bNum = new Label();
+        mv.visitJumpInsn(IF_ICMPEQ, bNum);
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_FLOAT);
+        mv.visitJumpInsn(IF_ICMPNE, doneFalse);
+        mv.visitLabel(bNum);
+        emitLoadDouble(mv, a);
+        emitLoadDouble(mv, b);
+        mv.visitInsn(DCMPL);
+        mv.visitJumpInsn(IFEQ, doneTrue);
+        mv.visitJumpInsn(GOTO, doneFalse);
+        // --- R[A] is BOOLEAN: R[B] must be the same boolean ---
+        mv.visitLabel(boolLane);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, b);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_BOOLEAN);
+        mv.visitJumpInsn(IF_ICMPNE, doneFalse);
+        emitLoadP(mv, a);
+        emitLoadP(mv, b);
+        mv.visitInsn(LCMP);
+        mv.visitJumpInsn(IFEQ, doneTrue);
+        mv.visitJumpInsn(GOTO, doneFalse);
+        // --- R[A] is NIL: equal only if R[B] is nil ---
+        mv.visitLabel(nilLane);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, b);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_NIL);
+        mv.visitJumpInsn(IF_ICMPEQ, doneTrue);
+        mv.visitJumpInsn(GOTO, doneFalse);
+        mv.visitLabel(doneFalse);
+        if (k == 1) {
+            mv.visitJumpInsn(GOTO, labels[pc + 2]);
+        } else {
+            mv.visitJumpInsn(GOTO, labels[pc + 1]);
+        }
+        mv.visitLabel(doneTrue);
+        if (k == 1) {
+            mv.visitJumpInsn(GOTO, labels[pc + 1]);
+        } else {
+            mv.visitJumpInsn(GOTO, labels[pc + 2]);
+        }
+    }
+
+    /**
+     * {@code EQK}: R[A] == K[B]. Only number/boolean/nil constants are
+     * compiled; string/table constants deopt to the interpreter (which may
+     * invoke {@code __eq}), so semantics stay exact.
+     */
+    private static void emitEqK(MethodVisitor mv, LuaProto proto, int a, int b, int k, int pc,
+            Label[] labels) {
+        LuaValue kv = proto.constants[b];
+        Label doneTrue = new Label();
+        Label doneFalse = new Label();
+        if (kv instanceof LuaInteger ki) {
+            long c = ki.toLong();
+            // R[A] must be int or float; int compares directly, float promotes.
+            mv.visitVarInsn(ALOAD, 3);
+            emitIndex(mv, a);
+            mv.visitInsn(BALOAD);
+            ldcInt(mv, TYPE_INT);
+            Label asFloat = new Label();
+            mv.visitJumpInsn(IF_ICMPNE, asFloat);
+            emitLoadP(mv, a);
+            mv.visitLdcInsn(c);
+            mv.visitInsn(LCMP);
+            mv.visitJumpInsn(IFEQ, doneTrue);
+            mv.visitJumpInsn(GOTO, doneFalse);
+            mv.visitLabel(asFloat);
+            mv.visitVarInsn(ALOAD, 3);
+            emitIndex(mv, a);
+            mv.visitInsn(BALOAD);
+            ldcInt(mv, TYPE_FLOAT);
+            mv.visitJumpInsn(IF_ICMPNE, doneFalse);
+            emitLoadDouble(mv, a);
+            mv.visitLdcInsn((double) c);
+            mv.visitInsn(DCMPL);
+            mv.visitJumpInsn(IFEQ, doneTrue);
+            mv.visitJumpInsn(GOTO, doneFalse);
+        } else if (kv instanceof org.luava.runtime.LuaFloat kf) {
+            double c = kf.toDouble();
+            // R[A] must be numeric; promote both.
+            mv.visitVarInsn(ALOAD, 3);
+            emitIndex(mv, a);
+            mv.visitInsn(BALOAD);
+            ldcInt(mv, TYPE_INT);
+            Label asFloat = new Label();
+            mv.visitJumpInsn(IF_ICMPNE, asFloat);
+            emitLoadP(mv, a);
+            mv.visitInsn(L2D);
+            mv.visitLdcInsn(c);
+            mv.visitInsn(DCMPL);
+            mv.visitJumpInsn(IFEQ, doneTrue);
+            mv.visitJumpInsn(GOTO, doneFalse);
+            mv.visitLabel(asFloat);
+            mv.visitVarInsn(ALOAD, 3);
+            emitIndex(mv, a);
+            mv.visitInsn(BALOAD);
+            ldcInt(mv, TYPE_FLOAT);
+            mv.visitJumpInsn(IF_ICMPNE, doneFalse);
+            emitLoadDouble(mv, a);
+            mv.visitLdcInsn(c);
+            mv.visitInsn(DCMPL);
+            mv.visitJumpInsn(IFEQ, doneTrue);
+            mv.visitJumpInsn(GOTO, doneFalse);
+        } else if (kv instanceof org.luava.runtime.LuaBoolean kb) {
+            mv.visitVarInsn(ALOAD, 3);
+            emitIndex(mv, a);
+            mv.visitInsn(BALOAD);
+            ldcInt(mv, TYPE_BOOLEAN);
+            mv.visitJumpInsn(IF_ICMPNE, doneFalse);
+            emitLoadP(mv, a);
+            mv.visitLdcInsn((long) (kb.toBoolean() ? 1 : 0));
+            mv.visitInsn(LCMP);
+            mv.visitJumpInsn(IFEQ, doneTrue);
+            mv.visitJumpInsn(GOTO, doneFalse);
+        } else if (kv.isNil()) {
+            mv.visitVarInsn(ALOAD, 3);
+            emitIndex(mv, a);
+            mv.visitInsn(BALOAD);
+            ldcInt(mv, TYPE_NIL);
+            mv.visitJumpInsn(IF_ICMPEQ, doneTrue);
+            mv.visitJumpInsn(GOTO, doneFalse);
+        } else {
+            // String/other constant: full equality may run metamethods.
+            emitDeopt(mv, pc);
+            return;
+        }
+        if (k == 1) {
+            mv.visitJumpInsn(GOTO, labels[pc + 2]);
+        } else {
+            mv.visitJumpInsn(GOTO, labels[pc + 1]);
+        }
+        mv.visitLabel(doneTrue);
+        if (k == 1) {
+            mv.visitJumpInsn(GOTO, labels[pc + 1]);
+        } else {
+            mv.visitJumpInsn(GOTO, labels[pc + 2]);
+        }
+    }
+
+    /**
+     * {@code TEST A k}: {@code if (truthy(R[A]) != (k==1)) pc++}. When the
+     * condition holds, control falls through to {@code pc+1}; otherwise the
+     * next instruction is skipped ({@code pc+2}).
+     */
+    private static void emitTest(MethodVisitor mv, int a, int k, int pc, Label[] labels) {
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, a);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/bytecode/BytecodeVM", "isTruthy",
+                "([J[BI)Z", false);
+        // isTruthy == (k==1) -> fall through;  else -> skip next.
+        Label truthy = new Label();
+        mv.visitJumpInsn(IFNE, truthy);
+        if (k == 1) {
+            mv.visitJumpInsn(GOTO, labels[pc + 2]);
+        } else {
+            mv.visitJumpInsn(GOTO, labels[pc + 1]);
+        }
+        mv.visitLabel(truthy);
+        if (k == 1) {
+            mv.visitJumpInsn(GOTO, labels[pc + 1]);
+        } else {
+            mv.visitJumpInsn(GOTO, labels[pc + 2]);
+        }
+    }
+
+    /**
+     * {@code TESTSET A B k}: like TEST on R[B], but on the fallthrough edge
+     * copies R[B] into R[A] (mirrors {@code OP_TESTSET}).
+     */
+    private static void emitTestSet(MethodVisitor mv, int a, int b, int k, int pc, Label[] labels) {
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, b);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/bytecode/BytecodeVM", "isTruthy",
+                "([J[BI)Z", false);
+        // The copy happens iff truthy == (k==1); otherwise skip the next
+        // instruction. (Mirrors OP_TESTSET's `truthy != (k==1)` test.)
+        Label skip = new Label();
+        if (k == 1) {
+            mv.visitJumpInsn(IFEQ, skip); // falsy -> no copy
+        } else {
+            mv.visitJumpInsn(IFNE, skip); // truthy -> no copy
+        }
+        copyRegTriple(mv, a, b);
+        mv.visitJumpInsn(GOTO, labels[pc + 1]);
+        mv.visitLabel(skip);
+        mv.visitJumpInsn(GOTO, labels[pc + 2]);
+    }
+
+    /** Copies the triple-stack register {@code src} into {@code dst}. */
+    private static void copyRegTriple(MethodVisitor mv, int dst, int src) {
+        for (int local : new int[] {2, 3, 4}) {
+            mv.visitVarInsn(ALOAD, local);
+            emitIndex(mv, dst);
+            mv.visitVarInsn(ALOAD, local);
+            emitIndex(mv, src);
+            if (local == 2) {
+                mv.visitInsn(LALOAD);
+                mv.visitInsn(LASTORE);
+            } else if (local == 3) {
+                mv.visitInsn(BALOAD);
+                mv.visitInsn(BASTORE);
+            } else {
+                mv.visitInsn(AALOAD);
+                mv.visitInsn(AASTORE);
+            }
         }
     }
 

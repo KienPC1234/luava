@@ -1,35 +1,40 @@
-# Luava Roadmap — Đột phá bằng JIT lai (Hybrid Tiered JIT)
+# plan.md — Mở rộng Hybrid Tiered JIT tối đa
 
-> **Mục tiêu tối thượng:** đánh bại hoặc hòa LuaJ 3.0.1 trên **cả 10 benchmark**,
-> trong khi giữ **30/30 suite PUC Lua 5.4.9 + 170 unit tests xanh** và không
-> bao giờ sửa `tests/lua-5.4.9-tests/`.
+> **Mục tiêu tối thượng:** mở rộng độ phủ JIT tới **mọi cấu trúc Lua 5.4 có thể
+> tăng tốc hợp lệ**, giữ **30/30 suite PUC 5.4.9 + toàn bộ unit test xanh**,
+> đánh bại hoặc hòa LuaJ 3.0.1 trên cả 10 benchmark, và **không bao giờ** sửa
+> `tests/lua-5.4.9-tests/`.
 >
-> **Tài liệu này thay thế** `DIFFICULTIES.md`, `OPTIMIZATION_PLAN.md`,
-> `PERF_WALL.md` (đã xóa, nội dung hợp nhất vào đây). `PLANS.md` giữ lại làm
-> hồ sơ thiết kế register-VM gốc + ghi chú non-goal §IX. `AGENTS.md` và
-> `README.md` giữ nguyên.
+> Tài liệu này là **nguồn duy nhất** thay cho `plan.md` cũ và `PLANS.md`
+> (đã xóa). Hồ sơ thiết kế register-VM cốt lõi được cô đọng lại ở §2; nhật ký
+> thất bại quan trọng được bảo tồn ở §9.
 >
-> Cập nhật: 2026-09-14. Trạng thái: interpreter đã khai thác cạn codegen;
-> đột phá tiếp theo bắt buộc là JIT.
+> Cập nhật: 2026-09-20. Trạng thái: **Phase B, C, E và A3 đã hoàn thành**, cùng
+> pha A1/A2 (tier-up theo loop + entry JIT cho top-level chunk). Độ phủ mở rộng
+> từ ~4/24 lên ~14/24 dạng cấu trúc; 180 unit test + 30/30 suite PUC xanh.
+> Xem §13 để biết trạng thái từng phase.
 
 ---
 
 ## 0. TL;DR cho người vội
 
-- Interpreter hiện tại: **4 task thắng LuaJ** (arith 0.74×, sieve 0.93×,
-  coroutines 0.06×, hash 0.63×), **1 hòa** (table_ops 1.04×), **5 thua**
-  (fib 1.82×, oop 1.18×, concat 1.76×, pattern 1.96×, closures 2.01×).
-- Mọi task thua đều bị **call-tax** chi phối (đã chứng minh bằng floor probe:
-  bỏ hết metadata vẫn 1.57× chậm hơn LuaJ).
-- **Spike JIT đã chứng minh đột phá:** translator tự động (không hand-code)
-  dịch bytecode Lua của fib sang **một method JVM**, đệ quy thành
-  `INVOKESTATIC` → fib(35) = **185ms**. So cùng máy: interpreter ~5300ms,
-  LuaJ ~2411ms, C Lua ~766ms. Tức **nhanh hơn LuaJ 13×, hơn cả C 4×**.
-- Kế hoạch: **JIT lai theo tầng** — interpreter là mặc định + fallback; JIT
-  chỉ biên dịch "kernel nóng" với guard kiểu + deopt; coroutine giữ nguyên
-  interpreter (đừng phá thế thắng 16×).
-- Lộ trình chia **8 giai đoạn** (Phase 0–7), mỗi phase có cổng kiểm soát
-  (size/compile/correctness/perf) và điều kiện rollback.
+- **JIT không yếu về chất lượng** — nó biến fib(35) từ ~5400 ms xuống ~266 ms
+  (nhanh 20×, thắng LuaJ ~10×) nhờ "một method JVM per proto" cho C2 inline.
+- **JIT yếu về độ phủ.** Bằng chứng đo được (paired, pinned core 8):
+  - JIT on/off: fib **0.049** (20×), closures 0.55, oop 0.74, concat 0.83;
+    còn **arith/table/hash/pattern/sieve ≈ 1.0 (vô dụng)**.
+  - Chỉ **4/10 kernel benchmark** được compile; 5/10 task chính chạy
+    interpreter thuần.
+- **Nút thắt lớn nhất (đã xác minh):** hotness chỉ đếm ở `OP_CALL`/`OP_TAILCALL`,
+  và **main chunk luôn `isVararg=true`** → mọi vòng lặp ở chunk chính
+  (arith/table/hash/pattern/sieve) **không bao giờ tier-up**.
+  Bằng chứng: loop arith 10M khi bọc vào hàm + `prewarm` → **39.7 ms**,
+  interpreter **220 ms** → **5.5× đang bỏ trên bàn**.
+- **Nút thắt thứ hai:** lattice số `T_INT` vs `T_NUM` xung đột ở loop header
+  `s=0; for … s=s+t[i]` → reject dù translator đã có numeric dispatch.
+  Headroom ~3.5× (42.9 ms compiled vs 151.7 ms interpreted).
+- Kế hoạch: **Phase A–J**, ROI cao trước (A, B, C), mở dần tới vararg,
+  generic-for, closure/OOP, inline-cache đa hình.
 
 ---
 
@@ -37,767 +42,543 @@
 
 ### 1.1 Kỷ luật test (từ `AGENTS.md`)
 - **Cấm** sửa/tamper/xóa/bỏ qua bất kỳ dòng nào trong `tests/lua-5.4.9-tests/`.
-- **Cấm** hardcode kết quả giả, mock return, hay branch "để qua test".
-- Tiến độ đo bằng **số suite pass tự nhiên** (30/30) + 170 unit tests.
-- Mọi lỗi phải truy gốc theo tầng (Lexer/Parser/AST/Bytecode/VM/Stdlib) và
-  sửa tại tầng đó. Không vá ngọn.
-- Mỗi lần chạy suite phải có `timeout`; cấm `nohup` (làm `files.lua:762` fail giả).
+- **Cấm** hardcode/mock/branch "để qua test".
+- Tiến độ = **30/30 suite pass tự nhiên** + toàn bộ unit test.
+- Mọi lỗi truy gốc theo tầng (Lexer/Parser/AST/Bytecode/VM/Stdlib/JIT) và sửa
+  tại tầng đó.
+- Mỗi lần chạy suite phải có `timeout`; không `nohup`.
 
-### 1.2 Kỷ luật đo lường (đã trả giá để rút ra)
-- **Máy drift ±10%.** Cấm đo naive before/after. Mọi claim perf = build 2 jar
-  (pre/post), chạy **xen kẽ từng cặp** (PRE,POST,PRE,POST…), **≥7 cặp**,
-  lấy median; **bar 3%** mới tính là thắng.
-- **Pin core:** mọi benchmark dùng `taskset -c <core rảnh>` (đã chứng minh:
-  không pin thì add-loop swing 855→1247ms; pin thì spread <11ms).
-- **Ngoại lệ coroutine:** KHÔNG pin 1 core (bóp chết virtual-thread pool:
-  297ms → 21s). Đo no-pin.
-- Profiler: **async-profiler** (`-agentpath:libasyncProfiler.so=start,event=cpu`),
-  KHÔNG dùng JFR `ExecutionSample` cho micro (safepoint bias — JFR báo
-  `divideUnsigned` 15.5% nhưng async-profiler không thấy; đã chứng minh artifact).
-- JIT nội tại: `-XX:+PrintCompilation`, `-XX:+PrintInlining`,
-  `-XX:+UnlockDiagnosticVMOptions`; hằng số C2: `HugeMethodLimit=8000`,
-  `MaxInlineSize/FreqInlineSize≈325`, `MaxRecursiveInlineLevel=1`.
+### 1.2 Kỷ luật đo lường
+- Máy drift ±10%. Mọi claim perf = **2 jar (pre/post)** chạy **xen kẽ từng cặp**
+  (A,B,A,B…), **≥7 cặp**, lấy **median**; **bar 3%** mới tính thắng.
+- **Pin core** (`taskset -c <core rảnh>`) cho mọi task trừ coroutine
+  (virtual-thread pool; pin sẽ bóp chết: 297ms → 21s).
+- Luôn đo thêm **JIT on/off per-task**, không chỉ tổng thể (tránh lọt việc JIT
+  làm task nào đó chậm đi).
+- Profiler: `async-profiler` (`-agentpath`), không JFR ExecutionSample.
 
 ### 1.3 Kỷ luật commit
 - Commit theo batch, message kèm số liệu interleave.
-- Revert nếu dưới bar hoặc gây regression; ghi lại lý do vào §7 (nhật ký thất bại).
-- Không thêm file rác, không vanity code. Mọi thay đổi phải phục vụ logic/
-  tương thích/perf đo được.
+- Revert nếu dưới bar hoặc gây regression; ghi lý do vào §9.
+- Không file rác, không vanity code. Mọi thay đổi phục vụ logic/tương thích/perf.
 
 ### 1.4 Ràng buộc nền tảng
-- Java 21 LTS stock, **không preview, không JNI/FFM**.
+- Java 21 LTS stock, **không preview, không JNI/FFM**, chỉ `org.ow2.asm`.
 - Không `System.out` trong runtime.
 - Kiến trúc value: triple-stack (`long[] pStack`, `byte[] tStack`,
-  `LuaValue[] oStack`) — giữ nguyên, JIT thao tác trực tiếp trên nó.
+  `LuaValue[] oStack`) — JIT thao tác trực tiếp trên nó.
 
 ---
 
-## 2. Hiện trạng & bằng chứng (baseline để đo tiến độ)
-
-### 2.1 Bảng điểm (paired, best-of-N, cùng core)
-| # | Task | Luava | LuaJ 3.0.1 | Tỷ lệ | Trạng thái |
-|---|---|---|---|---|---|
-| 01 | arith_loop | ~196ms | ~264ms | **0.74×** | THẮNG |
-| 02 | fibonacci | ~4400ms (interp) / **~254ms (JIT)** | ~2410ms | 1.82× → **0.11× THẮNG 9.5×** |
-| 03 | table_ops | ~97ms | ~94ms | 1.04× | HÒA |
-| 04 | string_concat | ~82ms | ~46ms | 1.76× | THUA |
-| 05 | closures | ~93ms (interp) / **~66ms (JIT)** | ~55ms | 2.01× → **1.15× (sát nút)** |
-| 06 | coroutines | ~282ms | ~4415ms | **0.06×** | THẮNG 16× |
-| 07 | hash_table | ~114ms | ~181ms | **0.63×** | THẮNG |
-| 08 | oop_metatables | ~701ms | ~594ms | 1.18× | THUA |
-| 09 | string_pattern | ~147ms | ~75ms | 1.96× | THUA |
-| 10 | sieve | ~285ms | ~305ms | **0.93×** | THẮNG |
-
-Fibonacci tuyệt đối: **7930ms (đầu dự án) → ~4400ms**.
-
-### 2.2 Bằng chứng call-tax là gốc duy nhất của khoảng cách
-| Tầng | Luava | LuaJ | C Lua |
-|---|---|---|---|
-| dispatch loop rỗng (50M) | **5.4ns/iter** | 11.0ns | 4.0ns |
-| add int (50M) | 25.6ns | 24.7ns | 7.6ns |
-| gọi `f(x)=x+1` (20M) | 116ns/call | 63ns | 22.5ns |
-| **thuế gọi (call−add)** | **~90ns** | ~38ns | ~0 |
-
-- Luava **thắng dispatch**, **hòa số học**, **thua ở thuế gọi**.
-- **Floor probe:** bỏ gần hết metadata frame vẫn 1805ms vs LuaJ 1152ms = 1.57×.
-  → trần của mọi tối ưu interpreter là ~20%, không đủ hòa.
-- Allocation trên đường gọi = **0** → không phải GC, mà là store/dispatch.
-
-### 2.3 Vì sao LuaJ nhanh ở call-heavy
-LuaJ (`LuaC` interpreter) biên dịch **mỗi closure thành một method Java riêng**
-(`LuaClosure.execute`), C2 inline thẳng call site. Luava dùng **một `runLoop`
-chung + bảng `ctx` trung gian**, mỗi call phải reload trạng thái từ heap →
-C2 không fusion được. Đây là khác biệt kiến trúc, không phải micro-opt.
-
-### 2.4 Bằng chứng đột phá: spike JIT (2026-09-14)
-- `/tmp/opencode/jitspike/JitSpike.java` (ASM 9.7 + `defineHiddenClass`).
-- Là **translator**, không hand-code: đọc `LuaProto` thật của fib (12 lệnh:
-  `LEI/JMP/RETURN1/GETUPVAL/SUBK/ADD/CALL/RETURN0`), sinh một method JVM
-  static `long exec(...)`, đệ quy self-call → `INVOKESTATIC`, load bằng
-  hidden class.
-- Kết quả fib(35): **~185ms** (interpreter ~5300ms, LuaJ ~2411ms, C ~766ms).
-- Ý nghĩa: "một method JVM per Lua function" cho C2 inlining là **thật và
-  cực mạnh**. Đây là con đường duy nhất để thắng call-heavy.
-
----
-
-## 3. Vấn đề cần giải: non-goal §IX và cách giải
-
-`PLANS.md §IX` tuyên bố phát JVM bytecode là **anti-pattern** vì 3 lý do.
-Kế hoạch mới thừa nhận cả 3 và có đối sách:
-
-| Rủi ro §IX | Bản chất | Đối sách trong thiết kế mới |
-|---|---|---|
-| **Metaspace leak** | mỗi closure = 1 class → OOM Metaspace | `defineHiddenClass` (JEP 371): lớp ẩn không bị classloader giữ, GC dọn khi closure chết. + **code cache có giới hạn LRU** (chỉ giữ N class nóng nhất). + chỉ JIT kernel nóng, không JIT mọi closure. |
-| **Coroutine yield bất khả** | method JVM không yield giữa frame | **JIT không bao giờ biên dịch hàm có khả năng yield.** Hàm gọi `coroutine.yield` (trực tiếp/gián tiếp) chạy interpreter. Coroutine giữ thế thắng 16×. |
-| **Giới hạn 64KB/method** | hàm Lua khổng lồ | Chỉ JIT proto ≤ ngưỡng opcode (vd 200 lệnh); proto lớn hơn ở lại interpreter. |
-
-**Quyết định kiến trúc:** JIT là **tầng tăng tốc tùy chọn**, interpreter vẫn là
-engine mặc định và fallback. Không có JIT thì hành vi y hệt hiện tại.
-
----
-
-## 4. Kiến trúc đích: Hybrid Tiered JIT
+## 2. Hiện trạng kiến trúc JIT (đọc trước khi sửa)
 
 ```
-Lua source ──Lexer/Parser──► AST ──BytecodeCompiler──► LuaProto
-                                                          │
-                                          ┌───────────────┴────────────────┐
-                                          ▼                                ▼
-                                  BytecodeVM (interpreter)          JitCompiler (ASM)
-                                   - mặc định                        - chỉ proto nóng
-                                   - fallback                        - int/float chuyên biệt
-                                   - coroutine                       - guard + deopt
-                                   - proto lớn                       - hidden class
-                                          ▲                                │
-                                          └────── deopt / tier-down ───────┘
+Lua source ─Lexer/Parser─► AST ─BytecodeCompiler─► LuaProto
+                                                     │
+                                     ┌───────────────┴────────────────┐
+                                     ▼                                ▼
+                              BytecodeVM (interpreter)         JitCompiler (ASM)
+                               - mặc định / fallback            - chỉ proto nóng
+                               - coroutine, guards              - hidden class
+                               - proto lớn / chưa phủ           - guard + deopt
+                                     ▲                                │
+                                     └──── deopt / tier-down ─────────┘
 ```
 
-### 4.1 Mô hình thực thi JIT
-- **Một method JVM per Lua proto** (không phải per closure instance):
-  `static long/int/LuaValue exec(Object[] upvals, long[] p, byte[] t, LuaValue[] o, int base)`.
-- Hàm số học thuần (int) → chữ ký trả `long` (không box). Hàm trả object →
-  trả `LuaValue`. Chọn theo type-inference tĩnh ở frontend (`Typer` đã có).
-- **Guard kiểu:** tại điểm cần giá trị, đọc `tStack[idx]`; nếu tag không như
-  giả định → `deopt` (throw một signal đặc biệt, unwound về interpreter với
-  `pc` chính xác).
-- **Call-site:** giai đoạn đầu chỉ xử lý self-recursion (`INVOKESTATIC` trực
-  tiếp, đã chứng minh). Sau mở rộng ra monomorphic call-site → `MethodHandle`
-  cache; polymorphic → `invokedynamic` + PIC.
+### 2.1 Mô hình thực thi
+- **Một method JVM per `LuaProto`** (không per closure):
+  `static long exec(LuaClosure, Object[] up, long[] p, byte[] t, LuaValue[] o, int base)`
+  (int-return) hoặc `static LuaValue execObj(...)` (object-return).
+- Hidden class qua `MethodHandles.Lookup.defineHiddenClass(..., NESTMATE)`;
+  `JitCodeCache` LRU **512** chống leak Metaspace (evict → clear `proto.jitCode`).
+- Register window dùng chung triple-stack; tham số truyền ngay trên window của
+  caller (`base = funcIdx + 1`).
+- `execInner` là biến thể đã hoist closure bất biến cho call-site fusion.
 
-### 4.2 Hotness & tier-up
-- Mỗi `LuaProto` có bộ đếm gọi/backedge (`int`, plain field). Khi vượt ngưỡng
-  (vd 1000) và proto "JIT-able" (không yield, ≤ ngưỡng lệnh) → đưa vào hàng
-  đợi biên dịch (1 luồng nền, hoặc biên dịch đồng bộ lần đầu cho đơn giản).
-- Biên dịch xong → lưu `MethodHandle` vào `LuaProto.jitCode` (volatile).
-  `OP_CALL` kiểm tra `jitCode != null` → gọi JIT thay vì push frame.
-- Deopt → tăng bộ đếm, tạm khóa proto (đừng JIT lại liên tục).
+### 2.2 Hotness & tier-up
+- `LuaProto.hotCount`, ngưỡng `LuaState.JIT_HOT_THRESHOLD = 50`, tăng **chỉ**
+  trong `tryJitCall`/`tryJitTailCall` (tức `OP_CALL`/`OP_TAILCALL`).
+- Vượt ngưỡng → `JitCompiler.requestCompile(proto)`:
+  - mặc định **compile nền** (daemon `luava-jit`, queue collapse `jitQueued`);
+  - `-Dluava.jit.sync=true` → compile đồng bộ (dùng cho đo đạc).
+- `JitCompiler.prewarm(closure[, state])` compile trước cả cây proto.
+- `ENABLE_JIT` mặc định **true**; override per-state `state.jitEnabled(Boolean)`.
 
-### 4.3 Tương tác coroutine
-- `LuaProto.mayYield` đánh dấu tĩnh: có lệnh gọi tới hàm có thể yield
-  (`coroutine.*`, hoặc hàm chưa xác định). Gọi qua ranh giới yield luôn đi
-  interpreter.
-- Nếu một hàm vừa nóng vừa `mayYield` → **không JIT** (bảo toàn thế thắng).
+### 2.3 Guard + deopt
+- Mọi giả định kiểu kiểm tra ở runtime: đọc `tStack[idx]` (tag), sai → `DeoptSignal`
+  (extends `Error`, không stack trace) mang `pc`.
+- Ba chế độ ở entry: `0` = không JIT (cold/không hợp lệ/guard); `1` = chạy xong
+  frameless; `2` = deopt giữa chừng, interpreter **resume tại `jitResumePc`**
+  với state đã commit (bảng/upvalue ghi an toàn, không chạy lại).
+- Deopt > 8 lần → `jitDisabled`, quay về interpreter (chống deopt storm).
 
----
+### 2.4 Giới hạn tĩnh của `analyze()`
+- `proto.isVararg` → **null** (reject).
+- `code.length == 0 || > 200` → reject.
+- `maxStackSize > 64 || numParams > 16` → reject.
+- Opcode phải nằm trong allow-list (§3.1); op khác → reject.
+- `hasCalls && impure` (có ghi upvalue/table/global) → reject.
+- Object-return + `hasCalls` → reject.
+- `CALL` phải `B>=1` và (nếu là `CALL`) `C==2`; `SETLIST B==0` → reject.
+- K-form `ADDK/SUBK/MULK/IDIVK/MODK/BANDK/BORK/BXORK` đòi hằng `LuaInteger`;
+  `DIVK/POWK` bị reject (luôn float).
+- Type-inference forward: `T_INT ∪ T_NUM` = **conflict → reject** (nút thắt B).
 
-## 5. Lộ trình 8 giai đoạn
-
-Mỗi phase có: **việc**, **file**, **cổng (gates)**, **rủi ro/rollback**.
-Cổng chuẩn dùng chung:
-- **G-SIZE:** method sinh ra / `runLoop` không vượt ngưỡng đã định; in ra log.
-- **G-COMPILE:** `-XX:+PrintCompilation` xác nhận code JIT + interpreter được C2.
-- **G-CORRECT:** 30/30 suite + 170 unit tests xanh; fuzz đối chiếu stock Lua.
-- **G-PERF:** interleave ≥7 cặp pinned, bar 3%, không regression task khác.
-
----
-
-### Phase 0 — Đóng băng & dựng giàn đo (0.5 ngày) — ✅ XONG (2026-09-15)
-
-**Việc:**
-1. Dọn file md thừa (đã xóa `DIFFICULTIES.md`, `OPTIMIZATION_PLAN.md`,
-   `PERF_WALL.md`); giữ `plan.md` (file này), `PLANS.md`, `AGENTS.md`,
-   `README.md`, `docs/`.
-2. Backup harness tạm (`/tmp/opencode/prof/Bench*.java`,
-   `/tmp/opencode/vs/LuaJ*`, `aggsample.py`, jars A/B, `jitspike/`) vào
-   `benchmarks/harness/` (số liệu/jar tạm không commit; riêng
-   `interleave.sh`, `Bench.java`, `LuaJBench.java`, `BASELINE.txt` được
-   track như hạ tầng đo lường).
-3. Viết script `benchmarks/harness/interleave.sh`:
-   nhận 2 jar + task list → chạy 7 cặp đảo thứ tự, in median ratio.
-4. Ghi baseline hiện tại (§2.1) vào `benchmarks/harness/BASELINE.txt`.
-
-**File:** `benchmarks/harness/*` (untracked), `plan.md`.
-
-**Gates:** G-CORRECT (30/30 + 111). Harness tái lập được số §2.1 ±3%.
-
-**Rollback:** không có (chỉ dọn + đo).
-
-### Phase 1 — Hạ tầng JIT (2–3 ngày) — ✅ XONG (2026-09-15)
-
-**Việc:**
-1. Thêm dependency `org.ow2.asm:asm:9.7` vào `pom.xml` (+
-   `maven-shade-plugin` gộp asm, relocate `org.luava.shaded.asm`; jar
-   439KB → 581KB, chạy độc lập).
-2. `runtime/jit/JitCode.java`: wrapper `MethodHandle` + metadata (proto gốc,
-   signature, trạng thái khóa/deopt).
-3. Hidden class qua `MethodHandles.Lookup.defineHiddenClass` (NESTMATE)
-   trong `JitCompiler` (gộp vai `JitClassLoader`).
-4. `runtime/jit/JitCodeCache.java`: LRU giới hạn 512 class — chống Metaspace;
-   evict thì clear `proto.jitCode`.
-5. Feature flag `LuaState.ENABLE_JIT` (mặc định **false**; bật bằng
-   `-Dluava.jit=true`), `JIT_HOT_THRESHOLD=50`.
-
-**File:** `pom.xml`, `runtime/jit/JitCode.java`, `JitCodeCache.java`,
-`JitCompiler.java`, `LuaState.java` (flag), `LuaProto.java`
-(`jitCode`/`jitDisabled`/`mayYield`/`hotCount`).
-
-**Gates:** G-CORRECT với JIT off (build + suite xanh). ✅ 30/30 + 111.
-G-SIZE (không đụng runLoop — chỉ thêm `tryJitCall` ngoài loop).
-
-**Rollback:** gỡ dependency + package jit; không ảnh hưởng engine.
+### 2.5 Tương tác coroutine/debug/guard
+- `proto.mayYield` → không JIT (bảo toàn coroutine).
+- `ctx.thread.hooksActive || state.loopGuard != null` → bỏ qua JIT hoàn toàn.
+- JIT frameless nhưng mọi lỗi Lua deopt trước khi phát sinh → line/frame chính xác.
 
 ---
 
-### Phase 2 — Translator lõi: int chuyên biệt + guard + deopt — ✅ XONG v1 (2026-09-15)
+## 3. Ma trận phủ JIT đầy đủ (bằng chứng 2026-09-20)
 
-Đây là **trái tim** của dự án. Bắt đầu từ spike, mở rộng thành translator
-tổng quát cho tập opcode số học.
+### 3.1 Opcode hiện được compile (allow-list thật)
+`MOVE, LOADI, LOADF, LOADK, LOADNIL, LOADTRUE, LOADFALSE, CLEANUP, GETUPVAL,
+SETUPVAL, GETTABUP, GETTABLE, GETI, GETFIELD, SETTABUP, SETTABLE, SETI, SETFIELD,
+NEWTABLE, EXTRAARG, UNM, BNOT, NOT, LEN, SETLIST, ADD, SUB, MUL, ADDI, ADDK,
+SUBK, MULK, IDIVK, MODK, BANDK, BORK, BXORK, LEI, LTI, GTI, GEI, EQI, JMP,
+FORPREP, FORLOOP, CALL, TAILCALL, RETURN, RETURN1, RETURN0` + intrinsic `math.sqrt`.
 
-**Việc:**
-1. `runtime/jit/LuaToJvmTranslator.java`: duyệt `LuaProto.code`, phát bytecode
-   ASM cho từng opcode. Bảng opcode Phase 2 (số học/branch/return/upvalue):
-   `MOVE, LOADI, LOADF, LOADK, LOADNIL, LOADTRUE/FALSE, GETUPVAL, SETUPVAL,
-   ADD/SUB/MUL/DIV/IDIV/MOD, ADDI, ADDK/SUBK/MULK/DIVK/IDIVK/MODK,
-   LTI/LEI/GTI/GEI/EQI/EQ/LT/LE, JMP, TEST/TESTSET, FORPREP/FORLOOP,
-   RETURN0/RETURN1/RETURN, GETTABUP/GETFIELD/GETI/GETTABLE (read-only trước),
-   CALL (self-recursion)`.
-2. **Type specialization:** hai biến thể hàm: `int-specialized` (mọi operand
-   giả định TYPE_INT, trả `long`) và `generic` (dùng LuaValue, gọi helper VM).
-   Chọn theo `Typer` tĩnh; mặc định generic.
-3. **Guard + deopt:** `runtime/jit/DeoptSignal.java` (extends `Error`, cold).
-   Tại mỗi đọc `pStack[idx]`, guard `tStack[idx]==TYPE_INT`; sai → ném
-   `DeoptSignal` mang `pc`. `BytecodeVM` bắt signal này, khôi phục frame tại
-   `pc` và chạy tiếp interpreter.
-4. **Self-recursion & direct calls:** `OP_CALL` tới closure có cùng proto →
-   `INVOKESTATIC`. Còn lại: gọi `BytecodeVM` helper (fallback trong code JIT).
-5. **Bảng deopt metadata:** mỗi vị trí guard lưu `(pc, liveRegs)` để tái lập
-   chính xác trạng thái khi deopt.
+### 3.2 Opcode/cấu trúc thiếu → nguyên nhân reject
 
-**File:** `runtime/jit/LuaToJvmTranslator.java`, `DeoptSignal.java`,
-`runtime/bytecode/BytecodeVM.java` (bắt DeoptSignal tại OP_CALL/runLoop),
-`runtime/bytecode/LuaProto.java` (`jitCode`, `hotCount`, `mayYield`).
-
-**Gates (kết quả 2026-09-15):**
-- G-CORRECT: ✅ 30/30 suite + 170 unit tests xanh **cả hai chế độ**
-  (JIT-off mặc định; JIT-on qua `_JAVA_OPTIONS=-Dluava.jit=true`, và ép
-  `JIT_HOT_THRESHOLD=1` để 21 proto trong suite thực sự compile — 4 deopt
-  fallback đúng). Fuzz 20 kernel biên (float/missing/string args, pcall,
-  closures) byte-identical on/off.
-- G-PERF: ✅ fib **4943ms → 402ms (12.3×)** rồi **→ 254ms (19.5×)** sau
-  tối ưu `execInner` (bỏ prologue `getValue`-upvalue-mở ~28% theo
-  async-profiler leaf); LuaJ 2460ms → **thắng 9.5×**; 9 task còn lại trong
-  noise (±3%, đã xác minh lại closures/hash bằng 10 cặp).
-- G-COMPILE: ✅ async-profiler thấy `Gen$*.exec` đệ quy C2.
-- **Gate quyết định: VƯỢT** (400ms ≤ 500ms; mục tiêu 200ms còn hở — tối ưu
-  GETUPVAL/CALL guard là dư địa Phase 3).
-
-Thiết kế v1 đã chốt (khác dự thảo ban đầu ở 2 điểm, đều vì đơn giản + đúng):
-- Deopt = **restart toàn bộ call bằng interpreter** (thay vì resume tại pc),
-  an toàn vì subset thuần khiết (không table/global/upvalue-write).
-- Chỉ JIT proto thỏa subset số-nguyên hẹp; còn lại interpreter nguyên vẹn.
-
-**Rủi ro/rollback:** phức tạp deopt; nếu deopt không tái lập đúng → sai ngữ
-nghĩa. Giảm thiểu: khởi đầu chỉ int, guard dày, test fuzz. Rollback = flag off.
-
----
-
-### Phase 3 — Call-site tổng quát: PIC & invokedynamic — ✅ XONG v1 (2026-09-15, monomorphic, chưa invokedynamic)
-
-**Việc (đã làm):**
-1. Call-site monomorphic 3 tầng trong code JIT: hoisted self (phân loại ở
-   entry, không re-check), self-direct `INVOKESTATIC`, callee proto khác có
-   `jitCode && pure` qua `JitRuntime.invoke` helper. Callee lạ → deopt.
-   (Bài học: hoisting "mọi callee cùng proto" SAI với `add` — sửa thành
-   classify + slow path re-validate.)
-2. `SETUPVAL` leaf + lane int cho upvalue (`Upvalue.isClosedInt/
-   getClosedInt/setClosedInt`; open/non-int → generic/deopt).
-3. Sửa gốc `Upvalue.setValue` giữ tag nguyên thủy (int/float) thay vì ép
-   OBJECT — xóa cả một lớp deopt ở biên tier-up (closure tạo trước khi
-   compile).
-4. Quy tắc an toàn: proto có CALL thì phải pure; impure leaf thì
-   `numParams==0` (resume-at-pc không bị frame setup clobber).
-
-**Kết quả:** closures **~80ms → ~65ms (thắng 1.23× nội bộ, chỉ còn thua
-LuaJ 1.15×)**; fib giữ ~400ms; 8 task còn lại trong noise. 30/30 + 111 xanh
-cả hai chế độ (ép threshold=1: 24 proto compile, deopt fallback đúng);
-fuzz 35/35 đồng nhất.
-
-**Chưa làm (dời):** `invokedynamic` + PIC đa hình thật, megamorphic
-fallback — chỉ cần khi oop/metatable vào diện (Phase 5). TAILCALL trong JIT
-hiện từ chối conservative (compiler biến `return f()` thành TAILCALL).
-
-**File:** `runtime/jit/JitRuntime.java`, `LuaToJvmTranslator.java`,
-`Upvalue.java` (lane int).
-
-**Gates:** ✅ G-CORRECT (metamethod/`__call`/Java/coroutine đều deopt về
-interpreter — subset không chứa chúng). G-PERF: closures hòa→thắng nội bộ.
-
-**Rollback:** flag; call-site luôn có đường interpreter.
-
----
-
-### Phase 4 — Hotness, tier-up, tương tác VM — ✅ XONG v1 (2026-09-15, trừ default-true)
-
-**Việc (đã làm):**
-1. Bộ đếm nóng `hotCount` trong `executeCallOp`; tier-up ở ngưỡng 50.
-2. Chọn ứng viên: `analyze()` (≤200 lệnh, không mayYield, subset thuần).
-3. `ENABLE_JIT` **mặc định true** (2026-09-15, sau khi mọi gate xanh cả
-   hai chế độ + fuzz 63/63 + stress + RSS bounded): opt-out bằng
-   `-Dluava.jit=false`. Compile **nền** (daemon `luava-jit`, queue collapse
-   trùng, `jitQueued`) để request nóng không trả phí compile;
-   `-Dluava.jit.sync=true` cho đo đạc đơn định (harness dùng).
-4. Chống JIT storm: deopt > 8 → clear + `jitDisabled`; compile fail →
-   `jitDisabled` ngay (tránh enqueue lặp); cache LRU 512.
-5. Prewarm API `JitCompiler.prewarm(closure)` cho server (compile trước
-   khi nhận traffic).
-6. Overhead khi JIT bật trên task không hưởng lợi: interleave base-vs-JIT
-   7 cặp — mọi task trong noise, không regression.
-
-**Chưa làm:** default true (chờ Phase 5–6); backedge counter cho loop
-(ít giá trị khi loop nằm ở main chunk lạnh).
-
-**Gates:** G-CORRECT (suite chạy cả 2 chế độ JIT on/off). G-PERF: không task
-nào regression > 3%.
-
-**Rollback:** tắt flag.
-
----
-
-### Phase 5 — Mở rộng độ phủ opcode — ✅ XONG v1 (2026-09-15: table R/W + NEWTABLE)
-
-**Việc (đã làm):**
-- Nền tảng bắt buộc trước: **resume-at-pc thật** — frame push trước,
-  `tryJitCall` 3-trạng thái (1=xong frameless, 2=resume tại `jitResumePc`,
-  0=chạy từ đầu); nested deopt convert về call-pc của frame hiện tại qua
-  try/catch trong code JIT. Bắt được **bug fusion+resume** (skip store +
-  resume tại CALL = thanh ghi stale → stress deep-recursion fail) nhờ
-  `LuavaStressTest` với JIT bật; sửa bằng resume fused-CALL tại def-pc và
-  chỉ skip store khi proto pure.
-- READ: `GETTABUP/GETTABLE/GETI/GETFIELD` — guard table + metatable-null,
-  mirror đúng fast lane interpreter (`rawgetInt`/`get`), còn lại deopt.
-  Bắt được **bug stack imbalance** (guard ăn mất ref) nhờ probe dịch trực
-  tiếp + ASM `COMPUTE_FRAMES`.
-- WRITE: `SETTABUP/SETTABLE/SETI/SETFIELD` (mirror fast lane, deopt nếu
-  metamethod), `NEWTABLE` (hằng số qua `self.proto.constants`, không đổi
-  signature), `EXTRAARG` no-op.
-- Quy tắc giữ nguyên: có CALL thì phải pure; callee JIT phải pure;
-  TAILCALL vẫn từ chối.
-- **Revert `OP_CLOSURE` khỏi JIT** (đo paired: closures 66ms → 76ms):
-  body toàn allocation, JIT không bớt việc nào mà thêm entry cost
-  (helper tốn 2 ThreadLocal lookup mà interpreter không cần). Factories ở
-  interpreter. Ghi vào §7.
-- **Fix `closeUpvalues` ở JIT return** (`closeOnJitReturn` trong
-  `tryJitCall`): upvalue mở của caller có thể alias vùng callee; thiếu nó
-  là bug hỏng dữ liệu (không chỉ perf).
-
-**Kết quả:** 30/30 + 111 xanh cả hai chế độ (ép threshold=1: **43 proto**
-compile); fuzz **56/56** (thêm table-write nóng, `__newindex`, string key,
-NEWTABLE); fib ~264ms, closures ~65ms, các task khác trong noise.
-
-**Chưa làm (dời):** `SELF`, varargs, generic loop, `CLOSE/TBC`,
-`LOADKX` — cần khi oop/metatable vào diện. `CONCAT`/`MMBIN*` ở interpreter.
-
-### Phase 5 v2 — opcode mở rộng + TAILCALL (2026-09-15)
-`UNM/BNOT` (int), `NOT` (truthiness thuần), `LEN` (table plain + string,
-`__len` deopt), `SETLIST` số lượng cố định (helper `setList`, `EXTRAARG`
-tính sẵn), `LOADNIL/TRUE/FALSE/CLEANUP/LOADF` lanes, `MUL`, `RETURN B==2`,
-`TAILCALL` (shift args + reuse window + return trực tiếp, cùng luật
-pure/callee-pure; fused/general 3 tầng như CALL). Bắt 2 bug: descriptor
-`setList` thừa int (ASM verify) và cổng `JitCompiler` vẫn cấm TAILCALL từ
-Phase 2. Scoreboard: **6 thắng / 1 hòa (closures) / 3 thua**.
-
-**Gates mỗi opcode:** ✅ G-CORRECT + fuzz (56/56); G-PERF chỉ ghi nhận
-(table-write kernel ~10x nội bộ, tổng thể không regression).
-
-**Rollback:** cờ từng opcode trong translator (`analyze`).
-
-### Phase 5 v3 — phủ K-form + vòng lặp `for` số (2026-09-15, hậu audit)
-Audit "JIT khó dùng" phát hiện hai lỗ hổng phủ lớn:
-1. **Thiếu K-form** `ADDK/MULK/IDIVK/MODK/BANDK/BORK/BXORK` — compiler sinh
-   chúng cho `x*2`, `x//3`, `x%7`... nên đa số kernel số không JIT.
-2. **Thiếu `FORPREP`/`FORLOOP`** — mọi vòng lặp `for` số (kể cả trong hàm)
-   không JIT; main-chunk loop cũng không tăng hotness.
-
-**Đã làm:** emit `emitArithK` (LAND/LOR/LXOR/LADD/LSUB/LMUL), `emitIdivK`/
-`emitModK` (`Math.floorDiv`/`floorMod` đúng ngữ nghĩa âm), `emitForPrep`/
-`emitForLoop` (unsigned trip-count + `divideUnsigned`, mirror `doForPrep`/
-`OP_FORLOOP`; dùng thuần stack tránh `VerifyError` do tranh scratch
-local 6/8). `analyze` từ chối proto chứa K-form hằng không phải
-`LuaInteger` (và `DIVK/POWK` luôn float) → giữ subset int. Sửa luôn
-`prewarm` no-op khi state tắt JIT.
-
-**API:** `LuaState.jitEnabled(Boolean)` / `isJitEnabled()` (per-state,
-`null` = theo global `ENABLE_JIT`); `JitCompiler.prewarm(LuaFunction)`
-overload + `prewarm(closure, state)`.
-
-**Kết quả:** int for-loop và K-form kernel giờ compile (kiểm bằng cache
-size); `JitCoverageTest` 10 test so sánh JIT on/off + giá trị đối chiếu
-stock; fuzz loop 200 case byte-identical. 30/30 + 123 xanh. Float loop,
-`while`/`repeat` vẫn interpreter (chủ ý — cần generic loop state).
-
----
-
-### Phase 6 — Ngữ nghĩa debug/error dưới JIT — ✅ XONG audit (2026-09-15)
-
-Thiết kế hiện tại né toàn bộ vấn đề thay vì vá từng cái, và đã kiểm chứng:
-1. **Line info/frame:** JIT frameless (không push `CallStack` frame) nhưng
-   mọi lỗi Lua đều deopt trước khi phát sinh (guard tag/metatable chạy
-   trước op), nên interpreter dựng frame + line chính xác. `getinfo` trong
-   JIT không thể xảy ra (subset không gọi ra ngoài trừ callee pure).
-2. **Error:** `LuaException` rethrow nguyên (không nuốt); deopt resume giữ
-   mọi side-effect đã commit đúng 1 lần.
-3. **Hooks/timeout:** `HOOKS_ARMED` hoặc `loopGuard != null` → bỏ qua JIT
-   hoàn toàn (đo ở entry, hooks không thể bật giữa chừng vì JIT không gọi
-   ra ngoài).
-4. **Bằng chứng:** fuzz pcall/traceback/getinfo/hook/coroutine/error-đệ-quy
-   đồng nhất on/off; `errors.lua`, `db.lua` xanh ở threshold=1 (JIT ép chạy).
-
-**Còn lại (chấp nhận, ghi nhận):** traceback của lỗi phát sinh *trong*
-helper JIT frameless thiếu 1 frame callee (hiếm — mọi lỗi thường đã deopt
-trước). Sửa đầy đủ cần push frame cho JIT (tốn ~30ns/call) — để Phase 6b
-nếu cần.
-
-**Rollback:** tắt flag (mặc định vẫn tắt).
-
----
-
-### Phase 7 — Gia cố & xác thực hiệu năng cuối — ✅ XONG v1 (2026-09-15)
-
-**Việc:**
-1. Interleave Luava-JIT vs LuaJ 10 task (paired, pinned, median): **6 thắng**
-   (arith 1.4×, fib **9.5×**, table ~1.0×, coroutines 16×, hash 1.4×,
-   sieve 1.1×), **1 hòa** (closures 1.05×), 3 thua stdlib/metatable-bound
-   (concat, oop, pattern). Mục tiêu "tất cả ≤ 1.03×" CHƯA đạt cho 3 task
-   cuối — cần varargs/CLOSURE/generic-fallback (ghi nhận, không cố).
-2. Đo lại **2026-09-16** sau đợt tối ưu lớn (paired, order-flipped,
-   median 7-9 cặp, warm=6, iters=12, `luava.jit.sync=true`):
-   **4 thắng** (arith 1.6×, fib 9.6×, coroutines 17-19×, hash 1.6×),
-   **2 hòa** (table ~1.0×, closures ~1.0×), **4 thua nhẹ**
-   (concat 1.03×, oop 1.2×, pattern 1.1×, sieve 1.05×). Từ 5 thua
-   nặng (tới 2.8×) còn 4 thua sát ngưỡng; toàn bộ script vẫn pass
-   assert nên đây là khoảng tối ưu engine, không phải bug.
-3. Đợt tối ưu 2026-09-16 (không đổi ngữ nghĩa, 30/30 + 148 test xanh
-   cả JIT on/off):
-   - Intern chuỗi ngắn **lazy**: `valueOf` không bao giờ pool (dữ liệu
-     script không ghim bộ nhớ); key canonical (hằng số compiler,
-     metamethod, tên stdlib) giữ **định danh tham chiếu** qua
-     `interned`, nên tra bảng thôi trả `String.equals`.
-   - Inline không frame cho `tostring(x)`, `string.gmatch`,
-     `math.sqrt` (raw-bits, không cấp `LuaFloat`), `setmetatable`.
-   - Inline **closure factory** cho `make_counter`/`Vec.new` (dựng
-     closure trực tiếp từ thanh ghi, cả `OP_CALL` lẫn `OP_TAILCALL`).
-   - `gmatch` quét trực tiếp cho pattern đơn giản `%<class><quant>`.
-   - Cache theo site cho `OP_GETTABUP`/`OP_SELF`/`OP_GETFIELD` (guard
-     `readVersion()` + định danh bảng/key).
-   - Danh sách tham số closure materialize lazy; `ensureFilled` rút
-     gọn; GC tự động **giới hạn theo state** (không còn chạy finalizer
-     / dọn weak table của state khác).
-   - Hardening: `runErrorHandler` luôn reset cờ `handling` dù push
-     frame handler ném `StackOverflowError`.
-4. Đợt fix tương thích 2026-09-16 (differential fuzz đối chiếu stock Lua
-   5.4.8; 30/30 + 148 test xanh):
-   - **Số học chuỗi qua metatable**: cài `__add/__sub/__mul/__div/__idiv/
-     __mod/__pow/__unm` mặc định trên string metatable như `lstrlib.c`;
-     người dùng override/xoá được. Trước đây Luava ép kiểu trực tiếp nên
-     `"10"+1` bỏ qua metamethod của người dùng.
-   - **Blame đúng toán hạng** cho lỗi bitwise (`!isNumber ? p1 : p2`).
-   - **`kname` chỉ đặt tên cho hằng chuỗi**: hết descriptor sai
-     `number (constant '?') has no integer representation`.
-   - `pairs`/`ipairs` không kiểm tra kiểu bảng (đúng PUC); `next`/`select`/
-     `rawlen` dùng `luaL_argcheck` đúng thông điệp; `tostring` hàm C in
-     `function: 0x…` như PUC.
-   - **`collectgarbage` trả integer** cho collect/stop/restart và **thất bại
-     (nil) khi gọi trong finalizer** (chống tái nhập).
-   - `string.pack/unpack/packsize`: blame đúng số tham số.
-   - **Bug compiler `maxStackSize`**: ghi trực tiếp `freereg` bỏ qua cập
-     nhật `maxstacksize`, khiến frame nhỏ hơn số thanh ghi dùng thật → JIT
-     guard cho qua rồi index tràn mảng (lỗi ngẫu nhiên `Index N out of
-     bounds`) khi đệ quy sâu. Nay mọi thay đổi `freereg` đi qua `setFreereg`.
-   - **Khởi tạo lớp giá trị sớm**: `Varargs.<clinit>` từng chạy ở đỉnh đệ
-     quy (test tràn C-stack), ném `StackOverflowError` và khiến JVM "poison"
-     lớp vĩnh viễn (`NoClassDefFoundError`). Nay `LuaState` chạm các lớp
-     giá trị lõi lúc khởi tạo.
-5. Đợt sửa JIT 2026-09-17 (JIT từ chỗ chỉ hữu ích cho fib → 8/10 task;
-   30/30 + 150 test xanh, fuzz JIT on/off 12k case đồng nhất):
-   - **Bug `GETFIELD` deopt**: guard cũ đòi bảng **không metatable**, nên
-     mọi `self.x` trên instance OOP (có `Vec.__index`) deopt mỗi lần —
-     `Vec:dot` không bao giờ chạy JIT. Nay guard là "rawget non-nil"
-     (độc lập metatable); trường hợp `__index` (rawget nil) deopt đúng.
-   - **Thiếu lane số thực**: JIT chỉ có số nguyên, nên hàm nóng trộn
-     int/float (`dot` toàn float) deopt ngay ở `MUL`. Nay `ADD`/`SUB`/`MUL`
-     (và các dạng K) phát **numeric dispatch**: lane int không box khi cả
-     hai là int, lane float raw-bit khi còn lại; kiểu trả về suy luận
-     `T_NUM` để chọn protocol đúng.
-   - `doTailCall` thêm fast lane như `OP_CALL` (bỏ `resolveCallable` khi
-     thanh ghi đã giữ `LuaFunction`).
-   - Gate mới: đo **JIT on/off từng task**, không chỉ tổng thể — trước đây
-     lọt việc JIT làm `arith_loop` chậm đi.
-   - Còn lại: main chunk không tier-up (hotness đếm số lần **gọi hàm**),
-     subset chưa gồm generic-for/closure/metatable-call; 3 task thua còn
-     lại (oop/pattern ~1.06×, sieve ~0.99×) là throughput engine.
-7. Đợt JIT 2026-09-18 (30/30 + 152 test xanh; fuzz JIT on/off 15k case):
-   - **Proto cache theo state** (LRU 256, key chunkName+source): eval cùng
-     script lặp lại dùng chung proto → hotness tích lũy qua request, gỡ
-     đúng giới hạn "eval lại mỗi request không tier-up". Mỗi lần vẫn tạo
-     closure mới với `_ENV` riêng nên ngữ nghĩa không đổi.
-   - **Fix `OP_TAILCALL` không bao giờ tier-up**: hotness chỉ đếm ở
-     `executeCallOp` (OP_CALL), nên hàm nóng gọi kiểu `return f(...)`
-     không bao giờ compile — dạng phổ biến của hàm entry. Nay đếm và chạy
-     kernel JIT ở cả tail call, có snapshot tham số để deopt an toàn.
-   - **Fix bug đúng/sai lane float**: kết quả float lưu bằng `D2L` (cắt
-     thành số nguyên) thay vì raw IEEE-754 bits → trả về denormal rác
-     (`4.94e-320` thay vì `50005000.0`). Sửa bằng `doubleToRawLongBits`.
-     Test regression cũ vô hiệu vì constant-folding gấp biểu thức literal;
-     đã viết lại dùng tham số + vòng lặp để thực sự chạy phép toán.
-   - Hiệu quả JIT on/off: fib 20.6×, closures 2.4×, oop 1.21× (trước chỉ
-     fib/closures).
-8. Đợt JIT 2026-09-19 (30/30 + 170 test xanh; fuzz sqrt 4.5k + tổng hợp 3.2k
-   case JIT on/off đồng nhất):
-   - **Intrinsic `math.sqrt` trong JIT**: `return math.sqrt(x)` và
-     `local r = math.sqrt(x)` compile thẳng thành `Math.sqrt`, guard bằng
-     so sánh identity với singleton `MathLib.SQRT` (gán lại `math.sqrt` hoặc
-     shadow `math` → deopt về interpreter, ngữ nghĩa y hệt). Trước đây call
-     builtin nằm ngoài subset nên cả proto bị loại — `Vec:length()` (gọi
-     `math.sqrt`) phải chạy interpreter dù thân hàm hoàn toàn trong subset,
-     đo được **2× chậm hơn** bản compile. Tail form box `LuaFloat` ở object
-     mode; call form giữ nguyên lane float raw-bit để feed số học tiếp.
-   - Đo lại task oop: **thắng LuaJ 1.12×** (trước thua 1.02×); JIT on/off
-     trên oop **1.30×** (trước 1.21×). Không đụng `BytecodeVM`/`LuaTable` —
-     thay đổi gọn trong `LuaToJvmTranslator` + test.
-   - Differential: 4500 case sqrt (gán lại/shadow/NaN/-0.0/int/1e300/bad
-     arg) và 2400 case tổng hợp JIT on/off đều khớp interpreter.
-   - Bảng mới vs LuaJ (7 cặp, warm=4, iters=8): **6 thắng** (fib 10.4×,
-     coroutines 18.5×, hash 1.55×, arith 1.45×, closures 1.25×, oop 1.12×),
-     **2 sát nút** (table 1.06×, concat 1.00×), **2 thua nhẹ** (pattern
-     1.08×, sieve 1.03×) — hai task này là throughput engine/main-chunk loop.
-9. Đợt audit conformance 2026-09-19 (30/30 + 170 test xanh; differential
-   PUC 5.4.9: ~7k case stdlib/table-ctor/JIT, JIT on/off đồng nhất):
-   - **Bug nghiêm trọng — table constructor sai register**: `flushListFields`
-     dùng `allocReg()` cho từng list field, nhưng element tự cấp temp (đọc
-     global `math.maxinteger` cấp register cho bảng trước `GETFIELD`) nên các
-     giá trị rải ra R1,R3,R5 trong khi `SETLIST` đọc R1,R2,R3 →
-     `{math.maxinteger, math.maxinteger, math.maxinteger}` lưu chính bảng
-     `math` vào index 2 (sai cả khi JIT off). Sửa: đặt element vào đúng slot
-     liền kề, reserve slot trên cho temp. Fuzzer table-ctor bắt được bug 3/3
-     seed khi revert fix → guard thật.
-   - **Zero-value return**: `print`/`table.sort`/`table.insert`/
-     `debug.sethook`/`debug.upvaluejoin`/`debug.getupvalue` (oob) trả 1 `nil`
-     thay vì 0 giá trị. PUC trả 0 giá trị (quan sát qua `select('#', ...)` và
-     ngữ cảnh multret).
-   - **C tail call**: PUC KHÔNG tái dùng frame caller khi tail-call hàm C
-     (`ldo.c luaD_pretailcall` chỉ trả -1 để "startfunc" với LUA_VLCL; C
-     closure/function đi qua `precallC` rồi `luaD_poscall`). Luava thay frame
-     caller → `debug.getlocal`/`getinfo`/return hook mất frame Lua. Sửa:
-     push frame C lên trên, giữ frame Lua, pop cả hai; return hook C tailcall
-     giờ khớp PUC (3 return cho `local r = g()`).
-   - **`debug.sethook` validation**: PUC check mask trước (number coerce,
-     nil/missing là lỗi), rồi hook phải là function, rồi count optional;
-     function với mask rỗng = tắt hook (gethook trả nil). Luava bỏ qua hết.
-   - **`debug.getlocal`**: index ngoài range trả thừa giá trị; hàm Lua tail
-     call báo sai frame.
-   - **Thông báo lỗi**: `debug.upvaluejoin` theo dạng PUC
-     `bad argument #N ... (invalid upvalue index)`.
-   - **Không sửa**: dấu NaN từ `%` khác glibc là không portable — chính suite
-     PUC dùng `isNaN`/`^%-?nan` chấp nhận cả hai.
-    - Gate: threshold=1 → 30/30 suite (big.lua excluded by design), fuzz
-      JIT on/off đồng nhất; `mvn test` 3 lần liên tiếp 170 test xanh.
-10. Đợt audit conformance 2026-09-19 (tiếp; 30/30 + 170 test xanh; differential
-    PUC 5.4.9: operator ma trận 4800 case, integer boundary, numeric-string
-    coercion, stdlib format 57.6k case, pattern/metatable):
-    - **`string.format`**: `%#o` với 0 in "0" (C không thêm số 0 thứ hai); thứ
-      tự kiểm tra đối số-trước-format (PUC `luaL_checkinteger` chạy trước
-      `checkformat` cho d/i/u/o/x/X/f/e/g/a, nhưng `checkformat` trước cho
-      c/s/p/q). Ma trận 57.6k case khớp tuyệt đối.
-    - **`pow` theo C99**: `pow(1, y) == 1` cho mọi y (kể cả NaN/±inf) và
-      `pow(-1, ±inf) == 1`; Java `Math.pow` trả NaN cho các ca này → thêm
-      `luaNumPow`.
-    - **Blame operand khi concat**: `luaG_concaterror` blame toán hạng thứ hai
-      khi toán hạng đầu ghép được (khác `luaG_opinterror` của số học).
-    - **Coercion chuỗi số (`lua_tointegerx`)**: `string.char/rep/sub/byte/find/
-      match/gsub/unpack`, `table.insert/remove/concat/unpack/move`,
-      `utf8.len/codepoint/offset`, `os.date/difftime`, `select`,
-      `debug.getinfo`, `string.pack` giờ nhận chuỗi số ("120", "0x10", " 9 ")
-      như PUC. Tách `toLuaIntegerCoercingStrings()` khỏi `toLuaInteger()`
-      (toán tử bitwise/số học vẫn KHÔNG coerce chuỗi, đúng PUC).
-    - **Subtype math**: `math.abs("120")` trả float (PUC test `lua_isinteger`
-      trên đối số thô, chuỗi → false → nhánh float).
-    - **`debug.sethook`**: mask kiểm tra trước (number coerce), rồi hook phải
-      function, rồi count; mask rỗng = tắt hook.
-    - **`package`**: `searchpath` dựng lỗi "no file" đúng `pusherrornotfound`
-      (không có separator mở đầu, liệt kê mọi segment kể cả rỗng); `require`
-      thêm tiền tố `\n\t` cho mỗi searcher như `findloader`.
-    - **Không sửa**: dấu zero của `x - 0` (PUC compile `x - <int const>` thành
-      `x + (-const)` qua ADDI → `-0.0 - 0` = +0.0) — dấu zero không được đặc
-      tả bởi manual và không suite nào test; fuzzer chuẩn hoá.
-    - Gate: threshold=1 → 30/30; fuzz JIT on/off đồng nhất; 170 test xanh.
-6. Stress JIT-on: `LuavaStressTest` 6/6 (deep recursion, tailcall 100k,
-   coroutine churn, table/string/error pressure); suite ép threshold=1:
-   45 proto compile, deopt đúng.
-4. Metaspace/RSS bounded: cache LRU 512, hidden class GC được; đo RSS fib:
-   JIT 55MB < interp 94MB.
-5. `string.dump`/`load` round-trip với JIT bật: OK (`jitCode` không lọt
-   vào dump; proto fresh compile lại khi cần).
-6. `README.md` thêm mục Hybrid JIT; `PLANS.md` giữ hồ sơ gốc.
-7. Nhật ký §7 cập nhật (SETLIST descriptor, cổng TAILCALL, CLOSURE revert,
-   closeUpvalues fix).
-
-**Quyết định mặc định:** `ENABLE_JIT` **true từ 2026-09-15** (mọi gate
-xanh, escape hatch `-Dluava.jit=false` giữ lại). Lưu ý kiến trúc: hotness
-tính theo proto-object; từ 2026-09-18 state có **proto cache** nên
-eval-lại-cùng-script dùng chung proto và hotness tích lũy được. Script
-ngắn vẫn chạy interpreter nhanh.
-
-**Gates:** G-CORRECT + G-PERF tổng thể. Nếu một task vẫn > 1.03× sau JIT →
-phân tích async-profiler trên code JIT, lặp micro-opt có đo.
-
-**Rollback:** `ENABLE_JIT=false` là an toàn tuyệt đối.
-
----
-
-## 6. Ước lượng tổng thời lượng
-
-| Phase | Nội dung | Effort | Lũy kế |
-|---|---|---|---|
-| 0 | Đóng băng & harness | 0.5 ngày | 0.5 |
-| 1 | Hạ tầng JIT | 2–3 ngày | ~3.5 |
-| 2 | Translator lõi + guard/deopt | 1–2 tuần | ~2.5 tuần |
-| 3 | PIC/invokedynamic | 1–2 tuần | ~4.5 tuần |
-| 4 | Hotness/tier-up | 3–5 ngày | ~5.5 tuần |
-| 5 | Mở rộng opcode | 1–2 tuần | ~7.5 tuần |
-| 6 | Debug/error semantics | 1 tuần | ~8.5 tuần |
-| 7 | Gia cố & xác thực | 1 tuần | **~9.5 tuần** |
-
-Đây là **dự án ~2–2.5 tháng** nếu làm tuần tự. Có thể rút ngắn bằng cách
-chỉ nhắm các kernel số học (fib/arith/sieve) trước và bỏ Phase 5 rộng nếu
-mục tiêu chỉ là "hòa call-heavy cơ bản".
-
----
-
-## 7. Nhật ký thất bại (đọc trước khi đề xuất lại — tiết kiệm thời gian)
-
-### 7.1 Interpreter đã thử & revert (có bằng chứng, bar 3%)
-| Thử nghiệm | Kết quả | Nguyên nhân thất bại |
+| Opcode thiếu | Sinh bởi cấu trúc Lua | Hệ quả |
 |---|---|---|
-| JIT `OP_CLOSURE`/object-return (`make_counter`) | closures 66→76ms (+15%, paired 7) | body toàn allocation, helper tốn 2 ThreadLocal lookup; revert, factories ở interpreter |
-| Thứ tự shift/move sai trong TAILCALL (`a < nArgs`) | (chưa nổ: compiler luôn đặt `a ≥ nArgs`; bắt bằng review) | move func trước, shift sau; base-1 không overlap nguồn |
-| `ctx.top` stale sau frameless call | (chưa nổ: compiler luôn thiết lập lại trước open-use; bắt bằng audit) | mirror `top = base+numParams` cho giống interpreter hệt |
-| General-call arity `==` thành `>=` + nilFill | (tránh deopt-disable oan cho gọi thừa/thiếu args) | extras bỏ qua, thiếu nil-fill như interpreter |
-| SETLIST descriptor thừa 1 int | ASM verify `NegativeArraySizeException` | đếm nhầm params helper (6 không phải 7); probe dịch trực tiếp bắt ngay |
-| Cổng `JitCompiler` cấm TAILCALL từ Phase 2 | tailcall protos "not eligible" dù translator xong | quên mở cổng khi thêm op; probe chỉ ra |
-| Kỳ vọng sai trong probe (`mix`) | tưởng JIT sai (600 vs 45750) | tự tính nhẩm sai: Σ(2+n−n)=600 mới đúng; luôn assert bằng tay trước |
-| JIT return thiếu `closeUpvalues` | (bug, chưa đo) | upvalue mở của caller alias vùng callee → hỏng khi slot tái dùng; fix `closeOnJitReturn` |
-| Lazy callName (P1b) | hòa tuyệt đối | Name đã cache 256-entry, ~2%; machinery phức tạp vô ích |
-| Cache callName external (P2e) | 1/3 (dưới bar) | Walk gốc chỉ ~20ns |
-| SELF fast lane (P2f) | 1/3 thua | OOP dùng metatable → lane không bao giờ cháy |
-| Method PIC 4-entry | ~2.3% | rawget 19ns ăn nửa savings |
-| MERGE CallInfo→Frame | 0 đến −10% | C2 không inline qua boundary mới |
-| RECUR Java-recursive OP_CALL | −14% | `runLoop 7634B hot method too big`, không inline |
-| Inline SUBK vào dispatch | fib −2.5% | runLoop 6907→7128B vượt mục tiêu ≤7000 |
-| Bỏ caller-frame stamp | 29/30 fail | `errors.lua:399` cần line caller |
-| Gate `ctx.oldpc` khi hooks off | 29/30 fail | hỏng line-hook |
-| Tắt `vmPcMirror` | sieve +4–5% | sai `debug.getinfo().currentline` |
-| Lazy 2 List của `LuaFunction` | closures +3%, oop −5% | đổi class-shape → C2 compile executeCallOp tệ; net âm |
-| Pattern ASCII + lazy Capture | 4/8, 5/8 (dưới bar) | per-match plumbing chi phối |
+| `LT`, `LE` | `while i<n`, `repeat until i>=n`, `if a<b` | while/repeat/so sánh biến không JIT |
+| `EQ` (RK), `EQK` | `if x==y` (không phải hằng int) | nhánh so sánh không JIT |
+| `TEST`, `TESTSET` | `and`/`or`, `if x then`, ternary | and/or không JIT |
+| `TFORPREP`, `TFORCALL`, `TFORLOOP`, `CLOSE` | `for k,v in pairs/ipairs/gmatch` | generic-for không JIT |
+| `CLOSURE` | tạo closure/hàm lồng | mọi hàm có closure con bị reject (kể cả main) |
+| `CLOSE`, `TBC` | `<close>`, block scope có upvalue | reject |
+| `SELF` | `obj:method()` | method call không JIT |
+| `CONCAT` | `a .. b` | nối chuỗi không JIT |
+| `DIV`, `DIVK` | `a / b` (luôn float) | phép chia không JIT |
+| `POW`, `POWK` | `a ^ b` | lũy thừa không JIT |
+| `BAND`,`BOR`,`BXOR`,`SHL`,`SHR`,`SHRI`,`SHLI` | bitwise 2 biến/số | bitwise không JIT |
+| `VARARG`, `VARARGPREP` | `...`, select | hàm vararg không JIT |
+| `LOADKX` | hằng vượt 2^18 | hiếm |
+| `MMBIN`,`MMBINI`,`MMBINK` | metamethod arith | (deopt đúng — giữ interpreter) |
+| `RETURN0` | `return` không giá trị | hiện emit deopt |
 
-**Bài học lớn:** mọi micro-opt quanh call/table/frame đã cạn. Hai lần exp2reg
-fail 12 suite vì thiếu loại trừ (call/vararg/CONCAT/AND/OR ghi nhiều register).
+### 3.3 Khảo sát 24 dạng cấu trúc "cần JIT" (probe tự động)
 
-### 7.2 Codegen gaps đã đóng (so với PUC `luac`, mạch THÀNH CÔNG)
-Đây là mạch hiệu quả nhất của interpreter — học PUC từng byte:
-| Commit | Nội dung | Kết quả |
-|---|---|---|
-| `bd734d6` | literal RHS dạng RK const | sieve −24% (hòa LuaJ) |
-| `92923f2` | K-form opcodes (MULK...) | table_ops −20%, fib −7.5% |
-| `7afd64f` | VM implement LTI/LEI/GTI/GEI + immediate | fib −4.5% |
-| `1064dc5` | `if` compare+JMP trực tiếp | fib −14.5% |
-| `09bc3ac` | `while` compare+JMP | while −17% |
-| `92b2a1d` | `repeat` compare+JMP | repeat −33% |
-| `29dd6a9` | exp2reg `acc = acc + i` → ADD trực tiếp | arith −42% |
-| `a054de9` | immediate compare trong điều kiện | fib −8% |
+Chú thích: ✅ compile · ❌ reject · (lý do opcode reject)
 
-**Kết luận:** Luava giờ **ít lệnh tĩnh hơn PUC ở mọi task** (fib 29/32,
-oop 86/94...). Mạch codegen đã cạn.
-
-### 7.3 Câu hỏi mở (chưa giải, đừng tưởng đã hiểu)
-1. `closeTbc` 1.4% self ở oop dù không có tbc var — ai vào?
-2. P1a cho fib +5% không rõ cơ chế (nghi inline side-effect).
-3. **ĐÃ XÁC NHẬN (2026-09-15):** `BASIC_METATABLES` static toàn JVM thật sự
-   ô nhiễm đa-state. Tái hiện: state A cài `debug.setmetatable('', ...)`,
-   tạo `new LuaState()` B (constructor gọi `resetBasicMetatables()`), rồi A
-   mất metatable string (`A:foo` → `nil`). Hai state cũng tranh nhau
-   metatable string dùng chung (ai cài sau thắng).
-   **Hướng fix (chưa làm, cần redesign):** metatable string nằm trên hot
-   path `LuaString.getMetatable()`; fix đúng cần tra metatable qua state
-   hiện hành (registry) hoặc gắn state vào chuỗi intern — cả hai đụng
-   đường nóng nên phải đo lại interleave. Trước mắt: dùng một `LuaState`
-   cho mỗi tenant, tránh tạo state mới sau khi đã cài metatable tùy biến.
-4. **ĐÃ XÁC NHẬN (2026-09-15):** `GCManager` là singleton toàn JVM
-   (`STATES`/`FINALIZERS`/`WEAK_TABLES` static). `GCManager.reset()` xóa
-   finalizer/root của **mọi** state đang sống, không chỉ state gọi. Tương
-   tự #3: fix cần chuyển sang instance per-state hoặc tách mark set.
-5. `calls.lua` flake ~15% (`LuaUnwindException: null`) — pre-existing, chưa sửa.
-
-### 7.4 Bug đã sửa (2026-09-15, audit "khó dùng/bug")
-| # | Bug | Tầng | Fix |
+| # | Cấu trúc | Kết quả | Opcode chặn |
 |---|---|---|---|
-| 1 | `evalWithTimeout` rò rỉ vthread chạy mãi sau timeout | LuaState | guard riêng + `cancel()` + join worker |
-| 2 | `SHORT_STRING_CACHE` phình vô hạn (200k entry giữ mãi) | LuaString | intern yếu (WeakHashMap + WeakReference); giữ identity (literals.lua) |
-| 3 | Chuỗi non-ASCII từ host sai `#`/`byte`/`utf8.len` | LuaDataConverter | encode UTF-8 tại biên host, decode UTF-8 khi trả về |
-| 4 | `maxAllocationBytes` bỏ qua `..` (x=x..x phình tới MB) | LuaValue.concat | áp cap, fast-path cờ `ANY_MAX_ALLOC` |
-| 5 | `ConstantFolder` dịch âm sai (`2 << -1` → 0, Lua = 1) | midend | `shiftLeft/Right` theo `luaV_shiftl` |
-| 6 | `Typer`/`ConstantFolder` là code chết (AGENTS §IV.1) | midend/bytecode | tích hợp fold vào `compileExprToReg` (choke point) |
-| 7 | Tài liệu `DEFAULT` gây hiểu nhầm chặn os/io | README | ghi rõ policy chỉ lọc cầu `java.*` |
-| 8 | Số liệu test lệch (31/31 vs 30/30) | AGENTS/PLANS | chú thích mốc lịch sử |
-| 9 | `BASIC_METATABLES` toàn cục: state mới xóa metatable state cũ | runtime | registry theo active `LuaState`, fallback toàn cục, scope lồng nhau |
-| 10 | `collectgarbage('collect')` chạy finalizer của state khác | GCManager | gắn owner theo state thực thi, lọc finalizer khi collect tường minh |
-| 11 | `GCManager.onAlloc` khóa toàn cục mỗi table/string | GCManager | đếm `AtomicLong` không khóa, chỉ khóa khi vượt ngưỡng/khi collect |
+| 01 | `for i=1,n` số nguyên | ✅ | — |
+| 02 | `for i=1.0,n` số thực | ✅ | — |
+| 03 | `while i<n` | ❌ | `LT` |
+| 04 | `repeat … until` | ❌ | `LE` |
+| 05 | `for k,v in ipairs(t)` | ❌ | `TFORPREP/TFORCALL/TFORLOOP/CLOSE` |
+| 06 | `for k,v in pairs(t)` | ❌ | `TFOR*` |
+| 07 | `o:method()` | ❌ | `CLOSURE`, `SELF` |
+| 08 | closure nội bộ + gọi | ❌ | `CLOSURE` |
+| 09 | `s = s .. "x"` | ❌ | `CONCAT` |
+| 10 | `s = s + i/2.0` | ❌ | `DIVK` |
+| 11 | `s = s + i^2` | ❌ | `POWK` |
+| 12 | `s = s + i%7` | ✅ | — |
+| 13 | `s = s + (i&255)` | ❌ | `BAND` |
+| 14 | `if i==5` (hằng int) | ✅ | — |
+| 15 | `if i<x` (biến) | ❌ | `LT` |
+| 16 | `x or i` | ❌ | `TESTSET` |
+| 17 | vararg `...` | ❌ | `VARARG` (+`isVararg`) |
+| 18 | `#t` (độ dài bảng) | ❌ | `LEN`? thực tế reject do CLOSURE+type |
+| 19 | `math.floor(i/3)` | ❌ | `DIVK` |
+| 20 | đa giá trị `a,b=f()` | ❌ | `CLOSURE` + multret |
+| 21 | OOP `__index` method | ❌ | `CLOSURE`, `SELF` |
+| 22 | hàm lồng gọi nhau | ❌ | `CLOSURE`, `CLOSE` |
+| 23 | `pcall(function()…)` | ❌ | `CLOSURE` |
+| 24 | table constructor `{1,2,3}` | ❌ | `CLOSURE` + type |
 
-### 7.5 Audit JIT (2026-09-15): phủ + API + bug hook
-Phát hiện khi soi tính năng JIT "có ổn định/dễ dùng không":
-| # | Vấn đề | Tầng | Fix |
+> Hầu hết case reject vì **`CLOSURE` xuất hiện ở main chunk** (mọi `local
+> function` đều phát `OP_CLOSURE` trong chunk chứa nó). Đây là lý do "cả main
+> chunk bị loại" và cũng là lý do hàm nóng bị loại nếu thân nó tạo closure.
+
+### 3.4 10 benchmark: ai được JIT, ai không
+
+| task | kernel JIT? | JIT on/off | vs LuaJ (paired) |
 |---|---|---|---|
-| J1 | Thiếu `ADDK/MULK/IDIVK/MODK/BANDK/BORK/BXORK` → `x*2`, `x//3`, `x%7` không JIT | translator | `emitArithK`/`emitIdivK`/`emitModK`; `analyze` đòi hằng `LuaInteger` |
-| J2 | Thiếu `FORPREP/FORLOOP` → mọi vòng `for` số không JIT | translator | `emitForPrep/emitForLoop` mirror `doForPrep`/`OP_FORLOOP` |
-| J3 | **`HOOKS_ARMED` static toàn JVM rò vĩnh viễn**: hook đặt rồi bỏ quên (hoặc coroutine bị bỏ) → **JIT tắt cho MỌI `LuaState` về sau** | LuaCoroutine/VM | đổi thành `hooksActive` per-coroutine (đúng ngữ nghĩa Lua: hook theo thread) |
-| J4 | `ENABLE_JIT`/ngưỡng là static, không điều khiển per-state | LuaState | `jitEnabled(Boolean)`/`isJitEnabled()` |
-| J5 | `prewarm` chỉ nhận `LuaClosure`, bỏ qua `LuaFunction`; vẫn compile khi JIT tắt | JitCompiler | overload `prewarm(LuaFunction)`; `prewarm(closure,state)` no-op khi state tắt JIT |
+| 01 arith (main loop) | ❌ main chunk | ~1.00 | 1.79× |
+| 02 fib | ✅ `fib` | **0.049** | **9.93×** |
+| 03 table (main loop) | ❌ | ~1.00 | 1.05–1.50× |
+| 04 concat (main loop) | ❌ (JIT on/off 0.83 do main?) | 0.83 | ~1.0 |
+| 05 closures | ✅ `make_counter` | 0.55 | ~0.99 |
+| 06 coroutines | ❌ (chủ ý) | ~0.98 | **16.4×** |
+| 07 hash (main loop) | ❌ | ~1.00 | **1.70×** |
+| 08 oop | ✅ `dot`/`length`, ❌ `new`/`add` | 0.74 | 1.17× |
+| 09 pattern (main loop) | ❌ | ~1.00 | 0.88–0.95× |
+| 10 sieve (main loop) | ❌ | ~1.00 | ~1.00× |
 
-**Bằng chứng:** `JitCoverageTest` (12 test) so JIT on/off + giá trị đối chiếu stock;
-fuzz loop 200 case byte-identical; J1/J2 kiểm bằng cache/proto `jitCode`.
-Hiệu năng: fib 9.5–21×; loop nhỏ gọi nhiều lần ~6.5×; loop 30M lần đầu
-ngang interpreter (OSR/C2 chưa chín) — không hồi quy. 30/30 + 135 xanh cả
-JIT on lẫn `-Dluava.jit=false`.
-
-**Giới hạn còn lại (chủ ý):** float loop, `while`/`repeat` (generic loop
-state), `CONCAT`/`VARARG`/metamethod vẫn interpreter. Hotness đếm theo
-`OP_CALL` nên loop ở main chunk không tier-up (kể cả loop trong hàm chỉ
-hưởng nếu hàm được gọi ≥ 50 lần hoặc `prewarm`).
-
+Kết luận: **thắng nhờ interpreter + fib JIT**, không nhờ phủ JIT rộng. Mở phủ
+JIT cho main-chunk loop là dư địa lớn nhất.
 
 ---
 
-## 8. Biện pháp đối phó rủi ro chính
+## 4. Năm nút thắt gốc rễ
+
+| # | Nút thắt | Tầng | Bằng chứng | ROI |
+|---|---|---|---|---|
+| **A** | Hotness chỉ đếm ở `OP_CALL`; main chunk không bao giờ tier-up; không đếm back-edge cho `while`/`repeat` | `BytecodeVM` + `JitCompiler` | loop arith bọc hàm + prewarm: **39.7 vs 220 ms (5.5×)** | **Rất cao** |
+| **B** | Lattice `T_INT ∪ T_NUM` = conflict → reject loop `s=0; s=s+t[i]` | `LuaToJvmTranslator.transfer` | tab_int reject, đổi `s=0.0` compile; **42.9 vs 151.7 ms (3.5×)** | **Rất cao** |
+| **C** | Thiếu `LT/LE/EQ/TEST/TESTSET` → `while`/`repeat`/and-or/so sánh không JIT | `analyze` + emit | probe 03/04/15/16 ❌ | Cao |
+| **D** | `CLOSURE`/`SELF`/object-return bị cấm → hầu hết hàm "thực tế" (có closure con, method) bị loại | `analyze` + `OP_CLOSURE` revert trước đây | probe 07/08/21/22/23 ❌; benchmark main chunk đều có `CLOSURE` | Cao |
+| **E** | Thiếu `CONCAT/DIV/POW/bitwise 2 ngôi/generic-for/vararg` | `analyze` + emit | probe 05/06/09/10/11/13/17 ❌ | Trung–cao |
+
+---
+
+## 5. Roadmap mở rộng (Phase A → J)
+
+Mỗi phase có: việc, file, cổng (G-CORRECT/G-PERF/G-SIZE), rủi ro/rollback.
+Cổng chuẩn:
+- **G-CORRECT:** 30/30 suite + toàn bộ unit test xanh **cả JIT on/off**; fuzz
+  đối chiếu JIT on/off byte-identical; test cụ thể cho phase.
+- **G-PERF:** interleave ≥7 cặp pinned, bar 3%, **không regression task khác**.
+- **G-SIZE:** method sinh ra không phình; `PrintCompilation` xác nhận C2.
+
+---
+
+### Phase A — Hotness theo back-edge + main chunk (ROI #1)
+
+**Mục tiêu:** mọi vòng lặp thực sự nóng (kể cả main chunk, `while`, `repeat`)
+được tier-up; mở khoá arith/table/hash/pattern/sieve.
+
+**Việc:**
+1. Thêm bộ đếm back-edge **không cấp phát**: `LuaProto.loopHotCount` (plain int).
+   Tăng tại `OP_FORLOOP`, `OP_JMP` có `offset < 0` (back-edge), và
+   `OP_TFORLOOP` khi đã hỗ trợ.
+2. Khi counter vượt ngưỡng (đề xuất `JIT_LOOP_THRESHOLD`, ví dụ = `code.length`
+   hoặc hằng số riêng) → `requestCompile(proto)`.
+3. Cho phép tier-up **main chunk**: tại entry `BytecodeVM.execute`, seed
+   `hotCount`/kiểm tra sớm để main chunk có cơ hội compile; hoặc đếm back-edge
+   trong main chunk và request compile chính proto đó.
+4. **Relax `isVararg`:** chỉ reject khi proto thực sự chứa `OP_VARARG`
+   (hoặc `VARARGPREP`), thay vì reject mọi `isVararg == true`. Main chunk
+   không dùng `...` sẽ hợp lệ.
+5. Tránh compile storm: dùng `jitQueued`/`jitDisabled` như hiện tại; ngưỡng
+   back-edge nên đủ lớn để không compile loop chạy vài lần.
+
+**File:** `LuaProto.java` (thêm counter), `BytecodeVM.java` (đếm back-edge,
+entry main chunk), `JitCompiler.java`/`LuaToJvmTranslator.analyze` (relax
+vararg), `LuaState.java` (ngưỡng).
+
+**Rủi ro:** JIT một proto đang chạy interpreter giữa loop → phải an toàn
+(compile là idempotent, lần gọi/loop sau dùng `jitCode`). Deopt storm nếu loop
+có kiểu động → giữ `jitDisabled` sau 8 deopt.
+
+**Gates:** arith/table/sieve JIT on/off < 0.5; G-CORRECT; không regression.
+
+**Rollback:** ngưỡng = ∞ / cờ tắt back-edge.
+
+---
+
+### Phase B — Hợp nhất lattice số (ROI #2)
+
+**Mục tiêu:** loop trộn `T_INT`/`T_NUM` không còn bị reject.
+
+**Việc:**
+1. Trong `transfer`/hợp nhất, đổi `T_INT ∪ T_NUM = T_NUM` (an toàn: emit đã có
+   numeric dispatch runtime; chỉ tốn một guard tag). Loại bỏ nhánh conflict
+   cho cặp int/num.
+2. Xác nhận mọi điểm dùng `T_INT`-specific (`emitGuardInt`) vẫn đúng khi giá
+   trị là `T_NUM` (đã có float lane cho `ADD/SUB/MUL/K`; cần bổ sung cho
+   bitwise/`UNM/BNOT` — chúng vốn int-only, giữ guard int).
+3. Giữ `T_OBJ ∪ T_NUM = reject` (object mode khác protocol).
+
+**File:** `LuaToJvmTranslator.java` (`transfer`, hợp nhất forward analysis).
+
+**Rủi ro:** suy luận sai subtype → kết quả sai. Giảm thiểu: mọi giá trị vẫn đi
+qua guard tag runtime; test `JitCoverageTest` numeric + fuzz.
+
+**Gates:** `tab_int` compile và JIT on/off < 0.5; numeric mixed test xanh.
+
+**Rollback:** khôi phục conflict.
+
+---
+
+### Phase C — Control-flow: `while`/`repeat`, so sánh, and/or
+
+**Mục tiêu:** `while`, `repeat`, `if a<b`, `and`/`or` JIT.
+
+**Việc (thêm emit + allow-list):**
+1. `LT`, `LE` (2 thanh ghi, có thể mixed int/float): so sánh numeric với
+   numeric dispatch; non-number → deopt (mirror interpreter).
+2. `EQ`, `EQK` (RK so sánh): hỗ trợ int/num/string/boolean; object phức tạp
+   (bảng/hàm) → deopt.
+3. `TEST`, `TESTSET`: truthiness thuần (đã có `isTruthy` helper cho `NOT`);
+   `TESTSET` ghi kết quả.
+4. `LFALSESKIP` nếu compiler phát (dùng trong `if` tối ưu).
+5. `CLOSE` mức tối thiểu khi không có upvalue mở (hoặc deopt an toàn).
+
+**File:** `LuaToJvmTranslator.java` (analyze + emit + transfer + successors).
+
+**Rủi ro:** semantics dấu `NaN`, so sánh int/float, `-0.0`; phải khớp
+interpreter bit-for-bit. Test ma trận `-7/3`, NaN, ±0.
+
+**Gates:** probe 03/04/15/16 compile; kết quả khớp JIT off; while/repeat loop
+micro-bench JIT on/off < 0.7.
+
+**Rollback:** cờ từng opcode trong allow-list.
+
+---
+
+### Phase D — Closure, SELF, object-return (dư địa lớn)
+
+**Mục tiêu:** hàm "thực tế" (tạo closure con, method OOP) JIT được.
+
+**Việc:**
+1. **`OP_CLOSURE` trong JIT** — trước đây revert vì helper tốn ThreadLocal.
+   Nay làm đúng: dựng `LuaClosure` trực tiếp từ `proto.protos[idx]` + upvalue
+   descriptors, **không** qua helper lookup. Đo lại paired; chỉ giữ nếu thắng.
+2. **`SELF`**: `R[A+1]=R[B]; R[A]=R[B][K[C]]` với guard "rawget non-nil" như
+   `GETFIELD`; miss `__index` → deopt.
+3. **Nới `returnsObj`**: cho phép object-return + call khi callee là pure
+   (truyền object protocol). Object-return hiện chỉ cho leaf call-free.
+4. **`CLOSE`/`TBC`** đúng ngữ nghĩa upvalue mở; nếu phức tạp → deopt an toàn.
+
+**File:** `LuaToJvmTranslator.java`, có thể `JitRuntime.java`,
+`Upvalue.java` (nếu cần lane mở).
+
+**Rủi ro:** Metaspace/alloc; đóng upvalue (`closeOnJitReturn`) sai → hỏng dữ
+liệu. Đã có bug này trước đây; test `LuavaStressTest` + closure/upvalue fuzz.
+
+**Gates:** benchmark `05_closures`, `08_oop`, `main` của mọi benchmark hết
+`CLOSURE` reject; closures/oop JIT on/off giảm thêm ≥10%; G-CORRECT.
+
+**Rollback:** cờ `OP_CLOSURE`/`SELF`/object-return.
+
+---
+
+### Phase E — CONCAT, DIV/POW, bitwise 2 ngôi
+
+**Việc:**
+1. `CONCAT` (B..C): fast path khi mọi operand là string/int/float (dùng
+   `LuaValue.concat` có cap alloc); có metamethod/object → deopt.
+2. `DIV`, `DIVK`, `POW`, `POWK`: luôn float (raw-bit lane), mirror `luaNumPow`
+   (đặc biệt `pow(1,y)=1`, `pow(-1,±inf)=1`).
+3. `BAND/BOR/BXOR/SHL/SHR/SHRI/SHLI`: integer-only + guard int; float → deopt
+   (đúng lỗi interpreter). `SHRI/SHLI` là dạng immediate.
+4. `MOD`, `IDIV` 2 ngôi (đã có K-form): thêm dạng thanh ghi.
+
+**File:** `LuaToJvmTranslator.java`.
+
+**Gates:** probe 09/10/11/13 compile; ma trận số học mở rộng (JIT off vs on vs
+stock) khớp bit-for-bit; không regression.
+
+**Rollback:** cờ từng opcode.
+
+---
+
+### Phase F — Generic-for: `pairs`/`ipairs`/`gmatch`
+
+**Việc:**
+1. `TFORPREP`, `TFORCALL`, `TFORLOOP`: mô hình hóa iterator 3 giá trị
+   (func, state, control). Fast path: iterator là closure pure của JIT →
+   gọi kernel; còn lại deopt.
+2. `ipairs`/`pairs` builtin: intrinsic hóa khi iterator đúng singleton
+   (như mô hình `math.sqrt`), guard identity để tôn trọng việc gán lại.
+3. `CLOSE` sau vòng lặp (nếu có upvalue mở).
+
+**Rủi ro:** ngữ nghĩa `__pairs`, thứ tự next, generic-for đa giá trị. Test đối
+chiếu interpreter và `nextvar.lua`.
+
+**Gates:** probe 05/06 compile; `nextvar.lua` xanh; pattern JIT on/off < 0.7.
+
+**Rollback:** cờ `TFOR*`.
+
+---
+
+### Phase G — Vararg
+
+**Việc:**
+1. `VARARGPREP`: thiết lập varargs từ frame.
+2. `VARARG` mức cố định `B!=0` (không mở multret) với guard; multret deopt.
+3. Cho phép `isVararg` proto nếu mọi `VARARG` đều cố định.
+
+**Rủi ro:** layout multret/stack. Test `vararg.lua`, `calls.lua`.
+
+**Gates:** vararg hàm cố định compile; toàn bộ vararg suite xanh.
+
+---
+
+### Phase H — Call-site đa hình & inline cache
+
+**Việc:**
+1. Mở rộng call-site ngoài self/monomorphic: **inline cache** theo
+   `(proto identity)`; polymorphic nhỏ → chuỗi guard; megamorphic → deopt
+   hoặc `invokedynamic` (chỉ khi có bằng chứng cần).
+2. Cache `MethodHandle` cho callee JIT; tránh `Method.invoke`.
+
+**Gates:** OOP kế thừa/đệ quy chéo JIT on/off giảm ≥15%; không tăng Metaspace
+quá cache bound.
+
+---
+
+### Phase I — Deopt robustness & debug semantics mở rộng
+
+**Việc:**
+1. Khi phủ rộng hơn, kiểm tra lại: line info, traceback, `pcall`/`xpcall`,
+   `debug.getinfo`, hook, coroutine, `error` đệ quy — tất cả phải khớp JIT off.
+2. Cân nhắc push frame cho JIT (nếu traceback thiếu frame trở thành vấn đề);
+   đo chi phí (~30ns/call) trước khi quyết định.
+3. Fuzz differential PUC 5.4.9 diện rộng sau mỗi phase mở rộng.
+
+**Gates:** `db.lua`, `errors.lua`, `events.lua`, `calls.lua` xanh ở threshold=1
+(JIT ép chạy); fuzz đồng nhất.
+
+---
+
+### Phase J — Xác thực hiệu năng cuối
+
+**Việc:**
+1. Interleave 10 task vs LuaJ 3.0.1 (≥9 cặp, pinned, median, warm=5, iters=8).
+2. Đo **cold start / warm start / hot** cho Luava và LuaJ (harness
+   `ProfileLuava`/`ProfileLuaj`), ghi bảng vào `benchmarks/harness/`.
+3. Đo JIT on/off từng task; mọi task phải `< 1.0` (JIT có lợi) hoặc trong noise.
+4. RSS/Metaspace bounded; stress JIT-on.
+5. Cập nhật `README.md` + bảng coverage.
+
+**Mục tiêu số:** thắng ≥7/10, hòa 2, không thua > 1.03×; arith/table/sieve
+JIT on/off ≤ 0.5.
+
+---
+
+## 6. Mục tiêu hiệu năng & cổng
+
+| Hạng mục | Hiện tại | Mục tiêu |
+|---|---|---|
+| arith JIT on/off | ~1.00 | ≤ 0.5 |
+| table JIT on/off | ~1.00 | ≤ 0.5 |
+| sieve JIT on/off | ~1.00 | ≤ 0.5 |
+| while/repeat | không JIT | JIT, on/off ≤ 0.7 |
+| closures JIT on/off | 0.55 | ≤ 0.4 |
+| oop JIT on/off | 0.74 | ≤ 0.5 |
+| fib JIT on/off | 0.049 | giữ ≤ 0.06 |
+| vs LuaJ | 6 thắng / 2 hòa / 2 thua nhẹ | ≥7 thắng, 0 thua >1.03× |
+| Cold start engine | 356 ms | giữ ≤ LuaJ |
+
+---
+
+## 7. Đo lường (harness có sẵn)
+
+- `benchmarks/lua/01..10*.lua` — 10 task.
+- `benchmarks/harness/interleave.sh <jarA> <jarB> <pairs> <warm> <iters> <core> [tasks]`
+  — paired đảo thứ tự, median, ratio `B/A`.
+- `benchmarks/harness/Bench.java` (Luava), `LuaJBench.java` (LuaJ).
+- `BenchmarkRunner.java` — cold/warm/hot trong 1 JVM.
+- `/tmp/opencode/cold/ProfileLuava.java`, `ProfileLuaj.java` — cold/warm/hot
+  đối xứng hai engine (harness tạm; số liệu §3.4).
+- Fuzz JIT on/off: sinh case số học/bảng/closure/pattern, so byte-identical
+  (đã dùng 12k–15k case trong các đợt trước).
+
+---
+
+## 8. Rủi ro & rollback
 
 | Rủi ro | Mức | Đối sách |
 |---|---|---|
-| Deopt sai → lệch ngữ nghĩa | Cao | guard dày + fuzz đối chiếu stock Lua mỗi opcode; lộ trình int trước |
-| Metaspace leak | Cao | hidden class + LRU code cache + chỉ JIT proto nóng |
-| Coroutine yếu đi | Cao | cấm JIT proto `mayYield`; test 2000 churn |
-| Debug/traceback sai | Cao | Phase 6 riêng; gate HOOKS_ARMED; suite db/errors/events |
-| C2 không inline code JIT | Trung | đo PrintInlining; giữ method JIT nhỏ gọn |
-| JIT chậm hơn interpreter task nhỏ | Trung | tier-up theo ngưỡng; đo overhead |
-| Build phức tạp (asm dep) | Thấp | shade asm vào jar; test `mvn package` |
-| Mất thế thắng dispatch/coroutine | Trung | interpreter giữ nguyên, JIT chỉ tăng tốc |
+| Deopt sai → lệch ngữ nghĩa | Cao | guard dày + fuzz đối chiếu stock mỗi opcode; mở từng opcode |
+| Metaspace leak khi phủ rộng | Cao | hidden class + LRU 512 + chỉ JIT proto nóng |
+| Coroutine yếu đi | Cao | cấm JIT `mayYield`; test 2000 churn |
+| Debug/traceback sai | Cao | Phase I; suite db/errors/events |
+| Compile storm / deopt storm | Trung | ngưỡng + `jitDisabled` sau 8 deopt |
+| C2 không inline code JIT | Trung | giữ method nhỏ; `PrintInlining` |
+| JIT chậm hơn interpreter task nhỏ | Trung | đo on/off per-task; tier-up ngưỡng |
+| `OP_CLOSURE` lại thua (đã revert 1 lần) | Trung | implement không-helper rồi đo paired; revert nếu dưới bar |
+
+Mọi phase rollback bằng cờ (opcode allow-list / ngưỡng / `ENABLE_JIT=false`).
 
 ---
 
-## 9. Điều KHÔNG làm
+## 9. Nhật ký thất bại (bảo tồn — đọc trước khi đề xuất lại)
+
+| Thử nghiệm | Kết quả | Nguyên nhân |
+|---|---|---|
+| JIT `OP_CLOSURE` bản cũ (helper ThreadLocal) | closures 66→76ms (+15%) | body toàn alloc, helper tốn 2 ThreadLocal lookup; revert |
+| `SELF` fast lane interpreter cũ | 1/3 thua | OOP dùng metatable → lane không cháy |
+| Method PIC 4-entry | ~2.3% | `rawget` 19ns ăn nửa savings |
+| MERGE CallInfo→Frame | 0…−10% | C2 không inline qua boundary |
+| Java-recursive OP_CALL | −14% | `runLoop` >8KB hot, không inline |
+| Inline SUBK vào dispatch | fib −2.5% | `runLoop` vượt ≤7000B |
+| Bỏ caller-frame stamp | 29/30 fail | `errors.lua:399` cần line caller |
+| Tắt `vmPcMirror` | sieve +4–5% | sai `debug.getinfo().currentline` |
+| Lazy 2 List `LuaFunction` | closures +3%, oop −5% | đổi class-shape, C2 compile tệ |
+| `BASIC_METATABLES` static toàn JVM | state mới xóa metatable state cũ | đã fix: registry theo active state |
+| `GCManager` singleton | xóa finalizer mọi state | đã fix: owner theo state |
+
+**Bài học:** mọi micro-opt quanh call/table/frame của interpreter đã cạn; hai
+lần exp2reg fail 12 suite vì thiếu loại trừ. Đột phá bắt buộc đến từ **phủ JIT
+rộng hơn**, không từ micro-opt interpreter.
+
+---
+
+## 10. Điều KHÔNG làm
 
 - Không sửa `tests/lua-5.4.9-tests/**`.
 - Không hardcode/mock để qua test.
-- Không bật JIT mặc định cho tới khi Phase 2–3 qua gate.
 - Không JIT hàm có thể yield (bảo toàn coroutine).
-- Không bỏ metadata debug để lấy tốc độ (đi ngược AGENTS.md).
-- Không thêm file rác/vanity.
+- Không bỏ metadata debug để lấy tốc độ (ngược `AGENTS.md`).
+- Không thêm file rác/vanity; harness tạm để `/tmp/opencode`.
+- Không JIT metamethod call phức tạp (`__call`, `__index` fallback) — deopt.
 
 ---
 
-## 10. Tham chiếu
+## 11. Ước lượng thời lượng
+
+| Phase | Nội dung | Effort |
+|---|---|---|
+| A | Back-edge + main chunk + relax vararg | 3–5 ngày |
+| B | Hợp nhất lattice số | 1–2 ngày |
+| C | while/repeat/cmp/and-or | 4–6 ngày |
+| D | CLOSURE/SELF/object-return | 1–2 tuần |
+| E | CONCAT/DIV/POW/bitwise | 4–6 ngày |
+| F | Generic-for | 1 tuần |
+| G | Vararg | 3–5 ngày |
+| H | Inline cache đa hình | 1–2 tuần |
+| I | Deopt/debug robustness | 1 tuần |
+| J | Xác thực cuối | 3–5 ngày |
+
+Ưu tiên thực dụng: **A + B + C** trước (≈1.5 tuần) đã mở khoá phần lớn
+benchmark main-chunk loop; D/E/F/G mở rộng dần theo nhu cầu thực tế.
+
+---
+
+## 12. Trạng thái thực hiện (2026-09-20)
+
+| Phase | Trạng thái | Nội dung đã làm |
+|---|---|---|
+| A1/A2 | ✅ xong | Tier-up theo loop qua `FORPREP` trip count (`JIT_LOOP_THRESHOLD=8192`); entry JIT cho top-level chunk trả 1 giá trị (`runTopLevelJit`) |
+| A3 | ✅ xong | Bỏ reject mọi `isVararg`; chỉ reject khi proto thực dùng `...` (VARARG ngoài allow-list) |
+| B | ✅ xong | `mergeTy`: `T_INT ∪ T_NUM = T_NUM` (an toàn nhờ numeric dispatch runtime) |
+| C | ✅ xong | `LT/LE/EQ/EQK/TEST/TESTSET/LFALSESKIP` + `successors`/`transfer` |
+| D | ⬜ chưa | CLOSURE/SELF/object-return |
+| E | ✅ xong | `CONCAT`, `DIV/DIVK`, `POW/POWK`, `MOD`, `IDIV`, bitwise 2 ngôi + `SHLI/SHRI`; helper `shiftLeft/Right`, `luaFloatMod`, `luaNumPow` |
+| F | ⬜ chưa | Generic-for (`TFOR*`) |
+| G | ⬜ chưa | Vararg đọc `...` |
+| H | ⬜ chưa | Inline cache đa hình |
+| I | ⬜ chưa | Mở rộng deopt/debug robustness |
+| J | ⬜ chưa | Xác thực cuối |
+
+**Bằng chứng (paired, core 8, `luava.jit.sync=true`):**
+- JIT on/off: `while` **~23×**, `if`-in-loop **~12×**, single-invocation heavy
+  loop **~5.6×**, concat 1.8×, closures 1.8×, oop 1.3×.
+- Fuzz đối chiếu JIT on/off: FuzzC 868 + FuzzE 1656 + FuzzConcat 45 case,
+  0 mismatch.
+- 180 unit test + 30/30 suite PUC xanh.
+- vs LuaJ (paired): arith 1.5×, hash 1.86×, oop 1.16×, concat 2.2× thắng;
+  table/sieve/pattern ~1.0; closures 0.99. Không task nào thua > 1.1×.
+
+**Bài học đo lường:** đếm back-edge mỗi vòng lặp (dù có granularity) làm
+`runLoop` chậm ~15–20% trên task top-level không hưởng lợi. Giải pháp cuối:
+chỉ request compile **một lần tại `FORPREP`** khi trip count đã biết là lớn —
+chi phí per-iteration bằng 0, vẫn phủ được loop trong hàm gọi một lần.
+
+---
+
+## 13. Tham chiếu
+
 - `AGENTS.md` — chuẩn kỹ thuật, đạo đức test, kiến trúc table.
-- `PLANS.md` — hồ sơ register-VM gốc; §IX non-goal JIT (đã mở lại có kiểm soát
-  trong plan này), §XI gates beat-LuaJ.
-- `README.md` — mô tả engine, bảng so sánh.
+- `README.md` — mô tả engine, bảng so sánh (mục Hybrid tiered JIT).
 - `docs/lua-5.4-reference-manual.md` — đặc tả.
-- `/tmp/opencode/jitspike/` — spike JIT (translator fib, FINDINGS.txt).
-- `benchmarks/lua/01..10` — bộ benchmark (untracked).
+- `benchmarks/harness/interleave.sh`, `Bench.java`, `LuaJBench.java` — harness.
+- `/tmp/opencode/jitspike/` — spike translator fib (FINDINGS.txt).

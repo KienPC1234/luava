@@ -13,7 +13,7 @@ import org.luava.runtime.bytecode.LuaProto;
 
 /**
  * Bounded registry of compiled protos. Caps the number of live hidden
- * classes so the JIT can never leak Metaspace (PLANS.md section IX):
+ * classes so the JIT can never leak Metaspace (plan.md section 2.1):
  * evicting a victim clears its {@code proto.jitCode} so the interpreter
  * transparently takes over and the class becomes collectable.
  */

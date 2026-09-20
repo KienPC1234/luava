@@ -34,6 +34,24 @@ public final class JitRuntime {
         return (LuaValue) jc.objHandle.invokeExact(callee, up, p, t, o, base);
     }
 
+    /**
+     * Lua {@code <<} with the 5.4 negative-count rule (luaV_shiftl): a count
+     * of |n| >= 64 yields 0, a negative count shifts the other way. Mirrors
+     * {@code LuaValue.shl}.
+     */
+    public static long shiftLeft(long value, long shift) {
+        if (shift >= 64 || shift <= -64) return 0;
+        if (shift < 0) return value >>> -shift;
+        return value << shift;
+    }
+
+    /** Lua {@code >>}; see {@link #shiftLeft}. Mirrors {@code LuaValue.shr}. */
+    public static long shiftRight(long value, long shift) {
+        if (shift >= 64 || shift <= -64) return 0;
+        if (shift < 0) return value << -shift;
+        return value >>> shift;
+    }
+
     /** Fills registers [from, to) with nil (missing-call-argument semantics). */
     public static void nilFill(long[] p, byte[] t, LuaValue[] o, int from, int to) {
         for (int i = from; i < to; i++) {
@@ -41,6 +59,34 @@ public final class JitRuntime {
             t[i] = 0;
             o[i] = null;
         }
+    }
+
+    /**
+     * Concatenates registers {@code [from, to)} into one string, mirroring
+     * the interpreter's {@code OP_CONCAT}. Returns {@code null} when any
+     * operand is not a plain string/number (a metatable {@code __concat}
+     * could run arbitrary code), signalling the generated code to deopt.
+     */
+    public static org.luava.runtime.LuaValue concatRange(long[] p, byte[] t, LuaValue[] o,
+            int from, int to) {
+        org.luava.runtime.LuaValue res =
+                org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, from);
+        if (!isConcatable(res)) {
+            return null;
+        }
+        for (int i = from + 1; i < to; i++) {
+            org.luava.runtime.LuaValue v =
+                    org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, i);
+            if (!isConcatable(v)) {
+                return null;
+            }
+            res = res.concat(v);
+        }
+        return res;
+    }
+
+    private static boolean isConcatable(org.luava.runtime.LuaValue v) {
+        return v.isString() || v.isNumber();
     }
 
     /**
