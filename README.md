@@ -183,23 +183,38 @@ execution timeouts never touch JIT code paths.
 
 Coverage and configuration:
 
-- **Hotness is per proto and counts calls**, so a kernel must be *called*
-  ≥50 times to tier up, whether via `OP_CALL` or `OP_TAILCALL` (`return
-  f(...)`). A loop in the main chunk is never JIT-compiled; wrap hot code in
-  a function (or use `prewarm`) to benefit.
+- **Hotness is per proto, by calls and by loop trip count**, so a kernel
+  tiers up whether it is *called* ≥50 times (`OP_CALL`/`OP_TAILCALL`) or
+  entered once with a numeric `for` loop whose trip count reaches
+  `JIT_LOOP_THRESHOLD` (8192). The loop request fires once per `FORPREP`
+  (never per iteration), so a single-invocation heavy loop is covered with
+  no dispatch overhead.
 - **Repeated evaluation reuses bytecode**: `LuaState` keeps a bounded LRU of
   compiled proto trees keyed by chunk name + source, so a server that
   `eval`s the same script per request shares one proto and its JIT hotness
   accumulates across requests (each call still gets a fresh closure/_ENV).
+- **Top-level chunks with a single-value return run compiled**: once a
+  cached chunk proto tier-ups, `BytecodeVM.execute` enters its kernel
+  directly instead of dispatching every instruction; a deopt resumes at the
+  faulting pc. Statement-only chunks (no value return) stay interpreted.
 - **Numeric `for` loops are JIT-compiled** (`FORPREP`/`FORLOOP`); the
   integer lane is unboxed and a float loop falls to the float lane.
-  `while`/`repeat` stay interpreted.
-- **Arithmetic is JIT-compiled for both int and float**: `ADD`/`SUB`/`MUL`
-  emit a runtime numeric dispatch (unboxed int lane when both operands are
-  ints, raw-bit float lane otherwise), so a mixed int/float hot function no
-  longer deopts on every call. The integer constant forms `ADDI`, `ADDK`,
-  `SUBK`, `MULK`, `IDIVK`, `MODK`, `BANDK`, `BORK`, `BXORK` carry the same
-  dispatch. `DIVK`/`POWK` yield floats and stay interpreted.
+  **`while`/`repeat` are JIT-compiled too**, via the two-register numeric
+  comparisons `LT`/`LE`.
+- **Arithmetic is JIT-compiled for both int and float**: `ADD`/`SUB`/`MUL`,
+  `DIV`, `MOD`, `IDIV`, `POW`, and the two-register/immediate bitwise ops
+  (`BAND`/`BOR`/`BXOR`/`SHL`/`SHR`/`SHLI`/`SHRI`) emit numeric or integer
+  lanes; the constant forms `ADDI`, `ADDK`, `SUBK`, `MULK`, `DIVK`, `POWK`,
+  `IDIVK`, `MODK`, `BANDK`, `BORK`, `BXORK` carry the same dispatch. `/`
+  and `^` use C99 `pow` semantics; shifts follow the Lua 5.4 negative-count
+  rule; `//` and `%` use floor semantics; division/modulo by zero deopts so
+  the interpreter raises the exact error.
+- **Control flow is JIT-compiled**: `EQ`, `EQK`, `LT`, `LE`, `TEST`,
+  `TESTSET`, `LFALSESKIP` cover equality, `and`/`or`, truthiness and `if`.
+  Mixed int/float equality (`1 == 1.0`) and NaN ordering match the
+  interpreter bit-for-bit.
+- **String concatenation** (`CONCAT`) is compiled when every operand is a
+  plain string/number; a metatable `__concat` deopts.
 - **Field access is metatable-aware**: `GETFIELD` fast-paths a non-nil
   `rawget` (independent of any metatable), so `self.x` on an OOP instance
   compiles instead of deopting; a nil raw hit (the `__index` case) deopts
@@ -234,21 +249,29 @@ closures 1.25×, oop **1.12×**), **2 near-ties** (table 1.06×, concat 1.00×),
 **2 small losses** (pattern 1.08×, sieve 1.03×). 30/30 PUC suites + 161 unit
 tests stay green with JIT both off and on.
 
-JIT effectiveness (same tasks, JIT on vs off) now covers **5/10** tasks:
-fib 19.2×, closures 2.3×, oop 1.30×, arith 1.29×, sieve 1.02×, with
-table/coroutines/concat/pattern within noise. This pass added the
-`math.sqrt` intrinsic: a float-returning method such as `Vec:length()`
-calls a builtin, and builtin calls used to force the whole proto out of the
-JIT subset, so it stayed interpreted (measured 2× slower than its
-compiled equivalent). The intrinsic is guarded by an identity check on
-`MathLib.SQRT`, so reassigning or shadowing still deopts to the
-interpreter. Earlier passes fixed the `GETFIELD` guard (metatable-free
-requirement made every OOP `self.x` deopt), the missing float lane, and
-`OP_TAILCALL` hotness counting. The float lane also stored its result with
-a truncating `D2L` instead of raw IEEE-754 bits (a correctness bug pinned
-by a regression test). The remaining gap is interpreter-loop cost in the
-main chunk (the dispatch loop is C2-compiled, but there is no OSR into a
-compiled Lua kernel for a script's top-level loop).
+The 2026-09-20 coverage pass widened the compiled subset substantially:
+`LT`/`LE`/`EQ`/`EQK`/`TEST`/`TESTSET`/`LFALSESKIP` (so `while`/`repeat`,
+`and`/`or`, equality and `if` compile), `DIV`/`MOD`/`IDIV`/`POW`, the full
+two-register and immediate bitwise set, `CONCAT`, and a single-value
+top-level chunk fast lane. Two structural limits were also removed: the
+numeric lattice now joins `INT ∪ NUM` to `NUM` instead of rejecting the
+merge (so a table-read loop with an integer accumulator compiles), and a
+vararg signature is only rejected when it actually reads `...`. Loop-driven
+tier-up (via `FORPREP` trip count) lets a function called only once still
+compile its heavy loop. Measured JIT-on vs JIT-off: `while` loops **~23×**,
+`if`-in-loop **~12×**, single-invocation heavy loops **~5.6×**, concat
+1.8×, and the previously-covered fib/closures/oop as before.
+
+This pass also added the `math.sqrt` intrinsic: a float-returning method
+such as `Vec:length()` calls a builtin, and builtin calls used to force the
+whole proto out of the JIT subset, so it stayed interpreted (measured 2×
+slower than its compiled equivalent). The intrinsic is guarded by an
+identity check on `MathLib.SQRT`, so reassigning or shadowing still deopts
+to the interpreter. Earlier passes fixed the `GETFIELD` guard
+(metatable-free requirement made every OOP `self.x` deopt), the missing
+float lane, and `OP_TAILCALL` hotness counting. The float lane also stored
+its result with a truncating `D2L` instead of raw IEEE-754 bits (a
+correctness bug pinned by a regression test).
 
 The 2026-09-16 optimization pass closed most of the interpreter-era gaps
 without weakening semantics: lazy short-string interning (canonical keys
@@ -357,8 +380,9 @@ src/test/java/org/luava/
 tests/lua-5.4.9-tests/         # upstream PUC-Rio suite (do not modify)
 ```
 
-Internal contributor rules live in `AGENTS.md`; the register-VM design
-record lives in `PLANS.md`. Lua 5.4 reference manual is under `docs/`.
+Internal contributor rules live in `AGENTS.md`; the register-VM design and
+JIT expansion roadmap lives in `plan.md`. Lua 5.4 reference manual is under
+`docs/`.
 
 ## License
 

@@ -145,6 +145,98 @@ public class JitCoverageTest {
     }
 
     @Test
+    void whileAndRepeatLoopsMatchInterpreter() {
+        // Regression: LT/LE were outside the JIT subset, so every while/repeat
+        // loop stayed interpreted. They now compile with a mixed int/float
+        // comparison lane and must match the interpreter exactly.
+        assertSameWithAndWithoutJit(hot("local i=0 local s=0 while i<1000 do i=i+1 s=s+i end return s"), 2);
+        assertSameWithAndWithoutJit(hot("local i=0 local s=0 while i<=1000 do i=i+1 s=s+i end return s"), 2);
+        assertSameWithAndWithoutJit(hot("local i=0 local s=0 repeat i=i+1 s=s+i until i>=1000 return s"), 2);
+        assertSameWithAndWithoutJit(hot("local s=0 for i=1,1000 do if i<500 then s=s+i end end return s"), 2);
+        assertSameWithAndWithoutJit(hot("local s=0 for i=1,1000 do if i<=500 then s=s+i end end return s"), 2);
+    }
+
+    @Test
+    void equalityAndTestOpsMatchInterpreter() {
+        // EQ/EQK/TEST/TESTSET/LFALSESKIP: and/or, if-truthy and equality must
+        // compile and stay bit-identical, including int/float equality
+        // (1 == 1.0) and NaN ordering.
+        assertSameWithAndWithoutJit(hot("local s=0 for i=1,1000 do if i==500 then s=s+1 end end return s"), 2);
+        assertSameWithAndWithoutJit(hot("local s=0 for i=1,1000 do if i~=500 then s=s+1 end end return s"), 2);
+        assertSameWithAndWithoutJit(hot("local x=3 local s=0 for i=1,1000 do s=s+(x or i) end return s"), 2);
+        assertSameWithAndWithoutJit(hot("local x=3 local s=0 for i=1,1000 do s=s+(x and i or 0) end return s"), 2);
+        assertSameWithAndWithoutJit(hot("local x=0 local s=0 for i=1,1000 do s=s+(x and i or 0) end return s"), 2);
+        // Mixed numeric equality through parameters (not folded literals).
+        assertSameWithAndWithoutJit(
+                "local function f(a,b) local n=0 for i=1,50 do if a==b then n=n+1 end end return n end "
+                + "local r for k=1,400 do r=f(1,1.0) end return r", 2);
+        assertSameWithAndWithoutJit(
+                "local function f(a,b) local n=0 for i=1,50 do if a<b then n=n+1 end end return n end "
+                + "local r for k=1,400 do r=f(1,2.5) end return r", 2);
+    }
+
+    @Test
+    void integerTableLoopWithIntAccumulatorCompiles() {
+        // Regression: the forward type inference rejected a loop that mixed a
+        // table read (T_UNKNOWN) into an integer accumulator because T_INT and
+        // T_NUM were treated as a conflict. Numbers now join to T_NUM, whose
+        // runtime int/float dispatch is exact.
+        LuaState state = new LuaState();
+        LuaClosure work = (LuaClosure) state.eval(
+                "local function work() local t={} for i=1,2000 do t[i]=i*3 end "
+                + "local s=0 for i=1,2000 do s=s+t[i] end return s end return work");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("work"), work);
+        state.eval("for k=1,200 do work() end");
+        assertTrue(awaitCompiled(work.proto, 5000),
+                "integer-accumulator table loop should JIT-compile after the numeric join");
+        assertEquals(6003000, state.eval("return work()").toLong());
+    }
+
+    @Test
+    void singleInvocationHeavyLoopTiersUp() {
+        // A function called once never crosses the call hotness threshold, so
+        // its long numeric for-loop is what must drive the compile (requested
+        // once per loop at FORPREP, not per iteration).
+        LuaState state = new LuaState();
+        LuaClosure work = (LuaClosure) state.eval(
+                "local function work() local s=0 for i=1,1000000 do s=s+i end return s end return work");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("work"), work);
+        // Called exactly once via a tail call after the loop request fires.
+        org.luava.runtime.LuaValue r = state.eval("return work()");
+        assertEquals(500000500000L, r.toLong());
+        assertTrue(awaitCompiled(work.proto, 5000),
+                "a single-invocation heavy loop should tier up via FORPREP");
+    }
+
+    @Test
+    void topLevelChunkWithReturnUsesJitKernel() {
+        // Regression for the top-level JIT fast lane: a chunk returning one
+        // value must run through its compiled kernel once hot, not stay
+        // interpreted because of the compiler-emitted trailing RETURN0.
+        LuaState state = new LuaState();
+        String code = "local s=0 for i=1,200000 do s=s+i end return s";
+        LuaClosure chunk = (LuaClosure) state.compile(code, "chunk", state.getGlobals());
+        for (int i = 0; i < 4; i++) {
+            assertEquals(20000100000L, chunk.call().toLong());
+        }
+        assertTrue(awaitCompiled(chunk.proto, 5000), "top-level chunk should tier up");
+    }
+
+    @Test
+    void varargProtoWithoutDotDotDotCompiles() {
+        // A vararg signature that never reads `...` is safe to compile; the
+        // blanket isVararg rejection was unnecessary (VARARG is still rejected
+        // by the opcode allow-list when actually used).
+        LuaState state = new LuaState();
+        LuaClosure f = (LuaClosure) state.eval(
+                "local function f(...) local s=0 for i=1,100 do s=s+i end return s end return f");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("f"), f);
+        state.eval("for k=1,400 do f(1,2,3) end");
+        assertTrue(awaitCompiled(f.proto, 5000),
+                "a vararg proto that never uses '...' should JIT-compile");
+    }
+
+    @Test
     void numericMixedArithmeticMatchesInterpreter() {
         // Regression: the JIT used to be integer-only, so any float arithmetic
         // in a hot function deopted on every call. It now emits a runtime

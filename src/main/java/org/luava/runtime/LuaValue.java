@@ -399,7 +399,7 @@ public abstract class LuaValue {
         return dispatchBinaryMetamethod(this, other, "__mod", "perform arithmetic on");
     }
 
-    static double luaFloatMod(double a, double b) {
+    public static double luaFloatMod(double a, double b) {
         double m = a % b;
         if (m > 0 ? b < 0 : (m < 0 && b > 0)) {
             m += b;
@@ -420,7 +420,7 @@ public abstract class LuaValue {
      * returns NaN for {@code pow(1, y)} when y is NaN/±infinity, and for
      * {@code pow(-1, ±infinity)}. C99 mandates 1.0 for all of these.
      */
-    static double luaNumPow(double base, double exp) {
+    public static double luaNumPow(double base, double exp) {
         if (base == 1.0) {
             return 1.0;
         }

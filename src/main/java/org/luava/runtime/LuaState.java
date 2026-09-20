@@ -781,6 +781,16 @@ public final class LuaState {
     public static final int JIT_HOT_THRESHOLD = 50;
 
     /**
+     * Loop back-edges of one proto before a JIT compile is attempted. Much
+     * larger than {@link #JIT_HOT_THRESHOLD}: a single loop iteration is far
+     * cheaper than a call, and this keeps short/once-around loops from
+     * triggering a compile for no benefit. Used for protos that are hot
+     * because of a loop (top-level chunks, {@code while}/{@code repeat}, or a
+     * function called only once).
+     */
+    public static final int JIT_LOOP_THRESHOLD = 8192;
+
+    /**
      * Per-state JIT override. {@code null} means "follow the global
      * {@link #ENABLE_JIT}"; true/false pins this state only, so a server can
      * keep JIT on for trusted tenants and off for others in the same JVM.

@@ -206,6 +206,13 @@ public final class BytecodeVM {
         ctx.oldpc = -1;
         ctx.varargPrepRan = false;
         ctx.thrown = null;
+        // A previous run of this (cached) proto may have tiered it up. Run
+        // the compiled kernel directly instead of dispatching every
+        // instruction; a deopt resumes the interpreter at the faulting pc
+        // with all committed state intact.
+        if (runTopLevelJit(state, ctx, initialClosure)) {
+            return boxTopLevelResults(ctx, ctx.base + 0, 1);
+        }
         // Hoisted: coroutine is constant for the whole execute() invocation
         // (resume continues the same thread/CURRENT; nested coroutines get
         // their own execute()). Saves a ThreadLocal lookup per instruction.
@@ -213,15 +220,96 @@ public final class BytecodeVM {
     }
 
     /**
-     * The HotSpot-critical dispatch loop. Kept small enough for C2/OSR
-     * (well under the 8 KB HugeMethodLimit); big opcode handlers live in
-     * helpers that mutate {@code ctx} directly.
+     * Attempts to run the top-level chunk through its compiled kernel.
+     * Returns true when the kernel produced a single result (in {@code R[0]}),
+     * false when the interpreter must run (cold, ineligible, guarded, or a
+     * deopt). A chunk that returns 0 or many values deopts inside the kernel
+     * and falls through to the interpreter, so the multret layout is never
+     * reimplemented here.
      */
+    private static boolean runTopLevelJit(LuaState state, VmContext ctx, LuaClosure closure) {
+        if (!state.isJitEnabled() || (ctx.co != null && ctx.co.hooksActive) || state.loopGuard != null) {
+            return false;
+        }
+        JitCode jc = closure.proto.jitCode;
+        if (jc == null || !jc.pure || (jc.objHandle == null && !jc.returnsInt)) {
+            return false;
+        }
+        // A chunk that would return 0/many values is not special-cased here:
+        // the translator emits a deopt for those shapes, which resumes the
+        // interpreter with committed state. A single-value return is the only
+        // path that hands a result back framelessly.
+        try {
+            if (jc.returnsInt) {
+                long r = (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals,
+                        ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
+                ctx.pStack[ctx.base] = r;
+                ctx.tStack[ctx.base] = TYPE_INT;
+                ctx.oStack[ctx.base] = null;
+            } else {
+                LuaValue r = (LuaValue) jc.objHandle.invokeExact(closure, (Object[]) closure.upvals,
+                        ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, r);
+            }
+            ctx.top = ctx.base + 1;
+            if (ctx.thread.getOpenUpvaluesHead() != null) {
+                state.closeUpvalues(ctx.thread, ctx.base);
+            }
+            return true;
+        } catch (DeoptSignal d) {
+            if (++jc.deopts > 8) {
+                closure.proto.jitCode = null;
+                closure.proto.jitDisabled = true;
+            }
+            ctx.pc = d.pc;
+            return false;
+        } catch (StackOverflowError soe) {
+            closure.proto.jitCode = null;
+            closure.proto.jitDisabled = true;
+            ctx.pc = 0;
+            return false;
+        } catch (RuntimeException | Error t) {
+            closure.proto.jitCode = null;
+            closure.proto.jitDisabled = true;
+            throw t;
+        } catch (Throwable t) {
+            closure.proto.jitCode = null;
+            closure.proto.jitDisabled = true;
+            return false;
+        }
+    }
+
+    /**
+     * Requests a compile for the current proto after a numeric {@code for}
+     * loop whose trip count reached {@link LuaState#JIT_LOOP_THRESHOLD}. This
+     * runs once per loop (at {@code FORPREP}), never per iteration, so a hot
+     * function called only once still tiers up with zero dispatch-loop
+     * overhead. Only called when the count is already known to be large, so
+     * short loops never trigger it.
+     */
+    private static void requestLoopCompile(LuaState state, VmContext ctx) {
+        if (!state.isJitEnabled()) {
+            return;
+        }
+        LuaProto proto = ctx.proto;
+        if (proto.loopCompileRequested || proto.jitCode != null || proto.jitDisabled) {
+            return;
+        }
+        proto.loopCompileRequested = true;
+        if (ctx.thread.hooksActive || state.loopGuard != null) {
+            return;
+        }
+        try {
+            JitCompiler.requestCompile(proto);
+        } catch (Throwable t) {
+            proto.jitDisabled = true;
+        }
+    }
+
     private static LuaValue[] runLoop(LuaState state, VmContext ctx) {
         LuaCoroutine co0 = ctx.co;
         // Cooperative runaway-script guard, constant for this execute() call.
         LuaState.LoopGuard guard = state.loopGuard;
-
         try {
             while (true) {
                 int instPc = ctx.pc;
@@ -704,7 +792,7 @@ public final class BytecodeVM {
                         return rN;
                     }
                 }
-                case OpCode.OP_FORPREP -> doForPrep(ctx, a, inst);
+                case OpCode.OP_FORPREP -> doForPrep(state, ctx, a, inst);
                 case OpCode.OP_FORLOOP -> {
                     int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
                     int regInit = ctx.base + a;
@@ -945,7 +1033,7 @@ public final class BytecodeVM {
      * dontinline} recovery), so the return bodies stay inline.
      */
     /**
-     * Hybrid JIT fast lane (plan.md Phase 2/4/5). Runs a compiled kernel
+     * Hybrid JIT fast lane (plan.md). Runs a compiled kernel
      * directly on the caller's register window instead of pushing an
      * interpreter frame.
      *
@@ -1259,7 +1347,7 @@ public final class BytecodeVM {
                 ctx.oStack = ctx.thread.getObjectStack();
                 return;
             }
-            // Hybrid JIT fast lane (plan.md Phase 2/4/5): a compiled kernel
+            // Hybrid JIT fast lane (plan.md): a compiled kernel
             // runs framelessly on the register window. 1 = handled; 2 = run
             // the interpreter below but resume at the deopt pc instead of 0;
             // 0 = cold/unsuitable, run from scratch.
@@ -1804,7 +1892,7 @@ public final class BytecodeVM {
      * {@code OP_FORPREP} handler (runs once per loop, so call overhead is
      * free). Initializes the numeric loop counter or skips the loop.
      */
-    private static void doForPrep(VmContext ctx, int a, int inst) {
+    private static void doForPrep(LuaState state, VmContext ctx, int a, int inst) {
         int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
         int regInit = ctx.base + a;
         if (ctx.tStack[regInit] == TYPE_INT && ctx.tStack[regInit + 1] == TYPE_INT && ctx.tStack[regInit + 2] == TYPE_INT) {
@@ -1822,6 +1910,12 @@ public final class BytecodeVM {
                 long count = step > 0 ? Long.divideUnsigned(limit - init, step)
                         : Long.divideUnsigned(init - limit, -step);
                 ctx.pStack[regInit + 1] = count;
+                // Loop-driven tier-up: a long numeric loop reached from a
+                // single call has no call hotness. This runs once per loop
+                // entry, so the dispatch hot path pays nothing.
+                if (count >= LuaState.JIT_LOOP_THRESHOLD) {
+                    requestLoopCompile(state, ctx);
+                }
             }
         } else {
             ctx.pc = executeForPrepSlow(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, bx, ctx.pc);

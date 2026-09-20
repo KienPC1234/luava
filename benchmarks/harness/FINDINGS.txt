@@ -27,7 +27,7 @@ Caveats (why this is a spike, not the feature):
   2. No call-site polymorphism: this emits a direct self-invokestatic. The
      real thing needs PIC/invokedynamic for general callees (tables with
      __call, Java functions, other closures).
-  3. PLANS.md §IX non-goals remain: coroutine yield (the generated method
+  3. plan.md non-goals remain: coroutine yield (the generated method
      cannot yield mid-frame), Metaspace (hidden classes mitigate), 64KB
      method limit (small funcs fine, huge funcs need splitting).
   4. Integration: closures with open upvalues, varargs, table ops, metamethods,

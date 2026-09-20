@@ -31,7 +31,7 @@ public final class LuaProto {
     public String rawSource;
     public org.luava.frontend.ast.Statements.BlockStmt body;
 
-    // Hybrid tiered JIT state (plan.md Phase 1/2/4). The interpreter remains
+    // Hybrid tiered JIT state (plan.md). The interpreter remains
     // the default engine; these fields only accelerate hot integer kernels.
     /** Compiled code for this proto, or null when interpreted. */
     public volatile JitCode jitCode;
@@ -43,6 +43,14 @@ public final class LuaProto {
     public boolean mayYield;
     /** Interpreter-side call counter driving tier-up. */
     public int hotCount;
+    /**
+     * Set once a loop-driven compile has been requested (a numeric
+     * {@code for} loop whose trip count crossed the threshold), so the
+     * request is made at most once per proto. Covers protos that are hot
+     * because of a loop rather than repeated calls, e.g. a function called
+     * only once.
+     */
+    public boolean loopCompileRequested;
 
     /**
      * Trivial-factory descriptor: a function whose body only forwards
