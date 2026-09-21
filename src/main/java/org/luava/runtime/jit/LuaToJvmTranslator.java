@@ -699,8 +699,21 @@ public final class LuaToJvmTranslator implements Opcodes {
                 case OpCode.OP_FORPREP -> emitForPrep(mv, a, Instruction.getBx(inst), pc, labels);
                 case OpCode.OP_FORLOOP -> emitForLoop(mv, a, Instruction.getBx(inst), pc, labels);
                 case OpCode.OP_CALL -> {
+                    if (isFloorSqrtIntrinsic(proto, proto.code, pc)) {
+                        emitFloorSqrtCall(mv, a, pc);
+                        break;
+                    }
                     if (isSqrtIntrinsic(proto, proto.code, pc)) {
                         emitSqrtCall(mv, a, pc);
+                        break;
+                    }
+                    if (isFloorIntrinsic(proto, proto.code, pc)) {
+                        emitFloorCall(mv, a, pc);
+                        break;
+                    }
+                    if (isIntrinsicCall(proto, proto.code, pc)) {
+                        // The multi-result sqrt half consumed by the following
+                        // fused floor(sqrt): emits nothing here.
                         break;
                     }
                     if (!pure) {
@@ -963,10 +976,11 @@ public final class LuaToJvmTranslator implements Opcodes {
             }
             if (Instruction.getOp(inst) == OpCode.OP_CALL
                     || Instruction.getOp(inst) == OpCode.OP_TAILCALL) {
-                // A recognized builtin intrinsic (`math.sqrt(x)`) is emitted
-                // inline as a guarded Math.sqrt, so it is NOT a general call:
+                // A recognized builtin intrinsic (`math.sqrt(x)`,
+                // `math.floor(x)`, `math.floor(math.sqrt(x))`) is emitted
+                // inline as a guarded Math call, so it is NOT a general call:
                 // it cannot reach a Lua callee and cannot observe state.
-                if (isSqrtIntrinsic(proto, code, pc)) {
+                if (isIntrinsicCall(proto, code, pc)) {
                     if (Instruction.getOp(inst) == OpCode.OP_TAILCALL) {
                         hasIntrinsicTail = true;
                     }
@@ -1169,26 +1183,111 @@ public final class LuaToJvmTranslator implements Opcodes {
         if (op == OpCode.OP_CALL && Instruction.getC(inst) != 2) {
             return false;
         }
-        int funcReg = Instruction.getA(inst);
-        int def = lastWrite(code, pc, funcReg);
-        if (def < 0 || Instruction.getOp(code[def]) != OpCode.OP_GETFIELD) {
+        return "sqrt".equals(mathFieldAt(proto, code, pc, Instruction.getA(inst)));
+    }
+
+    /**
+     * Recognizes the {@code math.floor(x)} one-result call shape (identity of
+     * the function register is {@code MathLib.FLOOR} at runtime).
+     */
+    private static boolean isFloorIntrinsic(LuaProto proto, int[] code, int pc) {
+        int inst = code[pc];
+        if (Instruction.getOp(inst) != OpCode.OP_CALL
+                || Instruction.getB(inst) != 2
+                || Instruction.getC(inst) != 2) {
             return false;
+        }
+        return "floor".equals(mathFieldAt(proto, code, pc, Instruction.getA(inst)));
+    }
+
+    /**
+     * Recognizes the {@code math.floor(math.sqrt(x))} loop-bound idiom, whose
+     * bytecode is a multi-result {@code sqrt} call immediately consumed by a
+     * one-result {@code floor} call. {@code pc} is the floor call; the sqrt
+     * call must be the directly preceding instruction with its result in
+     * {@code R[A+1]} ({@code sqrt} yields exactly one value, so the floor
+     * call's {@code B==0} argument window is exactly that value).
+     */
+    private static boolean isFloorSqrtIntrinsic(LuaProto proto, int[] code, int pc) {
+        int inst = code[pc];
+        if (Instruction.getOp(inst) != OpCode.OP_CALL
+                || Instruction.getB(inst) != 0
+                || Instruction.getC(inst) != 2) {
+            return false;
+        }
+        int af = Instruction.getA(inst);
+        if (!"floor".equals(mathFieldAt(proto, code, pc, af))) {
+            return false;
+        }
+        int prev = pc - 1;
+        if (prev < 0) {
+            return false;
+        }
+        int pinst = code[prev];
+        if (Instruction.getOp(pinst) != OpCode.OP_CALL
+                || Instruction.getB(pinst) != 2
+                || Instruction.getC(pinst) != 0
+                || Instruction.getA(pinst) != af + 1) {
+            return false;
+        }
+        return "sqrt".equals(mathFieldAt(proto, code, prev, af + 1));
+    }
+
+    /**
+     * Returns {@code "sqrt"}/{@code "floor"} when {@code R[reg]} is provably
+     * loaded straight-line by {@code GETFIELD <name>} off a {@code GETTABUP
+     * "math"} result, else {@code null}. The emitted code still identity-
+     * guards the shared builtin singleton, so a reassigned or shadowed
+     * {@code math} simply deopts.
+     */
+    private static String mathFieldAt(LuaProto proto, int[] code, int pc, int reg) {
+        int def = lastWrite(code, pc, reg);
+        if (def < 0 || Instruction.getOp(code[def]) != OpCode.OP_GETFIELD) {
+            return null;
         }
         int c = Instruction.getC(code[def]);
         if (!(c >= 0 && c < proto.constants.length)
-                || !(proto.constants[c] instanceof org.luava.runtime.LuaString ks)
-                || !"sqrt".equals(ks.toLuaString())) {
-            return false;
+                || !(proto.constants[c] instanceof org.luava.runtime.LuaString ks)) {
+            return null;
+        }
+        String name = ks.toLuaString();
+        if (!"sqrt".equals(name) && !"floor".equals(name)) {
+            return null;
         }
         int baseReg = Instruction.getB(code[def]);
         int baseDef = lastWrite(code, def, baseReg);
         if (baseDef < 0 || Instruction.getOp(code[baseDef]) != OpCode.OP_GETTABUP) {
-            return false;
+            return null;
         }
         int bc = Instruction.getC(code[baseDef]);
-        return bc >= 0 && bc < proto.constants.length
-                && proto.constants[bc] instanceof org.luava.runtime.LuaString ms
-                && "math".equals(ms.toLuaString());
+        if (!(bc >= 0 && bc < proto.constants.length)
+                || !(proto.constants[bc] instanceof org.luava.runtime.LuaString ms)
+                || !"math".equals(ms.toLuaString())) {
+            return null;
+        }
+        return name;
+    }
+
+    /**
+     * True when the call at {@code pc} is handled by an inlined numeric
+     * builtin rather than the general call protocol: {@code math.sqrt},
+     * {@code math.floor}, the fused {@code math.floor(math.sqrt(x))}, or the
+     * multi-result {@code sqrt} call that the following fused floor consumes.
+     * Such calls cannot reach a Lua callee and cannot observe state, so they
+     * are not general calls and do not reject or deopt a proto.
+     */
+    private static boolean isIntrinsicCall(LuaProto proto, int[] code, int pc) {
+        if (isSqrtIntrinsic(proto, code, pc)
+                || isFloorIntrinsic(proto, code, pc)
+                || isFloorSqrtIntrinsic(proto, code, pc)) {
+            return true;
+        }
+        // The multi-result sqrt half of a fused floor(sqrt): it emits nothing
+        // (the next instruction performs the whole computation).
+        int next = pc + 1;
+        return next < code.length && isFloorSqrtIntrinsic(proto, code, next)
+                && Instruction.getOp(code[pc]) == OpCode.OP_CALL
+                && Instruction.getC(code[pc]) == 0;
     }
 
     /** Successor pcs for control-flow (conditional compares skip one). */
@@ -1404,7 +1503,7 @@ public final class LuaToJvmTranslator implements Opcodes {
             case OpCode.OP_CALL -> {
                 // A recognized sqrt intrinsic yields a float; any other call
                 // yields an integer under the JIT call protocol.
-                setTy(out, regs, a, isSqrtIntrinsic(proto, code, pc) ? T_NUM : T_INT);
+                setTy(out, regs, a, isIntrinsicCall(proto, code, pc) ? T_NUM : T_INT);
             }
             case OpCode.OP_TAILCALL -> {
                 // No fallthrough register: the callee result becomes ours.
@@ -1850,20 +1949,95 @@ public final class LuaToJvmTranslator implements Opcodes {
      * leaves {@code Math.sqrt(arg)} as a JVM double on the stack.
      */
     private static void emitSqrtGuardAndCompute(MethodVisitor mv, int a, int pc) {
-        // Identity guard on R[a] == MathLib.SQRT.
-        mv.visitVarInsn(ALOAD, 4);
-        emitIndex(mv, a);
-        mv.visitInsn(AALOAD);
-        mv.visitFieldInsn(GETSTATIC, "org/luava/runtime/standard/MathLib", "SQRT",
-                "Lorg/luava/runtime/LuaFunction;");
-        Label isSqrt = new Label();
-        mv.visitJumpInsn(IF_ACMPEQ, isSqrt);
-        emitDeopt(mv, pc);
-        mv.visitLabel(isSqrt);
+        emitBuiltinIdentityGuard(mv, a, "SQRT", pc);
         // Argument must be a number.
         emitGuardNumber(mv, a + 1, pc);
         emitLoadDouble(mv, a + 1);
         mv.visitMethodInsn(INVOKESTATIC, "java/lang/Math", "sqrt", "(D)D", false);
+    }
+
+    /** Deopts unless {@code R[reg]} is the {@code MathLib.<field>} singleton. */
+    private static void emitBuiltinIdentityGuard(MethodVisitor mv, int reg, String field, int pc) {
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, reg);
+        mv.visitInsn(AALOAD);
+        mv.visitFieldInsn(GETSTATIC, "org/luava/runtime/standard/MathLib", field,
+                "Lorg/luava/runtime/LuaFunction;");
+        Label ok = new Label();
+        mv.visitJumpInsn(IF_ACMPEQ, ok);
+        emitDeopt(mv, pc);
+        mv.visitLabel(ok);
+    }
+
+    /**
+     * Emits {@code R[a] = math.floor(R[a+1])}. An integer argument is copied
+     * unchanged (exact over the whole 64-bit range, which a round-trip through
+     * {@code double} would not be); a float argument goes through
+     * {@code Math.floor} and {@link JitRuntime#storeFloored} for PUC subtype
+     * semantics.
+     */
+    private static void emitFloorCall(MethodVisitor mv, int a, int pc) {
+        emitBuiltinIdentityGuard(mv, a, "FLOOR", pc);
+        Label intArg = new Label();
+        Label done = new Label();
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, a + 1);
+        mv.visitInsn(BALOAD);
+        mv.visitVarInsn(ISTORE, 7);
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_INT);
+        mv.visitJumpInsn(IF_ICMPEQ, intArg);
+        mv.visitVarInsn(ILOAD, 7);
+        ldcInt(mv, TYPE_FLOAT);
+        Label floatArg = new Label();
+        mv.visitJumpInsn(IF_ICMPEQ, floatArg);
+        emitDeopt(mv, pc);
+        mv.visitLabel(floatArg);
+        emitLoadDouble(mv, a + 1);
+        mv.visitMethodInsn(INVOKESTATIC, "java/lang/Math", "floor", "(D)D", false);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "storeFloored",
+                "(D[J[B[Lorg/luava/runtime/LuaValue;I)V", false);
+        mv.visitJumpInsn(GOTO, done);
+        mv.visitLabel(intArg);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a);
+        mv.visitVarInsn(ALOAD, 2);
+        emitIndex(mv, a + 1);
+        mv.visitInsn(LALOAD);
+        mv.visitInsn(LASTORE);
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, a);
+        ldcInt(mv, TYPE_INT);
+        mv.visitInsn(BASTORE);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitInsn(ACONST_NULL);
+        mv.visitInsn(AASTORE);
+        mv.visitLabel(done);
+    }
+
+    /**
+     * Emits the fused {@code R[af] = math.floor(math.sqrt(R[af+2]))} idiom
+     * (the {@code for i = 2, math.floor(math.sqrt(N))} loop bound). Both
+     * singletons are identity-guarded; the argument must be a number.
+     */
+    private static void emitFloorSqrtCall(MethodVisitor mv, int af, int pc) {
+        emitBuiltinIdentityGuard(mv, af, "FLOOR", pc);
+        emitBuiltinIdentityGuard(mv, af + 1, "SQRT", pc);
+        emitGuardNumber(mv, af + 2, pc);
+        emitLoadDouble(mv, af + 2);
+        mv.visitMethodInsn(INVOKESTATIC, "java/lang/Math", "sqrt", "(D)D", false);
+        mv.visitMethodInsn(INVOKESTATIC, "java/lang/Math", "floor", "(D)D", false);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, af);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "storeFloored",
+                "(D[J[B[Lorg/luava/runtime/LuaValue;I)V", false);
     }
 
     /** Deopts unless register {@code reg} holds TYPE_INT or TYPE_FLOAT. */

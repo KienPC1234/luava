@@ -35,6 +35,25 @@ public final class JitRuntime {
     }
 
     /**
+     * Stores an already-floored double into register {@code idx} with PUC
+     * {@code math.floor} subtype semantics: an integral value that fits a Lua
+     * integer becomes an unboxed {@code TYPE_INT}, anything else (inf, nan,
+     * or out of range) a raw-bit {@code TYPE_FLOAT}. The caller has already
+     * computed {@code Math.floor}, so an in-range result is integral and the
+     * {@code (long)} cast is exact.
+     */
+    public static void storeFloored(double d, long[] p, byte[] t, LuaValue[] o, int idx) {
+        if (d >= -9223372036854775808.0 && d < 9223372036854775808.0) {
+            p[idx] = (long) d;
+            t[idx] = org.luava.runtime.bytecode.BytecodeVM.TYPE_INT;
+        } else {
+            p[idx] = Double.doubleToRawLongBits(d);
+            t[idx] = org.luava.runtime.bytecode.BytecodeVM.TYPE_FLOAT;
+        }
+        o[idx] = null;
+    }
+
+    /**
      * Lua {@code <<} with the 5.4 negative-count rule (luaV_shiftl): a count
      * of |n| >= 64 yields 0, a negative count shifts the other way. Mirrors
      * {@code LuaValue.shl}.

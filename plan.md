@@ -10,7 +10,7 @@
 > thất bại quan trọng được bảo tồn ở §9.
 >
 > Cập nhật: 2026-09-20. Trạng thái: **Phase A, B, C, D, E đã hoàn thành**. Độ
-> phủ mở rộng từ ~4/24 lên ~19/24 dạng cấu trúc; 185 unit test + 30/30 suite
+> phủ mở rộng từ ~4/24 lên ~19/24 dạng cấu trúc; 188 unit test + 30/30 suite
 > PUC xanh (ép prewarm mọi proto hợp lệ cũng 30/30). Xem §12 để biết trạng thái
 > từng phase.
 
@@ -556,22 +556,24 @@ benchmark main-chunk loop; D/E/F/G mở rộng dần theo nhu cầu thực tế.
 | D3 | ✅ xong | `OP_SELF`: `emitSelf` + `JitRuntime.selfMethod` guard rawget-non-nil |
 | D4 | ✅ xong | Bỏ reject `hasCalls && impure` **khi có loop back-edge trước call đầu tiên**: impure proto compile được nhưng **mọi CALL/TAILCALL deopt trước khi vào callee** (resume tại pc, không double-write). Deopt cấu trúc dùng budget riêng `JIT_STRUCTURAL_DEOPT_BUDGET=4096` (tránh phạt exception vĩnh viễn); `GETTABLE/SETTABLE` dispatch theo tag khoá (int vs string); `OP_CLEANUP` no-op kiểu (sửa reject sai `07/10`) |
 | E | ✅ xong | `CONCAT`, `DIV/DIVK`, `POW/POWK`, `MOD`, `IDIV`, bitwise 2 ngôi + `SHLI/SHRI`; helper `shiftLeft/Right`, `luaFloatMod`, `luaNumPow` |
-| F | ⬜ chưa | Generic-for (`TFOR*`) |
-| G | ⬜ chưa | Vararg đọc `...` |
+| E2 | ✅ xong | Intrinsic `math.floor` + fused `math.floor(math.sqrt(x))` (guard identity `MathLib.FLOOR`/`SQRT`); gỡ deopt cả kernel của `10_sieve` |
+| F | ⬜ chưa | Generic-for (`TFOR*`) — chặn bởi call-from-JIT + setup call trước loop |
+| G | ⬜ chưa | Vararg đọc `...` — cần mở rộng ABI `exec` để truyền varargs |
 | H | ⬜ chưa | Inline cache đa hình |
 | I | ⬜ chưa | Mở rộng deopt/debug robustness |
 | J | ⬜ chưa | Xác thực cuối |
 
 **Bằng chứng (paired, core 8, `luava.jit.sync=true`):**
 - JIT on/off (main-chunk loop giờ tier-up): arith **~5×**, table ops **~2.8×**,
-  closures **~2×**, hash **~1.4×**, oop 1.35×; `while` **~23×**, `if`-in-loop
-  **~12×**, single-invocation heavy loop **~5.6×**.
+  closures **~2×**, hash **~1.4×**, sieve **~1.9×** (nhờ intrinsic
+  `floor(sqrt)`), oop 1.35×; `while` **~23×**, `if`-in-loop **~12×**,
+  single-invocation heavy loop **~5.6×**.
 - Fuzz đối chiếu JIT on/off: FuzzC 868, FuzzE 1656, FuzzConcat 45, FuzzTL 13,
-  FuzzVoid 8, FuzzSelf 6, FuzzClosure 8, FuzzImpure 10, FuzzTable 12 — **0
-  mismatch**.
+  FuzzVoid 8, FuzzSelf 6, FuzzClosure 8, FuzzImpure 10, FuzzTable 12,
+  FuzzMulti 8, FuzzMath 11 — **0 mismatch**.
 - **Prewarm cưỡng bức mọi proto hợp lệ** trên toàn bộ 30 suite PUC → 30/30
   PASS (JIT on, `luava.jit.sync=true`).
-- 185 unit test + 30/30 suite PUC xanh (JIT cả on/off).
+- 188 unit test + 30/30 suite PUC xanh (JIT cả on/off).
 - vs LuaJ (paired): arith 8.3×, hash 1.96×, oop 1.18× thắng;
   table/sieve/pattern/closures ~1.0. Không task nào thua > 1.1×.
 
