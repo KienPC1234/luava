@@ -210,8 +210,9 @@ public final class BytecodeVM {
         // the compiled kernel directly instead of dispatching every
         // instruction; a deopt resumes the interpreter at the faulting pc
         // with all committed state intact.
-        if (runTopLevelJit(state, ctx, initialClosure)) {
-            return boxTopLevelResults(ctx, ctx.base + 0, 1);
+        LuaValue[] jitResult = runTopLevelJit(state, ctx, initialClosure);
+        if (jitResult != null) {
+            return jitResult;
         }
         // Hoisted: coroutine is constant for the whole execute() invocation
         // (resume continues the same thread/CURRENT; nested coroutines get
@@ -221,25 +222,33 @@ public final class BytecodeVM {
 
     /**
      * Attempts to run the top-level chunk through its compiled kernel.
-     * Returns true when the kernel produced a single result (in {@code R[0]}),
-     * false when the interpreter must run (cold, ineligible, guarded, or a
-     * deopt). A chunk that returns 0 or many values deopts inside the kernel
-     * and falls through to the interpreter, so the multret layout is never
-     * reimplemented here.
+     * Returns the boxed result array (possibly empty for a void chunk) when
+     * handled, or {@code null} when the interpreter must run (cold,
+     * ineligible, guarded, or a deopt, which resumes at the faulting pc).
+     * A chunk that returns many values deopts inside the kernel, so the
+     * multret layout is never reimplemented here.
      */
-    private static boolean runTopLevelJit(LuaState state, VmContext ctx, LuaClosure closure) {
+    private static LuaValue[] runTopLevelJit(LuaState state, VmContext ctx, LuaClosure closure) {
         if (!state.isJitEnabled() || (ctx.co != null && ctx.co.hooksActive) || state.loopGuard != null) {
-            return false;
+            return null;
         }
         JitCode jc = closure.proto.jitCode;
-        if (jc == null || !jc.pure || (jc.objHandle == null && !jc.returnsInt)) {
-            return false;
+        // Impure kernels are allowed: their every call deopts before entering
+        // a callee, and a deopt resumes the top-level interpreter at the
+        // faulting pc with committed state intact.
+        if (jc == null || (!jc.returnsInt && jc.objHandle == null)) {
+            return null;
         }
-        // A chunk that would return 0/many values is not special-cased here:
-        // the translator emits a deopt for those shapes, which resumes the
-        // interpreter with committed state. A single-value return is the only
-        // path that hands a result back framelessly.
         try {
+            if (jc.returnsVoid) {
+                // The handle returns a long sentinel; the cast pins the exact
+                // MethodType so invokeExact matches (a bare statement call
+                // would infer a void type). The value is discarded.
+                long ignored = (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals,
+                        ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
+                finishFrame(state, ctx);
+                return new LuaValue[0];
+            }
             if (jc.returnsInt) {
                 long r = (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals,
                         ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
@@ -252,22 +261,24 @@ public final class BytecodeVM {
                 setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, r);
             }
             ctx.top = ctx.base + 1;
-            if (ctx.thread.getOpenUpvaluesHead() != null) {
-                state.closeUpvalues(ctx.thread, ctx.base);
-            }
-            return true;
+            LuaValue[] ret = boxTopLevelResults(ctx, ctx.base + 0, 1);
+            finishFrame(state, ctx);
+            return ret;
         } catch (DeoptSignal d) {
-            if (++jc.deopts > 8) {
+            // A structural deopt (impure-proto call) is expected every run, so
+            // it gets a far larger budget; genuine guard failures disarm fast.
+            if (d.structural ? ++jc.structuralDeopts > LuaState.JIT_STRUCTURAL_DEOPT_BUDGET
+                    : ++jc.deopts > 8) {
                 closure.proto.jitCode = null;
                 closure.proto.jitDisabled = true;
             }
             ctx.pc = d.pc;
-            return false;
+            return null;
         } catch (StackOverflowError soe) {
             closure.proto.jitCode = null;
             closure.proto.jitDisabled = true;
             ctx.pc = 0;
-            return false;
+            return null;
         } catch (RuntimeException | Error t) {
             closure.proto.jitCode = null;
             closure.proto.jitDisabled = true;
@@ -275,7 +286,7 @@ public final class BytecodeVM {
         } catch (Throwable t) {
             closure.proto.jitCode = null;
             closure.proto.jitDisabled = true;
-            return false;
+            return null;
         }
     }
 
@@ -1113,9 +1124,29 @@ public final class BytecodeVM {
                 }
                 return 1;
             }
-            // The compiled integer kernel always yields exactly one integer
-            // result (RETURN0/multi-value shapes deopt inside); mirror the
-            // returnToCallerRaw layout framelessly.
+            if (jc.returnsVoid) {
+                // Void kernel: no result. Materialize zero values, or nil-fill
+                // however many the caller expected.
+                long ignored = (long) jc.handle.invokeExact(child, (Object[]) child.upvals,
+                        pStack, tStack, oStack, base);
+                ctx.pStack = pStack;
+                ctx.tStack = tStack;
+                ctx.oStack = oStack;
+                ctx.top = base + proto.numParams;
+                closeOnJitReturn(state, ctx, base);
+                if (nResults < 0) {
+                    ctx.top = funcIdx;
+                } else if (nResults > 1) {
+                    for (int i = 0; i < nResults; i++) {
+                        ctx.pStack[funcIdx + i] = 0;
+                        ctx.tStack[funcIdx + i] = TYPE_NIL;
+                        ctx.oStack[funcIdx + i] = null;
+                    }
+                }
+                return 1;
+            }
+            // The compiled integer kernel yields exactly one integer result;
+            // mirror the returnToCallerRaw layout framelessly.
             long r = (long) jc.handle.invokeExact(child, (Object[]) child.upvals, pStack, tStack, oStack, base);
             ctx.pStack = pStack;
             ctx.tStack = tStack;
@@ -1147,7 +1178,8 @@ public final class BytecodeVM {
             }
             return 1;
         } catch (DeoptSignal d) {
-            if (++jc.deopts > 8) {
+            if (d.structural ? ++jc.structuralDeopts > LuaState.JIT_STRUCTURAL_DEOPT_BUDGET
+                    : ++jc.deopts > 8) {
                 proto.jitCode = null;
                 proto.jitDisabled = true;
             }

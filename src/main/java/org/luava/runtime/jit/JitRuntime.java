@@ -62,6 +62,70 @@ public final class JitRuntime {
     }
 
     /**
+     * {@code OP_CLOSE A}: closes open upvalues at/above absolute register
+     * {@code fromIdx} and any pending to-be-closed variables on the current
+     * thread. Mirrors the interpreter's {@code doClose(..., false)}.
+     */
+    public static void closeAt(org.luava.runtime.bytecode.LuaClosure self, int fromIdx) {
+        org.luava.runtime.LuaState state = self.getState();
+        org.luava.runtime.concurrency.LuaCoroutine thread = state.getCurrentThread();
+        state.closeUpvalues(thread, fromIdx);
+        state.closeTbc(thread, fromIdx, null);
+    }
+
+    /**
+     * Builds the child closure for {@code OP_CLOSURE}, mirroring the
+     * interpreter's {@code executeClosure}: stack upvalues become open
+     * upvalues on the running thread, parent upvalues are shared by
+     * reference, and the stripped flag propagates. The child proto is loaded
+     * from {@code self.proto} (the JIT body and its closure always share one
+     * proto), so the whole closure captures the caller's register window.
+     */
+    public static org.luava.runtime.bytecode.LuaClosure buildClosure(
+            org.luava.runtime.bytecode.LuaClosure self, int childIdx,
+            long[] p, byte[] t, LuaValue[] o, int base) {
+        org.luava.runtime.bytecode.LuaProto childProto = self.proto.protos[childIdx];
+        org.luava.runtime.LuaState state = self.getState();
+        org.luava.runtime.concurrency.LuaCoroutine thread = state.getCurrentThread();
+        org.luava.runtime.eval.Upvalue[] ups =
+                new org.luava.runtime.eval.Upvalue[childProto.upvalues.length];
+        for (int i = 0; i < ups.length; i++) {
+            org.luava.runtime.bytecode.UpvalueDesc desc = childProto.upvalues[i];
+            if (desc.inStack) {
+                ups[i] = state.findOrCreateOpenUpvalue(thread, base + desc.index, desc.name);
+            } else {
+                ups[i] = self.upvals[desc.index];
+            }
+        }
+        org.luava.runtime.bytecode.LuaClosure child =
+                new org.luava.runtime.bytecode.LuaClosure(childProto, ups, self.env, state);
+        if (self.isStripped()) {
+            child.setStripped(true);
+        }
+        return child;
+    }
+
+    /**
+     * Resolves the method for {@code OP_SELF} on a plain table: returns
+     * {@code rawget(key)} when the object at {@code objIdx} is a
+     * {@code LuaTable} and the raw hit is non-nil. Returns {@code null}
+     * otherwise (non-table, or a nil raw hit that a metatable {@code __index}
+     * might still resolve) so the generated code deopts to the interpreter.
+     * Mirrors the interpreter's {@code executeSelfCached} table fast lane.
+     */
+    public static LuaValue selfMethod(long[] p, byte[] t, LuaValue[] o, int objIdx, LuaValue key) {
+        if (t[objIdx] != org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT) {
+            return null;
+        }
+        LuaValue obj = o[objIdx];
+        if (!(obj instanceof org.luava.runtime.LuaTable tbl)) {
+            return null;
+        }
+        LuaValue m = tbl.rawget(key);
+        return m.isNil() ? null : m;
+    }
+
+    /**
      * Concatenates registers {@code [from, to)} into one string, mirroring
      * the interpreter's {@code OP_CONCAT}. Returns {@code null} when any
      * operand is not a plain string/number (a metatable {@code __concat}

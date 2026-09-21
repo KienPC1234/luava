@@ -262,6 +262,26 @@ compile its heavy loop. Measured JIT-on vs JIT-off: `while` loops **~23×**,
 `if`-in-loop **~12×**, single-invocation heavy loops **~5.6×**, concat
 1.8×, and the previously-covered fib/closures/oop as before.
 
+A follow-up pass removed the last major structural rejections. Void
+(`RETURN0`-only) chunks now compile under the unboxed `long` ABI with a
+sentinel callers materialize, `OP_CLOSURE`/`OP_CLOSE` compile closure
+factories (`make_counter`), `OP_SELF` compiles `obj:method()` under a
+rawget-non-nil guard, and `GETTABLE`/`SETTABLE` dispatch on the key type so
+string-key hash tables use the hash lane. The `hasCalls && impure` blanket
+rejection was replaced by a *deopt-at-call* rule: an impure proto compiles
+only when a loop back-edge precedes its first general call, and every
+`CALL`/`TAILCALL` then deopts before entering the callee, so the interpreter
+re-executes the call with the compiled prefix committed and no write is
+double-applied. Such structural deopts are expected every run, so they get a
+much larger budget (`JIT_STRUCTURAL_DEOPT_BUDGET`) than genuine guard
+failures: a trivial loop before the call is disarmed instead of paying an
+exception forever. `OP_CLEANUP`, previously mistyped as a `T_OBJ` write
+(falsely conflicting with numeric register reuse at loop merges), is now a
+correct no-op. Forced-prewarm compilation of all 30 PUC suites stays green.
+Measured JIT-on vs JIT-off: arith main loop **~5×**, table ops **~2.8×**,
+hash table **~1.4×**, a two-million-call multret-tail shape **~4.7×**;
+187 unit tests + 30/30 suites pass with JIT both on and off.
+
 This pass also added the `math.sqrt` intrinsic: a float-returning method
 such as `Vec:length()` calls a builtin, and builtin calls used to force the
 whole proto out of the JIT subset, so it stayed interpreted (measured 2×

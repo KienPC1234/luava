@@ -91,11 +91,16 @@ public final class LuaToJvmTranslator implements Opcodes {
         for (int i = 0; i < len; i++) {
             fusedUp[i] = -1;
         }
-        for (int pc = 0; pc < len; pc++) {
-            int inst = proto.code[pc];
-            int op = Instruction.getOp(inst);
-            if (op == OpCode.OP_CALL || op == OpCode.OP_TAILCALL) {
-                fusedUp[pc] = fusedUpvalue(proto.code, pc, Instruction.getA(inst));
+        // Fusion hoists callee closures into locals 9+, which collide with
+        // the table-write scratch (local 9) and is pointless for impure
+        // protos: their every call deopts instead of entering a callee.
+        if (pure) {
+            for (int pc = 0; pc < len; pc++) {
+                int inst = proto.code[pc];
+                int op = Instruction.getOp(inst);
+                if (op == OpCode.OP_CALL || op == OpCode.OP_TAILCALL) {
+                    fusedUp[pc] = fusedUpvalue(proto.code, pc, Instruction.getA(inst));
+                }
             }
         }
         boolean[] skipStore = new boolean[len];
@@ -146,7 +151,7 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitCode();
         emitPrologue(mv, fusedBList, fusedBCount);
         emitBody(mv, internalName, proto, newLabels(len), fusedUp, fusedDef, skipStore, fusedBList,
-                fusedBCount, info.returnsInt(), info.types());
+                fusedBCount, info.returnsInt(), info.returnsVoid(), pure, info.types());
         mv.visitMaxs(0, 0);
         mv.visitEnd();
         if (info.returnsInt() && fusedBCount > 0) {
@@ -163,7 +168,7 @@ public final class LuaToJvmTranslator implements Opcodes {
                 mi.visitVarInsn(ISTORE, 9 + 2 * i);
             }
             emitBody(mi, internalName, proto, newLabels(len), fusedUp, fusedDef, skipStore, fusedBList,
-                    fusedBCount, true, info.types());
+                    fusedBCount, true, info.returnsVoid(), pure, info.types());
             mi.visitMaxs(0, 0);
             mi.visitEnd();
         }
@@ -213,7 +218,7 @@ public final class LuaToJvmTranslator implements Opcodes {
      */
     private static void emitBody(MethodVisitor mv, String owner, LuaProto proto, Label[] labels,
             int[] fusedUp, int[] fusedDef, boolean[] skipStore, int[] fusedBList, int fusedBCount,
-            boolean returnsInt, int[][] types) {
+            boolean returnsInt, boolean returnsVoid, boolean pure, int[][] types) {
         int len = proto.code.length;
         for (int pc = 0; pc < len; pc++) {
             mv.visitLabel(labels[pc]);
@@ -323,6 +328,7 @@ public final class LuaToJvmTranslator implements Opcodes {
                 case OpCode.OP_SETTABLE -> emitSetTable(mv, proto, a, b, c, Instruction.getk(inst), pc);
                 case OpCode.OP_SETI -> emitSetI(mv, proto, a, b, c, Instruction.getk(inst), pc);
                 case OpCode.OP_SETFIELD -> emitSetField(mv, proto, a, b, c, Instruction.getk(inst), pc);
+                case OpCode.OP_SELF -> emitSelf(mv, proto, a, b, c, Instruction.getk(inst), pc);
                 case OpCode.OP_SETLIST -> {
                     int n = b;
                     int last = c;
@@ -341,6 +347,32 @@ public final class LuaToJvmTranslator implements Opcodes {
                     ldcInt(mv, last);
                     mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "setList",
                             "([J[B[Lorg/luava/runtime/LuaValue;III)V", false);
+                }
+                case OpCode.OP_CLOSE -> {
+                    // Closes open upvalues at/above R[A] plus pending tbc
+                    // variables. Both act on this frame's running thread.
+                    mv.visitVarInsn(ALOAD, 0);
+                    mv.visitVarInsn(ILOAD, 5);
+                    ldcInt(mv, a);
+                    mv.visitInsn(IADD);
+                    mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "closeAt",
+                            "(Lorg/luava/runtime/bytecode/LuaClosure;I)V", false);
+                }
+                case OpCode.OP_CLOSURE -> {
+                    // Build the child closure over the caller's register
+                    // window. This mutates the open-upvalue list, so it is
+                    // classified impure; a later deopt resumes at-pc with the
+                    // upvalue already committed (idempotent under
+                    // findOrCreateOpenUpvalue).
+                    mv.visitVarInsn(ALOAD, 0);
+                    ldcInt(mv, Instruction.getBx(inst));
+                    mv.visitVarInsn(ALOAD, 2);
+                    mv.visitVarInsn(ALOAD, 3);
+                    mv.visitVarInsn(ALOAD, 4);
+                    mv.visitVarInsn(ILOAD, 5);
+                    mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "buildClosure",
+                            "(Lorg/luava/runtime/bytecode/LuaClosure;I[J[B[Lorg/luava/runtime/LuaValue;I)Lorg/luava/runtime/bytecode/LuaClosure;", false);
+                    emitStoreValueReg(mv, a);
                 }
                 case OpCode.OP_NEWTABLE -> {
                     mv.visitTypeInsn(NEW, "org/luava/runtime/LuaTable");
@@ -671,6 +703,17 @@ public final class LuaToJvmTranslator implements Opcodes {
                         emitSqrtCall(mv, a, pc);
                         break;
                     }
+                    if (!pure) {
+                        // Impure proto: never enter a callee from compiled
+                        // code. A nested deopt would re-invoke a callee whose
+                        // earlier writes are already committed, double-applying
+                        // them. Deopt here instead: committed prefix state is
+                        // intact and the interpreter re-executes this call.
+                        // Structural: expected every invocation, so it must not
+                        // count toward the deopt budget.
+                        emitDeopt(mv, pc, true);
+                        break;
+                    }
                     int slot = -1;
                     if (fusedUp[pc] >= 0) {
                         for (int i = 0; i < fusedBCount; i++) {
@@ -689,6 +732,12 @@ public final class LuaToJvmTranslator implements Opcodes {
                 case OpCode.OP_TAILCALL -> {
                     if (isSqrtIntrinsic(proto, proto.code, pc)) {
                         emitSqrtTail(mv, a, pc);
+                        break;
+                    }
+                    if (!pure) {
+                        // Same rule as OP_CALL: an impure proto never enters a
+                        // callee from compiled code. Structural deopt.
+                        emitDeopt(mv, pc, true);
                         break;
                     }
                     int slot = -1;
@@ -713,7 +762,16 @@ public final class LuaToJvmTranslator implements Opcodes {
                         emitReturnOne(mv, a, pc, returnsInt);
                     }
                 }
-                case OpCode.OP_RETURN0 -> emitDeopt(mv, pc);
+                case OpCode.OP_RETURN0 -> {
+                    if (returnsVoid) {
+                        // Void proto: return the sentinel; callers materialize
+                        // zero results (or nil-fill an expected count).
+                        mv.visitInsn(LCONST_0);
+                        mv.visitInsn(LRETURN);
+                    } else {
+                        emitDeopt(mv, pc);
+                    }
+                }
                 default -> emitDeopt(mv, pc);
             }
         }
@@ -743,10 +801,15 @@ public final class LuaToJvmTranslator implements Opcodes {
     }
 
     /**
-     * Static analysis result: purity, the return-type decision, and the
+     * Static analysis result: purity, the return-kind decision, and the
      * per-pc register type map (state before each instruction).
+     *
+     * @param returnsVoid the proto yields no value at all (all returns are
+     *     bare {@code return}/fall-off); {@code returnsInt} is true as well so
+     *     the kernel keeps the unboxed {@code long} ABI, and callers discard
+     *     the sentinel.
      */
-    public record Info(boolean pure, boolean returnsInt, int[][] types) {}
+    public record Info(boolean pure, boolean returnsInt, boolean returnsVoid, int[][] types) {}
 
     // Register abstract types for return-kind inference.
     private static final int T_UNKNOWN = 0;
@@ -787,9 +850,29 @@ public final class LuaToJvmTranslator implements Opcodes {
         if (proto.maxStackSize > 64 || proto.numParams > 16) {
             return null;
         }
-        boolean hasCalls = false;
+        // Purity is a whole-proto property (any write/closure/close). Compute
+        // it first: an impure proto emits a deopt for every CALL/TAILCALL, so
+        // its call shapes need no validation (see the call check below).
         boolean impure = false;
+        for (int pc = 0; pc < code.length; pc++) {
+            switch (Instruction.getOp(code[pc])) {
+                case OpCode.OP_SETUPVAL,
+                        OpCode.OP_SETTABUP,
+                        OpCode.OP_SETTABLE,
+                        OpCode.OP_SETI,
+                        OpCode.OP_SETFIELD,
+                        OpCode.OP_SETLIST,
+                        OpCode.OP_CLOSURE,
+                        OpCode.OP_CLOSE -> impure = true;
+                default -> {}
+            }
+        }
+        boolean hasCalls = false;
+        int firstGeneralCallPc = -1;
+        int firstLoopBackedgePc = -1;
         boolean hasReturn1 = false;
+        boolean hasVoidReturn = false;
+        boolean hasTailCall = false;
         boolean hasIntrinsicTail = false;
         for (int pc = 0; pc < code.length; pc++) {
             int inst = code[pc];
@@ -808,10 +891,13 @@ public final class LuaToJvmTranslator implements Opcodes {
                         OpCode.OP_GETTABLE,
                         OpCode.OP_GETI,
                         OpCode.OP_GETFIELD,
+                        OpCode.OP_SELF,
                         OpCode.OP_SETTABUP,
                         OpCode.OP_SETTABLE,
                         OpCode.OP_SETI,
                         OpCode.OP_SETFIELD,
+                        OpCode.OP_CLOSURE,
+                        OpCode.OP_CLOSE,
                         OpCode.OP_NEWTABLE,
                         OpCode.OP_EXTRAARG,
                         OpCode.OP_UNM,
@@ -869,14 +955,11 @@ public final class LuaToJvmTranslator implements Opcodes {
                     return null;
                 }
             }
-            switch (Instruction.getOp(inst)) {
-                case OpCode.OP_SETUPVAL,
-                        OpCode.OP_SETTABUP,
-                        OpCode.OP_SETTABLE,
-                        OpCode.OP_SETI,
-                        OpCode.OP_SETFIELD,
-                        OpCode.OP_SETLIST -> impure = true;
-                default -> {}
+            if (Instruction.getOp(inst) == OpCode.OP_FORLOOP
+                    || (Instruction.getOp(inst) == OpCode.OP_JMP && Instruction.getsJ(inst) < 0)) {
+                if (firstLoopBackedgePc < 0) {
+                    firstLoopBackedgePc = pc;
+                }
             }
             if (Instruction.getOp(inst) == OpCode.OP_CALL
                     || Instruction.getOp(inst) == OpCode.OP_TAILCALL) {
@@ -889,19 +972,34 @@ public final class LuaToJvmTranslator implements Opcodes {
                     }
                 } else {
                     hasCalls = true;
-                    int bb = Instruction.getB(inst);
-                    int cc = Instruction.getC(inst);
-                    // CALL always yields exactly one JIT value; TAILCALL forwards
-                    // it as our own single result regardless of C.
-                    if (bb < 1 || (Instruction.getOp(inst) == OpCode.OP_CALL && cc != 2)) {
-                        return null;
+                    if (firstGeneralCallPc < 0) {
+                        firstGeneralCallPc = pc;
+                    }
+                    if (Instruction.getOp(inst) == OpCode.OP_TAILCALL) {
+                        hasTailCall = true;
+                    } else if (!impure) {
+                        // Pure proto: the JIT actually enters the callee, so
+                        // OP_CALL must yield exactly one value (C==2) or no
+                        // value (C==1, a statement call), with at least the
+                        // function register (B>=1). An impure proto deopts
+                        // every call, so its shape is irrelevant.
+                        int cc = Instruction.getC(inst);
+                        if ((cc != 2 && cc != 1) || Instruction.getB(inst) < 1) {
+                            return null;
+                        }
                     }
                 }
+            }
+            if (Instruction.getOp(inst) == OpCode.OP_RETURN0) {
+                hasVoidReturn = true;
             }
             if (Instruction.getOp(inst) == OpCode.OP_RETURN1
                     || (Instruction.getOp(inst) == OpCode.OP_RETURN && Instruction.getB(inst) == 2)) {
                 hasReturn1 = true;
             }
+            // NOTE: OP_RETURN with B!=2 (multret) is not rejected here; the
+            // emitter deopts on it. Return-kind classification is refined
+            // after reachability so dead trailing returns do not skew it.
             if (Instruction.getOp(inst) == OpCode.OP_SETLIST && Instruction.getB(inst) == 0) {
                 return null;
             }
@@ -930,10 +1028,17 @@ public final class LuaToJvmTranslator implements Opcodes {
                 default -> {}
             }
         }
-        if (!hasReturn1 && !hasIntrinsicTail) {
-            return null;
-        }
-        if (hasCalls && impure) {
+        // An impure proto may still be compiled, but every CALL/TAILCALL in
+        // it deopts (see emitBody): entering a callee from compiled code
+        // risks a nested deopt re-invoking an impure callee whose prefix
+        // writes are already committed. The compiled prefix is side-effect
+        // committed before the deopt, so resuming at the call pc is exact.
+        //
+        // Only compile an impure *calling* proto when a loop back-edge
+        // precedes its first general call: then the hot loop runs compiled and
+        // only the trailing call deopts each invocation. Otherwise every entry
+        // would pay a structural-deopt exception for no compiled work.
+        if (impure && hasCalls && (firstLoopBackedgePc < 0 || firstLoopBackedgePc > firstGeneralCallPc)) {
             return null;
         }
         // Reachable pcs (jumps + conditional skips).
@@ -991,6 +1096,27 @@ public final class LuaToJvmTranslator implements Opcodes {
                 break;
             }
         }
+        // Return-kind classification over reachable code only (the compiler
+        // always appends a dead RETURN0). A tail call always forwards a
+        // value, so it disqualifies voidness.
+        boolean reachVoid = false;
+        boolean reachValue = false;
+        for (int pc = 0; pc < code.length; pc++) {
+            if (!reach[pc]) {
+                continue;
+            }
+            int op = Instruction.getOp(code[pc]);
+            if (op == OpCode.OP_RETURN0) {
+                reachVoid = true;
+            } else if (op == OpCode.OP_RETURN1
+                    || (op == OpCode.OP_RETURN && Instruction.getB(code[pc]) == 2)) {
+                reachValue = true;
+            }
+        }
+        boolean returnsVoid = reachVoid && !reachValue && !hasTailCall && !hasIntrinsicTail;
+        if (!reachValue && !hasIntrinsicTail && !returnsVoid) {
+            return null;
+        }
         boolean seenObj = false;
         for (int pc = 0; pc < code.length; pc++) {
             int op = Instruction.getOp(code[pc]);
@@ -1011,10 +1137,14 @@ public final class LuaToJvmTranslator implements Opcodes {
             seenObj = true;
         }
         boolean returnsInt = !seenObj;
-        if (!returnsInt && hasCalls) {
+        if (!returnsInt && hasCalls && !impure) {
+            // Pure object-returning protos enter their callees under the
+            // unboxed integer call protocol, which cannot carry an object
+            // result, so reject. An impure proto deopts every call instead,
+            // so its object result is only ever boxed at the call boundary.
             return null;
         }
-        return new Info(!impure, returnsInt, in);
+        return new Info(!impure, returnsInt, returnsVoid, in);
     }
 
     /**
@@ -1127,8 +1257,13 @@ public final class LuaToJvmTranslator implements Opcodes {
                     OpCode.OP_LOADTRUE,
                     OpCode.OP_LOADFALSE -> setTy(out, regs, a, T_OBJ);
             case OpCode.OP_CLEANUP -> {
+                // OP_CLEANUP clears compiler-dead slots to nil at a loop
+                // entry; the slots are immediately redefined (e.g. by the
+                // following FORPREP). Widening them to T_OBJ falsely conflicts
+                // with that numeric reuse at the loop merge, so mark them
+                // unknown: conservative and never over-constraining.
                 for (int j = 0; j <= b && a + j < regs; j++) {
-                    setTy(out, regs, a + j, T_OBJ);
+                    setTy(out, regs, a + j, T_UNKNOWN);
                 }
             }
             case OpCode.OP_LOADK -> {
@@ -1254,6 +1389,18 @@ public final class LuaToJvmTranslator implements Opcodes {
                 setTy(out, regs, a + 3, T_INT);
             }
             case OpCode.OP_CLOSURE, OpCode.OP_NEWTABLE, OpCode.OP_CONCAT -> setTy(out, regs, a, T_OBJ);
+            case OpCode.OP_CLOSE -> {
+                // Closes upvalues at/above R[A]; the register value itself is
+                // unchanged (the interpreter clears it to nil after close).
+                for (int j = a; j < regs; j++) {
+                    setTy(out, regs, j, T_UNKNOWN);
+                }
+            }
+            case OpCode.OP_SELF -> {
+                // R[A] = method, R[A+1] = receiver. Both are objects.
+                setTy(out, regs, a, T_OBJ);
+                setTy(out, regs, a + 1, T_OBJ);
+            }
             case OpCode.OP_CALL -> {
                 // A recognized sqrt intrinsic yields a float; any other call
                 // yields an integer under the JIT call protocol.
@@ -2789,10 +2936,25 @@ public final class LuaToJvmTranslator implements Opcodes {
     }
 
     private static void emitSetTable(MethodVisitor mv, LuaProto proto, int a, int b, int c, int k, int pc) {
-        // Fast lane mirrors the interpreter: plain table + integer key.
-        // Scratch local 9 is free: table writes forbid calls (analyze),
-        // hence no fused-callee or vc-param locals exist here.
-        emitGuardInt(mv, b, pc);
+        // Key dispatch: integer keys go through rawsetInt on the array part;
+        // object (string) keys through rawset on a metatable-free table. A
+        // metatable could run __newindex, so the plain-table guard deopts.
+        // Scratch local 9 is free: a metatable-free table write never enters
+        // a callee and fused callee locals exist only in pure protos.
+        Label intKey = new Label();
+        Label objKey = new Label();
+        Label done = new Label();
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, b);
+        mv.visitInsn(BALOAD);
+        mv.visitInsn(DUP);
+        ldcInt(mv, TYPE_INT);
+        mv.visitJumpInsn(IF_ICMPEQ, intKey);
+        ldcInt(mv, TYPE_OBJECT);
+        mv.visitJumpInsn(IF_ICMPEQ, objKey);
+        emitDeopt(mv, pc);
+        mv.visitLabel(intKey);
+        mv.visitInsn(POP);
         emitGuardObject(mv, a, pc);
         mv.visitVarInsn(ALOAD, 4);
         emitIndex(mv, a);
@@ -2813,6 +2975,27 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ALOAD, 9);
         mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawsetInt",
                 "(JLorg/luava/runtime/LuaValue;)V", false);
+        mv.visitJumpInsn(GOTO, done);
+        mv.visitLabel(objKey);
+        emitGuardObject(mv, a, pc);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardPlainTable(mv, pc);
+        mv.visitInsn(POP);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, b);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 9);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/LuaTable");
+        mv.visitVarInsn(ALOAD, 9);
+        emitBoxValue(mv, proto, c, c, k, pc);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawset",
+                "(Lorg/luava/runtime/LuaValue;Lorg/luava/runtime/LuaValue;)V", false);
+        mv.visitLabel(done);
     }
 
     private static void emitSetI(MethodVisitor mv, LuaProto proto, int a, int b, int c, int k, int pc) {
@@ -2894,6 +3077,54 @@ public final class LuaToJvmTranslator implements Opcodes {
                 "([J[B[Lorg/luava/runtime/LuaValue;ILorg/luava/runtime/LuaValue;)V", false);
     }
 
+    /**
+     * {@code R[A+1] = R[B]; R[A] = R[B][K[C] or R[C]]} (method lookup for
+     * {@code obj:method()}). The raw-hit fast lane mirrors
+     * {@code emitGetField}; a miss deopts so the interpreter can resolve
+     * {@code __index}. On success the receiver lands in {@code A+1} and the
+     * method in {@code A}, ready for the following CALL.
+     */
+    private static void emitSelf(MethodVisitor mv, LuaProto proto, int a, int b, int c, int k, int pc) {
+        // Resolve R[B][key] with a raw-hit fast lane. Push (p, t, o, objIdx)
+        // first, then compute the key on top so the helper's trailing LuaValue
+        // parameter works without a scratch local; reading a register after
+        // pushing arrays is stack-neutral.
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, b);
+        mv.visitInsn(IADD);
+        if (k == 1) {
+            emitLoadConst(mv, c);
+        } else {
+            emitGuardObject(mv, c, pc);
+            mv.visitVarInsn(ALOAD, 4);
+            emitIndex(mv, c);
+            mv.visitInsn(AALOAD);
+        }
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "selfMethod",
+                "([J[B[Lorg/luava/runtime/LuaValue;ILorg/luava/runtime/LuaValue;)Lorg/luava/runtime/LuaValue;", false);
+        mv.visitInsn(DUP);
+        Label selfOk = new Label();
+        mv.visitJumpInsn(IFNONNULL, selfOk);
+        mv.visitInsn(POP);
+        emitDeopt(mv, pc);
+        mv.visitLabel(selfOk);
+        // method -> R[A]
+        emitStoreValueReg(mv, a);
+        // receiver -> R[A+1]
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a + 1);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, b);
+        mv.visitInsn(AALOAD);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/bytecode/BytecodeVM", "setLuaValue",
+                "([J[B[Lorg/luava/runtime/LuaValue;ILorg/luava/runtime/LuaValue;)V", false);
+    }
+
     private static void emitGetTabUp(MethodVisitor mv, int a, int b, int c, int pc) {
         mv.visitVarInsn(ALOAD, 1);
         ldcInt(mv, b);
@@ -2912,8 +3143,23 @@ public final class LuaToJvmTranslator implements Opcodes {
     }
 
     private static void emitGetTable(MethodVisitor mv, int a, int b, int c, int pc) {
-        // Fast lane mirrors the interpreter: plain table + integer key.
-        emitGuardInt(mv, c, pc);
+        // Key dispatch: integer keys use the array-part fast lane; object
+        // keys (typically strings, e.g. t["key_"..i]) use rawget on a plain
+        // table. Any other key type deopts.
+        Label intKey = new Label();
+        Label objKey = new Label();
+        Label done = new Label();
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, c);
+        mv.visitInsn(BALOAD);
+        mv.visitInsn(DUP);
+        ldcInt(mv, TYPE_INT);
+        mv.visitJumpInsn(IF_ICMPEQ, intKey);
+        ldcInt(mv, TYPE_OBJECT);
+        mv.visitJumpInsn(IF_ICMPEQ, objKey);
+        emitDeopt(mv, pc);
+        mv.visitLabel(intKey);
+        mv.visitInsn(POP);
         emitGuardObject(mv, b, pc);
         mv.visitVarInsn(ALOAD, 4);
         emitIndex(mv, b);
@@ -2928,6 +3174,23 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawgetInt",
                 "(J)Lorg/luava/runtime/LuaValue;", false);
         emitStoreValueReg(mv, a);
+        mv.visitJumpInsn(GOTO, done);
+        mv.visitLabel(objKey);
+        // A raw miss can still resolve via __index, so require non-nil.
+        emitGuardObject(mv, b, pc);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, b);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        emitGuardTableTyped(mv, pc);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, c);
+        mv.visitInsn(AALOAD);
+        mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawget",
+                "(Lorg/luava/runtime/LuaValue;)Lorg/luava/runtime/LuaValue;", false);
+        emitStoreValueRegDeoptOnNil(mv, a, pc);
+        mv.visitLabel(done);
     }
 
     private static void emitGetI(MethodVisitor mv, int a, int b, int c, int pc) {
@@ -3033,10 +3296,24 @@ public final class LuaToJvmTranslator implements Opcodes {
     }
 
     private static void emitDeopt(MethodVisitor mv, int pc) {
+        emitDeopt(mv, pc, false);
+    }
+
+    /**
+     * Emits a deopt. {@code structural} marks an unconditional deopt the
+     * compiled body always takes for this proto (impure-proto CALL/TAILCALL),
+     * which the deopt budget ignores so it never disarms the hot prefix.
+     */
+    private static void emitDeopt(MethodVisitor mv, int pc, boolean structural) {
         mv.visitTypeInsn(NEW, "org/luava/runtime/jit/DeoptSignal");
         mv.visitInsn(DUP);
         ldcInt(mv, pc);
-        mv.visitMethodInsn(INVOKESPECIAL, "org/luava/runtime/jit/DeoptSignal", "<init>", "(I)V", false);
+        if (structural) {
+            mv.visitInsn(ICONST_1);
+            mv.visitMethodInsn(INVOKESPECIAL, "org/luava/runtime/jit/DeoptSignal", "<init>", "(IZ)V", false);
+        } else {
+            mv.visitMethodInsn(INVOKESPECIAL, "org/luava/runtime/jit/DeoptSignal", "<init>", "(I)V", false);
+        }
         mv.visitInsn(ATHROW);
     }
 
