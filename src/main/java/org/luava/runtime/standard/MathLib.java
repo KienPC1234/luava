@@ -29,6 +29,23 @@ public final class MathLib {
     public static final org.luava.runtime.LuaFunction SQRT =
             org.luava.runtime.LuaFunction.of(args -> org.luava.runtime.LuaFloat.valueOf(Math.sqrt(checkNumber(args, 0, "sqrt"))));
 
+    /**
+     * Shared stateless {@code math.floor} builtin. The JIT recognizes the
+     * {@code math.floor(math.sqrt(N))} loop-bound shape by the identity of
+     * this and {@link #SQRT}, so it must be one process-wide instance.
+     */
+    public static final org.luava.runtime.LuaFunction FLOOR = org.luava.runtime.LuaFunction.of(args -> {
+        LuaValue v = checkNumberValue(args, 0, "floor");
+        if (v.isInteger()) {
+            return v;
+        }
+        double d = Math.floor(v.toDouble());
+        if (d >= -9223372036854775808.0 && d < 9223372036854775808.0) {
+            return LuaInteger.valueOf((long) d);
+        }
+        return LuaFloat.valueOf(d);
+    });
+
     public static void open(LuaTable globals) {
         LuaTable math = new LuaTable();
         fillInto(math, globals);
@@ -48,15 +65,7 @@ public final class MathLib {
             return LuaFloat.valueOf(Math.abs(v.toDouble()));
         }));
 
-        math.rawset(LuaString.interned("floor"), LuaFunction.of(args -> {
-            LuaValue v = checkNumberValue(args, 0, "floor");
-            if (v.isInteger()) return v;
-            double d = Math.floor(v.toDouble());
-            if (d >= -9223372036854775808.0 && d < 9223372036854775808.0) {
-                return LuaInteger.valueOf((long) d);
-            }
-            return LuaFloat.valueOf(d);
-        }));
+        math.rawset(LuaString.interned("floor"), FLOOR);
 
         math.rawset(LuaString.interned("ceil"), LuaFunction.of(args -> {
             LuaValue v = checkNumberValue(args, 0, "ceil");

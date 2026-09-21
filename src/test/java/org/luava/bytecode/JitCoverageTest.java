@@ -544,6 +544,48 @@ public class JitCoverageTest {
     }
 
     @Test
+    void floorAndFloorSqrtIntrinsicsMatchInterpreter() {
+        // `math.floor` and the fused `math.floor(math.sqrt(x))` loop bound are
+        // emitted inline under an identity guard on the shared MathLib
+        // singletons. Every numeric subtype (int, integral float, fractional,
+        // huge, inf, nan) must come back with the exact value, kind and sign.
+        for (String arg : new String[] {"0", "1", "3", "-3", "3.0", "-3.0", "3.9", "-3.9",
+                "1e100", "-1e100", "math.huge", "-math.huge", "0/0", "2^53", "1.5"}) {
+            assertSameWithAndWithoutJit(
+                    hot("return tostring(math.floor(" + arg + ")) .. ':' .. math.type(math.floor(" + arg + "))"), 2);
+        }
+        assertSameWithAndWithoutJit(
+                "local function f(n) local s=0 for i=1,n do s=s+math.floor(i/3) end return s end "
+                        + "local r for i=1,400 do r=f(100) end return r",
+                2);
+        assertSameWithAndWithoutJit(
+                "local function f(n) return math.floor(math.sqrt(n)) end "
+                        + "local r for i=1,400 do r=f(i) end return r",
+                2);
+        // A reassigned or shadowed builtin must not be replaced by the intrinsic.
+        assertSameWithAndWithoutJit(
+                "math.floor = function(x) return 42 end "
+                        + "local function f(x) return math.floor(x) end "
+                        + "local r for i=1,400 do r=f(9.5) end return r",
+                2);
+        assertSameWithAndWithoutJit(
+                "local math = { floor = function(x) return 7 end, sqrt = function(x) return 9 end } "
+                        + "local function f(x) return math.floor(math.sqrt(x)) end "
+                        + "local r for i=1,400 do r=f(16) end return r",
+                2);
+        // The fused idiom genuinely compiles (not merely correct via deopt).
+        LuaState state = new LuaState();
+        LuaClosure chunk = (LuaClosure) state.compile(
+                "local N=200000 local sieve={} for i=2,N do sieve[i]=true end "
+                + "for i=2,math.floor(math.sqrt(N)) do if sieve[i] then for j=i*i,N,i do sieve[j]=false end end end "
+                + "local c=0 for i=2,N do if sieve[i] then c=c+1 end end return c",
+                "chunk", state.getGlobals());
+        assertEquals(17984, chunk.call().toLong());
+        assertTrue(awaitCompiled(chunk.proto, 5000),
+                "a floor(sqrt) loop bound must be inside the JIT subset");
+    }
+
+    @Test
     void impureProtoWithMultretCallStillCompilesHotLoop() {
         // An impure proto containing a multi-result or object call was once
         // rejected wholesale, so a hot numeric loop that merely *ends* with
