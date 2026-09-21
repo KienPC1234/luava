@@ -777,8 +777,14 @@ public final class LuaState {
      */
     public static volatile boolean ENABLE_JIT = !"false".equalsIgnoreCase(System.getProperty("luava.jit", "true"));
 
-    /** Interpreter calls of one proto before a JIT compile is attempted. */
-    public static final int JIT_HOT_THRESHOLD = 50;
+    /**
+     * Interpreter calls of one proto before a JIT compile is attempted.
+     * Overridable via {@code -Dluava.jit.hotThreshold=N} for testing the
+     * compiled subset at the most aggressive tier-up (N=1 forces every call
+     * site through the JIT on its first invocation).
+     */
+    public static final int JIT_HOT_THRESHOLD =
+            Integer.getInteger("luava.jit.hotThreshold", 50);
     /**
      * How many structural deopts (impure-proto CALL/TAILCALL, expected every
      * run) a kernel tolerates before it is disarmed. Impure calling protos
@@ -797,7 +803,8 @@ public final class LuaState {
      * because of a loop (top-level chunks, {@code while}/{@code repeat}, or a
      * function called only once).
      */
-    public static final int JIT_LOOP_THRESHOLD = 8192;
+    public static final int JIT_LOOP_THRESHOLD =
+            Integer.getInteger("luava.jit.loopThreshold", 8192);
 
     /**
      * Per-state JIT override. {@code null} means "follow the global

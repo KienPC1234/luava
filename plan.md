@@ -10,7 +10,7 @@
 > thất bại quan trọng được bảo tồn ở §9.
 >
 > Cập nhật: 2026-09-20. Trạng thái: **Phase A, B, C, D, E đã hoàn thành**. Độ
-> phủ mở rộng từ ~4/24 lên ~19/24 dạng cấu trúc; 188 unit test + 30/30 suite
+> phủ mở rộng từ ~4/24 lên ~19/24 dạng cấu trúc; 189 unit test + 30/30 suite
 > PUC xanh (ép prewarm mọi proto hợp lệ cũng 30/30). Xem §12 để biết trạng thái
 > từng phase.
 
@@ -560,7 +560,7 @@ benchmark main-chunk loop; D/E/F/G mở rộng dần theo nhu cầu thực tế.
 | F | ⬜ chưa | Generic-for (`TFOR*`) — chặn bởi call-from-JIT + setup call trước loop |
 | G | ⬜ chưa | Vararg đọc `...` — cần mở rộng ABI `exec` để truyền varargs |
 | H | ⬜ chưa | Inline cache đa hình |
-| I | ⬜ chưa | Mở rộng deopt/debug robustness |
+| I | ✅ xong | Ngưỡng tier-up chỉnh qua property; chạy cả 30 suite ở `hotThreshold=1`/`loopThreshold=1` **phát hiện + sửa bug thật**: void kernel gọi trong ngữ cảnh 1 giá trị để lọt function object thay vì nil (`calls.lua`). 30/30 suite xanh ở cả ngưỡng 1 |
 | J | ⬜ chưa | Xác thực cuối |
 
 **Bằng chứng (paired, core 8, `luava.jit.sync=true`):**
@@ -573,7 +573,7 @@ benchmark main-chunk loop; D/E/F/G mở rộng dần theo nhu cầu thực tế.
   FuzzMulti 8, FuzzMath 11 — **0 mismatch**.
 - **Prewarm cưỡng bức mọi proto hợp lệ** trên toàn bộ 30 suite PUC → 30/30
   PASS (JIT on, `luava.jit.sync=true`).
-- 188 unit test + 30/30 suite PUC xanh (JIT cả on/off).
+- 189 unit test + 30/30 suite PUC xanh (JIT cả on/off).
 - vs LuaJ (paired): arith 8.3×, hash 1.96×, oop 1.18× thắng;
   table/sieve/pattern/closures ~1.0. Không task nào thua > 1.1×.
 

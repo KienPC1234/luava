@@ -544,6 +544,30 @@ public class JitCoverageTest {
     }
 
     @Test
+    void voidProtoCalledInOneValueContextYieldsNil() {
+        // Regression (found by running the PUC suites at hotThreshold=1): a
+        // void JIT kernel called where one value is expected used to leave the
+        // function object in the result register instead of nil. The
+        // load(reader-that-returns-nil) idiom in calls.lua pinned it.
+        // `load(function() ... return nil end)` yields an empty (void) chunk.
+        // Force-compile it, then call it in a one-value context: the result
+        // must be nil, never the leftover function object.
+        LuaState state = new LuaState();
+        LuaClosure empty = (LuaClosure) state.eval("return load(function() return nil end)");
+        org.luava.runtime.jit.JitCompiler.prewarm(empty);
+        assertTrue(empty.proto.jitCode != null, "the empty chunk should have compiled");
+        assertTrue(empty.call().isNil(),
+                "a void kernel in a one-value context must yield nil, got " + empty.call());
+        // The reader idiom that exposed it: each read returns the next line.
+        LuaState s2 = new LuaState();
+        LuaClosure reader = (LuaClosure) s2.eval(
+                "local t = {nil, 'return ', '3'} "
+                + "return load(function () return table.remove(t, 1) end)");
+        org.luava.runtime.jit.JitCompiler.prewarm(reader);
+        assertTrue(reader.call().isNil(), "the reader's empty-chunk result must be nil");
+    }
+
+    @Test
     void floorAndFloorSqrtIntrinsicsMatchInterpreter() {
         // `math.floor` and the fused `math.floor(math.sqrt(x))` loop bound are
         // emitted inline under an identity guard on the shared MathLib
