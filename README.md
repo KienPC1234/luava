@@ -285,7 +285,7 @@ with numeric register reuse at loop merges), is now a correct no-op.
 Forced-prewarm compilation of all 30 PUC suites stays green. Measured
 JIT-on vs JIT-off: the arith main loop at about 5×, table ops near 2.8×,
 hash table at 1.4×, and a two-million-call multret-tail shape at 4.7×.
-All 189 unit tests plus 30/30 suites pass with JIT both on and off.
+All 190 unit tests plus 30/30 suites pass with JIT both on and off.
 
 The `math.sqrt` intrinsic family was extended to `math.floor` and the fused
 `for i = 2, math.floor(math.sqrt(N))` loop bound (both identity-guarded on
@@ -304,6 +304,17 @@ invocation) exposed a real bug: a void JIT kernel called in a one-value
 context left the function object in the result register instead of `nil`,
 breaking `load(reader)` in `calls.lua`. Fixed and pinned by a regression
 test; all 30 PUC suites now pass at maximum JIT coverage too.
+
+A second host-embedding bug followed from the same audit. A JIT kernel that
+deopted at a callee it can never enter — a builtin (Java-backed, never a
+`LuaClosure`) or, for an impure proto, every call — counted toward the small
+8-deopt guard budget and disarmed after eight invocations, silently dropping
+its compiled hot loop. That made a host calling a compiled chunk directly
+run at interpreter speed after a handful of calls (`01_arith_loop` 205 ms
+vs 32 ms once fixed) even though `Bench`'s reported `best` hid it. Structural
+deopts now never disarm a proto that tiered up through a hot loop, while a
+call-tiered proto with no such loop still falls back after a larger budget,
+so the pathological trivial-loop-before-a-call case stays at parity.
 
 This pass also added the `math.sqrt` intrinsic: a float-returning method
 such as `Vec:length()` calls a builtin, and builtin calls used to force the

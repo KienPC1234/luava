@@ -10,7 +10,7 @@
 > thất bại quan trọng được bảo tồn ở §9.
 >
 > Cập nhật: 2026-09-20. Trạng thái: **Phase A, B, C, D, E đã hoàn thành**. Độ
-> phủ mở rộng từ ~4/24 lên ~19/24 dạng cấu trúc; 189 unit test + 30/30 suite
+> phủ mở rộng từ ~4/24 lên ~19/24 dạng cấu trúc; 190 unit test + 30/30 suite
 > PUC xanh (ép prewarm mọi proto hợp lệ cũng 30/30). Xem §12 để biết trạng thái
 > từng phase.
 
@@ -560,7 +560,7 @@ benchmark main-chunk loop; D/E/F/G mở rộng dần theo nhu cầu thực tế.
 | F | ⬜ chưa | Generic-for (`TFOR*`) — chặn bởi call-from-JIT + setup call trước loop |
 | G | ⬜ chưa | Vararg đọc `...` — cần mở rộng ABI `exec` để truyền varargs |
 | H | ⬜ chưa | Inline cache đa hình |
-| I | ✅ xong | Ngưỡng tier-up chỉnh qua property; chạy cả 30 suite ở `hotThreshold=1`/`loopThreshold=1` **phát hiện + sửa bug thật**: void kernel gọi trong ngữ cảnh 1 giá trị để lọt function object thay vì nil (`calls.lua`). 30/30 suite xanh ở cả ngưỡng 1 |
+| I | ✅ xong | Ngưỡng tier-up chỉnh qua property; chạy cả 30 suite ở `hotThreshold=1`/`loopThreshold=1` **phát hiện + sửa 2 bug thật**: (1) void kernel gọi trong ngữ cảnh 1 giá trị để lọt function object thay vì nil (`calls.lua`); (2) deopt cấu trúc tại callee builtin/impure tiêu budget 8 → tự tắt JIT sau 8 lần gọi trực tiếp từ host, mất loop đã compile (`01_arith_loop` 205ms→32ms). 30/30 suite xanh ở cả ngưỡng 1 |
 | J | ⬜ chưa | Xác thực cuối |
 
 **Bằng chứng (paired, core 8, `luava.jit.sync=true`):**
@@ -573,9 +573,11 @@ benchmark main-chunk loop; D/E/F/G mở rộng dần theo nhu cầu thực tế.
   FuzzMulti 8, FuzzMath 11 — **0 mismatch**.
 - **Prewarm cưỡng bức mọi proto hợp lệ** trên toàn bộ 30 suite PUC → 30/30
   PASS (JIT on, `luava.jit.sync=true`).
-- 189 unit test + 30/30 suite PUC xanh (JIT cả on/off).
-- vs LuaJ (paired): arith 8.3×, hash 1.96×, oop 1.18× thắng;
-  table/sieve/pattern/closures ~1.0. Không task nào thua > 1.1×.
+- 190 unit test + 30/30 suite PUC xanh (JIT cả on/off); 30/30 cả khi ép
+  `hotThreshold=1`/`loopThreshold=1`.
+- vs LuaJ (paired, 9 cặp): arith **8.4×**, fib **10.3×**, table **3.0×**,
+  hash **2.4×**, sieve **1.9×**, oop 1.19× thắng; concat 0.99 (hòa);
+  closures 0.95, pattern 0.94 (thua nhẹ, pattern cần `TFOR*`).
 
 **Bài học đo lường:** đếm back-edge mỗi vòng lặp (dù có granularity) làm
 `runLoop` chậm ~15–20% trên task top-level không hưởng lợi. Giải pháp cuối:

@@ -2634,7 +2634,10 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitTypeInsn(INSTANCEOF, "org/luava/runtime/bytecode/LuaClosure");
         Label isClosure = new Label();
         mv.visitJumpInsn(IFNE, isClosure);
-        emitDeopt(mv, resumePc);
+        // A builtin (Java-backed) callee is not a LuaClosure and never will
+        // be, so this deopt is expected on every invocation; it must not
+        // consume the small guard-failure budget and disarm the hot prefix.
+        emitDeopt(mv, resumePc, true);
         mv.visitLabel(isClosure);
         // Same proto -> direct INVOKESTATIC; else a pure JIT proto -> helper.
         mv.visitVarInsn(ALOAD, 8);
@@ -2667,13 +2670,14 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ASTORE, 21);
         Label hasJit = new Label();
         mv.visitJumpInsn(IFNONNULL, hasJit);
-        emitDeopt(mv, resumePc);
+        // Callee not (yet) compiled: expected, structural (see isClosure).
+        emitDeopt(mv, resumePc, true);
         mv.visitLabel(hasJit);
         mv.visitVarInsn(ALOAD, 21);
         mv.visitFieldInsn(GETFIELD, "org/luava/runtime/jit/JitCode", "pure", "Z");
         Label isPure = new Label();
         mv.visitJumpInsn(IFNE, isPure);
-        emitDeopt(mv, resumePc);
+        emitDeopt(mv, resumePc, true);
         mv.visitLabel(isPure);
         // The integer call protocol carries an unboxed long result; an
         // object-returning callee cannot feed it.
@@ -2681,7 +2685,7 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitFieldInsn(GETFIELD, "org/luava/runtime/jit/JitCode", "returnsInt", "Z");
         Label returnsIntOk = new Label();
         mv.visitJumpInsn(IFNE, returnsIntOk);
-        emitDeopt(mv, resumePc);
+        emitDeopt(mv, resumePc, true);
         mv.visitLabel(returnsIntOk);
         ldcInt(mv, nArgs);
         mv.visitVarInsn(ALOAD, 20);

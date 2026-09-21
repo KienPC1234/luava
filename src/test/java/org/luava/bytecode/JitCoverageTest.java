@@ -544,6 +544,25 @@ public class JitCoverageTest {
     }
 
     @Test
+    void topLevelChunkWithTrailingBuiltinCallStaysCompiled() {
+        // Regression (host embedding): a pure chunk with a hot loop and a
+        // trailing builtin call (assert(....) in every benchmark) deopted at
+        // that builtin every run. The normal 8-deopt budget then disarmed the
+        // kernel, so the hot loop fell back to the interpreter. A builtin
+        // callee is not a LuaClosure and never will be, so that deopt is
+        // structural and must use the large budget instead.
+        LuaState state = new LuaState();
+        String code = "local sum=0 for i=1,200000 do sum=sum+i end "
+                + "assert(sum == 20000100000) return sum";
+        LuaClosure chunk = (LuaClosure) state.compile(code, "chunk", state.getGlobals());
+        for (int i = 0; i < 30; i++) {
+            assertEquals(20000100000L, chunk.call().toLong());
+        }
+        assertTrue(chunk.proto.jitCode != null && !chunk.proto.jitDisabled,
+                "a chunk with a trailing builtin call must not disarm its hot loop");
+    }
+
+    @Test
     void voidProtoCalledInOneValueContextYieldsNil() {
         // Regression (found by running the PUC suites at hotThreshold=1): a
         // void JIT kernel called where one value is expected used to leave the
