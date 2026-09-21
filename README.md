@@ -285,7 +285,7 @@ with numeric register reuse at loop merges), is now a correct no-op.
 Forced-prewarm compilation of all 30 PUC suites stays green. Measured
 JIT-on vs JIT-off: the arith main loop at about 5×, table ops near 2.8×,
 hash table at 1.4×, and a two-million-call multret-tail shape at 4.7×.
-All 188 unit tests plus 30/30 suites pass with JIT both on and off.
+All 189 unit tests plus 30/30 suites pass with JIT both on and off.
 
 The `math.sqrt` intrinsic family was extended to `math.floor` and the fused
 `for i = 2, math.floor(math.sqrt(N))` loop bound (both identity-guarded on
@@ -296,6 +296,14 @@ integer argument is copied unchanged (a `double` round-trip would lose
 precision above 2^53); floats use PUC `math.floor` subtype rules, and a
 reassigned or shadowed `math.floor` deopts. The `FuzzMath` differential
 fuzzer (12 total) reports 0 mismatch.
+
+Tier-up thresholds are now property-overridable
+(`-Dluava.jit.hotThreshold=N` / `-Dluava.jit.loopThreshold=N`). Running the
+whole PUC suite with both at 1 (every call site JIT-compiled on its first
+invocation) exposed a real bug: a void JIT kernel called in a one-value
+context left the function object in the result register instead of `nil`,
+breaking `load(reader)` in `calls.lua`. Fixed and pinned by a regression
+test; all 30 PUC suites now pass at maximum JIT coverage too.
 
 This pass also added the `math.sqrt` intrinsic: a float-returning method
 such as `Vec:length()` calls a builtin, and builtin calls used to force the

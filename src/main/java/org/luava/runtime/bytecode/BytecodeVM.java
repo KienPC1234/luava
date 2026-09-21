@@ -1136,7 +1136,10 @@ public final class BytecodeVM {
                 closeOnJitReturn(state, ctx, base);
                 if (nResults < 0) {
                     ctx.top = funcIdx;
-                } else if (nResults > 1) {
+                } else if (nResults >= 1) {
+                    // Includes nResults == 1: a void call in a one-value
+                    // context must still write nil over the callee register,
+                    // otherwise the function object leaks as the result.
                     for (int i = 0; i < nResults; i++) {
                         ctx.pStack[funcIdx + i] = 0;
                         ctx.tStack[funcIdx + i] = TYPE_NIL;
