@@ -9,10 +9,10 @@
 > (đã xóa). Hồ sơ thiết kế register-VM cốt lõi được cô đọng lại ở §2; nhật ký
 > thất bại quan trọng được bảo tồn ở §9.
 >
-> Cập nhật: 2026-09-20. Trạng thái: **Phase B, C, E và A3 đã hoàn thành**, cùng
-> pha A1/A2 (tier-up theo loop + entry JIT cho top-level chunk). Độ phủ mở rộng
-> từ ~4/24 lên ~14/24 dạng cấu trúc; 180 unit test + 30/30 suite PUC xanh.
-> Xem §13 để biết trạng thái từng phase.
+> Cập nhật: 2026-09-20. Trạng thái: **Phase A, B, C, D, E đã hoàn thành**. Độ
+> phủ mở rộng từ ~4/24 lên ~19/24 dạng cấu trúc; 185 unit test + 30/30 suite
+> PUC xanh (ép prewarm mọi proto hợp lệ cũng 30/30). Xem §12 để biết trạng thái
+> từng phase.
 
 ---
 
@@ -20,21 +20,21 @@
 
 - **JIT không yếu về chất lượng** — nó biến fib(35) từ ~5400 ms xuống ~266 ms
   (nhanh 20×, thắng LuaJ ~10×) nhờ "một method JVM per proto" cho C2 inline.
-- **JIT yếu về độ phủ.** Bằng chứng đo được (paired, pinned core 8):
-  - JIT on/off: fib **0.049** (20×), closures 0.55, oop 0.74, concat 0.83;
-    còn **arith/table/hash/pattern/sieve ≈ 1.0 (vô dụng)**.
-  - Chỉ **4/10 kernel benchmark** được compile; 5/10 task chính chạy
-    interpreter thuần.
-- **Nút thắt lớn nhất (đã xác minh):** hotness chỉ đếm ở `OP_CALL`/`OP_TAILCALL`,
-  và **main chunk luôn `isVararg=true`** → mọi vòng lặp ở chunk chính
-  (arith/table/hash/pattern/sieve) **không bao giờ tier-up**.
-  Bằng chứng: loop arith 10M khi bọc vào hàm + `prewarm` → **39.7 ms**,
-  interpreter **220 ms** → **5.5× đang bỏ trên bàn**.
-- **Nút thắt thứ hai:** lattice số `T_INT` vs `T_NUM` xung đột ở loop header
-  `s=0; for … s=s+t[i]` → reject dù translator đã có numeric dispatch.
-  Headroom ~3.5× (42.9 ms compiled vs 151.7 ms interpreted).
-- Kế hoạch: **Phase A–J**, ROI cao trước (A, B, C), mở dần tới vararg,
-  generic-for, closure/OOP, inline-cache đa hình.
+- **JIT yếu về độ phủ** (đã cải thiện mạnh trong đợt 2026-09-20):
+  - JIT on/off: fib **0.049** (20×), arith main loop **0.18–0.21** (~5×),
+    table ops **0.36** (2.8×), closures 0.50, hash 0.73, oop 0.74; còn
+    pattern (cần `TFOR*`) và sieve (cần multret) ≈ 1.0.
+  - **5/10 kernel benchmark** được compile (01/03/05/07 + hàm 02/08).
+- **Nút thắt đầu tiên (đã xử lý):** hotness chỉ đếm ở `OP_CALL`/`OP_TAILCALL`,
+  và main chunk luôn `isVararg=true` → vòng lặp ở chunk chính không tier-up.
+  Đã thêm tier-up theo loop tại `FORPREP` + entry JIT top-level (kể cả void).
+- **Nút thắt thứ hai (đã xử lý):** lattice số `T_INT` vs `T_NUM` xung đột;
+  nay join về `T_NUM` nhờ numeric dispatch runtime.
+- **Nút thắt thứ ba (đã xử lý):** `hasCalls && impure` chặn gần hết code thực
+  (bảng + gọi hàm). Nay impure proto compile được, **mọi CALL/TAILCALL deopt**
+  trước khi vào callee → resume tại pc, không ghi lặp.
+- Kế hoạch: **Phase A–J**; A, B, C, D, E đã xong. Còn generic-for (`TFOR*`),
+  vararg đọc `...`, inline-cache đa hình.
 
 ---
 
@@ -134,11 +134,14 @@ Lua source ─Lexer/Parser─► AST ─BytecodeCompiler─► LuaProto
 ## 3. Ma trận phủ JIT đầy đủ (bằng chứng 2026-09-20)
 
 ### 3.1 Opcode hiện được compile (allow-list thật)
-`MOVE, LOADI, LOADF, LOADK, LOADNIL, LOADTRUE, LOADFALSE, CLEANUP, GETUPVAL,
-SETUPVAL, GETTABUP, GETTABLE, GETI, GETFIELD, SETTABUP, SETTABLE, SETI, SETFIELD,
-NEWTABLE, EXTRAARG, UNM, BNOT, NOT, LEN, SETLIST, ADD, SUB, MUL, ADDI, ADDK,
-SUBK, MULK, IDIVK, MODK, BANDK, BORK, BXORK, LEI, LTI, GTI, GEI, EQI, JMP,
-FORPREP, FORLOOP, CALL, TAILCALL, RETURN, RETURN1, RETURN0` + intrinsic `math.sqrt`.
+`MOVE, LOADI, LOADF, LOADK, LOADNIL, LOADTRUE, LOADFALSE, CLEANUP, CLOSE,
+GETUPVAL, SETUPVAL, GETTABUP, GETTABLE, GETI, GETFIELD, SETTABUP, SETTABLE, SETI,
+SETFIELD, SELF, CLOSURE, NEWTABLE, EXTRAARG, UNM, BNOT, NOT, LEN, SETLIST,
+ADD, SUB, MUL, ADDI, ADDK, SUBK, MULK, IDIVK, MODK, BANDK, BORK, BXORK,
+LEI, LTI, GTI, GEI, EQI, EQ, EQK, LT, LE, TEST, TESTSET, LFALSESKIP,
+DIV, DIVK, POW, POWK, MOD, IDIV, BAND, BOR, BXOR, SHL, SHR, SHLI, SHRI,
+CONCAT, JMP, FORPREP, FORLOOP, CALL, TAILCALL, RETURN, RETURN1, RETURN0`
++ intrinsic `math.sqrt`.
 
 ### 3.2 Opcode/cấu trúc thiếu → nguyên nhân reject
 
@@ -147,18 +150,14 @@ FORPREP, FORLOOP, CALL, TAILCALL, RETURN, RETURN1, RETURN0` + intrinsic `math.sq
 | `LT`, `LE` | `while i<n`, `repeat until i>=n`, `if a<b` | while/repeat/so sánh biến không JIT |
 | `EQ` (RK), `EQK` | `if x==y` (không phải hằng int) | nhánh so sánh không JIT |
 | `TEST`, `TESTSET` | `and`/`or`, `if x then`, ternary | and/or không JIT |
-| `TFORPREP`, `TFORCALL`, `TFORLOOP`, `CLOSE` | `for k,v in pairs/ipairs/gmatch` | generic-for không JIT |
-| `CLOSURE` | tạo closure/hàm lồng | mọi hàm có closure con bị reject (kể cả main) |
-| `CLOSE`, `TBC` | `<close>`, block scope có upvalue | reject |
-| `SELF` | `obj:method()` | method call không JIT |
-| `CONCAT` | `a .. b` | nối chuỗi không JIT |
-| `DIV`, `DIVK` | `a / b` (luôn float) | phép chia không JIT |
-| `POW`, `POWK` | `a ^ b` | lũy thừa không JIT |
-| `BAND`,`BOR`,`BXOR`,`SHL`,`SHR`,`SHRI`,`SHLI` | bitwise 2 biến/số | bitwise không JIT |
-| `VARARG`, `VARARGPREP` | `...`, select | hàm vararg không JIT |
+| `TFORPREP`, `TFORCALL`, `TFORLOOP` | `for k,v in pairs/ipairs/gmatch` | generic-for không JIT |
+| `VARARG`, `VARARGPREP` | `...`, select | hàm vararg (đọc `...`) không JIT |
 | `LOADKX` | hằng vượt 2^18 | hiếm |
 | `MMBIN`,`MMBINI`,`MMBINK` | metamethod arith | (deopt đúng — giữ interpreter) |
-| `RETURN0` | `return` không giá trị | hiện emit deopt |
+
+Các opcode từng bị reject nay **đã hỗ trợ**: `CLOSURE`, `CLOSE`, `SELF`,
+`RETURN0` (void), `CONCAT`, `DIV/DIVK`, `POW/POWK`, bitwise hai ngôi + immediate.
+Còn lại chủ yếu là generic-for (`TFOR*`) và vararg đọc `...`.
 
 ### 3.3 Khảo sát 24 dạng cấu trúc "cần JIT" (probe tự động)
 
@@ -199,19 +198,20 @@ Chú thích: ✅ compile · ❌ reject · (lý do opcode reject)
 
 | task | kernel JIT? | JIT on/off | vs LuaJ (paired) |
 |---|---|---|---|
-| 01 arith (main loop) | ❌ main chunk | ~1.00 | 1.79× |
+| 01 arith (main loop) | ✅ main chunk (void + loop) | **0.18–0.21** | **8.3×** |
 | 02 fib | ✅ `fib` | **0.049** | **9.93×** |
-| 03 table (main loop) | ❌ | ~1.00 | 1.05–1.50× |
-| 04 concat (main loop) | ❌ (JIT on/off 0.83 do main?) | 0.83 | ~1.0 |
-| 05 closures | ✅ `make_counter` | 0.55 | ~0.99 |
+| 03 table (main loop) | ✅ main chunk (impure, call deopt) | **0.36** | ~1.03× |
+| 04 concat (main loop) | ❌ (main không eligible) | ~0.85–0.96 (nhiễu) | ~0.9× |
+| 05 closures | ✅ `make_counter` (CLOSURE) | **0.50–0.55** | ~0.98× |
 | 06 coroutines | ❌ (chủ ý) | ~0.98 | **16.4×** |
-| 07 hash (main loop) | ❌ | ~1.00 | **1.70×** |
-| 08 oop | ✅ `dot`/`length`, ❌ `new`/`add` | 0.74 | 1.17× |
-| 09 pattern (main loop) | ❌ | ~1.00 | 0.88–0.95× |
-| 10 sieve (main loop) | ❌ | ~1.00 | ~1.00× |
+| 07 hash (main loop) | ✅ main chunk (string key) | **0.73** | **1.96×** |
+| 08 oop | ✅ `dot`/`length`, ❌ `new`/`add` | 0.74 | 1.18× |
+| 09 pattern (main loop) | ❌ (cần `TFOR*`) | ~1.00 | 0.91× |
+| 10 sieve (main loop) | ❌ (cần multret call `math.floor(math.sqrt(N))`) | ~1.00 | ~1.02× |
 
-Kết luận: **thắng nhờ interpreter + fib JIT**, không nhờ phủ JIT rộng. Mở phủ
-JIT cho main-chunk loop là dư địa lớn nhất.
+Kết luận: nhờ mở phủ main-chunk loop + void/CLOSURE/SELF, **5/10 kernel** giờ
+tier-up (01/03/05/07 + 02/08 hàm). Hai task còn chặn là `04` (main không eligible)
+và `09`/`10` (generic-for / multret).
 
 ---
 
@@ -551,7 +551,10 @@ benchmark main-chunk loop; D/E/F/G mở rộng dần theo nhu cầu thực tế.
 | A3 | ✅ xong | Bỏ reject mọi `isVararg`; chỉ reject khi proto thực dùng `...` (VARARG ngoài allow-list) |
 | B | ✅ xong | `mergeTy`: `T_INT ∪ T_NUM = T_NUM` (an toàn nhờ numeric dispatch runtime) |
 | C | ✅ xong | `LT/LE/EQ/EQK/TEST/TESTSET/LFALSESKIP` + `successors`/`transfer` |
-| D | ⬜ chưa | CLOSURE/SELF/object-return |
+| D1 | ✅ xong | `RETURN0`/void proto: kernel trả sentinel `long`, caller materialize 0/nil; `Info.returnsVoid`; `execInner` phát cả cho void |
+| D2 | ✅ xong | `OP_CLOSURE` + `OP_CLOSE`: `JitRuntime.buildClosure`/`closeAt`; đánh dấu impure (factory object-return) |
+| D3 | ✅ xong | `OP_SELF`: `emitSelf` + `JitRuntime.selfMethod` guard rawget-non-nil |
+| D4 | ✅ xong | Bỏ reject `hasCalls && impure` **khi có loop back-edge trước call đầu tiên**: impure proto compile được nhưng **mọi CALL/TAILCALL deopt trước khi vào callee** (resume tại pc, không double-write). Deopt cấu trúc dùng budget riêng `JIT_STRUCTURAL_DEOPT_BUDGET=4096` (tránh phạt exception vĩnh viễn); `GETTABLE/SETTABLE` dispatch theo tag khoá (int vs string); `OP_CLEANUP` no-op kiểu (sửa reject sai `07/10`) |
 | E | ✅ xong | `CONCAT`, `DIV/DIVK`, `POW/POWK`, `MOD`, `IDIV`, bitwise 2 ngôi + `SHLI/SHRI`; helper `shiftLeft/Right`, `luaFloatMod`, `luaNumPow` |
 | F | ⬜ chưa | Generic-for (`TFOR*`) |
 | G | ⬜ chưa | Vararg đọc `...` |
@@ -560,13 +563,17 @@ benchmark main-chunk loop; D/E/F/G mở rộng dần theo nhu cầu thực tế.
 | J | ⬜ chưa | Xác thực cuối |
 
 **Bằng chứng (paired, core 8, `luava.jit.sync=true`):**
-- JIT on/off: `while` **~23×**, `if`-in-loop **~12×**, single-invocation heavy
-  loop **~5.6×**, concat 1.8×, closures 1.8×, oop 1.3×.
-- Fuzz đối chiếu JIT on/off: FuzzC 868 + FuzzE 1656 + FuzzConcat 45 case,
-  0 mismatch.
-- 180 unit test + 30/30 suite PUC xanh.
-- vs LuaJ (paired): arith 1.5×, hash 1.86×, oop 1.16×, concat 2.2× thắng;
-  table/sieve/pattern ~1.0; closures 0.99. Không task nào thua > 1.1×.
+- JIT on/off (main-chunk loop giờ tier-up): arith **~5×**, table ops **~2.8×**,
+  closures **~2×**, hash **~1.4×**, oop 1.35×; `while` **~23×**, `if`-in-loop
+  **~12×**, single-invocation heavy loop **~5.6×**.
+- Fuzz đối chiếu JIT on/off: FuzzC 868, FuzzE 1656, FuzzConcat 45, FuzzTL 13,
+  FuzzVoid 8, FuzzSelf 6, FuzzClosure 8, FuzzImpure 10, FuzzTable 12 — **0
+  mismatch**.
+- **Prewarm cưỡng bức mọi proto hợp lệ** trên toàn bộ 30 suite PUC → 30/30
+  PASS (JIT on, `luava.jit.sync=true`).
+- 185 unit test + 30/30 suite PUC xanh (JIT cả on/off).
+- vs LuaJ (paired): arith 8.3×, hash 1.96×, oop 1.18× thắng;
+  table/sieve/pattern/closures ~1.0. Không task nào thua > 1.1×.
 
 **Bài học đo lường:** đếm back-edge mỗi vòng lặp (dù có granularity) làm
 `runLoop` chậm ~15–20% trên task top-level không hưởng lợi. Giải pháp cuối:

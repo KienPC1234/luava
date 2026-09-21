@@ -31,14 +31,32 @@ public final class JitCode {
     public final boolean pure;
     /** True when every reachable single-value return yields an integer. */
     public final boolean returnsInt;
+    /**
+     * True when the proto yields no value at all (every return is a bare
+     * {@code return}/fall-off). The kernel returns a sentinel {@code long};
+     * callers materialize zero results (or nil-fill an expected count).
+     */
+    public final boolean returnsVoid;
     public int deopts;
+    /**
+     * Structural deopts (impure-proto CALL/TAILCALL) are expected every run,
+     * so they get their own, much larger budget: a proto that runs a hot loop
+     * before its trailing call keeps benefiting, but one whose compiled
+     * prefix never pays for the per-call exception is disarmed eventually.
+     */
+    public int structuralDeopts;
 
     public JitCode(LuaProto proto, MethodHandle handle, boolean pure) {
-        this(proto, handle, null, pure, true);
+        this(proto, handle, null, pure, true, false);
     }
 
     public JitCode(LuaProto proto, MethodHandle handle, MethodHandle objHandle, boolean pure,
             boolean returnsInt) {
+        this(proto, handle, objHandle, pure, returnsInt, false);
+    }
+
+    public JitCode(LuaProto proto, MethodHandle handle, MethodHandle objHandle, boolean pure,
+            boolean returnsInt, boolean returnsVoid) {
         this.proto = proto;
         this.handle = handle;
         this.objHandle = objHandle;
@@ -46,6 +64,8 @@ public final class JitCode {
         this.numParams = proto.numParams;
         this.pure = pure;
         this.returnsInt = returnsInt;
+        this.returnsVoid = returnsVoid;
         this.deopts = 0;
+        this.structuralDeopts = 0;
     }
 }

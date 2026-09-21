@@ -457,6 +457,150 @@ public class JitCoverageTest {
                 "a hook on an abandoned coroutine must not disable JIT for other states");
     }
 
+    @Test
+    void voidProtoCompilesAndMatchesInterpreter() {
+        // RETURN0-only protos used to reject (no reachable value return). They
+        // now compile under the unboxed long ABI with a void sentinel that
+        // callers materialize as zero results.
+        String[] bodies = {
+            "local function g() local x=0 for i=1,200 do x=x+i end end g() return 1",
+            "local function g(n) local x=0 for i=1,n do x=x+i end end g(200) return 2",
+            "local function g() local t={} for i=1,200 do t[i]=i end end g() return 3",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+        LuaState state = new LuaState();
+        LuaClosure f = (LuaClosure) state.eval(
+                "local function f() local x=0 for i=1,100 do x=x+i end end return f");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("f"), f);
+        state.eval("for k=1,400 do f() end");
+        assertTrue(awaitCompiled(f.proto, 5000), "a void loop proto should JIT-compile");
+    }
+
+    @Test
+    void closureFactoryCompilesAndMatchesInterpreter() {
+        // OP_CLOSURE + OP_CLOSE (the make_counter shape) now compile: the
+        // factory is an object-returning pure kernel; escaping upvalues are
+        // closed by OP_CLOSE and by the caller's closeOnJitReturn.
+        String[] bodies = {
+            "local function mk(n) return function() n=n+1 return n end end "
+                    + "local s=0 for i=1,200 do local c=mk(i) s=s+c()+c() end return s",
+            "local function mk() local n=10 return function() n=n+1 return n end end "
+                    + "local c=mk() local s=0 for i=1,200 do s=s+c() end return s",
+            "local function pair() local x=0 return function() x=x+1 end, function() return x end end "
+                    + "local inc,get=pair() local s=0 for i=1,200 do inc() inc() s=s+get() end return s",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+    }
+
+    @Test
+    void selfMethodCallCompilesAndMatchesInterpreter() {
+        // OP_SELF (obj:method()) is inside the subset under a rawget-non-nil
+        // guard mirroring GETFIELD.
+        LuaState state = new LuaState();
+        LuaClosure dot = (LuaClosure) state.eval(
+                "Vec={} Vec.__index=Vec "
+                + "function Vec.new(x,y) return setmetatable({x=x,y=y},Vec) end "
+                + "function Vec:dot(o) return self.x*o.x+self.y*o.y end "
+                + "return Vec.dot");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("dot"), dot);
+        state.eval("""
+                local a = Vec.new(1.0, 2.0)
+                local b = Vec.new(3.0, 4.0)
+                local acc = 0.0
+                for i = 1, 400 do acc = acc + a:dot(b) end
+                """);
+        assertTrue(awaitCompiled(dot.proto, 5000),
+                "a colon-called method should JIT-compile via OP_SELF");
+    }
+
+    @Test
+    void impureProtoWithCallsCompilesButDeoptsCalls() {
+        // An impure proto (table/upvalue writes + a general call) may compile:
+        // every CALL deopts before entering the callee, so the interpreter
+        // re-executes the call with the committed prefix intact. Results must
+        // be identical and no write may be double-applied.
+        String[] bodies = {
+            "local t={} for i=1,200 do t[i]=i*i end local s=0 for i=1,200 do s=s+t[i] end return s",
+            "local x=0 local function bump() x=x+1 end for i=1,200 do bump() end return x",
+            "local t={} for i=1,200 do t['k'..i]=i end local s=0 for i=1,200 do s=s+t['k'..i] end return s",
+            "local t={} local function f(v) t[#t+1]=v return #t end "
+                    + "local n=0 for i=1,200 do n=f(i) end return n",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+        LuaState state = new LuaState();
+        LuaClosure work = (LuaClosure) state.eval(
+                "local function work() local t={} for i=1,2000 do t[i]=i*3 end "
+                + "local s=0 for i=1,2000 do s=s+t[i] end return s end return work");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("work"), work);
+        state.eval("for k=1,200 do work() end");
+        assertTrue(awaitCompiled(work.proto, 5000),
+                "an impure table-write loop with no calls should JIT-compile");
+    }
+
+    @Test
+    void impureProtoWithMultretCallStillCompilesHotLoop() {
+        // An impure proto containing a multi-result or object call was once
+        // rejected wholesale, so a hot numeric loop that merely *ends* with
+        // `local a,b = f()` never compiled. Such calls now deopt instead of
+        // rejecting the proto, so the loop runs compiled and the trailing
+        // call resumes in the interpreter.
+        String[] bodies = {
+            "local function g() return 1, 2, 3 end local t={} for i=1,200 do t[i]=i end "
+                    + "local s=0 for i=1,200 do s=s+t[i] end local a,b=g() return s+a+b",
+            "local t={} local s=0 for i=1,200 do s=s+i end local a,b=table.unpack(t) return s+#t",
+            "local t={} for i=1,200 do t[i]=tostring(i) end local s=0 for i=1,200 do s=s+#t[i] end return s",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+        LuaState state = new LuaState();
+        LuaClosure work = (LuaClosure) state.eval(
+                "local function work() local s=0 for i=1,2000 do s=s+i end "
+                + "local function g() return 1,2 end local a,b=g() return s+a+b end return work");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("work"), work);
+        state.eval("for k=1,200 do work() end");
+        assertTrue(awaitCompiled(work.proto, 5000),
+                "an impure proto with a trailing multret call should still compile its hot loop");
+    }
+
+    @Test
+    void tinyImpureLoopWithTrailingCallIsDisarmedNotPenalized() {
+        // Worst case for the impure deopt-at-call relaxation: a trivial loop
+        // followed by a call, invoked far past the structural-deopt budget.
+        // The kernel must be disarmed rather than paying an exception forever.
+        LuaState state = new LuaState();
+        LuaClosure f = (LuaClosure) state.eval(
+                "local t = {} "
+                + "local function f(x) t[1] = x local s = 0 for i = 1, 1 do s = s + i end "
+                + "return #tostring(x .. s) end "
+                + "local acc = 0 for k = 1, 2000000 do acc = acc + f(k) end "
+                + "return f");
+        assertTrue(f.proto.jitDisabled,
+                "a trivial impure loop with a per-call deopt must disarm, not pay exceptions forever");
+    }
+
+    @Test
+    void objectKeyTableAccessMatchesInterpreter() {
+        // GETTABLE/SETTABLE now dispatch on the key type: integer keys use the
+        // array-part lane, string keys rawget/rawset on a metatable-free table.
+        String[] bodies = {
+            "local t={} for i=1,200 do t['key_'..i]=i end local s=0 for i=1,200 do s=s+t['key_'..i] end return s",
+            "local t={} for i=1,200 do local k='x'..i t[k]=(t[k] or 0)+i end return t.x100",
+            "local t={} for i=1,200 do t[i]=i end local s=0 for i=1,200 do s=s+t[i] end return s",
+            "local t={} t.a=1 t.b=2 t['a']=t['a']+t['b'] return t.a",
+            "local t={} for i=1,100 do t['p_'..i]={v=i} end local s=0 for i=1,100 do s=s+t['p_'..i].v end return s",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+    }
+
     /**
      * Polls until {@code proto.jitCode} is set (or the timeout elapses).
      * Background tier-up latency is not deterministic under a loaded test

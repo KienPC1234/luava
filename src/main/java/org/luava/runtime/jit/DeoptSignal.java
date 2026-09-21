@@ -15,9 +15,22 @@ package org.luava.runtime.jit;
  */
 public final class DeoptSignal extends Error {
     public final int pc;
+    /**
+     * True for a deopt the compiled code always takes for this proto (an
+     * impure proto deopts every CALL), not a runtime guard failure. Such
+     * deopts are expected, so they must not count toward the storm-disarm
+     * budget: a hot loop before the call still benefits, and the call itself
+     * resumes in the interpreter every time.
+     */
+    public final boolean structural;
 
     public DeoptSignal(int pc) {
+        this(pc, false);
+    }
+
+    public DeoptSignal(int pc, boolean structural) {
         super(null, null, false, false);
         this.pc = pc;
+        this.structural = structural;
     }
 }

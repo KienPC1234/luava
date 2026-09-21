@@ -779,6 +779,15 @@ public final class LuaState {
 
     /** Interpreter calls of one proto before a JIT compile is attempted. */
     public static final int JIT_HOT_THRESHOLD = 50;
+    /**
+     * How many structural deopts (impure-proto CALL/TAILCALL, expected every
+     * run) a kernel tolerates before it is disarmed. Impure calling protos
+     * are only compiled when a hot loop precedes the call, where the compiled
+     * prefix easily pays for one exception per invocation; a proto whose
+     * compiled prefix never pays (a trivial loop before the call, called
+     * millions of times) is disabled here instead of penalized forever.
+     */
+    public static final int JIT_STRUCTURAL_DEOPT_BUDGET = 4096;
 
     /**
      * Loop back-edges of one proto before a JIT compile is attempted. Much

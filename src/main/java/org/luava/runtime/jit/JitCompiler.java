@@ -169,7 +169,7 @@ public final class JitCompiler {
                 java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "exec",
                         MethodType.methodType(long.class, LuaClosure.class, Object[].class,
                                 long[].class, byte[].class, org.luava.runtime.LuaValue[].class, int.class));
-                code = new JitCode(proto, mh, null, info.pure(), true);
+                code = new JitCode(proto, mh, null, info.pure(), true, info.returnsVoid());
             } else {
                 java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "execObj",
                         MethodType.methodType(org.luava.runtime.LuaValue.class, LuaClosure.class,
