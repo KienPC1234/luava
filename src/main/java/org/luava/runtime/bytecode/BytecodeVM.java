@@ -228,6 +228,27 @@ public final class BytecodeVM {
      * A chunk that returns many values deopts inside the kernel, so the
      * multret layout is never reimplemented here.
      */
+    /**
+     * Decides whether a deopt should disarm a kernel. A genuine guard failure
+     * always disarms after a small budget. A structural deopt (a general call
+     * the kernel can never enter: an impure proto's every call, or a pure
+     * proto's builtin callee) is expected on every run, so it never disarms a
+     * proto that tiered up through a hot loop — that loop is compiled work
+     * that outweighs one exception per invocation. A proto that tiered up via
+     * repeated calls with no such loop falls back to the interpreter after a
+     * much larger budget, so a trivial loop before a per-call deopt is not
+     * penalized forever.
+     */
+    private static boolean disarms(DeoptSignal d, JitCode jc, LuaProto proto) {
+        if (!d.structural) {
+            return ++jc.deopts > 8;
+        }
+        if (proto.loopCompileRequested) {
+            return false;
+        }
+        return ++jc.structuralDeopts > LuaState.JIT_STRUCTURAL_DEOPT_BUDGET;
+    }
+
     private static LuaValue[] runTopLevelJit(LuaState state, VmContext ctx, LuaClosure closure) {
         if (!state.isJitEnabled() || (ctx.co != null && ctx.co.hooksActive) || state.loopGuard != null) {
             return null;
@@ -265,10 +286,7 @@ public final class BytecodeVM {
             finishFrame(state, ctx);
             return ret;
         } catch (DeoptSignal d) {
-            // A structural deopt (impure-proto call) is expected every run, so
-            // it gets a far larger budget; genuine guard failures disarm fast.
-            if (d.structural ? ++jc.structuralDeopts > LuaState.JIT_STRUCTURAL_DEOPT_BUDGET
-                    : ++jc.deopts > 8) {
+            if (disarms(d, jc, closure.proto)) {
                 closure.proto.jitCode = null;
                 closure.proto.jitDisabled = true;
             }
@@ -1181,8 +1199,7 @@ public final class BytecodeVM {
             }
             return 1;
         } catch (DeoptSignal d) {
-            if (d.structural ? ++jc.structuralDeopts > LuaState.JIT_STRUCTURAL_DEOPT_BUDGET
-                    : ++jc.deopts > 8) {
+            if (disarms(d, jc, proto)) {
                 proto.jitCode = null;
                 proto.jitDisabled = true;
             }
