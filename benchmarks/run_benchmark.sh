@@ -10,7 +10,12 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LUA_DIR="$SCRIPT_DIR/lua"
 RUNNER_DIR="$SCRIPT_DIR/runner"
 RESULTS_DIR="$SCRIPT_DIR/results"
-LUAVA_JAR="$PROJECT_ROOT/target/luava-1.0.0-SNAPSHOT.jar"
+# Auto-detect the built engine jar (version-agnostic).
+LUAVA_JAR="$(ls -1 "$PROJECT_ROOT"/target/luava-*.jar 2>/dev/null | grep -v sources | grep -v javadoc | head -1)"
+if [ -z "$LUAVA_JAR" ]; then
+    echo "error: no target/luava-*.jar found; run 'mvn -DskipTests package' first" >&2
+    exit 1
+fi
 
 # Native Lua binary
 LUA_BIN="${LUA_BIN:-$(command -v lua5.4 || command -v lua || echo "lua")}"

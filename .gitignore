@@ -10,3 +10,19 @@ lua-source/
 *.so
 *.out
 /libs
+
+# Release / signing artifacts must never be committed
+*.asc
+*.gpg
+*.p12
+*.jks
+release.properties
+pom.xml.releaseBackup
+
+# Local, personal release tooling and secrets. Kept on the maintainer's disk,
+# never published. Anyone can build the engine from source with Maven; the
+# Central-publishing setup is maintainer-only.
+.env
+.env.*
+PUBLISHING.md
+scripts/release.sh
