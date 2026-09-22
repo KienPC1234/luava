@@ -63,7 +63,7 @@ java  -cp luava-0.1.0-alpha.jar:. MyApp
 
 ```bash
 mvn package          # target/luava-0.1.0-alpha.jar
-mvn test             # 30/30 PUC Lua 5.4.9 suites + unit tests
+mvn test             # 31/31 PUC Lua 5.4.9 suites + unit tests
 ```
 
 </details>
@@ -256,17 +256,22 @@ Knobs:
 
 ## Conformance status
 
-- **30/30** runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass on
+- **31/31** runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass on
   Luava, asserted by `OfficialSuiteEvaluationTest` so any regression fails
-  the build; **213** unit tests run alongside, including a byte-for-byte
-  differential conformance suite against stock PUC Lua 5.4. All green with
-  JIT both on and off, and at maximum JIT coverage.
+  the build; **227** unit tests run alongside, including a byte-for-byte
+  differential conformance suite against stock PUC Lua 5.4 and a fixed
+  stdlib sweep run under JIT both on and off. All green with JIT both on
+  and off, and at maximum JIT coverage.
+- `all.lua`, the PUC driver, runs in user-test mode (`_U`): it re-runs every
+  suite through its `string.dump`/`load` wrapper, adding an independent
+  round-trip pass over the whole corpus.
 - Test files are checksum-identical to the upstream tarball and are never
   edited by the runner.
-- Excluded by design: `heavy.lua` (intentional memory-overflow stress),
-  `all.lua` (needs C test libs plus an interactive runner) and `main.lua`
-  (stand-alone CLI driver; `os.execute`-driven, not applicable to an
-  embedded engine).
+- Excluded by design: `heavy.lua` (deliberate heap-exhaustion stress that
+  needs a large heap; it passes on Luava but is not a conformance suite) and
+  `main.lua` (stand-alone CLI driver; `os.execute`-driven against the
+  reference `lua` binary, not applicable to an embedded engine — the Luava
+  CLI is covered by `MainTest`).
 - Robustness: deep recursion (3000 tested; a clean `stack overflow` past the
   10000-frame limit), 200-coroutine churn, 100k tail calls, heavy
   table/string/`<close>`/error pressure, and 8 concurrent states on one JVM
