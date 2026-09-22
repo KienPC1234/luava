@@ -305,4 +305,137 @@ public class LuavaBugfixRegressionTest {
         assertTrue(s.get("java").isNil());
         assertTrue(s.eval("return java == nil").toBoolean());
     }
+
+    @Test
+    void formatIntegerRejectsFloatsAtOrAboveTwoToThe63() {
+        // A naive `(long) d` saturates at Long.MAX_VALUE and `(double)
+        // Long.MAX_VALUE` rounds back to 2^63, so the old round-trip check
+        // accepted 2^63 and printed a bogus maxinteger. Lua 5.4 rejects any
+        // float that does not fit a 64-bit integer.
+        LuaState s = new LuaState();
+        assertEquals("false,bad argument #2 to 'string.format' (number has no integer representation)",
+                s.eval("local ok, e = pcall(string.format, '%d', 2^63) "
+                        + "return tostring(ok) .. ',' .. e").toLuaString());
+        assertEquals("false,bad argument #2 to 'string.format' (number has no integer representation)",
+                s.eval("local ok, e = pcall(string.format, '%x', 2^63) "
+                        + "return tostring(ok) .. ',' .. e").toLuaString());
+        // 2^63-1 as a float is actually 2^63 (the nearest double), so it is
+        // rejected too; the largest representable float below 2^63 works.
+        assertEquals("-9223372036854775808",
+                s.eval("return string.format('%d', -2^63)").toLuaString());
+        assertEquals("9223372036854774784",
+                s.eval("return string.format('%d', 9223372036854774784.0)").toLuaString());
+    }
+
+    @Test
+    void exhaustedGmatchIteratorYieldsZeroValues() {
+        // PUC's gmatch_aux returns 0 results when the scan is exhausted, not
+        // one nil. Returning a single nil made `select('#', it())` report 1
+        // and let a stale function escape through a multi-value position.
+        LuaState s = new LuaState();
+        assertEquals("0", s.eval(
+                "local it = ('hello'):gmatch('l'); it(); it(); "
+                        + "return tostring(select('#', it()))").toLuaString());
+        assertEquals("0", s.eval(
+                "local it = ('abc'):gmatch('z'); return tostring(select('#', it()))").toLuaString());
+        assertEquals("1", s.eval(
+                "local it = ('aaaa'):gmatch('a'); return tostring(select('#', it()))").toLuaString());
+    }
+
+    @Test
+    void breakOutsideLoopIsASyntaxError() {
+        // PUC's breakstat resolves `break` as a goto to an implicit label
+        // created only inside a loop; outside one it is reported as a syntax
+        // error at load time, never executing.
+        LuaState s = new LuaState();
+        for (String src : new String[]{"break", "do break end", "if true then break end"}) {
+            // load returns (nil, errmsg); pcall wraps that as (true, nil, err).
+            String r = s.eval("local ok, f, e = pcall(load, " + quote(src) + ") "
+                    + "return tostring(ok) .. '|' .. tostring(f) .. '|' .. tostring(e)").toLuaString();
+            assertTrue(r.startsWith("true|nil|") && r.contains("break outside loop at line 1"),
+                    "expected syntax error for " + quote(src) + ", got: " + r);
+        }
+        // Inside a loop it still loads.
+        assertEquals("true|function", s.eval(
+                "local ok, f = pcall(load, 'while true do break end') "
+                        + "return tostring(ok) .. '|' .. type(f)").toLuaString());
+    }
+
+    private static String quote(String s) {
+        return "\"" + s + "\"";
+    }
+
+    @Test
+    void osDateUtcZoneNameIsGmt() {
+        // `!%Z` formats with gmtime, whose %Z is the literal "GMT" on glibc
+        // (and in the C locale), never the ZoneOffset id "Z". The local %Z
+        // is environment-dependent, so only the UTC form is deterministic.
+        LuaState s = new LuaState();
+        assertEquals("GMT", s.eval("return os.date('!%Z', 0)").toLuaString());
+    }
+
+    @Test
+    void pcallAndXpcallBadArgumentsRaiseLikePuc() {
+        // luaL_checkany/luaL_checktype, which RAISE: an enclosing pcall sees
+        // false, not a returned (false, msg) pair. They also require the
+        // xpcall message handler to be a real function (nil or a callable
+        // table is rejected).
+        LuaState s = new LuaState();
+        assertEquals("false", s.eval("return tostring(pcall(pcall))").toLuaString());
+        assertEquals("false", s.eval("return tostring(pcall(xpcall))").toLuaString());
+        assertEquals("false", s.eval("return tostring(pcall(xpcall, nil))").toLuaString());
+        assertEquals("false", s.eval("return tostring(pcall(xpcall, function() end))").toLuaString());
+        // A callable table as the *handler* is still not a function: rejected.
+        assertEquals("false", s.eval(
+                "return tostring(pcall(xpcall, function() return 1 end, "
+                        + "setmetatable({}, {__call=function() return 'H' end})))")
+                .toLuaString());
+        // A proper handler still works.
+        assertEquals("false,H:x", s.eval(
+                "local ok, e = xpcall(function() error('x', 0) end, function(m) return 'H:'..m end) "
+                        + "return tostring(ok) .. ',' .. e").toLuaString());
+    }
+
+    @Test
+    void adversarialStdlibCallsNeverLeakJavaThrowables() {
+        // Every stdlib call is wrapped in pcall. If a raw Java throwable
+        // escapes, pcall cannot catch it and the eval would throw something
+        // other than a string/table error object. This reproduces the
+        // AGENTS.md §IV.2 rule that unchecked exceptions never leak.
+        LuaState s = new LuaState();
+        String script =
+                "local weird = {true, false, 0, 1, -1, 0.5, 1e308, 1/0, 0/0, "
+                + "math.maxinteger, math.mininteger, 'x', '', '\\0', {}, {1,2}} "
+                + "local libs = {string, table, math, utf8, coroutine} "
+                + "local bad = 0 "
+                + "for _, lib in ipairs(libs) do "
+                + "  for _, fn in pairs(lib) do "
+                + "    if type(fn) == 'function' then "
+                + "      for i = 1, #weird do "
+                + "        for j = 1, #weird do "
+                + "          local ok, e = pcall(fn, weird[i], weird[j]) "
+                + "          if not ok and type(e) ~= 'string' and type(e) ~= 'table' "
+                + "             and type(e) ~= 'nil' then bad = bad + 1 end "
+                + "        end "
+                + "      end "
+                + "    end "
+                + "  end "
+                + "end "
+                + "return bad";
+        assertEquals(0, s.eval(script).toLong());
+    }
+
+    @Test
+    void hostBoundaryWrapsInternalJavaErrors() {
+        // A host function that throws an unchecked Java exception must be
+        // surfaced as a LuaException, never a raw NullPointerException.
+        LuaState s = new LuaState();
+        s.registerFunction("boom", () -> {
+            throw new IllegalStateException("kaboom");
+        });
+        Throwable t = assertThrows(Throwable.class, () -> s.eval("return boom()"));
+        assertTrue(t instanceof LuaException, "leaked " + t.getClass().getName());
+        // The control-flow signals still pass through untouched.
+        assertThrows(LuaException.class, () -> s.eval("error('lua error')"));
+    }
 }

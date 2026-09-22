@@ -556,10 +556,15 @@ public final class StringLib {
             return v.toLong();
         }
         if (v.isFloat()) {
+            // Use the exact Lua 5.4 range test: a float whose value fits a
+            // 64-bit signed integer and is integral converts; anything else
+            // (2^63 and above, inf, NaN, non-integral) has no integer
+            // representation. A naive `(long) d` saturates at Long.MAX_VALUE,
+            // and `(double) Long.MAX_VALUE` rounds back to 2^63, so the cast
+            // round-trip falsely accepts 2^63 — reject via the open upper bound.
             double d = v.toDouble();
-            long n = (long) d;
-            if (d == (double) n) {
-                return n;
+            if (d >= -9223372036854775808.0 && d < 9223372036854775808.0 && Math.floor(d) == d) {
+                return (long) d;
             }
             throw new LuaException("bad argument #" + argIdx + " to 'string.format' (number has no integer representation)");
         }

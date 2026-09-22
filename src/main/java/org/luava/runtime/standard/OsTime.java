@@ -430,7 +430,7 @@ final class OsTime {
      * renders huge years wrapped); offSecs feeds %z; zone feeds %Z.
      */
     static String formatSpec(String spec, long[] f, int tmYear, long dispYear,
-                             int offSecs, ZoneId zone) {
+                             int offSecs, ZoneId zone, boolean isUtc, boolean dst) {
         long y = f[0];
         long mon = f[1];
         long d = f[2];
@@ -487,8 +487,19 @@ final class OsTime {
                 yield String.format("%s%02d%02d", offSecs < 0 ? "-" : "+",
                         a / 3600, (a % 3600) / 60);
             }
-            case 'Z' -> zone.getId().equals("UTC") ? "UTC"
-                    : zone.getDisplayName(java.time.format.TextStyle.SHORT, java.util.Locale.ROOT);
+            case 'Z' -> {
+                // glibc strftime %Z: the DST-aware abbreviation from the
+                // active timezone. Lua's `!` prefix formats with gmtime,
+                // whose %Z is always "GMT" (not the ZoneOffset id "Z"), and
+                // whose zone abbreviation comes from the *system* zone for
+                // local time. Java's SHORT display name matches glibc for
+                // the common zones (EST/EDT, CET/CEST, GMT/BST, IST, ...).
+                if (isUtc) {
+                    yield "GMT";
+                }
+                java.util.TimeZone tz = java.util.TimeZone.getTimeZone(zone);
+                yield tz.getDisplayName(dst, java.util.TimeZone.SHORT);
+            }
             default -> throw new IllegalStateException("unhandled spec " + spec + " mod=" + mod);
         };
     }

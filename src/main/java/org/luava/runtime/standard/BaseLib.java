@@ -341,7 +341,10 @@ public final class BaseLib {
 
         globals.rawset(LuaString.interned("pcall"), LuaFunction.of("pcall", args -> {
             if (args.length == 0) {
-                return Varargs.of(LuaBoolean.FALSE, LuaString.interned("bad argument #1 to 'pcall' (value expected)"));
+                // PUC's luaB_pcall does luaL_checkany(L, 1), which raises;
+                // the enclosing pcall observes false, it is not a returned
+                // (false, msg) pair.
+                throw LuaValue.argError(1, "pcall", "value expected");
             }
             LuaValue target = args[0];
             LuaValue[] fnArgs = new LuaValue[args.length - 1];
@@ -393,11 +396,18 @@ public final class BaseLib {
         }));
 
         globals.rawset(LuaString.interned("xpcall"), LuaFunction.of("xpcall", args -> {
+            // PUC: luaL_checktype(L, 2, LUA_TFUNCTION) — the message handler
+            // must be an actual function (not a callable table, not nil), and
+            // a missing handler is reported as "no value". These raise, so an
+            // enclosing pcall observes false; they are not returned pairs.
             if (args.length < 2) {
-                return Varargs.of(LuaBoolean.FALSE, LuaString.interned("bad arguments to 'xpcall' (value expected)"));
+                throw LuaValue.argError(2, "xpcall", "function expected, got no value");
             }
             LuaValue target = args[0];
             LuaValue msgh = args[1];
+            if (!(msgh instanceof LuaFunction)) {
+                throw LuaValue.argError(2, "xpcall", "function expected, got " + msgh.typeName());
+            }
             LuaValue[] fnArgs = new LuaValue[args.length - 2];
             System.arraycopy(args, 2, fnArgs, 0, fnArgs.length);
 

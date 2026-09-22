@@ -1,0 +1,265 @@
+-- Differential stdlib/runtime sweep. Every observable is canonicalized so
+-- stdout is engine-independent: no table/function addresses, no NaN sign
+-- (unspecified), no string.dump byte length. The expected block was captured
+-- verbatim from stock PUC Lua 5.4 (lua-source build, -DLUA_COMPAT_5_3).
+local out = {}
+local function canon(x)
+  local t = type(x)
+  if t == 'nil' then return 'nil' end
+  if t == 'number' then
+    if x ~= x then return 'nan' end
+    return string.format('%.17g', x)
+  end
+  if t == 'boolean' then return tostring(x) end
+  if t == 'string' then return '<' .. x .. '>' end
+  if t == 'table' then return 'table' end
+  return t
+end
+local function C(f, ...)
+  local r = table.pack(pcall(f, ...))
+  if not r[1] then return 'ERR' end
+  local o = { 'ok' }
+  for i = 2, r.n do o[#o + 1] = canon(r[i]) end
+  return table.concat(o, ',')
+end
+local function A(f, ...) out[#out + 1] = C(f, ...) end
+
+-- operator / numeric corner cases
+A(function() return 1 // 0 end)
+A(function() return 3.0 // 2 end)
+A(function() return -3.0 // 2 end)
+A(function() return 7.0 % 3 end)
+A(function() return -7.0 % 3 end)
+A(function() return 5 // 2, 5.0 // 2, 5 % 2, 5.0 % 2, -5 // 2, -5 % 2 end)
+A(function() return 2 ^ 0.5 end)
+A(function() return (-8) ^ (1 / 3) end)
+A(function() return 0 ^ 0 end)
+A(function() return 1 ^ math.huge end)
+A(function() return (-1) ^ math.huge end)
+A(function() return math.type(1), math.type(1.0), math.type(2 ^ 0), math.type(2.0 ^ 0) end)
+A(function() return tostring(math.tointeger(3.0)), tostring(math.tointeger(3.5)), tostring(math.tointeger(math.huge)) end)
+A(function() return math.maxinteger + 1 == math.mininteger end)
+A(function() return math.mininteger // -1, math.mininteger % -1 end)
+A(function() return math.abs(math.mininteger) end)
+A(function() return 2 ^ 63 == math.maxinteger end)
+A(function() return 1 << 63, 1 << -63, 1 << 64, -1 >> 1 end)
+A(function() return 3 & 5, 3 | 5, 3 ~ 5, ~0 end)
+A(function() return 0x7fffffffffffffff, 0x8000000000000000 end)
+A(function() return 2 ^ 53, 2 ^ 53 + 1, 2 ^ 53 + 1 == 2 ^ 53 end)
+A(function() return 9007199254740993, 9007199254740993.0 end)
+A(function() return 0.1 + 0.2, (0.1 + 0.2) == 0.3 end)
+
+-- math
+A(function() return math.floor(-0.5), math.ceil(-0.5), math.abs(-0.0) end)
+A(function() return math.fmod(7, 3), math.fmod(-7, 3), math.fmod(7, -3), math.fmod(-7, -3) end)
+A(function() return math.fmod(5.5, 2), math.fmod(-5.5, 2) end)
+A(function() local ok = pcall(math.fmod, 7, 0); return tostring(ok) end)
+A(function() return math.log(8, 2), math.exp(0) end)
+A(function() return math.max(1, 2.5, 2), math.min(1, 2.5, 2) end)
+A(function() return tostring(math.max(1, 2.5, 2) == 2.5), math.type(math.max(1, 2.5, 2)) end)
+A(function() local a, b = math.modf(3.7) return a, string.format('%.17g', b) end)
+A(function() return math.ult(1, -1), math.ult(-1, 1) end)
+A(function() return math.floor(math.maxinteger), math.ceil(math.mininteger) end)
+A(function() return 1e308 * 10, -1e308 * 10 end)
+A(function() return math.sqrt(4), math.type(math.sqrt(4)) end)
+A(function() return string.format('%x', math.mininteger), string.format('%x', math.maxinteger) end)
+
+-- string.format integer overflow (the 2^63 bug)
+A(function() return string.format('%d', 2 ^ 63) end)
+A(function() return string.format('%x', 2 ^ 63) end)
+A(function() return string.format('%d', -2 ^ 63) end)
+A(function() return string.format('%d', 9223372036854774784.0) end)
+A(function() return string.format('%d', 3.5) end)
+A(function() return string.format('%d', 3.0) end)
+A(function() return string.format('%d', '42') end)
+A(function() return string.format('%d', 1e300) end)
+A(function() return string.format('%d %i %u %x %X %o', 255, 255, 255, 255, 255, 255) end)
+A(function() return string.format('%5.2f|%-5d|%05d|%+d', 3.14159, 42, 42, 42) end)
+A(function() return string.format('%s %q %c', 'hi', 'a\nb', 65) end)
+A(function() return string.format('%g %g %g', 0.5, 100000, 0.0001) end)
+A(function() return string.format('%a', 1.0), string.format('%a', 3.5) end)
+A(function() return string.format('%.0f', 0.5), string.format('%.0f', 1.5), string.format('%.0f', 2.5) end)
+A(function() return string.format('%f', 1e30) end)
+A(function() local ok = pcall(string.format, '%', 1); return tostring(ok) end)
+A(function() local ok = pcall(string.format, '%z', 1); return tostring(ok) end)
+A(function() return string.format('%s', nil), string.format('%s', true) end)
+A(function() return string.format('%q', math.mininteger) end)
+A(function() return string.format('%q', 'a\0b') end)
+A(function() return string.format('%q', 1 / 3) end)
+A(function() return string.format('%q', math.huge) end)
+
+-- string library
+A(function() return ('abc'):sub(2, -1), ('abc'):sub(-2, -1), ('abc'):sub(0), ('abc'):sub(3, 2) end)
+A(function() return ('abc'):byte(1, -1), string.char(72, 105) end)
+A(function() return ('abc'):len(), string.len('hello'), #'hello' end)
+A(function() return ('a,b,,c'):gsub(',', ';') end)
+A(function() return ('hello'):find('l+'), ('abc'):find('z') end)
+A(function() return ('hello world'):match('(%w+) (%w+)') end)
+A(function() return ('a1b2c3'):gsub('%d', function(d) return '[' .. d .. ']' end) end)
+A(function() return ('aaa'):gsub('a', 'b', 2) end)
+A(function() return ('abc'):gsub('', '-') end)
+A(function() return ('abc'):gsub('(a)(b)(c)', '%3%2%1') end)
+A(function() return ('x'):rep(3, '-') end)
+A(function() return ('  x  '):gsub('^%s+', '') end)
+A(function() return ('a.b.c'):gsub('%.', '/') end)
+A(function() return string.rep('ab', 3, ',') end)
+A(function() return ('test'):upper(), ('TEST'):lower() end)
+A(function() return ('abc'):reverse() end)
+-- gmatch exhaustion: zero results, not one nil
+A(function() local it = ('hello'):gmatch('l'); it(); it(); return select('#', it()) end)
+A(function() local it = ('abc'):gmatch('z'); return select('#', it()) end)
+A(function() local it = ('aaaa'):gmatch('a'); return select('#', it()) end)
+A(function() local s = '' for k, v in ('a=1,b=2'):gmatch('(%w+)=(%w+)') do s = s .. k .. ':' .. v .. ' ' end return s end)
+
+-- table library
+A(function() return table.concat({1, 2, 3}, ','), select('#', table.unpack({1, 2, 3})) end)
+A(function() return table.concat({}, '-'), table.concat({1, 2, 3}, '-', 2, 2) end)
+A(function() local t = {3, 1, 2} table.sort(t) return table.concat(t, ',') end)
+A(function() local t = {3, 1, 2} table.sort(t, function(a, b) return a > b end); return table.concat(t, ',') end)
+A(function() local t = {1, 2, 3, 4} table.insert(t, 5); return #t, t[5] end)
+A(function() local t = {1, 2, 3, 4} table.remove(t, 1); return #t, t[1] end)
+A(function() local t = {1, 2, 3} table.insert(t, 5, 9); return pcall(function() return t end) end)
+A(function() local t = {1, 2, 3} return pcall(table.remove, t, 0) end)
+A(function() return table.concat(table.move({1, 2, 3, 4}, 1, 3, 2), ',') end)
+A(function() return table.concat({1, 2, 3, 4, 5}, ',', 2, 4) end)
+A(function() local p = table.pack(1, nil, 3) return p.n, p[1], p[3] end)
+A(function() return tostring(rawequal(1, 1.0)), tostring(1 == 1.0), tostring(1 < 1.5) end)
+A(function() return next({}) end)
+A(function() local t = {1, 2, 3} return select('#', table.unpack(t, 2)) end)
+A(function() return table.concat({1, 2, 3}) .. select('#', table.unpack({1, 2, 3}, 0, 2)) end)
+
+-- tonumber / coercion
+A(function() return tonumber('0x10'), tonumber('10', 16), tonumber('  12  '), tonumber('1e2') end)
+A(function() return tonumber('0x1p4'), tonumber('0b101'), tostring(tonumber('1e')) end)
+A(function() return tostring(tonumber('zz', 36)), tostring(tonumber('10', 37)) end)
+A(function() return tostring(tonumber(nil)), tostring(tonumber(true)), tostring(tonumber(10)) end)
+A(function() return '10' + 1, '0x10' + 1, 1 + '10', '1e2' + 0 end)
+A(function() return pcall(function() return 1 == '1' end) end)
+
+-- metatables / metamethods
+A(function() local mt = {__index = function() return 'default' end} local t = setmetatable({}, mt) return t.x, t.y end)
+A(function() local mt = {__add = function() return 100 end} return setmetatable({}, mt) + 1 end)
+A(function() local t = setmetatable({}, {__len = function() return 99 end}) return #t end)
+A(function() local t = setmetatable({}, {__tostring = function() return 'TS' end}) return tostring(t) end)
+A(function() local mt = {__eq = function() return true end} return setmetatable({}, mt) == setmetatable({}, getmetatable(t)) end)
+A(function() local mt = {__call = function(self, a) return a * 2 end} return setmetatable({}, mt)(21) end)
+A(function() local mt = {__concat = function() return 'CC' end} return setmetatable({}, mt) .. 'x' end)
+A(function() local t = setmetatable({}, {__newindex = function(t, k, v) rawset(t, k, v * 2) end}) t.x = 5; return t.x end)
+A(function() local mt = {__metatable = 'locked'} return getmetatable(setmetatable({}, mt)) end)
+A(function() return pcall(rawset, {}, nil, 1) end)
+
+-- pcall / xpcall semantics (the bad-argument bugs)
+A(function() return select('#', pcall(function() return 1, nil, 3 end)) end)
+A(function() return pcall(error, 'e') end)
+A(function() return pcall(function() error('x', 0) end) end)
+A(function() return xpcall(function() error('x', 0) end, function(m) return 'H:' .. m end) end)
+A(function() local ok = pcall(pcall); return tostring(ok) end)
+A(function() local ok = pcall(xpcall); return tostring(ok) end)
+A(function() local ok = pcall(xpcall, nil); return tostring(ok) end)
+A(function() local ok = pcall(xpcall, function() end); return tostring(ok) end)
+A(function() local ok = pcall(xpcall, function() return 1 end, setmetatable({}, {__call = function() return 'H' end})); return tostring(ok) end)
+
+-- multiple returns through wrappers
+A(function() local function f() return 1, nil, 3 end return f() end)
+A(function() local function f() return end return f() end)
+A(function() local function f() return 1, 2 end return f(), 5 end)
+A(function() local function f() return 1, 2 end return 5, f() end)
+A(function() local function f() return 1, 2 end return {f()} end)
+A(function() local function f() return 1, 2 end return {f(), 9} end)
+A(function() local function f() return 1, 2 end return (f()) end)
+A(function() return select('#', 1, nil, nil) end)
+A(function() return select(2, 'a', 'b', 'c'), select(-1, 'a', 'b', 'c') end)
+
+-- goto / break
+A(function() local s = 0 for i = 1, 5 do if i == 3 then break end s = s + i end return s end)
+A(function() local s = 0 for i = 1, 5 do for j = 1, 5 do if j == 2 then break end s = s + 1 end end return s end)
+A(function() local s = 0 for i = 1, 5 do if i == 2 then goto skip end s = s + i ::skip:: end return s end)
+A(function() local s = 0 for i = 1, 3 do for j = 1, 3 do if i + j == 4 then goto out end s = s + 1 end end ::out:: return s end)
+A(function() local s = 0 do goto done s = 999 ::done:: end return s end)
+-- break outside loop is a syntax error at load
+A(function() local ok, f, e = pcall(load, 'break') return ok, f, tostring(e):find('break outside loop') ~= nil end)
+A(function() local ok, f, e = pcall(load, 'do break end') return ok, f, tostring(e):find('break outside loop') ~= nil end)
+A(function() local ok, f = pcall(load, 'while true do break end') return ok, type(f) end)
+
+-- <close> semantics
+A(function() local log = {} local function mk(n) return setmetatable({}, {__close = function() log[#log + 1] = n end}) end do local a <close> = mk('a'); local b <close> = mk('b') end return table.concat(log, ',') end)
+A(function() local log = {} local function mk(n) return setmetatable({}, {__close = function() log[#log + 1] = n end}) end for i = 1, 3 do local a <close> = mk(i) end return table.concat(log, ',') end)
+A(function() local log = {} local function mk(n) return setmetatable({}, {__close = function() log[#log + 1] = n end}) end for i = 1, 4 do local a <close> = mk(i) if i == 2 then break end end return table.concat(log, ',') end)
+A(function() local ok = pcall(function() local x <close> = 5 end) return tostring(ok) end)
+A(function() local ok = pcall(function() local x <close> = {} end) return tostring(ok) end)
+A(function() local ok = pcall(function() local x <close> = nil end) return tostring(ok) end)
+
+-- string.pack / unpack
+A(function() return #string.pack('i4i4', 7, 9), tostring(string.unpack('i4i4', string.pack('i4i4', 7, 9))) end)
+A(function() return tostring(string.unpack('i8', string.pack('i8', -5))) end)
+A(function() return string.unpack('z', string.pack('z', 'abc')) end)
+A(function() return tostring(string.packsize('i4i4')), tostring(string.packsize('!8i3')) end)
+A(function() return pcall(string.pack, 'b', 128) end)
+A(function() return pcall(string.pack, 'i4', 2 ^ 63) end)
+A(function() local a, b, c = string.unpack('BBB', string.pack('BBB', 1, 2, 3)) return a, b, c end)
+A(function() return tostring(string.unpack('i4', 'ab')) end)
+
+-- utf8
+A(function() return utf8.char(72, 0x20AC), #utf8.char(0x10FFFF) end)
+A(function() return utf8.codepoint(utf8.char(0x1F600), 1), utf8.len('h\u{e9}llo') end)
+A(function() return pcall(utf8.char, 0x110000), pcall(utf8.char, 0xD800) end)
+A(function() return tostring(utf8.len('abc', 2)), tostring(utf8.len('\255')) end)
+A(function() return tostring(utf8.offset('h\u{e9}llo', 2)) end)
+A(function() local t = {} for p, c in utf8.codes('a\u{e9}') do t[#t + 1] = p .. ':' .. c end return table.concat(t, ',') end)
+
+-- coroutines
+A(function() local co = coroutine.create(function(a, b) local x = a + b for i = 1, 3 do x = x + coroutine.yield(x) end return x end)
+  local o = {} local ok, v = coroutine.resume(co, 1, 3) o[#o + 1] = tostring(ok) .. ':' .. canon(v)
+  for i = 1, 3 do ok, v = coroutine.resume(co, i) o[#o + 1] = tostring(ok) .. ':' .. canon(v) end return table.concat(o, '|') end)
+A(function() local co = coroutine.create(function() return 1, 2, 3 end) return coroutine.resume(co) end)
+A(function() local co = coroutine.create(function() error('x') end) local ok, e = coroutine.resume(co) return ok, e:find('x') ~= nil end)
+A(function() return coroutine.status(coroutine.create(function() end)) end)
+A(function() local co = coroutine.create(function() coroutine.yield() end) coroutine.resume(co) return coroutine.status(co) end)
+A(function() local co = coroutine.create(function() coroutine.yield() end) coroutine.resume(co) return tostring(coroutine.resume(co)) end)
+A(function() return tostring(coroutine.isyieldable()) end)
+
+-- os.date deterministic (UTC)
+A(function() return os.date('!%Y-%m-%d %H:%M:%S', 0) end)
+A(function() return os.date('!%j', 0), os.date('!%w', 0) end)
+A(function() return os.date('!%a %b %d', 0) end)
+A(function() return os.date('!%Z', 0) end)
+A(function() return tostring(os.time{year = 2000, month = 1, day = 1, hour = 12, min = 0, sec = 0, isdst = false}) end)
+A(function() return os.difftime(100, 50) end)
+
+-- tostring / concat
+A(function() return tostring(nil), tostring(true), tostring(1), tostring(1.5) end)
+A(function() return (1 .. 2), (1.5 .. ''), ('' .. 1.0) end)
+A(function() return tostring(2 ^ 53) .. '/' .. tostring(2 ^ 53 + 1) end)
+A(function() return string.format('%.17g', 0.1), string.format('%.17g', 1 / 3) end)
+
+-- vararg reading (interpreter correctness; JIT intentionally excludes ...)
+A(function() local function f(...) return ... end return f(1, 2, 3) end)
+A(function() local function f(...) return select('#', ...) end return f() end)
+A(function() local function f(...) return select('#', ...) end return f(nil, nil) end)
+A(function() local function f(a, ...) return a, ... end return f(1) end)
+A(function() local function f(a, ...) return a, ... end return f(1, 2, 3) end)
+A(function() local function f(a, ...) return a, select('#', ...) end return f(1, nil, 3) end)
+A(function() local function f(...) local a, b, c = ... return a, b, c end return f(1, 2) end)
+A(function() local function f(...) return table.pack(...).n end return f(1, nil, 3) end)
+A(function() local function g(...) return ... end local function f(...) return g(...) end return f(7, 8, 9) end)
+A(function() local function g(...) return select('#', ...) end local function f(...) return g(...) end return f() end)
+A(function() local function f(...) for i = 1, select('#', ...) do local v = select(i, ...) if v == 2 then return i end end return -1 end return f(1, 2, 3) end)
+A(function() local function f(...) return select(2, ...) end return f('a', 'b', 'c') end)
+A(function() local function f(...) return select(-1, ...) end return f('a', 'b', 'c') end)
+A(function() local function f(...) return table.unpack({...}) end return f(1, 2, 3) end)
+A(function() local function f(...) return ... + 1 end return f(41) end)
+A(function() local function f(...) local t = {...} t[#t + 1] = 9 return table.concat(t, ',') end return f(1, 2) end)
+A(function() local function f(...) return ({...})[1] end return f(1, 2) end)
+A(function() local function f(...) return ({...})[3] end return f(1, 2) end)
+A(function() local function f(a, ...) return a, ... end return f(1, 2, 3, 4) end)
+A(function() local function f(...) return select('#', ...) .. type(...) end return f(1) end)
+A(function() local function f(...) local s = 0 for _, v in ipairs({...}) do s = s + v end return s end return f(1, 2, 3) end)
+A(function() local function f(...) return tostring(...) end return f(42) end)
+A(function() local function f(...) return string.format('%d-%d', ...) end return f(1, 2) end)
+A(function() local function f(...) return math.max(...) end return f(3, 1, 2) end)
+A(function() local function f(n, ...) if n > 0 then return f(n - 1, ...) end return ... end return f(3, 'x') end)
+A(function() local function f(...) return ... end return f(f(1, 2), f(3, 4)) end)
+A(function() local function f(...) return ... end return table.pack(f(1, 2)).n end)
+A(function() local function f(...) coroutine.yield(...) end local co = coroutine.create(f) return coroutine.resume(co, 1, 2, 3) end)
+
+return table.concat(out, '\n')

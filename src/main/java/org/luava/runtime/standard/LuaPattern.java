@@ -747,7 +747,11 @@ public final class LuaPattern {
                 }
             }
             pos = srcLen + 1;
-            return LuaNil.NIL;
+            // PUC's gmatch_aux returns 0 results when exhausted, not one nil.
+            // Returning a single nil would make `select('#', it())` report 1
+            // and would let a raw iterator result misbehave in multi-value
+            // contexts (e.g. `it()` as the last expression).
+            return Varargs.EMPTY;
         }
 
         private LuaValue nextSimple() {
@@ -790,7 +794,8 @@ public final class LuaPattern {
                 }
             }
             pos = srcLen + 1;
-            return LuaNil.NIL;
+            // Exhausted: zero results, exactly like gmatch_aux.
+            return Varargs.EMPTY;
         }
 
         @Override

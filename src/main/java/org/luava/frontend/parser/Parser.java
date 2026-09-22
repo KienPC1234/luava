@@ -103,6 +103,13 @@ public final class Parser {
         final List<LabelDef> labels = new ArrayList<>();
         final List<GotoRef> gotos = new ArrayList<>();
         BlockContext currentBlock = null;
+        /**
+         * Number of enclosing loops in this function. PUC rejects a
+         * {@code break} outside any loop as a syntax error; a plain counter
+         * is enough because any break inside a loop (even nested in an
+         * {@code if}/{@code do} block) targets the innermost one.
+         */
+        int loopDepth = 0;
 
         FunctionContext(FunctionContext parent, int lineDefined, Scope outerScope) {
             this.parent = parent;
@@ -320,6 +327,10 @@ public final class Parser {
                 case DO -> parseDoStatement();
                 case BREAK -> {
                     advance();
+                    if (currentFuncCtx.loopDepth == 0) {
+                        throw new ParseException("break outside loop at line " + token.line(),
+                                token.line(), token.column());
+                    }
                     yield new Statements.BreakStmt(token.line(), token.column());
                 }
                 case GOTO -> {
@@ -487,7 +498,13 @@ public final class Parser {
         Expression cond = parseExpression();
         consume(TokenType.DO, "'do' expected");
         enterScope();
-        Statements.BlockStmt body = parseBlockInternal();
+        currentFuncCtx.loopDepth++;
+        Statements.BlockStmt body;
+        try {
+            body = parseBlockInternal();
+        } finally {
+            currentFuncCtx.loopDepth--;
+        }
         exitScope();
         Token endToken = checkMatch(TokenType.END, TokenType.WHILE, whileToken);
         return new Statements.WhileStmt(cond, body, whileToken.line(), whileToken.column(), endToken.line());
@@ -496,7 +513,13 @@ public final class Parser {
     private Statement parseRepeatStatement() {
         Token repeatToken = advance(); // consume 'repeat'
         enterScope();
-        Statements.BlockStmt body = parseBlockInternal();
+        currentFuncCtx.loopDepth++;
+        Statements.BlockStmt body;
+        try {
+            body = parseBlockInternal();
+        } finally {
+            currentFuncCtx.loopDepth--;
+        }
         checkMatch(TokenType.UNTIL, TokenType.REPEAT, repeatToken);
         Expression cond = parseExpression();
         exitScope();
@@ -519,7 +542,13 @@ public final class Parser {
             consume(TokenType.DO, "'do' expected");
             enterScope();
             defineLocal(varName.lexeme(), false, varName);
-            Statements.BlockStmt body = parseBlockInternal();
+            currentFuncCtx.loopDepth++;
+            Statements.BlockStmt body;
+            try {
+                body = parseBlockInternal();
+            } finally {
+                currentFuncCtx.loopDepth--;
+            }
             exitScope();
             Token endToken = checkMatch(TokenType.END, TokenType.FOR, forToken);
             return new Statements.ForNumericStmt(varName.lexeme(), start, limit, step, body, forToken.line(), forToken.column(), endToken.line());
@@ -544,7 +573,13 @@ public final class Parser {
             for (String v : vars) {
                 defineLocal(v, false, forToken);
             }
-            Statements.BlockStmt body = parseBlockInternal();
+            currentFuncCtx.loopDepth++;
+            Statements.BlockStmt body;
+            try {
+                body = parseBlockInternal();
+            } finally {
+                currentFuncCtx.loopDepth--;
+            }
             exitScope();
             Token endToken = checkMatch(TokenType.END, TokenType.FOR, forToken);
             return new Statements.ForGenericStmt(vars, iterators, body, forToken.line(), forToken.column(), endToken.line());

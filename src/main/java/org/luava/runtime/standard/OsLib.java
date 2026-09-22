@@ -228,7 +228,7 @@ public final class OsLib {
                         throw new LuaException("bad argument #1 to 'os.date' (invalid conversion specifier '%" + fmt.substring(convStart) + "')");
                     }
                     sIdx += opLen;
-                    b.append(OsTime.formatSpec(spec, f, tmYear, dispYear, offSecs, zone));
+                    b.append(OsTime.formatSpec(spec, f, tmYear, dispYear, offSecs, zone, isUtc, dst));
                 }
             }
             return LuaString.valueOf(b.toString());

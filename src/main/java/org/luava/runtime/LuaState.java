@@ -592,7 +592,34 @@ public final class LuaState {
         for (int i = 0; i < args.length; i++) {
             luaArgs[i] = LuaDataConverter.toLua(args[i]);
         }
-        return fn.call(luaArgs);
+        return guardHostBoundary(() -> fn.call(luaArgs));
+    }
+
+    /**
+     * Runs a host-initiated entry point, converting any unchecked Java
+     * throwable that is not a Lua control-flow signal into a {@link
+     * LuaException}. This is the embedding contract from AGENTS.md §IV.2:
+     * an internal {@code NullPointerException}/{@code IndexOutOfBoundsException}
+     * must never leak to the host application. Control-flow signals
+     * ({@link LuaException} itself, {@link LuaExit},
+     * {@link org.luava.runtime.eval.LuaUnwindException},
+     * {@link org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal})
+     * pass through unchanged so {@code os.exit}, coroutine close and error
+     * unwinding keep their semantics.
+     */
+    private static <T> T guardHostBoundary(java.util.function.Supplier<T> body) {
+        try {
+            return body.get();
+        } catch (LuaException | LuaExit
+                | org.luava.runtime.eval.LuaUnwindException
+                | org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal e) {
+            throw e;
+        } catch (StackOverflowError e) {
+            throw new LuaException("stack overflow");
+        } catch (Throwable t) {
+            String msg = t.getMessage() != null ? t.getMessage() : t.toString();
+            throw new LuaException("internal error: " + t.getClass().getSimpleName() + ": " + msg);
+        }
     }
 
     public LuaValue eval(String luaSource) {
@@ -615,11 +642,13 @@ public final class LuaState {
         JavaAccessPolicy prevPolicy = JavaAccessPolicy.setActive(javaAccessPolicy);
         armGuard();
         try {
-            LuaFunction chunk = compile(luaSource, chunkName, globals);
-            if (chunk instanceof org.luava.runtime.bytecode.LuaClosure lc) {
-                lc.setState(this);
-            }
-            return chunk.call();
+            return guardHostBoundary(() -> {
+                LuaFunction chunk = compile(luaSource, chunkName, globals);
+                if (chunk instanceof org.luava.runtime.bytecode.LuaClosure lc) {
+                    lc.setState(this);
+                }
+                return chunk.call();
+            });
         } finally {
             JavaAccessPolicy.restoreActive(prevPolicy);
             if (prevMax == null) {
