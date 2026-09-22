@@ -254,4 +254,81 @@ public class JavaBindingComprehensiveTest {
         assertThrows(LuaException.class, () -> state.eval("return echo(true)"));
         assertThrows(LuaException.class, () -> state.eval("return echo({})"));
     }
+
+    /**
+     * {@code obj.method} is re-read on every loop iteration; the resolved
+     * invoker must be memoized so the read returns the same function object
+     * and does not rebuild the candidate set. Semantics (including overload
+     * resolution) must be unchanged.
+     */
+    @Test
+    void methodInvokerIsMemoizedPerUserdata() {
+        state.setLive("demo", new OverloadDemo());
+        LuaValue first = state.eval("return demo.process");
+        LuaValue second = state.eval("return demo.process");
+        assertTrue(first == second,
+                "repeated property reads must return the cached method invoker");
+        assertEquals("string:x", state.eval("return demo.process('x')").toLuaString());
+        assertEquals("int:5", state.eval("return demo.process(5)").toLuaString());
+    }
+
+    /**
+     * A Lua function passed where a Java SAM is expected must still adapt
+     * after the MethodHandle-based, cached implementation.
+     */
+    @Test
+    void samProxyUsesCachedMethodHandle() {
+        AtomicBoolean called = new AtomicBoolean(false);
+        Consumer<String> consumer = s -> called.set(true);
+        state.setLive("consumer", consumer);
+        state.eval("consumer('x')");
+        assertTrue(called.get());
+        // The adapter created from a Lua function must work in both directions.
+        state.registerFunction("runTwice", Runnable.class, (Runnable r) -> { r.run(); r.run(); });
+        state.eval("local n=0 runTwice(function() n=n+1 end) seen=n");
+        assertEquals(2L, state.eval("return seen").toLong());
+    }
+
+    /**
+     * A Java object implementing a SAM interface must be callable from Lua
+     * through the cached handle, with primitive argument coercion preserved.
+     */
+    @Test
+    void samObjectCallFromLuaNarrowsLongToInt() {
+        state.setLive("op", (java.util.function.IntUnaryOperator) x -> x * 3);
+        assertEquals(63L, state.eval("return op(21)").toLong());
+    }
+
+    /** A method whose body throws must be invoked exactly once. */
+    public static class ThrowingSvc {
+        public int calls = 0;
+
+        public void boom(int x) {
+            calls++;
+            throw new IllegalArgumentException("target threw");
+        }
+
+        public void boomCast(Object x) {
+            calls++;
+            throw new ClassCastException("target cast");
+        }
+    }
+
+    /**
+     * Regression: {@code MethodHandle.invokeWithArguments} propagates the
+     * target's own {@code IllegalArgumentException}/{@code ClassCastException}
+     * unchanged (unlike {@code Method.invoke}, which wraps them in
+     * {@code InvocationTargetException}), so the old "narrow longs and retry"
+     * catch re-invoked a method that threw and double-applied its side effects.
+     * The method body must run exactly once.
+     */
+    @Test
+    void throwingJavaMethodIsInvokedExactlyOnce() {
+        ThrowingSvc svc = new ThrowingSvc();
+        state.setLive("svc", svc);
+        assertThrows(LuaException.class, () -> state.eval("svc.boom(1)"));
+        assertEquals(1, svc.calls, "IllegalArgumentException from the target must not retrigger a call");
+        assertThrows(LuaException.class, () -> state.eval("svc.boomCast('x')"));
+        assertEquals(2, svc.calls, "ClassCastException from the target must not retrigger a call");
+    }
 }

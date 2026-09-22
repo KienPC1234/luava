@@ -18,6 +18,8 @@ import org.luava.runtime.LuaTable;
 import org.luava.runtime.LuaUserdata;
 import org.luava.runtime.LuaValue;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Array;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -31,9 +33,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class LuaDataConverter {
     private LuaDataConverter() {}
+
+    /** Cached SAM lookup: interface -> the unique abstract method (or NONE). */
+    private static final Map<Class<?>, Method> SAM_METHOD_CACHE = new ConcurrentHashMap<>();
+    private static final Set<Class<?>> NO_SAM = ConcurrentHashMap.newKeySet();
+    /** Cached unreflected SAM handles, keyed by the abstract method. */
+    private static final Map<Method, MethodHandle> SAM_HANDLE_CACHE = new ConcurrentHashMap<>();
 
     /**
      * Converts a host Java {@code String} (Unicode text) into a Lua string.
@@ -416,16 +425,28 @@ public final class LuaDataConverter {
 
     public static Method findSingleAbstractMethod(Class<?> iface) {
         if (!iface.isInterface()) return null;
+        if (NO_SAM.contains(iface)) return null;
+        Method cached = SAM_METHOD_CACHE.get(iface);
+        if (cached != null) return cached;
         Method candidate = null;
         for (Method m : iface.getMethods()) {
             if (Modifier.isAbstract(m.getModifiers())) {
                 if (isObjectMethod(m)) continue;
                 if (candidate != null) {
-                    return null; // More than one abstract method
+                    // More than one abstract method: remember the negative
+                    // result so repeated scoreArg/conversion probes do not
+                    // rescan the interface on every call.
+                    NO_SAM.add(iface);
+                    return null;
                 }
                 candidate = m;
             }
         }
+        if (candidate == null) {
+            NO_SAM.add(iface);
+            return null;
+        }
+        SAM_METHOD_CACHE.put(iface, candidate);
         return candidate;
     }
 
@@ -440,29 +461,79 @@ public final class LuaDataConverter {
 
     @SuppressWarnings("unchecked")
     private static <T> T createSamProxy(Class<T> iface, LuaFunction fn, Method samMethod) {
-        return (T) Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface}, (proxy, method, args) -> {
-            if (method.getName().equals("equals")) {
+        return (T) Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface},
+                new SamInvocationHandler(iface, fn, samMethod));
+    }
+
+    /**
+     * Invocation handler for a Lua-function SAM proxy. The abstract method
+     * is pre-resolved (never re-derived per invocation); only {@code equals},
+     * {@code hashCode}, {@code toString} and the single abstract method are
+     * ever accepted. Each call converts the Java arguments through the same
+     * {@link #toLua}/{@link #toJava} bridge the rest of the interop layer
+     * uses, so semantics are identical to {@code JavaInteropLib} proxies.
+     */
+    private static final class SamInvocationHandler implements java.lang.reflect.InvocationHandler {
+        private final Class<?> iface;
+        private final LuaFunction fn;
+        private final Method samMethod;
+        private final String samName;
+        private final Class<?> returnType;
+
+        SamInvocationHandler(Class<?> iface, LuaFunction fn, Method samMethod) {
+            this.iface = iface;
+            this.fn = fn;
+            this.samMethod = samMethod;
+            this.samName = samMethod.getName();
+            this.returnType = samMethod.getReturnType();
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) {
+            String name = method.getName();
+            if ("equals".equals(name)) {
                 return args != null && args.length == 1 && args[0] == proxy;
             }
-            if (method.getName().equals("hashCode")) {
+            if ("hashCode".equals(name)) {
                 return System.identityHashCode(proxy);
             }
-            if (method.getName().equals("toString")) {
+            if ("toString".equals(name)) {
                 return "LuaSAMProxy:" + iface.getSimpleName() + "@" + Integer.toHexString(System.identityHashCode(proxy));
             }
-            if (method.getName().equals(samMethod.getName())) {
-                int count = (args != null ? args.length : 0);
-                LuaValue[] luaArgs = new LuaValue[count];
-                for (int i = 0; i < count; i++) {
-                    luaArgs[i] = toLua(args[i]);
-                }
-                LuaValue res = fn.call(luaArgs);
-                if (samMethod.getReturnType() == void.class || samMethod.getReturnType() == Void.class) {
-                    return null;
-                }
-                return toJava(res, samMethod.getReturnType());
+            if (!name.equals(samName) || method.getParameterCount() != samMethod.getParameterCount()) {
+                throw new UnsupportedOperationException("Method " + name + " is not supported on SAM proxy");
             }
-            throw new UnsupportedOperationException("Method " + method.getName() + " is not supported on SAM proxy");
-        });
+            int count = (args != null ? args.length : 0);
+            LuaValue[] luaArgs = new LuaValue[count];
+            for (int i = 0; i < count; i++) {
+                luaArgs[i] = toLua(args[i]);
+            }
+            LuaValue res = fn.call(luaArgs);
+            if (returnType == void.class || returnType == Void.class) {
+                return null;
+            }
+            return toJava(res, returnType);
+        }
+    }
+
+    /**
+     * Returns a cached, unreflected {@link MethodHandle} for a SAM method.
+     * Prefer this over {@code Method.invoke} on any hot Java-interop path so
+     * the reflection cost is paid once per method and C2 can optimize the
+     * call site. Returns {@code null} when the method cannot be unreflected.
+     */
+    public static MethodHandle samHandle(Method method) {
+        MethodHandle h = SAM_HANDLE_CACHE.get(method);
+        if (h != null) {
+            return h;
+        }
+        try {
+            method.setAccessible(true);
+            MethodHandle mh = MethodHandles.lookup().unreflect(method);
+            MethodHandle prev = SAM_HANDLE_CACHE.putIfAbsent(method, mh);
+            return prev != null ? prev : mh;
+        } catch (IllegalAccessException e) {
+            return null;
+        }
     }
 }

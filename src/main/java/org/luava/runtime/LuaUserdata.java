@@ -30,6 +30,18 @@ public final class LuaUserdata extends LuaValue {
     private final boolean isLight;
     private LuaTable metatable;
     private final LuaValue[] userValues;
+    /**
+     * Per-userdata memo for resolved method invokers. A Lua loop such as
+     * {@code for ... do obj.method(x) end} reads {@code obj.method} every
+     * iteration; without this, each read allocated a fresh {@link LuaFunction}
+     * and re-resolved the candidate overload set. Keys are only inserted for
+     * names that actually matched a Java method, so the map stays bounded by
+     * the class's public API. Null for light userdata.
+     */
+    private ConcurrentHashMap<String, LuaFunction> methodCache;
+    /** Cached single-abstract-method lookup for the SAM call lane. */
+    private volatile boolean samResolved;
+    private volatile Method samMethod;
 
     public LuaUserdata(Object instance) {
         this(instance, false, 1);
@@ -182,6 +194,8 @@ public final class LuaUserdata extends LuaValue {
                 // Static methods
                 List<Method> methods = findMethods(clazz, name, true);
                 if (!methods.isEmpty()) {
+                    LuaFunction fn = cachedInvoker(name, null, methods);
+                    if (fn != null) return fn;
                     return createMethodInvoker(null, name, methods);
                 }
             } else {
@@ -200,6 +214,8 @@ public final class LuaUserdata extends LuaValue {
                 // Instance methods
                 List<Method> methods = findMethods(clazz, name, false);
                 if (!methods.isEmpty()) {
+                    LuaFunction fn = cachedInvoker(name, instance, methods);
+                    if (fn != null) return fn;
                     return createMethodInvoker(instance, name, methods);
                 }
 
@@ -232,41 +248,11 @@ public final class LuaUserdata extends LuaValue {
         }
 
         if (instance != null) {
-            // Check if instance implements a Single Abstract Method (SAM) interface
-            Class<?> clazz = instance.getClass();
-            Method sam = null;
-            for (Class<?> iface : clazz.getInterfaces()) {
-                Method ifaceSam = LuaDataConverter.findSingleAbstractMethod(iface);
-                if (ifaceSam != null) {
-                    for (Method m : clazz.getMethods()) {
-                        if (m.getName().equals(ifaceSam.getName()) && !m.isBridge()) {
-                            sam = m;
-                            break;
-                        }
-                    }
-                    if (sam == null) sam = ifaceSam;
-                    break;
-                }
-            }
-            if (sam == null) {
-                sam = LuaDataConverter.findSingleAbstractMethod(clazz);
-            }
-
+            Method sam = resolveSam();
             if (sam != null) {
                 try {
-                    sam.setAccessible(true);
                     Object[] javaArgs = convertArgs(sam.getParameterTypes(), sam.isVarArgs(), args);
-                    Object res;
-                    try {
-                        res = sam.invoke(instance, javaArgs);
-                    } catch (IllegalArgumentException iae) {
-                        for (int i = 0; i < javaArgs.length; i++) {
-                            if (javaArgs[i] instanceof Long l && l >= Integer.MIN_VALUE && l <= Integer.MAX_VALUE) {
-                                javaArgs[i] = l.intValue();
-                            }
-                        }
-                        res = sam.invoke(instance, javaArgs);
-                    }
+                    Object res = invokeSam(sam, instance, javaArgs);
                     if (sam.getReturnType() == void.class || sam.getReturnType() == Void.class) {
                         return LuaNil.NIL;
                     }
@@ -365,6 +351,43 @@ public final class LuaUserdata extends LuaValue {
         throw new LuaException("Cannot set field '" + key.toLuaString() + "' on Java object " + instance);
     }
 
+    /**
+     * Resolves (once per userdata) the single abstract method implemented by
+     * the wrapped instance, so {@code userdata(args)} can forward to a SAM
+     * interface without rescanning interfaces on every call.
+     */
+    private Method resolveSam() {
+        if (samResolved) {
+            return samMethod;
+        }
+        synchronized (this) {
+            if (samResolved) {
+                return samMethod;
+            }
+            Class<?> clazz = instance.getClass();
+            Method sam = null;
+            for (Class<?> iface : clazz.getInterfaces()) {
+                Method ifaceSam = LuaDataConverter.findSingleAbstractMethod(iface);
+                if (ifaceSam != null) {
+                    for (Method m : clazz.getMethods()) {
+                        if (m.getName().equals(ifaceSam.getName()) && !m.isBridge()) {
+                            sam = m;
+                            break;
+                        }
+                    }
+                    if (sam == null) sam = ifaceSam;
+                    break;
+                }
+            }
+            if (sam == null) {
+                sam = LuaDataConverter.findSingleAbstractMethod(clazz);
+            }
+            samMethod = sam;
+            samResolved = true;
+            return sam;
+        }
+    }
+
     private static LuaFunction createConstructorFunction(Class<?> clazz) {
         return LuaFunction.of(args -> {
             List<Constructor<?>> ctors = CTOR_CACHE.computeIfAbsent(clazz, c -> Arrays.asList(c.getConstructors()));
@@ -393,6 +416,34 @@ public final class LuaUserdata extends LuaValue {
         });
     }
 
+    /**
+     * Returns the per-userdata memoized invoker for {@code name}, creating it
+     * on first use. The bound target is always this userdata's own instance
+     * (or null for static members), so no key beyond the name is needed.
+     */
+    private LuaFunction cachedInvoker(String name, Object target, List<Method> candidates) {
+        if (isLight) {
+            return null;
+        }
+        ConcurrentHashMap<String, LuaFunction> cache = methodCache;
+        if (cache == null) {
+            synchronized (this) {
+                cache = methodCache;
+                if (cache == null) {
+                    cache = new ConcurrentHashMap<>();
+                    methodCache = cache;
+                }
+            }
+        }
+        LuaFunction existing = cache.get(name);
+        if (existing != null) {
+            return existing;
+        }
+        LuaFunction created = createMethodInvoker(target, name, candidates);
+        LuaFunction prev = cache.putIfAbsent(name, created);
+        return prev != null ? prev : created;
+    }
+
     private static LuaFunction createMethodInvoker(Object target, String methodName, List<Method> candidates) {
         return LuaFunction.of(args -> {
             Method bestMatch = null;
@@ -413,7 +464,7 @@ public final class LuaUserdata extends LuaValue {
 
             try {
                 Object[] javaArgs = convertArgs(bestMatch.getParameterTypes(), bestMatch.isVarArgs(), args);
-                Object result = bestMatch.invoke(target, javaArgs);
+                Object result = invokeResolved(bestMatch, target, javaArgs);
                 if (bestMatch.getReturnType() == void.class || bestMatch.getReturnType() == Void.class) {
                     return LuaNil.NIL;
                 }
@@ -422,6 +473,76 @@ public final class LuaUserdata extends LuaValue {
                 throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }
         });
+    }
+
+    /**
+     * Memoized, unreflected invocation for a resolved method. The
+     * {@link java.lang.invoke.MethodHandle} is cached by
+     * {@link LuaDataConverter#samHandle(Method)} (per {@code Method}, so per
+     * overload), replacing the repeated {@code Method.invoke} reflection the
+     * interop layer used to pay on every call.
+     *
+     * <p>Arguments are already converted to the exact declared parameter types
+     * by {@link #convertArgs}, so no widening retry is needed. That matters
+     * for correctness: unlike {@code Method.invoke}, which wraps any exception
+     * thrown by the target in {@code InvocationTargetException},
+     * {@code MethodHandle.invokeWithArguments} propagates the target's own
+     * {@code IllegalArgumentException}/{@code ClassCastException} unchanged,
+     * so catching them here to "retry" would re-invoke a method that threw and
+     * double-apply its side effects.
+     */
+    private static Object invokeResolved(Method method, Object target, Object[] javaArgs) throws Throwable {
+        java.lang.invoke.MethodHandle mh = LuaDataConverter.samHandle(method);
+        if (mh == null) {
+            return method.invoke(target, javaArgs);
+        }
+        return mh.invokeWithArguments(withReceiver(method, target, javaArgs));
+    }
+
+    /**
+     * Invokes a Java object that implements a SAM interface (a lambda or
+     * anonymous class) from Lua. Such a method's erased parameter type is
+     * {@code Object}, so a Lua integer becomes a {@code Long} while the typed
+     * lambda body may expect an {@code Integer}; a {@code Method.invoke} with
+     * the wrong box throws a pre-invocation {@code IllegalArgumentException}.
+     * Narrowing the integers and retrying once fixes that, and is safe
+     * <em>only</em> because {@code Method.invoke} wraps any exception the
+     * target itself throws in {@code InvocationTargetException} (so a bare
+     * {@code IllegalArgumentException} is a type mismatch, never a target
+     * failure already applied). {@code MethodHandle} does not wrap, so it
+     * cannot be used for this retry.
+     */
+    private static Object invokeSam(Method method, Object target, Object[] javaArgs) throws Throwable {
+        method.setAccessible(true);
+        try {
+            return method.invoke(target, javaArgs);
+        } catch (IllegalArgumentException iae) {
+            boolean narrowed = false;
+            for (int i = 0; i < javaArgs.length; i++) {
+                if (javaArgs[i] instanceof Long l && l >= Integer.MIN_VALUE && l <= Integer.MAX_VALUE) {
+                    javaArgs[i] = l.intValue();
+                    narrowed = true;
+                }
+            }
+            if (!narrowed) {
+                throw iae;
+            }
+            return method.invoke(target, javaArgs);
+        }
+    }
+
+    /**
+     * An unreflected instance-method handle takes the receiver as its leading
+     * argument, so prepend it. Static methods take the arguments unchanged.
+     */
+    private static Object[] withReceiver(Method method, Object target, Object[] javaArgs) {
+        if (Modifier.isStatic(method.getModifiers())) {
+            return javaArgs;
+        }
+        Object[] effective = new Object[javaArgs.length + 1];
+        effective[0] = target;
+        System.arraycopy(javaArgs, 0, effective, 1, javaArgs.length);
+        return effective;
     }
 
     private static int scoreParameters(Class<?>[] paramTypes, boolean isVarArgs, LuaValue[] args) {
