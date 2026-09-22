@@ -109,7 +109,7 @@ code naturally, intuitively, and without latency:
 ### Phase 1: Stabilize Test Harness & Fix Logic Bugs (DONE: 31/31 Suites Passed at the time)
 > Historical milestone count. The current harness excludes `all.lua`,
 > `main.lua` and `heavy.lua` by design and runs **30/30** runnable PUC
-> suites + **111** unit tests (`README.md`, `OfficialSuiteEvaluationTest`).
+> suites + **213** unit tests (`README.md`, `OfficialSuiteEvaluationTest`).
 
 1. **Standardize the Test Harness**:
    - Exclude `all.lua` from automatic per-file runs in

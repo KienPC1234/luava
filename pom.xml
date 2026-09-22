@@ -4,13 +4,20 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>org.luava</groupId>
+    <!--
+      Released coordinates. The groupId is the Sonatype-verified namespace
+      (io.github.kienpc1234 is verified through the GitHub account KienPC1234).
+      Once a version is published it can never be changed, so keep groupId and
+      artifactId stable across releases.
+    -->
+    <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>0.1.0-alpha</version>
     <packaging>jar</packaging>
 
     <name>Luava</name>
-    <description>High-Performance Pure Java Lua 5.4 Compiler and Runtime on Java 21</description>
+    <description>Pure-Java Lua 5.4 engine for the JVM: register bytecode VM, hybrid tiered JIT, sandboxing and Java interop.</description>
+    <url>https://github.com/KienPC1234/luava</url>
 
     <licenses>
         <license>
@@ -20,42 +27,99 @@
         </license>
     </licenses>
 
+    <developers>
+        <developer>
+            <id>KienPC1234</id>
+            <name>Ha Tri Kien</name>
+            <url>https://github.com/KienPC1234</url>
+        </developer>
+    </developers>
+
+    <scm>
+        <connection>scm:git:https://github.com/KienPC1234/luava.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/KienPC1234/luava.git</developerConnection>
+        <url>https://github.com/KienPC1234/luava</url>
+    </scm>
+
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
         <junit.jupiter.version>5.10.2</junit.jupiter.version>
+        <asm.version>9.7</asm.version>
+
+        <!-- Plugin versions (kept in one place so release tooling is reproducible). -->
+        <maven.compiler.plugin.version>3.13.0</maven.compiler.plugin.version>
+        <maven.shade.plugin.version>3.5.1</maven.shade.plugin.version>
+        <maven.surefire.plugin.version>3.2.5</maven.surefire.plugin.version>
+        <maven.source.plugin.version>3.3.1</maven.source.plugin.version>
+        <maven.javadoc.plugin.version>3.8.0</maven.javadoc.plugin.version>
+        <maven.gpg.plugin.version>3.2.8</maven.gpg.plugin.version>
+        <central.publishing.plugin.version>0.11.0</central.publishing.plugin.version>
+        <spotless.plugin.version>2.43.0</spotless.plugin.version>
     </properties>
 
     <dependencies>
+        <!--
+          ASM is shaded into the published jar (relocated to
+          org.luava.shaded.asm), so it is an implementation detail: consumers
+          get a single dependency-free artifact and do not inherit a transitive
+          ASM. The dependency stays compile-scoped for the build.
+        -->
+        <!--
+          ASM is shaded into the published jar and relocated to
+          org.luava.shaded.asm, so it is an implementation detail. Marking it
+          optional keeps it on the build classpath (so the shade plugin
+          bundles it) while ensuring consumers do NOT inherit a transitive
+          ASM dependency and cannot clash with their own version.
+        -->
+        <dependency>
+            <groupId>org.ow2.asm</groupId>
+            <artifactId>asm</artifactId>
+            <version>${asm.version}</version>
+            <optional>true</optional>
+        </dependency>
+
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>
             <version>${junit.jupiter.version}</version>
             <scope>test</scope>
         </dependency>
-        <dependency>
-            <groupId>org.ow2.asm</groupId>
-            <artifactId>asm</artifactId>
-            <version>9.7</version>
-        </dependency>
     </dependencies>
 
     <build>
+        <!-- MPL 2.0 requires the license text to travel with the artifact. -->
+        <resources>
+            <resource>
+                <directory>${project.basedir}</directory>
+                <targetPath>META-INF</targetPath>
+                <includes>
+                    <include>LICENSE</include>
+                </includes>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.13.0</version>
+                <version>${maven.compiler.plugin.version}</version>
                 <configuration>
                     <release>21</release>
                 </configuration>
             </plugin>
+
+            <!--
+              Shade ASM into the jar and relocate it, so the published artifact
+              has zero runtime dependencies and cannot clash with a consumer's
+              own ASM version. The shaded jar replaces the main artifact.
+            -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.5.1</version>
+                <version>${maven.shade.plugin.version}</version>
                 <executions>
                     <execution>
                         <phase>package</phase>
@@ -64,20 +128,44 @@
                         </goals>
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <shadedArtifactAttached>false</shadedArtifactAttached>
+                            <transformers>
+                                <!-- Expose the version to org.luava.cli.Main's -v. -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>org.luava.cli.Main</mainClass>
+                                    <manifestEntries>
+                                        <Implementation-Title>Luava</Implementation-Title>
+                                        <Implementation-Version>${project.version}</Implementation-Version>
+                                        <Implementation-Vendor>Ha Tri Kien</Implementation-Vendor>
+                                    </manifestEntries>
+                                </transformer>
+                            </transformers>
                             <relocations>
                                 <relocation>
                                     <pattern>org.objectweb.asm</pattern>
                                     <shadedPattern>org.luava.shaded.asm</shadedPattern>
                                 </relocation>
                             </relocations>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
                         </configuration>
                     </execution>
                 </executions>
             </plugin>
+
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
-                <version>3.2.5</version>
+                <version>${maven.surefire.plugin.version}</version>
                 <configuration>
                     <argLine>-Xmx2g</argLine>
                     <systemPropertyVariables>
@@ -85,10 +173,11 @@
                     </systemPropertyVariables>
                 </configuration>
             </plugin>
+
             <plugin>
                 <groupId>com.diffplug.spotless</groupId>
                 <artifactId>spotless-maven-plugin</artifactId>
-                <version>2.43.0</version>
+                <version>${spotless.plugin.version}</version>
                 <configuration>
                     <java>
                         <licenseHeader>
@@ -117,4 +206,100 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+          Publishing profile: `mvn -Prelease deploy`.
+
+          GPG signing is deliberately opt-in so a normal `mvn package`/`mvn test`
+          needs neither a GPG key nor a passphrase. Credentials for the
+          Sonatype Central Portal (a User Token) and the GPG passphrase come
+          from ~/.m2/settings.xml (server id "central") and the environment.
+          Nothing secret belongs in this file.
+        -->
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>${maven.source.plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>${maven.javadoc.plugin.version}</version>
+                        <configuration>
+                            <!--
+                              Alpha release: keep doclint quiet so a missing
+                              @param on a public method cannot fail the release
+                              build. Tighten before 1.0.
+                            -->
+                            <doclint>none</doclint>
+                            <quiet>true</quiet>
+                            <notimestamp>true</notimestamp>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>${maven.gpg.plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <!-- Loopback lets the passphrase come from the env
+                                 (MAVEN_GPG_PASSPHRASE) in CI, without a TTY. -->
+                            <gpgArguments>
+                                <arg>--pinentry-mode</arg>
+                                <arg>loopback</arg>
+                            </gpgArguments>
+                        </configuration>
+                    </plugin>
+
+                    <!--
+                      Official Sonatype Central Publisher Portal plugin. It
+                      uploads the signed bundle and (with autoPublish) releases
+                      it once validation passes.
+                    -->
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>${central.publishing.plugin.version}</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <autoPublish>true</autoPublish>
+                            <waitUntil>published</waitUntil>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

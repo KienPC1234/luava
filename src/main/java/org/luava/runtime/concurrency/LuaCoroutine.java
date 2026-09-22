@@ -353,7 +353,8 @@ public final class LuaCoroutine extends LuaValue {
 
     /**
      * Directly fires the line hook for BytecodeVM execution.
-     * Lua 5.4 semantics (ldebug.c: npci <= oldpc || changedline) are evaluated in BytecodeVM loop.
+     * Lua 5.4 semantics (ldebug.c: npci {@code <=} oldpc || changedline) are
+     * evaluated in the BytecodeVM loop.
      */
     public void fireLineHookDirect(int line, CallStack.Frame frame) {
         if (hookConfig.hook.isNil() || hookConfig.inHook || !hookConfig.hookLine) {

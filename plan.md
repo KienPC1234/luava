@@ -9,10 +9,12 @@
 > (đã xóa). Hồ sơ thiết kế register-VM cốt lõi được cô đọng lại ở §2; nhật ký
 > thất bại quan trọng được bảo tồn ở §9.
 >
-> Cập nhật: 2026-09-20. Trạng thái: **Phase A, B, C, D, E đã hoàn thành**. Độ
-> phủ mở rộng từ ~4/24 lên ~19/24 dạng cấu trúc; 190 unit test + 30/30 suite
-> PUC xanh (ép prewarm mọi proto hợp lệ cũng 30/30). Xem §12 để biết trạng thái
-> từng phase.
+> Cập nhật: 2026-09-21. Trạng thái: **Phase A, B, C, D, E, F (generic-for),
+> I đã hoàn thành**; thêm string-receiver `SELF`, tương tác Java dùng
+> `MethodHandle` cache, virtual module loader và CLI/REPL. Độ phủ mở rộng từ
+> ~4/24 lên ~21/24 dạng cấu trúc; 213 unit test + 30/30 suite PUC xanh (ép
+> prewarm mọi proto hợp lệ và ngưỡng JIT=1 cũng 30/30). Xem §12 để biết trạng
+> thái từng phase.
 
 ---
 
@@ -24,7 +26,8 @@
   - JIT on/off: fib **0.049** (20×), arith main loop **0.18–0.21** (~5×),
     table ops **0.36** (2.8×), closures 0.50, hash 0.73, oop 0.74; còn
     pattern (cần `TFOR*`) và sieve (cần multret) ≈ 1.0.
-  - **5/10 kernel benchmark** được compile (01/03/05/07 + hàm 02/08).
+  - **7/10 kernel benchmark** được compile (01/02/03/05/07/09/10; 08 được hàm
+    `dot`/`length`).
 - **Nút thắt đầu tiên (đã xử lý):** hotness chỉ đếm ở `OP_CALL`/`OP_TAILCALL`,
   và main chunk luôn `isVararg=true` → vòng lặp ở chunk chính không tier-up.
   Đã thêm tier-up theo loop tại `FORPREP` + entry JIT top-level (kể cả void).
@@ -198,20 +201,21 @@ Chú thích: ✅ compile · ❌ reject · (lý do opcode reject)
 
 | task | kernel JIT? | JIT on/off | vs LuaJ (paired) |
 |---|---|---|---|
-| 01 arith (main loop) | ✅ main chunk (void + loop) | **0.18–0.21** | **8.3×** |
-| 02 fib | ✅ `fib` | **0.049** | **9.93×** |
-| 03 table (main loop) | ✅ main chunk (impure, call deopt) | **0.36** | ~1.03× |
-| 04 concat (main loop) | ❌ (main không eligible) | ~0.85–0.96 (nhiễu) | ~0.9× |
+| 01 arith (main loop) | ✅ main chunk (void + loop) | **0.19–0.21** | **8.3×** |
+| 02 fib | ✅ `fib` | **0.047** | **9.93×** |
+| 03 table (main loop) | ✅ main chunk (impure, call deopt) | **0.37** | ~1.03× |
+| 04 concat (main loop) | ✅ nhờ intrinsic `tostring` (loop `parts[i]=tostring(i)`) | **~0.86** | cải thiện |
 | 05 closures | ✅ `make_counter` (CLOSURE) | **0.50–0.55** | ~0.98× |
 | 06 coroutines | ❌ (chủ ý) | ~0.98 | **16.4×** |
 | 07 hash (main loop) | ✅ main chunk (string key) | **0.73** | **1.96×** |
-| 08 oop | ✅ `dot`/`length`, ❌ `new`/`add` | 0.74 | 1.18× |
-| 09 pattern (main loop) | ❌ (cần `TFOR*`) | ~1.00 | 0.91× |
-| 10 sieve (main loop) | ❌ (cần multret call `math.floor(math.sqrt(N))`) | ~1.00 | ~1.02× |
+| 08 oop | ✅ `dot`/`length`, ❌ `new`/`add` | 0.73 | 1.18× |
+| 09 pattern (main loop) | ✅ `TFOR*` generic-for + string `SELF` | **~0.66** | ~0.9×→cải thiện |
+| 10 sieve (main loop) | ✅ nhờ floor(sqrt) intrinsic | **0.53** | **~2.0×** |
 
-Kết luận: nhờ mở phủ main-chunk loop + void/CLOSURE/SELF, **5/10 kernel** giờ
-tier-up (01/03/05/07 + 02/08 hàm). Hai task còn chặn là `04` (main không eligible)
-và `09`/`10` (generic-for / multret).
+Kết luận: nhờ generic-for `TFOR*` + string-receiver `SELF` + intrinsic
+`tostring`, **8/10 kernel** giờ tier-up thực chất (01/02/03/04/05/07/09/10).
+Chỉ còn phần `new`/`add` của `08` (OOP tạo bảng rồi gọi constructor — thân
+`new` chứa `SETFIELD` + `TAILCALL` nên impure deopt) là chưa phủ.
 
 ---
 
@@ -451,11 +455,22 @@ JIT on/off ≤ 0.5.
 | table JIT on/off | ~1.00 | ≤ 0.5 |
 | sieve JIT on/off | ~1.00 | ≤ 0.5 |
 | while/repeat | không JIT | JIT, on/off ≤ 0.7 |
-| closures JIT on/off | 0.55 | ≤ 0.4 |
-| oop JIT on/off | 0.74 | ≤ 0.5 |
-| fib JIT on/off | 0.049 | giữ ≤ 0.06 |
-| vs LuaJ | 6 thắng / 2 hòa / 2 thua nhẹ | ≥7 thắng, 0 thua >1.03× |
-| Cold start engine | 356 ms | giữ ≤ LuaJ |
+| closures JIT on/off | 0.52 | ≤ 0.4 |
+| oop JIT on/off | 0.73 | ≤ 0.5 |
+| fib JIT on/off | 0.048 | giữ ≤ 0.06 |
+| vs LuaJ | **10 thắng / 0 hòa / 0 thua** | ≥7 thắng, 0 thua >1.03× (đạt) |
+| Cold start: ctor engine | ~50 ms (thắng LuaJ ~57–65 ms) | giữ ≤ LuaJ |
+| Cold start: first eval nhỏ | ~47 ms (LuaJ ~13 ms) | chấp nhận (class-load một lần ~30 ms) |
+| Warmup: hội tụ (loop 100k) | call ~4, steady ~35 ms vs LuaJ ~285 ms | nhanh hơn LuaJ |
+
+**Cold start / warmup (đo 2026-09-22, unpinned, median 9):** JVM boot ~44 ms;
+`LuaState` ctor Luava ~50 ms (nhanh hơn LuaJ ~57–65 ms); first eval
+realistic.lua Luava ~47 ms vs LuaJ ~13 ms do parse+compile lần đầu nạp class
+JVM (~30 ms, lần compile thứ hai chỉ 0.02 ms) và loop nóng chạy interpreter
+đến khi tier-up. Full process realistic: Luava ~184 ms vs LuaJ ~173 ms.
+Sau vài call JIT vượt LuaJ: loop 100k hội tụ ở call ~4 (~35 ms/call so với
+~285 ms/call của LuaJ). Prewarm `JitCompiler.prewarm(closure)` để bỏ
+class-load khỏi first request.
 
 ---
 
@@ -557,11 +572,62 @@ benchmark main-chunk loop; D/E/F/G mở rộng dần theo nhu cầu thực tế.
 | D4 | ✅ xong | Bỏ reject `hasCalls && impure` **khi có loop back-edge trước call đầu tiên**: impure proto compile được nhưng **mọi CALL/TAILCALL deopt trước khi vào callee** (resume tại pc, không double-write). Deopt cấu trúc dùng budget riêng `JIT_STRUCTURAL_DEOPT_BUDGET=4096` (tránh phạt exception vĩnh viễn); `GETTABLE/SETTABLE` dispatch theo tag khoá (int vs string); `OP_CLEANUP` no-op kiểu (sửa reject sai `07/10`) |
 | E | ✅ xong | `CONCAT`, `DIV/DIVK`, `POW/POWK`, `MOD`, `IDIV`, bitwise 2 ngôi + `SHLI/SHRI`; helper `shiftLeft/Right`, `luaFloatMod`, `luaNumPow` |
 | E2 | ✅ xong | Intrinsic `math.floor` + fused `math.floor(math.sqrt(x))` (guard identity `MathLib.FLOOR`/`SQRT`); gỡ deopt cả kernel của `10_sieve` |
-| F | ⬜ chưa | Generic-for (`TFOR*`) — chặn bởi call-from-JIT + setup call trước loop |
-| G | ⬜ chưa | Vararg đọc `...` — cần mở rộng ABI `exec` để truyền varargs |
+| F | ✅ xong | Generic-for (`TFOR*`) cho iterator builtin: setup `pairs`/`ipairs`/`gmatch` emit inline qua `BaseLib.PAIRS/IPAIRS` + `StringLib.GMATCH` (identity guard), bước `TFORCALL` chạy `JitRuntime.tforCall` (raw table/array/pattern scan); iterator lạ/`__pairs`/`__index` deopt **trước side-effect** → resume tại đúng 1 TFORCALL. `SELF` nhận string receiver qua metatable string. `gmatch` ~3.4×, `ipairs` ~1.6×, pattern task 1.0→0.66 |
+| G | ⬜ chưa (đã phác) | Vararg đọc `...` — cần mở rộng ABI `exec` để truyền varargs. Đợt 2026-09-21 đã thử và **chủ động rollback** vì đổi 3 descriptor + mọi call site + MethodType, rủi ro > lợi ích (~1 hàm). Thiết kế sẵn: `LuaValue[] varargs` cuối `exec`/`execObj`/`execInner`, local 6 = varargs, `OP_VARARG C>1` → `JitRuntime.varargFixed`, `C==0` deopt |
 | H | ⬜ chưa | Inline cache đa hình |
 | I | ✅ xong | Ngưỡng tier-up chỉnh qua property; chạy cả 30 suite ở `hotThreshold=1`/`loopThreshold=1` **phát hiện + sửa 2 bug thật**: (1) void kernel gọi trong ngữ cảnh 1 giá trị để lọt function object thay vì nil (`calls.lua`); (2) deopt cấu trúc tại callee builtin/impure tiêu budget 8 → tự tắt JIT sau 8 lần gọi trực tiếp từ host, mất loop đã compile (`01_arith_loop` 205ms→32ms). 30/30 suite xanh ở cả ngưỡng 1 |
-| J | ⬜ chưa | Xác thực cuối |
+| J | ✅ xong | Xác thực cuối + đợt 2026-09-21/22: generic-for `TFOR*` (F), string `SELF`, java interop `MethodHandle` cache, virtual module loader, CLI/REPL. 213 unit test + 30/30 suite xanh ở JIT on/off và tại ngưỡng 1 |
+
+**Đợt 2026-09-21 (mở phủ thực chiến):**
+- **F generic-for:** setup `pairs`/`ipairs`/`gmatch` emit inline (identity
+  guard singleton `BaseLib.PAIRS/IPAIRS`, `StringLib.GMATCH`), bước
+  `TFORCALL` gọi `JitRuntime.tforCall` (raw `LuaTable.next`, array-part
+  `ipairs`, `GmatchIterator.next`); iterator lạ/`__pairs`/`__index` deopt
+  **trước side-effect** nên resume đúng 1 TFORCALL. Kết quả: `gmatch`
+  **~3.4×**, `ipairs` **~1.6×**, `pairs` đúng và không chậm hơn;
+  `09_string_pattern` 1.00 → **0.66**; 30/30 suite + JitCoverageTest xanh.
+- **String-receiver `SELF`:** `str:sub/gmatch/byte` resolve qua metatable
+  string (`__index` table read-only), nhờ đó loop nhiều method chuỗi compile.
+- **Intrinsic `tostring`:** call `tostring(x)` một tham số emit inline dưới
+  identity guard `BaseLib.TOSTRING`; render int/float/bool/nil/plain-string
+  chính xác, còn `__tostring`/number-metatable deopt. Gỡ reject main-chunk
+  `04_string_concat` (loop `parts[i]=tostring(i)`), JIT on/off ~0.25–0.35.
+- **VARARG (đọc `...`):** quyết định **không** làm ở đợt này. Cần đổi ABI
+  `exec`/`execObj`/`execInner` thêm tham số varargs (mọi call site + 5
+  descriptor + `JitCompiler` MethodType + `JitRuntime.invoke`), rủi ro cao
+  trong khi lợi ích chỉ ~1 hàm vararg/hot-loop. Ghi lại làm hạng mục Phase G
+  tương lai với thiết kế đã phác: thêm `LuaValue[] varargs` cuối descriptor,
+  local 6 = varargs, `OP_VARARG C>1` gọi `JitRuntime.varargFixed`, callee
+  vararg build mảng từ vùng đối số; `C==0` (multret) deopt.
+- **Java interop:** method đã resolve cache `MethodHandle` (không
+  `Method.invoke` lặp); property read memoize invoker theo `(userdata,name)`;
+  SAM proxy tái dùng abstract method đã resolve. `Runnable` gọi từ Lua:
+  ~10.8× chậm hơn pure-Lua → **~0.9×**.
+- **Virtual module loader:** `state.resourceLoader(LuaResourceLoader.classpath())`
+  + `resourcePath(...)` cho `require` nạp từ JAR/classpath/in-memory; searcher
+  thứ 5 chỉ thêm khi có loader, giữ nguyên semantics PUC.
+- **CLI/REPL:** `org.luava.cli.Main` (script + `arg`, `-e`, `-v`, REPL đa dòng
+  với nhận diện `<eof>`, in giá trị biểu thức).
+- **Zero-alloc closure:** `LuaFunction.upvalues`/`params` chuyển sang lazy —
+  mỗi closure trước đây cấp 2 `ArrayList` rồi `LuaClosure` vứt ngay (JFR:
+  nguồn rác nóng nhất, 2924 allocation sample). JIT on/off `05_closures`
+  ~0.55 → ~0.52.
+- **vs LuaJ (paired, warm=6, iters=10, 2026-09-22):** **thắng cả 10/10**
+  — arith 8.47×, fib 10.41×, table 2.83×, concat 3.03×, closures 1.21×,
+  coroutines 19.39×, hash 2.68×, oop 1.21×, pattern 1.43×, sieve 1.84×.
+- **Audit correctness/bảo mật (2026-09-22):** phát hiện + sửa 2 bug thật:
+  (1) lane gọi Java method double-invoke — `MethodHandle.invokeWithArguments`
+  propagate exception gốc của target (khác `Method.invoke` bọc
+  `InvocationTargetException`), nên catch-narrow-retry cũ chạy lại method đã
+  ném và áp side-effect 2 lần → bỏ retry ở lane method; lane SAM giữ retry
+  (dùng `Method.invoke`, an toàn). (2) REPL tạo `LuaState` mới mỗi dòng để
+  dò `<eof>` → rò state mỗi keystroke → dùng lại state sống. Kiểm thêm:
+  edge case generic-for (yield/error/`<close>`/goto/iterator error) và ma trận
+  tostring/string-`SELF` khớp JIT on/off; fuzz ngẫu nhiên 4000 case 0 mismatch;
+  sandbox chặn loader/require/package/java; loader classpath chống traversal;
+  guard + 8 thread interop đúng.
+- Bằng chứng cuối: 213 unit test + 30/30 suite PUC xanh (JIT on/off và
+  `hotThreshold=1`/`loopThreshold=1`); prewarm cưỡng bức toàn bộ suite vẫn xanh.
 
 **Bằng chứng (paired, core 8, `luava.jit.sync=true`):**
 - JIT on/off (main-chunk loop giờ tier-up): arith **~5×**, table ops **~2.8×**,
