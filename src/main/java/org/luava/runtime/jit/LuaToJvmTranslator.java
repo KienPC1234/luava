@@ -698,6 +698,9 @@ public final class LuaToJvmTranslator implements Opcodes {
                 }
                 case OpCode.OP_FORPREP -> emitForPrep(mv, a, Instruction.getBx(inst), pc, labels);
                 case OpCode.OP_FORLOOP -> emitForLoop(mv, a, Instruction.getBx(inst), pc, labels);
+                case OpCode.OP_TFORPREP -> emitTForPrep(mv, a, Instruction.getBx(inst), pc, labels);
+                case OpCode.OP_TFORCALL -> emitTForCall(mv, a, c, pc);
+                case OpCode.OP_TFORLOOP -> emitTForLoop(mv, a, Instruction.getBx(inst), pc, labels);
                 case OpCode.OP_CALL -> {
                     if (isFloorSqrtIntrinsic(proto, proto.code, pc)) {
                         emitFloorSqrtCall(mv, a, pc);
@@ -709,6 +712,14 @@ public final class LuaToJvmTranslator implements Opcodes {
                     }
                     if (isFloorIntrinsic(proto, proto.code, pc)) {
                         emitFloorCall(mv, a, pc);
+                        break;
+                    }
+                    if (isTForSetup(proto, proto.code, pc)) {
+                        emitTForSetup(mv, a, b - 1, pc);
+                        break;
+                    }
+                    if (isTostringIntrinsic(proto, proto.code, pc)) {
+                        emitTostringCall(mv, a, pc);
                         break;
                     }
                     if (isIntrinsicCall(proto, proto.code, pc)) {
@@ -959,6 +970,9 @@ public final class LuaToJvmTranslator implements Opcodes {
                         OpCode.OP_JMP,
                         OpCode.OP_FORPREP,
                         OpCode.OP_FORLOOP,
+                        OpCode.OP_TFORPREP,
+                        OpCode.OP_TFORCALL,
+                        OpCode.OP_TFORLOOP,
                         OpCode.OP_CALL,
                         OpCode.OP_TAILCALL,
                         OpCode.OP_RETURN,
@@ -969,6 +983,7 @@ public final class LuaToJvmTranslator implements Opcodes {
                 }
             }
             if (Instruction.getOp(inst) == OpCode.OP_FORLOOP
+                    || Instruction.getOp(inst) == OpCode.OP_TFORLOOP
                     || (Instruction.getOp(inst) == OpCode.OP_JMP && Instruction.getsJ(inst) < 0)) {
                 if (firstLoopBackedgePc < 0) {
                     firstLoopBackedgePc = pc;
@@ -1279,7 +1294,11 @@ public final class LuaToJvmTranslator implements Opcodes {
     private static boolean isIntrinsicCall(LuaProto proto, int[] code, int pc) {
         if (isSqrtIntrinsic(proto, code, pc)
                 || isFloorIntrinsic(proto, code, pc)
-                || isFloorSqrtIntrinsic(proto, code, pc)) {
+                || isFloorSqrtIntrinsic(proto, code, pc)
+                || isTostringIntrinsic(proto, code, pc)) {
+            return true;
+        }
+        if (isTForSetup(proto, code, pc)) {
             return true;
         }
         // The multi-result sqrt half of a fused floor(sqrt): it emits nothing
@@ -1288,6 +1307,57 @@ public final class LuaToJvmTranslator implements Opcodes {
         return next < code.length && isFloorSqrtIntrinsic(proto, code, next)
                 && Instruction.getOp(code[pc]) == OpCode.OP_CALL
                 && Instruction.getC(code[pc]) == 0;
+    }
+
+    /**
+     * Recognizes a one-argument, one-result {@code tostring(x)} call whose
+     * callee register is loaded straight-line from {@code GETTABUP} on the
+     * global table. The emitted code identity-guards the shared
+     * {@code BaseLib.TOSTRING} singleton and deopts for any argument whose
+     * rendering is not a pure primitive/string (a metatable {@code __tostring}
+     * or a number-format override must run interpreted for exact semantics).
+     */
+    private static boolean isTostringIntrinsic(LuaProto proto, int[] code, int pc) {
+        int inst = code[pc];
+        if (Instruction.getOp(inst) != OpCode.OP_CALL
+                || Instruction.getB(inst) != 2
+                || Instruction.getC(inst) != 2) {
+            return false;
+        }
+        return isGlobalConst(proto, code, pc, Instruction.getA(inst), "tostring");
+    }
+
+    /**
+     * True when register {@code reg} is loaded straight-line by
+     * {@code GETTABUP <globalTable> "name"}: the PUC bytecode for reading a
+     * global function. The {@code GETTABUP} {@code B} operand is the _ENV
+     * upvalue, which is always 0 in a normal chunk.
+     */
+    private static boolean isGlobalConst(LuaProto proto, int[] code, int pc, int reg, String name) {
+        int def = lastWrite(code, pc, reg);
+        if (def < 0 || Instruction.getOp(code[def]) != OpCode.OP_GETTABUP) {
+            return false;
+        }
+        int c = Instruction.getC(code[def]);
+        return c >= 0 && c < proto.constants.length
+                && proto.constants[c] instanceof org.luava.runtime.LuaString ks
+                && name.equals(ks.toLuaString());
+    }
+
+    /**
+     * True when the CALL at {@code pc} is the iterator-factory call that
+     * immediately feeds a generic-for {@code TFORPREP}. Such a call is
+     * emitted inline (guarded by identity against the shared {@code pairs} /
+     * {@code ipairs} / {@code gmatch} builtins) rather than through the
+     * general call protocol, so a generic-for loop can run entirely compiled.
+     * An unrecognized factory deopts structurally before any side effect.
+     */
+    private static boolean isTForSetup(LuaProto proto, int[] code, int pc) {
+        if (Instruction.getOp(code[pc]) != OpCode.OP_CALL) {
+            return false;
+        }
+        int next = pc + 1;
+        return next < code.length && Instruction.getOp(code[next]) == OpCode.OP_TFORPREP;
     }
 
     /** Successor pcs for control-flow (conditional compares skip one). */
@@ -1302,6 +1372,18 @@ public final class LuaToJvmTranslator implements Opcodes {
             return new int[] {pc + 1, pc + 1 + bx};
         }
         if (op == OpCode.OP_FORLOOP) {
+            int bx = Instruction.getBx(code[pc]);
+            return new int[] {pc + 1, pc + 1 - bx};
+        }
+        // Generic-for: TFORPREP skips to TFORCALL; TFORLOOP jumps back to the
+        // body start when the control variable is non-nil. The body lies
+        // between TFORPREP+1 and TFORCALL-1 (plus, for the back edge, between
+        // TFORCALL+1 and TFORLOOP-1).
+        if (op == OpCode.OP_TFORPREP) {
+            int bx = Instruction.getBx(code[pc]);
+            return new int[] {pc + 1, pc + 1 + bx};
+        }
+        if (op == OpCode.OP_TFORLOOP) {
             int bx = Instruction.getBx(code[pc]);
             return new int[] {pc + 1, pc + 1 - bx};
         }
@@ -1487,6 +1569,24 @@ public final class LuaToJvmTranslator implements Opcodes {
                 setTy(out, regs, a, T_INT);
                 setTy(out, regs, a + 3, T_INT);
             }
+            case OpCode.OP_TFORPREP -> {
+                // Pushes a TBC marker; register values are unchanged.
+            }
+            case OpCode.OP_TFORCALL -> {
+                // Iterator results are dynamic values (a `pairs` value is
+                // commonly a number used in arithmetic). They must be
+                // T_UNKNOWN, not T_OBJ: marking a numeric-but-dynamic slot
+                // object would falsely conflict with a following ADD. Every
+                // use is runtime-guarded, so unknown only costs a guard.
+                int nVars = Math.max(1, c);
+                for (int i = 0; i < nVars; i++) {
+                    setTy(out, regs, a + 4 + i, T_UNKNOWN);
+                }
+                setTy(out, regs, a + 2, T_UNKNOWN);
+            }
+            case OpCode.OP_TFORLOOP -> {
+                setTy(out, regs, a + 2, T_UNKNOWN);
+            }
             case OpCode.OP_CLOSURE, OpCode.OP_NEWTABLE, OpCode.OP_CONCAT -> setTy(out, regs, a, T_OBJ);
             case OpCode.OP_CLOSE -> {
                 // Closes upvalues at/above R[A]; the register value itself is
@@ -1501,9 +1601,21 @@ public final class LuaToJvmTranslator implements Opcodes {
                 setTy(out, regs, a + 1, T_OBJ);
             }
             case OpCode.OP_CALL -> {
-                // A recognized sqrt intrinsic yields a float; any other call
-                // yields an integer under the JIT call protocol.
-                setTy(out, regs, a, isIntrinsicCall(proto, code, pc) ? T_NUM : T_INT);
+                if (isTForSetup(proto, code, pc)) {
+                    // Iterator-setup call: R[A..A+2] are objects and R[A+3]
+                    // (the to-be-closed slot) is nil.
+                    setTy(out, regs, a, T_OBJ);
+                    setTy(out, regs, a + 1, T_OBJ);
+                    setTy(out, regs, a + 2, T_OBJ);
+                    setTy(out, regs, a + 3, T_OBJ);
+                } else if (isTostringIntrinsic(proto, code, pc)) {
+                    // tostring yields a string (object).
+                    setTy(out, regs, a, T_OBJ);
+                } else {
+                    // A recognized sqrt intrinsic yields a float; any other
+                    // call yields an integer under the JIT call protocol.
+                    setTy(out, regs, a, isIntrinsicCall(proto, code, pc) ? T_NUM : T_INT);
+                }
             }
             case OpCode.OP_TAILCALL -> {
                 // No fallthrough register: the callee result becomes ours.
@@ -1956,6 +2068,41 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitMethodInsn(INVOKESTATIC, "java/lang/Math", "sqrt", "(D)D", false);
     }
 
+    /**
+     * Emits {@code R[a] = tostring(R[a+1])} inline under an identity guard on
+     * the shared {@code BaseLib.TOSTRING} singleton. The helper renders the
+     * primitive/string cases exactly and returns {@code null} otherwise, so a
+     * value with a {@code __tostring} metatable (or a number-format override)
+     * deopts to the interpreter instead of producing a different string.
+     */
+    private static void emitTostringCall(MethodVisitor mv, int a, int pc) {
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitInsn(AALOAD);
+        mv.visitFieldInsn(GETSTATIC, "org/luava/runtime/standard/BaseLib", "TOSTRING",
+                "Lorg/luava/runtime/LuaFunction;");
+        Label ok = new Label();
+        mv.visitJumpInsn(IF_ACMPEQ, ok);
+        emitDeopt(mv, pc);
+        mv.visitLabel(ok);
+        mv.visitVarInsn(ALOAD, 0);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a + 1);
+        mv.visitInsn(IADD);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "tostringInline",
+                "(Lorg/luava/runtime/bytecode/LuaClosure;[J[B[Lorg/luava/runtime/LuaValue;I)Lorg/luava/runtime/LuaValue;", false);
+        mv.visitInsn(DUP);
+        Label rendered = new Label();
+        mv.visitJumpInsn(IFNONNULL, rendered);
+        mv.visitInsn(POP);
+        emitDeopt(mv, pc);
+        mv.visitLabel(rendered);
+        emitStoreValueReg(mv, a);
+    }
+
     /** Deopts unless {@code R[reg]} is the {@code MathLib.<field>} singleton. */
     private static void emitBuiltinIdentityGuard(MethodVisitor mv, int reg, String field, int pc) {
         mv.visitVarInsn(ALOAD, 4);
@@ -1967,6 +2114,91 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitJumpInsn(IF_ACMPEQ, ok);
         emitDeopt(mv, pc);
         mv.visitLabel(ok);
+    }
+
+    /**
+     * Emits the generic-for iterator-factory call {@code R[a] = pairs(t)} /
+     * {@code ipairs(t)} / {@code gmatch(s,p)} inline. The factory register is
+     * identity-guarded against the shared builtin singleton; an unrecognized
+     * function, or a {@code pairs} target with an {@code __pairs} metamethod,
+     * deopts structurally (no side effect before the deopt). The helper fills
+     * the three registers the loop reserved ({@code R[a], R[a+1], R[a+2]})
+     * with the PUC iterator triple.
+     */
+    private static void emitTForSetup(MethodVisitor mv, int a, int nArgs, int pc) {
+        // The resolved triple is kept on the JVM operand stack and merged at
+        // `matched`: every path pushes exactly one Varargs, so ASM's frame
+        // computation sees a single consistent stack shape. No scratch local
+        // is used (locals 6..8 are shared and 9+ hold fused-callee state).
+        Label isPairs = new Label();
+        Label isIpairs = new Label();
+        Label isGmatch = new Label();
+        Label matched = new Label();
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, a);
+        mv.visitInsn(AALOAD);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitFieldInsn(GETSTATIC, "org/luava/runtime/standard/BaseLib", "PAIRS",
+                "Lorg/luava/runtime/LuaFunction;");
+        mv.visitJumpInsn(IF_ACMPEQ, isPairs);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitFieldInsn(GETSTATIC, "org/luava/runtime/standard/BaseLib", "IPAIRS",
+                "Lorg/luava/runtime/LuaFunction;");
+        mv.visitJumpInsn(IF_ACMPEQ, isIpairs);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitFieldInsn(GETSTATIC, "org/luava/runtime/standard/StringLib", "GMATCH",
+                "Lorg/luava/runtime/LuaFunction;");
+        mv.visitJumpInsn(IF_ACMPEQ, isGmatch);
+        emitDeopt(mv, pc, true);
+        mv.visitLabel(isPairs);
+        emitGetValueReg(mv, a + 1);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/standard/BaseLib", "pairsFast",
+                "(Lorg/luava/runtime/LuaValue;)Lorg/luava/runtime/Varargs;", false);
+        // pairsFast returns null for an __pairs target: deopt to the handler.
+        mv.visitInsn(DUP);
+        Label pairsOk = new Label();
+        mv.visitJumpInsn(IFNONNULL, pairsOk);
+        mv.visitInsn(POP);
+        emitDeopt(mv, pc);
+        mv.visitLabel(pairsOk);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitJumpInsn(GOTO, matched);
+        mv.visitLabel(isIpairs);
+        emitGetValueReg(mv, a + 1);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/standard/BaseLib", "ipairsFast",
+                "(Lorg/luava/runtime/LuaValue;)Lorg/luava/runtime/Varargs;", false);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitJumpInsn(GOTO, matched);
+        mv.visitLabel(isGmatch);
+        // R[a+1]=string, R[a+2]=pattern, optional R[a+3]=init are exactly the
+        // gmatch builtin arguments; delegate to it (it returns the iterator
+        // closure) and let tforCall recognize that iterator.
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a + 1);
+        mv.visitInsn(IADD);
+        ldcInt(mv, nArgs);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "gmatchSetup",
+                "([J[B[Lorg/luava/runtime/LuaValue;II)Lorg/luava/runtime/Varargs;", false);
+        mv.visitVarInsn(ASTORE, 8);
+        mv.visitJumpInsn(GOTO, matched);
+        mv.visitLabel(matched);
+        // Unpack the triple into R[a..a+3], nil-filling missing slots. Local 8
+        // is the shared ref scratch (dead at a TFORCALL), so it holds the
+        // Varargs from whichever factory path ran.
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ALOAD, 8);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a);
+        mv.visitInsn(IADD);
+        ldcInt(mv, 4);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "unpackTForSetup",
+                "([J[B[Lorg/luava/runtime/LuaValue;Lorg/luava/runtime/Varargs;II)V", false);
     }
 
     /**
@@ -2221,6 +2453,67 @@ public final class LuaToJvmTranslator implements Opcodes {
         emitTagIntNull(mv, a);
         mv.visitJumpInsn(GOTO, labels[pc + 1 - bx]);
         mv.visitLabel(exit);
+    }
+
+    /**
+     * {@code OP_TFORPREP}: push the loop-state slot (R[A+3]) as a to-be-closed
+     * variable, then continue. The helper mirrors the interpreter exactly; it
+     * runs once per loop entry, so the call is free in steady state.
+     */
+    private static void emitTForPrep(MethodVisitor mv, int a, int bx, int pc, Label[] labels) {
+        mv.visitVarInsn(ALOAD, 0);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a + 3);
+        mv.visitInsn(IADD);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "tforPrep",
+                "(Lorg/luava/runtime/bytecode/LuaClosure;[J[B[Lorg/luava/runtime/LuaValue;I)V", false);
+        // PUC OP_TFORPREP is an unconditional jump to the matching TFORCALL,
+        // so the body never runs before the first iterator step.
+        mv.visitJumpInsn(GOTO, labels[pc + 1 + bx]);
+    }
+
+    /**
+     * {@code OP_TFORCALL}: ask {@link JitRuntime#tforCall} to step the
+     * built-in iterator ({@code next}/{@code ipairsaux}/{@code gmatch}) and
+     * write the {@code c} result registers. A {@code false} return means the
+     * iterator is not one the compiled body can complete atomically (a custom
+     * closure, a metatable-sensitive access); deopt before any side effect so
+     * the interpreter re-executes this TFORCALL exactly once.
+     */
+    private static void emitTForCall(MethodVisitor mv, int a, int c, int pc) {
+        // The helper stores the results and throws DeoptSignal itself when the
+        // iterator is one it cannot complete atomically. Branchless at the
+        // call site, so ASM's frame computation sees a single stack shape.
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        ldcInt(mv, a);
+        mv.visitInsn(IADD);
+        ldcInt(mv, c);
+        ldcInt(mv, pc);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "tforCall",
+                "([J[B[Lorg/luava/runtime/LuaValue;III)V", false);
+    }
+
+    /**
+     * {@code OP_TFORLOOP}: if R[A+4] is non-nil, copy it to the loop control
+     * R[A+2] and jump back to the body. The value is a runtime object, so the
+     * copy is a triple-stack move and truthiness is a tag check (nil only).
+     */
+    private static void emitTForLoop(MethodVisitor mv, int a, int bx, int pc, Label[] labels) {
+        mv.visitVarInsn(ALOAD, 3);
+        emitIndex(mv, a + 4);
+        mv.visitInsn(BALOAD);
+        // NIL is 0; anything else is a live control value.
+        Label isNil = new Label();
+        mv.visitJumpInsn(IFEQ, isNil);
+        emitMove(mv, a + 2, a + 4);
+        mv.visitJumpInsn(GOTO, labels[pc + 1 - bx]);
+        mv.visitLabel(isNil);
     }
 
     /** Pushes {@code p[base+reg]} (an unboxed long) onto the JVM stack. */
@@ -3263,10 +3556,11 @@ public final class LuaToJvmTranslator implements Opcodes {
      * method in {@code A}, ready for the following CALL.
      */
     private static void emitSelf(MethodVisitor mv, LuaProto proto, int a, int b, int c, int k, int pc) {
-        // Resolve R[B][key] with a raw-hit fast lane. Push (p, t, o, objIdx)
-        // first, then compute the key on top so the helper's trailing LuaValue
-        // parameter works without a scratch local; reading a register after
-        // pushing arrays is stack-neutral.
+        // Resolve R[B][key] with a raw-hit fast lane. Push the closure, the
+        // three stacks, objIdx, then the key on top, so the helper's trailing
+        // LuaValue parameter works without a scratch local; reading a register
+        // after pushing arrays is stack-neutral.
+        mv.visitVarInsn(ALOAD, 0);
         mv.visitVarInsn(ALOAD, 2);
         mv.visitVarInsn(ALOAD, 3);
         mv.visitVarInsn(ALOAD, 4);
@@ -3282,7 +3576,7 @@ public final class LuaToJvmTranslator implements Opcodes {
             mv.visitInsn(AALOAD);
         }
         mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/jit/JitRuntime", "selfMethod",
-                "([J[B[Lorg/luava/runtime/LuaValue;ILorg/luava/runtime/LuaValue;)Lorg/luava/runtime/LuaValue;", false);
+                "(Lorg/luava/runtime/bytecode/LuaClosure;[J[B[Lorg/luava/runtime/LuaValue;ILorg/luava/runtime/LuaValue;)Lorg/luava/runtime/LuaValue;", false);
         mv.visitInsn(DUP);
         Label selfOk = new Label();
         mv.visitJumpInsn(IFNONNULL, selfOk);
@@ -3465,6 +3759,16 @@ public final class LuaToJvmTranslator implements Opcodes {
         emitIndex(mv, reg);
         mv.visitInsn(ACONST_NULL);
         mv.visitInsn(AASTORE);
+    }
+
+    /** Pushes {@code BytecodeVM.getLuaValue(p, t, o, base+reg)} onto the stack. */
+    private static void emitGetValueReg(MethodVisitor mv, int reg) {
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        emitIndex(mv, reg);
+        mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/bytecode/BytecodeVM", "getLuaValue",
+                "([J[B[Lorg/luava/runtime/LuaValue;I)Lorg/luava/runtime/LuaValue;", false);
     }
 
     private static void emitIndex(MethodVisitor mv, int reg) {

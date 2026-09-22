@@ -38,6 +38,94 @@ public final class BaseLib {
      */
     public static final LuaFunction SETMETATABLE = LuaFunction.of(BaseLib::setmetatableImpl);
 
+    /**
+     * Shared stateless {@code next} builtin. One JVM-wide instance so the
+     * JIT generic-for lane can recognize it by identity and iterate a table
+     * without a re-entrant call. Lua semantics require a single stable
+     * iterator function per state (PUC {@code next{} == next{}}), which a
+     * shared instance preserves exactly.
+     */
+    public static final LuaFunction NEXT = LuaFunction.of(args -> {
+        if (args.length == 0) {
+            throw LuaValue.argError(1, "next", "table expected, got no value");
+        }
+        if (!args[0].isTable()) {
+            throw LuaValue.argError(1, "next", "table expected, got " + args[0].typeName());
+        }
+        LuaTable t = (LuaTable) args[0];
+        LuaValue currentKey = args.length > 1 ? args[1] : LuaNil.NIL;
+        return t.next(currentKey);
+    });
+
+    /**
+     * Shared stateless {@code ipairs} iterator (PUC {@code ipairsaux}):
+     * returns {@code (i+1, t[i+1])} until a nil element. Shared so the JIT
+     * generic-for lane can recognize it by identity.
+     */
+    public static final LuaFunction IPAIRSAUX = LuaFunction.of(iterArgs -> {
+        if (iterArgs.length < 2 || !iterArgs[1].isNumber()) {
+            return LuaNil.NIL;
+        }
+        LuaValue table = iterArgs[0];
+        long i = iterArgs[1].toLong() + 1;
+        LuaValue val = table.get(LuaInteger.valueOf(i));
+        if (val.isNil()) return LuaNil.NIL;
+        return Varargs.of(LuaInteger.valueOf(i), val);
+    });
+
+    /**
+     * Shared stateless {@code pairs} builtin. PUC pushes its internal
+     * {@code luaB_next} directly (not the {@code next} global), so a shared
+     * instance is faithful and lets the JIT recognize the generic-for setup
+     * by identity.
+     */
+    public static final LuaFunction PAIRS = LuaFunction.of(args -> {
+        if (args.length == 0) {
+            throw new LuaException("bad argument #1 to 'pairs' (value expected)");
+        }
+        Varargs fast = pairsFast(args[0]);
+        if (fast != null) return fast;
+        // __pairs handler runs with the target as 'self'.
+        LuaTable mt = args[0].getMetatable();
+        LuaValue handler = mt.rawget(LuaString.interned("__pairs"));
+        return handler.call(args[0]);
+    });
+
+    /**
+     * Shared stateless {@code ipairs} builtin (PUC's factory never consults a
+     * metamethod).
+     */
+    public static final LuaFunction IPAIRS = LuaFunction.of(args -> {
+        if (args.length == 0) {
+            throw new LuaException("bad argument #1 to 'ipairs' (value expected)");
+        }
+        return ipairsFast(args[0]);
+    });
+
+    /**
+     * Inline fast path for the {@code pairs(t)} iterator-setup call, shared
+     * with the JIT. Returns {@code null} when {@code t} has an
+     * {@code __pairs} metamethod (the interpreter must run the handler), else
+     * the PUC triple {@code (next, t, nil)}. The caller writes as many
+     * registers as the enclosing generic-for reserved; missing ones are nil.
+     */
+    public static Varargs pairsFast(LuaValue target) {
+        LuaTable mt = target.getMetatable();
+        if (mt != null && !mt.rawget(LuaString.interned("__pairs")).isNil()) {
+            return null;
+        }
+        return Varargs.of(NEXT, target, LuaNil.NIL);
+    }
+
+    /**
+     * Inline fast path for the {@code ipairs(t)} iterator-setup call: PUC
+     * 5.4's {@code ipairs} factory never consults a metamethod, so this is
+     * unconditional. Returns the triple {@code (ipairsaux, t, 0)}.
+     */
+    public static Varargs ipairsFast(LuaValue target) {
+        return Varargs.of(IPAIRSAUX, target, LuaInteger.valueOf(0));
+    }
+
     static LuaValue setmetatableImpl(LuaValue[] args) {
         if (args.length == 0 || !args[0].isTable()) {
             throw new LuaException("bad argument #1 to 'setmetatable' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
@@ -456,54 +544,9 @@ public final class BaseLib {
                     "table or string expected, got " + args[0].typeName());
         }));
 
-        globals.rawset(LuaString.interned("pairs"), LuaFunction.of(args -> {
-            if (args.length == 0) {
-                throw new LuaException("bad argument #1 to 'pairs' (value expected)");
-            }
-            LuaValue target = args[0];
-            LuaTable mt = target.getMetatable();
-            if (mt != null) {
-                LuaValue handler = mt.rawget(LuaString.interned("__pairs"));
-                if (!handler.isNil()) {
-                    return handler.call(target);
-                }
-            }
-            // PUC luaB_pairs only requires an argument; a non-table is
-            // returned as-is (the iterator errors when actually called).
-            LuaFunction nextFunc = (LuaFunction) globals.rawget(LuaString.interned("next"));
-            return Varargs.of(nextFunc, target, LuaNil.NIL);
-        }));
-
-
-        globals.rawset(LuaString.interned("next"), LuaFunction.of(args -> {
-            if (args.length == 0) {
-                throw LuaValue.argError(1, "next", "table expected, got no value");
-            }
-            if (!args[0].isTable()) {
-                throw LuaValue.argError(1, "next", "table expected, got " + args[0].typeName());
-            }
-            LuaTable t = (LuaTable) args[0];
-            LuaValue currentKey = args.length > 1 ? args[1] : LuaNil.NIL;
-            return t.next(currentKey);
-        }));
-
-        LuaFunction ipairsaux = LuaFunction.of(iterArgs -> {
-            if (iterArgs.length < 2 || !iterArgs[1].isNumber()) {
-                return LuaNil.NIL;
-            }
-            LuaValue table = iterArgs[0];
-            long i = iterArgs[1].toLong() + 1;
-            LuaValue val = table.get(LuaInteger.valueOf(i));
-            if (val.isNil()) return LuaNil.NIL;
-            return Varargs.of(LuaInteger.valueOf(i), val);
-        });
-
-        globals.rawset(LuaString.interned("ipairs"), LuaFunction.of(args -> {
-            if (args.length == 0) {
-                throw new LuaException("bad argument #1 to 'ipairs' (value expected)");
-            }
-            return Varargs.of(ipairsaux, args[0], LuaInteger.valueOf(0));
-        }));
+        globals.rawset(LuaString.interned("pairs"), PAIRS);
+        globals.rawset(LuaString.interned("next"), NEXT);
+        globals.rawset(LuaString.interned("ipairs"), IPAIRS);
 
         boolean[] warningsOn = new boolean[]{false};
         globals.rawset(LuaString.interned("warn"), LuaFunction.of(args -> {

@@ -807,12 +807,15 @@ public final class LuaPattern {
          */
         @Override
         public java.util.List<org.luava.runtime.eval.Upvalue> getUpvalues() {
+            // Materialize through the base lazy accessor (super.upvalues may be
+            // null), then append the observable captures once.
+            java.util.List<org.luava.runtime.eval.Upvalue> list = super.getUpvalues();
             if (!upvaluesBuilt) {
                 upvaluesBuilt = true;
-                super.upvalues.add(new org.luava.runtime.eval.Upvalue("s", srcVal));
-                super.upvalues.add(new org.luava.runtime.eval.Upvalue("pattern", patVal));
+                list.add(new org.luava.runtime.eval.Upvalue("s", srcVal));
+                list.add(new org.luava.runtime.eval.Upvalue("pattern", patVal));
             }
-            return super.upvalues;
+            return list;
         }
 
         @Override
