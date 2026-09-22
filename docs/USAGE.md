@@ -4,6 +4,7 @@ A task-oriented cookbook for embedding the Luava Lua 5.4 engine. Each section
 is a self-contained scenario. API details live in the Javadoc; this guide
 shows the idiomatic way to do common things.
 
+- [Running Lua from the command line](#running-lua-from-the-command-line)
 - [Getting a state](#getting-a-state)
 - [Evaluating scripts](#evaluating-scripts)
 - [Passing values between Java and Lua](#passing-values-between-java-and-lua)
@@ -21,6 +22,27 @@ shows the idiomatic way to do common things.
 - [Common pitfalls](#common-pitfalls)
 
 ---
+
+## Running Lua from the command line
+
+If you only want to run scripts or poke at Lua 5.4 syntax, use the launcher
+[`./luava`](../luava) (it locates the engine jar automatically) or the jar
+directly:
+
+```bash
+./luava script.lua arg1 arg2       # run a script; arg[0] is the script name
+./luava -e "print(1 + 2)"          # evaluate a string
+./luava                            # interactive multi-line REPL
+./luava -v                         # version
+./luava -h                         # help
+
+# equivalent without the launcher:
+java -jar luava-0.1.0-alpha.jar script.lua arg1 arg2
+LUAVA_JAR=/path/to/luava.jar ./luava -e "print('hi')"   # explicit jar
+```
+
+This is a convenience front end; embedding through `LuaState` (below) is the
+primary use and the only way to control sandboxing, JIT and interop.
 
 ## Getting a state
 

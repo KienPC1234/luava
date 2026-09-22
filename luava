@@ -1,0 +1,75 @@
+#!/usr/bin/env sh
+# =============================================================================
+# luava — launcher for the Luava Lua 5.4 CLI / REPL.
+#
+# Usage:
+#   ./luava script.lua [args...]   run a script
+#   ./luava -e "print(1+2)"        evaluate a string
+#   ./luava                        interactive REPL
+#   ./luava -v | -h                version / help
+#
+# It finds the engine jar automatically:
+#   1. a jar named luava-*.jar next to this script (distribution layout), else
+#   2. target/luava-*.jar (built from source with `mvn package`).
+# Override with LUAVA_JAR=/path/to/luava.jar.
+#
+# Requires a stock JDK 21+ on PATH (or JAVA_HOME set).
+# =============================================================================
+set -eu
+
+# Resolve this script's directory, following symlinks.
+SCRIPT="$0"
+while [ -h "$SCRIPT" ]; do
+    dir=$(cd -P "$(dirname "$SCRIPT")" >/dev/null 2>&1 && pwd)
+    SCRIPT=$(readlink "$SCRIPT")
+    case "$SCRIPT" in
+        /*) ;;
+        *) SCRIPT="$dir/$SCRIPT" ;;
+    esac
+done
+DIR=$(cd -P "$(dirname "$SCRIPT")" >/dev/null 2>&1 && pwd)
+
+# Java launcher.
+if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+    JAVA="$JAVA_HOME/bin/java"
+else
+    JAVA=$(command -v java || true)
+fi
+if [ -z "$JAVA" ]; then
+    echo "luava: no 'java' found. Install JDK 21+ or set JAVA_HOME." >&2
+    exit 1
+fi
+
+# Locate the engine jar.
+find_jar() {
+    for candidate in \
+        "$DIR"/luava-*.jar \
+        "$DIR"/target/luava-*.jar
+    do
+        # globs that match nothing stay literal; skip those.
+        [ -e "$candidate" ] || continue
+        case "$candidate" in
+            *-sources.jar | *-javadoc.jar) continue ;;
+        esac
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    return 1
+}
+
+if [ -n "${LUAVA_JAR:-}" ]; then
+    JAR="$LUAVA_JAR"
+    if [ ! -f "$JAR" ]; then
+        echo "luava: LUAVA_JAR=$JAR does not exist." >&2
+        exit 1
+    fi
+else
+    if ! JAR=$(find_jar); then
+        echo "luava: no engine jar found." >&2
+        echo "  build it first:  mvn -DskipTests package" >&2
+        echo "  or point at one: LUAVA_JAR=/path/to/luava.jar ./luava ..." >&2
+        exit 1
+    fi
+fi
+
+exec "$JAVA" -jar "$JAR" "$@"

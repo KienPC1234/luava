@@ -218,7 +218,18 @@ adds a fifth searcher that is a no-op when no loader is set.
 ## CLI and REPL
 
 The jar is executable and also exposes a small front end for developing and
-smoke-testing Lua 5.4:
+smoke-testing Lua 5.4. A convenience launcher, [`./luava`](luava), finds the
+jar automatically (a `luava-*.jar` next to it, or `target/luava-*.jar` after
+a source build), so no classpath is needed:
+
+```bash
+./luava script.lua arg1 arg2       # run a script
+./luava -e "print(1+2)"            # evaluate a string
+./luava                            # interactive REPL (also on a TTY)
+./luava -v                         # version
+```
+
+Or invoke the jar directly:
 
 ```bash
 java -jar luava-0.1.0-alpha.jar script.lua arg1 arg2
