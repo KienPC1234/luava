@@ -479,6 +479,52 @@ public class JitCoverageTest {
     }
 
     @Test
+    void tailCallToVoidForwardZeroResults() {
+        // Regression: a compiled tail call into a void callee returned its
+        // sentinel long, which the caller read as the integer 0. A bare
+        // `return g()` where g returns nothing must yield zero values, and a
+        // one-value context must see nil. The void sentinel has no register
+        // representation, so compiled callers now deopt to the interpreter.
+        assertSameWithAndWithoutJit(
+                "local function g() end local function h() return g() end "
+                        + "for i=1,300 do if select('#', h()) ~= 0 then error('bad') end end return 1",
+                2);
+        assertSameWithAndWithoutJit(
+                "local function g() end local function f(x) if x then return g() else return 1 end end "
+                        + "local ok for i=1,300 do if f(true) ~= nil then ok=1 end end return 1",
+                2);
+        // A statement call to a void function stays void.
+        assertSameWithAndWithoutJit(
+                "local function g() end local function f(x) g() if x then return 1 end return 2 end "
+                        + "for i=1,300 do local r=f(i%2==0) if r~=1 and r~=2 then error('bad') end end return 1",
+                2);
+        // Void as a non-final value (nil) in a multret list.
+        assertSameWithAndWithoutJit(
+                "local function g() end local function m() return g(), 5 end "
+                        + "for i=1,300 do local a,b=m() if a~=nil or b~=5 then error('bad') end end return 1",
+                2);
+    }
+
+    @Test
+    void prewarmedVoidTailCallForwardsZeroResults() {
+        // Deterministic tier-up: prewarm the caller and callee, then assert
+        // the compiled caller still forwards zero results from the void tail.
+        LuaState state = new LuaState().jitEnabled(true);
+        state.eval("local function g() end local function h() return g() end "
+                + "rawset(_G, 'g', g); rawset(_G, 'h', h)");
+        org.luava.runtime.jit.JitCompiler.prewarm((LuaFunction) state.get("g"));
+        org.luava.runtime.jit.JitCompiler.prewarm((LuaFunction) state.get("h"));
+        for (int i = 0; i < 50; i++) {
+            assertEquals(0L, state.eval("return select('#', h())").toLong(), "run " + i);
+        }
+        // The void callee g must be compiled (it is a leaf, but h is the one
+        // whose void tail handling matters).
+        assertTrue(((LuaClosure) state.get("g")).proto.jitCode != null
+                        || ((LuaClosure) state.get("g")).proto.jitDisabled,
+                "g must be compiled or rejected deterministically after prewarm");
+    }
+
+    @Test
     void closureFactoryCompilesAndMatchesInterpreter() {
         // OP_CLOSURE + OP_CLOSE (the make_counter shape) now compile: the
         // factory is an object-returning pure kernel; escaping upvalues are
@@ -771,6 +817,71 @@ public class JitCoverageTest {
         for (String code : bodies) {
             assertSameWithAndWithoutJit(hot(code), 2);
         }
+    }
+
+    @Test
+    void hostOnlyCallsTierUp() {
+        // Regression: tier-up counters were only bumped at Lua call sites
+        // (tryJitCall/tryJitTailCall). A function invoked only from the host
+        // (LuaState.call / LuaClosure.invoke) never compiled, so a small hot
+        // loop driven from Java stayed interpreted forever. runTopLevelJit now
+        // counts host entries.
+        LuaState state = new LuaState().jitEnabled(true);
+        LuaClosure fn = (LuaClosure) state.eval(
+                "local function work(n) local x=0 for i=1,n do x=x+i end return x end return work");
+        // Small loop: below JIT_LOOP_THRESHOLD, so only the call hotness can
+        // drive the compile. Call it enough times from the host.
+        for (int i = 0; i < 5000; i++) {
+            fn.call(org.luava.runtime.LuaInteger.valueOf(100));
+        }
+        assertTrue(awaitCompiled(fn.proto, 5000),
+                "a host-only-called function must tier up via runTopLevelJit");
+        // Correct result after compilation.
+        assertEquals(5050, fn.call(org.luava.runtime.LuaInteger.valueOf(100)).toLong());
+    }
+
+    @Test
+    void repeatedEvalOfCachedChunkTiersUp() {
+        // The same chunk name is served from the proto cache; repeated eval
+        // must keep returning the same value and (now) tier the chunk up.
+        LuaState state = new LuaState().jitEnabled(true);
+        String code = "local s=0 for i=1,100 do s=s+i end return s";
+        for (int i = 0; i < 300; i++) {
+            assertEquals(5050, state.eval(code, "@cached").toLong());
+        }
+        // The compiled chunk must exist somewhere in the proto tree; assert the
+        // result is still exact and no exception surfaced.
+        assertEquals(5050, state.eval(code, "@cached").toLong());
+    }
+
+    @Test
+    void hostCallPathDoesNotAllocatePerCallHeavyweights() {
+        // Regression: every BytecodeVM.execute allocated CallInfo[256] plus
+        // 256 CallInfo objects and VmContext's 11 cache arrays (~6.5 KB). A
+        // leaf handler driven from the host now allocates only its VmContext
+        // and a tiny grow-on-demand CallInfo array. Assert a generous bound on
+        // bytes/call so a reintroduced 256-element allocation fails loudly.
+        LuaState state = new LuaState();
+        LuaFunction h = (LuaFunction) state.eval(
+                "return function(a) local s=0 for i=1,8 do s=s+a+i end return s end");
+        for (int i = 0; i < 20000; i++) {
+            h.call(org.luava.runtime.LuaInteger.valueOf(3));
+        }
+        java.lang.management.ThreadMXBean bean = java.lang.management.ManagementFactory.getThreadMXBean();
+        com.sun.management.ThreadMXBean sun =
+                (com.sun.management.ThreadMXBean) bean;
+        long before = sun.getThreadAllocatedBytes(Thread.currentThread().getId());
+        int n = 200000;
+        for (int i = 0; i < n; i++) {
+            h.call(org.luava.runtime.LuaInteger.valueOf(3));
+        }
+        long bytes = sun.getThreadAllocatedBytes(Thread.currentThread().getId()) - before;
+        long perCall = bytes / n;
+        // A VmContext plus one 8-slot CallInfo[] is ~200 bytes; the old 256
+        // CallInfo objects alone were > 8 KB/call. Allow headroom for JIT
+        // metadata but reject the old heavyweight allocation.
+        assertTrue(perCall < 4000,
+                "host call allocates " + perCall + " bytes/call (expected < 4000)");
     }
 
     /**

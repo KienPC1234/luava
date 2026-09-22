@@ -751,7 +751,7 @@ public final class LuaToJvmTranslator implements Opcodes {
                     // interpreter recomputes the function register.
                     int resumePc = fusedDef[pc] >= 0 ? fusedDef[pc] : pc;
                     emitCall(mv, owner, proto, a, b - 1, resumePc, fusedUp[pc], slot, fusedBList,
-                            fusedBCount);
+                            fusedBCount, c - 1 != 0);
                 }
                 case OpCode.OP_TAILCALL -> {
                     if (isSqrtIntrinsic(proto, proto.code, pc)) {
@@ -2895,7 +2895,8 @@ public final class LuaToJvmTranslator implements Opcodes {
      * interpreter.
      */
     private static void emitCall(MethodVisitor mv, String owner, LuaProto proto, int a, int nArgs,
-            int resumePc, int fusedB, int hoistSlot, int[] fusedBList, int fusedBCount) {
+            int resumePc, int fusedB, int hoistSlot, int[] fusedBList, int fusedBCount,
+            boolean resultUsed) {
         Label done = new Label();
         if (hoistSlot >= 0) {
             // Fast tier: entry-classified self callee straight into the
@@ -2980,6 +2981,18 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitJumpInsn(IFNE, returnsIntOk);
         emitDeopt(mv, resumePc, true);
         mv.visitLabel(returnsIntOk);
+        // A void callee returns a sentinel long that is indistinguishable from
+        // the integer 0. When the call result is consumed (a value context) the
+        // interpreter must run it; a discarded statement call is harmless and
+        // stays compiled. Structural deopt: expected for this shape.
+        if (resultUsed) {
+            mv.visitVarInsn(ALOAD, 21);
+            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/jit/JitCode", "returnsVoid", "Z");
+            Label notVoidCall = new Label();
+            mv.visitJumpInsn(IFEQ, notVoidCall);
+            emitDeopt(mv, resumePc, true);
+            mv.visitLabel(notVoidCall);
+        }
         ldcInt(mv, nArgs);
         mv.visitVarInsn(ALOAD, 20);
         mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "numParams", "I");
@@ -3163,6 +3176,15 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitJumpInsn(IFNE, returnsIntOk);
         emitDeopt(mv, resumePc);
         mv.visitLabel(returnsIntOk);
+        // A void callee forwards zero results; the compiled tail path can
+        // only return one long (the sentinel would be read as integer 0 by
+        // the caller), so run it in the interpreter. Structural.
+        mv.visitVarInsn(ALOAD, 21);
+        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/jit/JitCode", "returnsVoid", "Z");
+        Label notVoidTail = new Label();
+        mv.visitJumpInsn(IFEQ, notVoidTail);
+        emitDeopt(mv, resumePc, true);
+        mv.visitLabel(notVoidTail);
         ldcInt(mv, nArgs);
         mv.visitVarInsn(ALOAD, 20);
         mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaProto", "numParams", "I");

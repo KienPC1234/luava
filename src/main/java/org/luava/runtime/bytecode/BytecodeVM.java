@@ -164,8 +164,11 @@ public final class BytecodeVM {
         ctx.tStack = ctx.thread.getTypeStack();
         ctx.oStack = ctx.thread.getObjectStack();
 
-        ctx.callStack = new CallInfo[256];
-        for (int i = 0; i < ctx.callStack.length; i++) ctx.callStack[i] = new CallInfo();
+        // Grow-on-demand CallInfo stack. A host call that makes no Lua-to-Lua
+        // nested call (a leaf handler) never needs an entry, so eagerly
+        // allocating 256 CallInfo objects on every execute() was pure garbage
+        // on the embedding hot path. Entries are materialized on first push.
+        ctx.callStack = new CallInfo[8];
         ctx.callDepth = 0;
 
         ctx.savedStackTop = ctx.thread.getStackTop();
@@ -254,10 +257,32 @@ public final class BytecodeVM {
             return null;
         }
         JitCode jc = closure.proto.jitCode;
+        // Host-entry tier-up: `execute` is the entry point for every host call
+        // (LuaState.call/eval, a direct LuaClosure.invoke), whereas Lua-to-Lua
+        // calls are inlined and never reach here. Count host entries so a
+        // function driven only from Java (e.g. a request handler invoked in a
+        // loop) still tiers up; loop-driven tier-up at FORPREP only covers
+        // loops above JIT_LOOP_THRESHOLD, leaving small hot host-only loops
+        // interpreted forever.
+        if (jc == null) {
+            LuaProto proto = closure.proto;
+            if (!proto.jitDisabled && !proto.loopCompileRequested) {
+                int hot = proto.hotCount + 1;
+                proto.hotCount = hot;
+                if (hot >= LuaState.JIT_HOT_THRESHOLD) {
+                    try {
+                        org.luava.runtime.jit.JitCompiler.requestCompile(proto);
+                    } catch (Throwable t) {
+                        proto.jitDisabled = true;
+                    }
+                }
+            }
+            return null;
+        }
         // Impure kernels are allowed: their every call deopts before entering
         // a callee, and a deopt resumes the top-level interpreter at the
         // faulting pc with committed state intact.
-        if (jc == null || (!jc.returnsInt && jc.objHandle == null)) {
+        if (!jc.returnsInt && jc.objHandle == null) {
             return null;
         }
         try {
@@ -1301,9 +1326,14 @@ public final class BytecodeVM {
         for (int i = 0; i < nActualArgs; i++) {
             snapshot[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1 + i);
         }
-        int r = tryJitCall(state, ctx, child, funcIdx, nActualArgs, 1);
+        // A void callee forwards zero results, not one nil. Ask the compiled
+        // kernel for no result and signal the caller with a distinct code so
+        // it can propagate an empty result set (a bare `return f()` where
+        // f returns nothing must yield 0 values, matching the interpreter).
+        boolean voidResult = jc.returnsInt && jc.returnsVoid;
+        int r = tryJitCall(state, ctx, child, funcIdx, nActualArgs, voidResult ? 0 : 1);
         if (r == 1) {
-            return 1;
+            return voidResult ? 3 : 1;
         }
         if (r == 2) {
             // Deopt left the register window partially written; restore the
@@ -1418,6 +1448,9 @@ public final class BytecodeVM {
                 ctx.callStack = expandCallStack(ctx.callStack);
             }
             CallInfo ci = ctx.callStack[ctx.callDepth++];
+            if (ci == null) {
+                ci = ctx.callStack[ctx.callDepth - 1] = new CallInfo();
+            }
             ci.init(ctx.closure, funcIdx, ctx.base, ctx.top, ctx.pc, nResults);
             ci.varargs = ctx.varargs;
             ci.oldpc = ctx.oldpc;
@@ -1545,6 +1578,12 @@ public final class BytecodeVM {
                     // generic tail path.
                     state.closeUpvalues(ctx.thread, ctx.base);
                     return tailReturnInline(state, ctx, res);
+                }
+                if (jit == 3) {
+                    // Void callee: forward ZERO results (a bare `return g()`
+                    // where g returns nothing must not become one nil).
+                    state.closeUpvalues(ctx.thread, ctx.base);
+                    return tailReturnVoid(state, ctx);
                 }
                 if (jit == 2) {
                     // Deopt: run the generic tail path from a clean state.
@@ -2027,23 +2066,21 @@ public final class BytecodeVM {
      * must only be read. A cached miss (null) is remembered too.
      */
     private static String[] callName(VmContext ctx, LuaProto p, int lastpc, int reg) {
+        ctx.ensureNameCache();
         int idx = (lastpc + reg * 33) & (VmContext.NAME_CACHE_SIZE - 1);
-        if (ctx.ncFilled[idx] && ctx.ncProto[idx] == p && ctx.ncPc[idx] == lastpc && ctx.ncReg[idx] == reg) {
-            return ctx.ncInfo[idx];
+        if (ctx.ncFilledAt(idx) && ctx.ncProtoAt(idx) == p && ctx.ncPcAt(idx) == lastpc
+                && ctx.ncRegAt(idx) == reg) {
+            return ctx.ncInfoAt(idx);
         }
         String[] info = getobjname(p, lastpc, reg);
-        ctx.ncFilled[idx] = true;
-        ctx.ncProto[idx] = p;
-        ctx.ncPc[idx] = lastpc;
-        ctx.ncReg[idx] = reg;
-        ctx.ncInfo[idx] = info;
+        ctx.ncStore(idx, p, lastpc, reg, info);
         return info;
     }
 
     private static CallInfo[] expandCallStack(CallInfo[] callStack) {
         CallInfo[] newStack = new CallInfo[callStack.length * 2];
         System.arraycopy(callStack, 0, newStack, 0, callStack.length);
-        for (int i = callStack.length; i < newStack.length; i++) newStack[i] = new CallInfo();
+        // Leave new slots null: entries are materialized lazily on first push.
         return newStack;
     }
 
@@ -2431,6 +2468,43 @@ public final class BytecodeVM {
     }
 
     /**
+     * Tail-call return with ZERO results (the callee was a void function).
+     * Mirrors {@link #tailReturnInline} but propagates an empty result set:
+     * a fixed caller expects nil-fill, a multret caller leaves top at the
+     * function slot (no values).
+     */
+    private static LuaValue[] tailReturnVoid(LuaState state, VmContext ctx) {
+        CallStack.pop(ctx.callState, ctx.co);
+        if (ctx.callDepth <= 0) {
+            return new LuaValue[0];
+        }
+        CallInfo ci = ctx.callStack[--ctx.callDepth];
+        int callerFunc = ci.funcIndex;
+        ctx.base = ci.baseIndex;
+        ctx.closure = ci.closure;
+        ctx.proto = ctx.closure.proto;
+        ctx.code = ctx.proto.code;
+        ctx.k = ctx.proto.constants;
+        ctx.upvals = ctx.closure.upvals;
+        ctx.pc = ci.savedPc;
+        ctx.varargs = ci.varargs;
+        ctx.oldpc = ci.oldpc;
+        ctx.varargPrepRan = ci.varargPrepRan;
+        ctx.thread.ensureStackCapacity(callerFunc + (ci.expectedResults > 0 ? ci.expectedResults : 1) + 32);
+        ctx.pStack = ctx.thread.getPrimitiveStack();
+        ctx.tStack = ctx.thread.getTypeStack();
+        ctx.oStack = ctx.thread.getObjectStack();
+        if (ci.expectedResults > 0) {
+            for (int i = 0; i < ci.expectedResults; i++) {
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, callerFunc + i, LuaNil.NIL);
+            }
+        } else if (ci.expectedResults < 0) {
+            ctx.top = callerFunc;
+        }
+        return null;
+    }
+
+    /**
      * Frameless single-result builtins ({@code setmetatable/2} on a fresh
      * table, {@code math.sqrt/1} on a number). Returns the result, or null
      * when the generic path must run (bad argument types, protected
@@ -2543,25 +2617,20 @@ public final class BytecodeVM {
         LuaValue key = ctx.k[c];
         LuaValue uv = ctx.upvals[b].getValue();
         if (key instanceof LuaString && uv instanceof LuaTable tbl) {
+            ctx.ensureGlobalCache();
             int idx = (System.identityHashCode(tbl) ^ (pc * 33) ^ System.identityHashCode(key))
                     & (VmContext.GLOBAL_CACHE_SIZE - 1);
-            if (ctx.gcProto[idx] == ctx.proto && ctx.gcPc[idx] == pc
-                    && ctx.gcTable[idx] == tbl && ctx.gcKey[idx] == key) {
+            if (ctx.gcHit(idx, ctx.proto, pc, tbl, key)) {
                 long ver = tbl.readVersion();
-                if (ver != -1L && ver == ctx.gcVersion[idx]) {
-                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValue[idx]);
+                if (ver != -1L && ver == ctx.gcVersionAt(idx)) {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValueAt(idx));
                     return;
                 }
             }
             LuaValue val = tbl.get(key);
             long ver = tbl.readVersion();
             if (ver != -1L) {
-                ctx.gcProto[idx] = ctx.proto;
-                ctx.gcPc[idx] = pc;
-                ctx.gcTable[idx] = tbl;
-                ctx.gcKey[idx] = key;
-                ctx.gcVersion[idx] = ver;
-                ctx.gcValue[idx] = val;
+                ctx.gcStore(idx, ctx.proto, pc, tbl, key, ver, val);
             }
             setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, val);
             return;
@@ -2710,26 +2779,21 @@ public final class BytecodeVM {
                 LuaTable mt = tbl.getMetatable();
                 LuaValue handler = (mt != null) ? mt.rawget(LuaValue.Meta.INDEX) : null;
                 if (handler instanceof LuaTable idx) {
+                    ctx.ensureGlobalCache();
                     int id = (System.identityHashCode(mt) ^ System.identityHashCode(idx) ^ (pc * 33)
                             ^ System.identityHashCode(ks)) & (VmContext.GLOBAL_CACHE_SIZE - 1);
-                    if (ctx.gcProto[id] == ctx.proto && ctx.gcPc[id] == pc
-                            && ctx.gcTable[id] == idx && ctx.gcKey[id] == ks) {
+                    if (ctx.gcHit(id, ctx.proto, pc, idx, ks)) {
                         long ver = idx.readVersion();
-                        if (ver != -1L && ver == ctx.gcVersion[id]) {
+                        if (ver != -1L && ver == ctx.gcVersionAt(id)) {
                             setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
-                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValue[id]);
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValueAt(id));
                             return;
                         }
                     }
                     LuaValue m = idx.rawget(ks);
                     long ver = idx.readVersion();
                     if (ver != -1L && !m.isNil()) {
-                        ctx.gcProto[id] = ctx.proto;
-                        ctx.gcPc[id] = pc;
-                        ctx.gcTable[id] = idx;
-                        ctx.gcKey[id] = ks;
-                        ctx.gcVersion[id] = ver;
-                        ctx.gcValue[id] = m;
+                        ctx.gcStore(id, ctx.proto, pc, idx, ks, ver, m);
                         setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
                         setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, m);
                         return;
@@ -2739,26 +2803,21 @@ public final class BytecodeVM {
             LuaTable mt = state.basicMetatable(LuaType.STRING);
             LuaValue handler = (mt != null) ? mt.rawget(LuaValue.Meta.INDEX) : null;
             if (handler instanceof LuaTable idx) {
+                ctx.ensureGlobalCache();
                 int id = (System.identityHashCode(idx) ^ (pc * 33) ^ System.identityHashCode(ks))
                         & (VmContext.GLOBAL_CACHE_SIZE - 1);
-                if (ctx.gcProto[id] == ctx.proto && ctx.gcPc[id] == pc
-                        && ctx.gcTable[id] == idx && ctx.gcKey[id] == ks) {
+                if (ctx.gcHit(id, ctx.proto, pc, idx, ks)) {
                     long ver = idx.readVersion();
-                    if (ver != -1L && ver == ctx.gcVersion[id]) {
+                    if (ver != -1L && ver == ctx.gcVersionAt(id)) {
                         setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
-                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValue[id]);
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValueAt(id));
                         return;
                     }
                 }
                 LuaValue m = idx.rawget(ks);
                 long ver = idx.readVersion();
                 if (ver != -1L && !m.isNil()) {
-                    ctx.gcProto[id] = ctx.proto;
-                    ctx.gcPc[id] = pc;
-                    ctx.gcTable[id] = idx;
-                    ctx.gcKey[id] = ks;
-                    ctx.gcVersion[id] = ver;
-                    ctx.gcValue[id] = m;
+                    ctx.gcStore(id, ctx.proto, pc, idx, ks, ver, m);
                     setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
                     setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, m);
                     return;

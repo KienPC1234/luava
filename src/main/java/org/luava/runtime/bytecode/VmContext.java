@@ -84,11 +84,60 @@ public final class VmContext {
      * thrash (a 4-entry table did, re-scanning on nearly every call).
      */
     public static final int NAME_CACHE_SIZE = 256;
-    public final LuaProto[] ncProto = new LuaProto[NAME_CACHE_SIZE];
-    public final int[] ncPc = new int[NAME_CACHE_SIZE];
-    public final int[] ncReg = new int[NAME_CACHE_SIZE];
-    public final String[][] ncInfo = new String[NAME_CACHE_SIZE][];
-    public final boolean[] ncFilled = new boolean[NAME_CACHE_SIZE];
+    private LuaProto[] ncProto;
+    private int[] ncPc;
+    private int[] ncReg;
+    private String[][] ncInfo;
+    private boolean[] ncFilled;
+
+    /**
+     * Lazily-allocated name cache. A host call into a leaf handler never
+     * resolves a call-site name (no Lua-to-Lua call), so the 256-entry
+     * arrays were pure garbage on the embedding hot path. {@link #ensureNameCache()}
+     * materializes them on the first name resolution; the dispatch code calls
+     * it before touching the arrays.
+     */
+    public boolean nameCacheReady() {
+        return ncProto != null;
+    }
+
+    public void ensureNameCache() {
+        if (ncProto == null) {
+            ncProto = new LuaProto[NAME_CACHE_SIZE];
+            ncPc = new int[NAME_CACHE_SIZE];
+            ncReg = new int[NAME_CACHE_SIZE];
+            ncInfo = new String[NAME_CACHE_SIZE][];
+            ncFilled = new boolean[NAME_CACHE_SIZE];
+        }
+    }
+
+    public LuaProto ncProtoAt(int i) {
+        return ncProto[i];
+    }
+
+    public int ncPcAt(int i) {
+        return ncPc[i];
+    }
+
+    public int ncRegAt(int i) {
+        return ncReg[i];
+    }
+
+    public String[] ncInfoAt(int i) {
+        return ncInfo[i];
+    }
+
+    public boolean ncFilledAt(int i) {
+        return ncFilled[i];
+    }
+
+    public void ncStore(int i, LuaProto p, int pc, int reg, String[] info) {
+        ncFilled[i] = true;
+        ncProto[i] = p;
+        ncPc[i] = pc;
+        ncReg[i] = reg;
+        ncInfo[i] = info;
+    }
 
     /**
      * Direct-mapped site cache for {@code OP_GETTABUP} with string keys
@@ -98,12 +147,50 @@ public final class VmContext {
      * ({@code SETTABUP}, {@code rawset(_G)}, host {@code setLive}, ...)
      * invalidates the entry. Keyed by (proto, pc) plus table/key identity,
      * so swapped upvalues or re-pointed {@code ctx} entries safely miss.
+     * Lazily allocated for the same reason as the name cache.
      */
     public static final int GLOBAL_CACHE_SIZE = 64;
-    public final LuaProto[] gcProto = new LuaProto[GLOBAL_CACHE_SIZE];
-    public final int[] gcPc = new int[GLOBAL_CACHE_SIZE];
-    public final org.luava.runtime.LuaTable[] gcTable = new org.luava.runtime.LuaTable[GLOBAL_CACHE_SIZE];
-    public final LuaValue[] gcKey = new LuaValue[GLOBAL_CACHE_SIZE];
-    public final long[] gcVersion = new long[GLOBAL_CACHE_SIZE];
-    public final LuaValue[] gcValue = new LuaValue[GLOBAL_CACHE_SIZE];
+    private LuaProto[] gcProto;
+    private int[] gcPc;
+    private org.luava.runtime.LuaTable[] gcTable;
+    private LuaValue[] gcKey;
+    private long[] gcVersion;
+    private LuaValue[] gcValue;
+
+    public boolean globalCacheReady() {
+        return gcProto != null;
+    }
+
+    public void ensureGlobalCache() {
+        if (gcProto == null) {
+            gcProto = new LuaProto[GLOBAL_CACHE_SIZE];
+            gcPc = new int[GLOBAL_CACHE_SIZE];
+            gcTable = new org.luava.runtime.LuaTable[GLOBAL_CACHE_SIZE];
+            gcKey = new LuaValue[GLOBAL_CACHE_SIZE];
+            gcVersion = new long[GLOBAL_CACHE_SIZE];
+            gcValue = new LuaValue[GLOBAL_CACHE_SIZE];
+        }
+    }
+
+    public boolean gcHit(int id, LuaProto proto, int pc, org.luava.runtime.LuaTable idx, LuaValue key) {
+        return gcProto[id] == proto && gcPc[id] == pc && gcTable[id] == idx && gcKey[id] == key;
+    }
+
+    public long gcVersionAt(int id) {
+        return gcVersion[id];
+    }
+
+    public LuaValue gcValueAt(int id) {
+        return gcValue[id];
+    }
+
+    public void gcStore(int id, LuaProto proto, int pc, org.luava.runtime.LuaTable idx, LuaValue key,
+            long ver, LuaValue value) {
+        gcProto[id] = proto;
+        gcPc[id] = pc;
+        gcTable[id] = idx;
+        gcKey[id] = key;
+        gcVersion[id] = ver;
+        gcValue[id] = value;
+    }
 }
