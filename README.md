@@ -1,5 +1,9 @@
 # Luava: Pure-Java Lua 5.4 Engine (Java 21)
 
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.kienpc1234/luava.svg?label=Maven%20Central)](https://central.sonatype.com/artifact/io.github.kienpc1234/luava)
+[![License](https://img.shields.io/badge/license-MPL%202.0-blue.svg)](LICENSE)
+[![JDK](https://img.shields.io/badge/JDK-21%2B-orange.svg)](#install)
+
 Luava is a pure-Java implementation of **Lua 5.4** for the JVM: lexer,
 parser, AST, register-based bytecode compiler, register VM interpreter,
 hybrid tiered JIT, sandboxing and deep Java interop. It ships as a single
@@ -14,7 +18,11 @@ Pipeline: `Lua source → Lexer → Parser → AST → BytecodeCompiler → LuaP
 
 ## Install
 
-Maven:
+Published on **Maven Central** as
+[`io.github.kienpc1234:luava`](https://central.sonatype.com/artifact/io.github.kienpc1234/luava).
+Requires **JDK 21+** (stock LTS, no `--enable-preview`).
+
+**Maven**
 
 ```xml
 <dependency>
@@ -24,13 +32,57 @@ Maven:
 </dependency>
 ```
 
-Gradle:
+**Gradle (Kotlin DSL)**
 
 ```kotlin
 implementation("io.github.kienpc1234:luava:0.1.0-alpha")
 ```
 
-Requirements: **JDK 21+** (stock LTS, no `--enable-preview`).
+**Gradle (Groovy DSL)**
+
+```groovy
+implementation 'io.github.kienpc1234:luava:0.1.0-alpha'
+```
+
+The artifact has zero transitive dependencies, so there is nothing else to add.
+
+<details>
+<summary>Other ways to get it</summary>
+
+**Download the jar** from the
+[GitHub release](https://github.com/KienPC1234/luava/releases/latest) and put
+it on your classpath:
+
+```bash
+javac -cp luava-0.1.0-alpha.jar MyApp.java
+java  -cp luava-0.1.0-alpha.jar:. MyApp
+```
+
+**Run a Lua script / open the REPL** (the jar is executable):
+
+```bash
+java -jar luava-0.1.0-alpha.jar script.lua arg1 arg2
+java -jar luava-0.1.0-alpha.jar -e "print(1 + 2)"
+java -jar luava-0.1.0-alpha.jar            # interactive REPL
+```
+
+**Build from source** (this repository):
+
+```bash
+mvn package          # target/luava-0.1.0-alpha.jar
+mvn test             # 30/30 PUC Lua 5.4.9 suites + unit tests
+```
+
+</details>
+
+Every Maven Central artifact is GPG-signed; you can verify it (optional):
+
+```bash
+gpg --keyserver keyserver.ubuntu.com --recv-keys 5D85410AF087FBB6
+BASE=https://repo1.maven.org/maven2/io/github/kienpc1234/luava/0.1.0-alpha
+curl -O $BASE/luava-0.1.0-alpha.jar -O $BASE/luava-0.1.0-alpha.jar.asc
+gpg --verify luava-0.1.0-alpha.jar.asc luava-0.1.0-alpha.jar
+```
 
 ## Quick start
 
