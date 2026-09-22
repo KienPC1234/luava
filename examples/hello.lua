@@ -1,9 +1,9 @@
 -- ============================================================================
 -- hello.lua — a tour of Lua 5.4 running on the Luava engine.
 --
--- Run it from the project root:
---     ./luava examples/hello.lua
---     ./luava examples/hello.lua Alice Bob       # passes script arguments
+-- Run it (from the project root, after `mvn package`):
+--     java -jar target/luava-0.1.0-alpha.jar examples/hello.lua
+--     java -jar target/luava-0.1.0-alpha.jar examples/hello.lua Alice Bob
 --
 -- It exercises the features that make Luava interesting: integers vs floats,
 -- bitwise ops, metatables/OOP, closures/upvalues, generic-for, string

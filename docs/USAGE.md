@@ -25,20 +25,15 @@ shows the idiomatic way to do common things.
 
 ## Running Lua from the command line
 
-If you only want to run scripts or poke at Lua 5.4 syntax, use the launcher
-[`./luava`](../luava) (it locates the engine jar automatically) or the jar
-directly:
+If you only want to run scripts or poke at Lua 5.4 syntax, the engine jar is
+executable:
 
 ```bash
-./luava script.lua arg1 arg2       # run a script; arg[0] is the script name
-./luava -e "print(1 + 2)"          # evaluate a string
-./luava                            # interactive multi-line REPL
-./luava -v                         # version
-./luava -h                         # help
-
-# equivalent without the launcher:
-java -jar luava-0.1.0-alpha.jar script.lua arg1 arg2
-LUAVA_JAR=/path/to/luava.jar ./luava -e "print('hi')"   # explicit jar
+java -jar luava-0.1.0-alpha.jar script.lua arg1 arg2   # arg[0] is the script name
+java -jar luava-0.1.0-alpha.jar -e "print(1 + 2)"      # evaluate a string
+java -jar luava-0.1.0-alpha.jar                        # interactive multi-line REPL
+java -jar luava-0.1.0-alpha.jar -v                     # version
+java -jar luava-0.1.0-alpha.jar -h                     # help
 ```
 
 This is a convenience front end; embedding through `LuaState` (below) is the

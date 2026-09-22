@@ -59,14 +59,6 @@ javac -cp luava-0.1.0-alpha.jar MyApp.java
 java  -cp luava-0.1.0-alpha.jar:. MyApp
 ```
 
-**Run a Lua script / open the REPL** (the jar is executable):
-
-```bash
-java -jar luava-0.1.0-alpha.jar script.lua arg1 arg2
-java -jar luava-0.1.0-alpha.jar -e "print(1 + 2)"
-java -jar luava-0.1.0-alpha.jar            # interactive REPL
-```
-
 **Build from source** (this repository):
 
 ```bash
@@ -75,15 +67,6 @@ mvn test             # 30/30 PUC Lua 5.4.9 suites + unit tests
 ```
 
 </details>
-
-Every Maven Central artifact is GPG-signed; you can verify it (optional):
-
-```bash
-gpg --keyserver keyserver.ubuntu.com --recv-keys 5D85410AF087FBB6
-BASE=https://repo1.maven.org/maven2/io/github/kienpc1234/luava/0.1.0-alpha
-curl -O $BASE/luava-0.1.0-alpha.jar -O $BASE/luava-0.1.0-alpha.jar.asc
-gpg --verify luava-0.1.0-alpha.jar.asc luava-0.1.0-alpha.jar
-```
 
 ## Quick start
 
@@ -115,7 +98,7 @@ The host surface is small and fluent:
 | `state.setLive(name, obj)` | Expose a Java object as **live** userdata (mutations flow both ways). |
 | `state.registerFunction(name, ...)` | Expose a typed Java lambda (`Supplier`, `Consumer`, `Function`, `BiFunction`, ...). |
 | `state.registerModule(obj)` | Bind an `@LuaModule`-annotated class or instance. |
-| `state.registerClass(clazz)` | Expose a class for `java.import`-style access. |
+| `state.registerClass(clazz)` | Expose a class under its simple name (e.g. `ArrayList`). |
 | `state.resourceLoader(loader)` | Resolve `require` from a JAR/classpath/virtual store. |
 
 ```java
@@ -218,27 +201,17 @@ adds a fifth searcher that is a no-op when no loader is set.
 ## CLI and REPL
 
 The jar is executable and also exposes a small front end for developing and
-smoke-testing Lua 5.4. A convenience launcher, [`./luava`](luava), finds the
-jar automatically (a `luava-*.jar` next to it, or `target/luava-*.jar` after
-a source build), so no classpath is needed:
-
-```bash
-./luava script.lua arg1 arg2       # run a script
-./luava -e "print(1+2)"            # evaluate a string
-./luava                            # interactive REPL (also on a TTY)
-./luava -v                         # version
-```
-
-Or invoke the jar directly:
+smoke-testing Lua 5.4:
 
 ```bash
 java -jar luava-0.1.0-alpha.jar script.lua arg1 arg2
-java -jar luava-0.1.0-alpha.jar -e "print(1+2)"
+java -jar luava-0.1.0-alpha.jar -e "print(1 + 2)"
 java -jar luava-0.1.0-alpha.jar            # interactive REPL (also on a TTY)
 ```
 
 A script sees the standard `arg` table (`arg[0]` is the script name).
-Embedding through `LuaState` remains the primary use.
+Embedding through `LuaState` remains the primary use; the
+[Usage Guide](docs/USAGE.md) has runnable examples.
 
 ## Execution model
 
@@ -294,9 +267,9 @@ Knobs:
   `all.lua` (needs C test libs plus an interactive runner) and `main.lua`
   (stand-alone CLI driver; `os.execute`-driven, not applicable to an
   embedded engine).
-- Robustness: 8000+ recursion levels (clean `stack overflow` past the 10000
-  limit), 2000-coroutine churn, heavy table/string/error pressure, and 8
-  concurrent states on one JVM with a flat heap across repetitions
+- Robustness: deep recursion (3000 tested; a clean `stack overflow` past the
+  10000-frame limit), 200-coroutine churn, 100k tail calls, heavy
+  table/string/`<close>`/error pressure, and 8 concurrent states on one JVM
   (`LuavaStressTest`).
 
 ## Benchmarks
@@ -321,10 +294,10 @@ LuaJ runs its `LuaClosure.execute` interpreter as Lua 5.2 (no `//`, bitwise
 ops, `<close>` or integer subtype); Luava implements 5.4. What remains
 between Luava and PUC Lua (C) is dispatch cost.
 
-A 13-line cross-engine script (OOP, coroutine sieve, memoized fib, varargs,
-tail-recursive fold, record sort, cyclic deepcopy, `pcall`/`xpcall`,
-upvalue counters, a 100k loop, `string.format`) produces **byte-identical
-output on PUC Lua, Luava and LuaJ**.
+Conformance is backed by a byte-for-byte differential suite
+(`Lua54ConformanceTest`): each case's expected string was copied from stock
+PUC Lua 5.4 output, covering operator matrices, integer boundaries,
+`string.format`, patterns, metatables and numeric-string coercion.
 
 Cold start (unpinned, median of 9, JDK 21): `LuaState` construction ~50 ms
 (faster than LuaJ's ~57–65 ms); first eval of a small realistic script
@@ -347,7 +320,7 @@ pure Java and round-trips within Luava (`load(string.dump(f))`).
 ```text
 src/main/java/org/luava/
 ├── frontend/lexer|parser|ast  # tokenizer, parser, AST nodes
-├── midend/optimizer           # constant folding, type inference
+├── midend/optimizer           # constant folding
 ├── runtime/                   # LuaState, LuaValue hierarchy, Varargs
 │   ├── bytecode/              # OpCode, LuaProto, BytecodeCompiler, BytecodeVM
 │   ├── eval/                  # CallStack, Upvalue, GCManager, Environment

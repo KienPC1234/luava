@@ -1,8 +1,8 @@
 -- ============================================================================
 -- interop.lua — Lua calling into Java, run on the Luava engine.
 --
--- Run from the project root:
---     ./luava examples/interop.lua
+-- Run (from the project root, after `mvn package`):
+--     java -jar target/luava-0.1.0-alpha.jar examples/interop.lua
 --
 -- Luava exposes a `java` bridge to scripts. Use java.import to load a class,
 -- Class.new(...) to construct, then read fields and call methods. Access is
