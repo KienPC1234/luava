@@ -39,17 +39,20 @@ public final class PackageLib {
         pkg.rawset(LuaString.interned("cpath"), LuaString.interned("./?.so;./loadall.so"));
         pkg.rawset(LuaString.interned("config"), LuaString.valueOf("/\n;\n?\n!\n-\n"));
 
-        // Register default modules in package.loaded
+        // Register the standard libraries in package.loaded exactly as PUC
+        // does at open time. Seed from the state's recorded stdlib tables,
+        // NOT from the current globals: `all.lua` nils the globals and then
+        // requires them back, which must still resolve (PUC keeps them in
+        // package.loaded). Only the PUC standard names are registered; the
+        // Luava-only `java`/`luajava` tables are intentionally excluded.
         loaded.rawset(LuaString.interned("_G"), globals);
         loaded.rawset(LuaString.interned("package"), pkg);
-        if (!globals.rawget(LuaString.interned("math")).isNil()) loaded.rawset(LuaString.interned("math"), globals.rawget(LuaString.interned("math")));
-        if (!globals.rawget(LuaString.interned("string")).isNil()) loaded.rawset(LuaString.interned("string"), globals.rawget(LuaString.interned("string")));
-        if (!globals.rawget(LuaString.interned("table")).isNil()) loaded.rawset(LuaString.interned("table"), globals.rawget(LuaString.interned("table")));
-        if (!globals.rawget(LuaString.interned("coroutine")).isNil()) loaded.rawset(LuaString.interned("coroutine"), globals.rawget(LuaString.interned("coroutine")));
-        if (!globals.rawget(LuaString.interned("utf8")).isNil()) loaded.rawset(LuaString.interned("utf8"), globals.rawget(LuaString.interned("utf8")));
-        if (!globals.rawget(LuaString.interned("os")).isNil()) loaded.rawset(LuaString.interned("os"), globals.rawget(LuaString.interned("os")));
-        if (!globals.rawget(LuaString.interned("io")).isNil()) loaded.rawset(LuaString.interned("io"), globals.rawget(LuaString.interned("io")));
-        if (!globals.rawget(LuaString.interned("debug")).isNil()) loaded.rawset(LuaString.interned("debug"), globals.rawget(LuaString.interned("debug")));
+        for (String name : new String[]{"math", "string", "table", "coroutine", "utf8", "os", "io", "debug"}) {
+            LuaTable lib = state.standardLibs().get(name);
+            if (lib != null) {
+                loaded.rawset(LuaString.valueOf(name), lib);
+            }
+        }
 
         LuaFunction searchpathFn = LuaFunction.of(args -> {
             if (args.length < 2) throw new LuaException("bad argument to 'package.searchpath'");

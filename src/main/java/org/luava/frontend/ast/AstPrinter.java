@@ -24,6 +24,30 @@ public final class AstPrinter {
         return sb.toString();
     }
 
+    /**
+     * Prints a function-definition name in the only form the grammar accepts:
+     * {@code Name {'.' Name}} with an optional final {@code ':' Name} for a
+     * method. The parser represents {@code function a.b:c()} as nested
+     * {@link Expressions.TableAccessExpr} nodes with string-literal keys, so a
+     * naive expression print yields {@code a["b"]:(...)} which cannot be
+     * reparsed. A computed key (never produced by this grammar) would fall
+     * back to bracket notation, which is still the best available rendering.
+     */
+    private static void printFunctionDefName(Expression target, boolean isMethod, StringBuilder sb) {
+        if (target instanceof Expressions.TableAccessExpr ta
+                && ta.key() instanceof Expressions.StringLiteral sl) {
+            if (isMethod) {
+                printFunctionDefName(ta.table(), false, sb);
+                sb.append(":").append(sl.value());
+            } else {
+                printFunctionDefName(ta.table(), false, sb);
+                sb.append(".").append(sl.value());
+            }
+            return;
+        }
+        printExpression(target, sb);
+    }
+
     public static void printStatement(Statement stmt, StringBuilder sb) {
         switch (stmt) {
             case Statements.BlockStmt b -> {
@@ -120,15 +144,24 @@ public final class AstPrinter {
             }
             case Statements.FunctionDefStmt fd -> {
                 sb.append("function ");
-                printExpression(fd.targetName(), sb);
-                if (fd.isMethod()) sb.append(":");
+                // A function-definition name must be the `Name {'.' Name}
+                // [':' Name]` grammar, never bracket access: the parser turns
+                // `function a.b:c()` into nested TableAccessExpr with string
+                // keys, so printing it as `a["b"]:(...)` produced source that
+                // fails to reparse (broke string.dump/load round-trips).
+                printFunctionDefName(fd.targetName(), fd.isMethod(), sb);
                 sb.append("(");
-                for (int i = 0; i < fd.parameters().size(); i++) {
-                    if (i > 0) sb.append(", ");
+                // In colon form `self` is implicit; the parser prepends it to
+                // the parameter list, so drop it again here.
+                int start = (fd.isMethod() && !fd.parameters().isEmpty()
+                        && "self".equals(fd.parameters().get(0))) ? 1 : 0;
+                for (int i = start; i < fd.parameters().size(); i++) {
+                    if (i > start) sb.append(", ");
                     sb.append(fd.parameters().get(i));
                 }
+                boolean hasParams = fd.parameters().size() > start;
                 if (fd.isVararg()) {
-                    if (!fd.parameters().isEmpty()) sb.append(", ");
+                    if (hasParams) sb.append(", ");
                     sb.append("...");
                 }
                 sb.append(")\n");

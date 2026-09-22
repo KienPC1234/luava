@@ -66,6 +66,15 @@ public final class LuaState {
     private final EnumMap<LuaType, LuaTable> basicMetatables = new EnumMap<>(LuaType.class);
     private final Environment rootEnvironment;
     private final List<ModuleBinder.ModuleInfo> registeredModules = new ArrayList<>();
+    /**
+     * Standard-library tables by module name, recorded when the state is
+     * built. {@code package.loaded} is seeded from this map, not from the
+     * current globals: PUC registers every opened stdlib in
+     * {@code package.loaded} at startup, so `debug = nil; require"debug"`
+     * must still resolve. Reading the globals at package-fill time would miss
+     * any library the script had already nil'd (the real `all.lua` setup).
+     */
+    private final Map<String, LuaTable> standardLibs = new java.util.LinkedHashMap<>();
     private LuaValue savedLoadfile;
     private LuaValue savedDofile;
 
@@ -380,7 +389,13 @@ public final class LuaState {
         table.setLazyFiller(() -> filler.accept(holder[0]));
         holder[0] = table;
         globals.rawset(LuaString.valueOf(name), table);
+        standardLibs.put(name, table);
         return table;
+    }
+
+    /** Standard-library tables by module name (for {@code package.loaded}). */
+    public Map<String, LuaTable> standardLibs() {
+        return standardLibs;
     }
 
     /**
@@ -830,6 +845,13 @@ public final class LuaState {
                 Parser parser = new Parser(tokens);
                 Statements.BlockStmt block = parser.parse();
                 proto = org.luava.runtime.bytecode.BytecodeCompiler.compile(block, chunkName);
+                // Keep the verbatim chunk text so string.dump can round-trip
+                // through load() with exact line info and semantics. The
+                // AstPrinter fallback reformats source (loses line numbers and
+                // can mis-render some constructs), which broke the PUC suite's
+                // dump/undump harness ("all.lua" dofile wrapper). Nested protos
+                // keep a null rawSource and use the printer.
+                proto.rawSource = luaSource;
             } catch (org.luava.frontend.parser.ParseException pe) {
                 throw new LuaException(pe.format(chunkName != null ? chunkName : luaSource));
             }
