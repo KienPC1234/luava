@@ -53,16 +53,39 @@ public abstract class LuaFunction extends LuaValue {
     protected String rawSource = null;
     public String getRawSource() { return rawSource; }
     public void setRawSource(String rawSource) { this.rawSource = rawSource; }
-    protected java.util.List<org.luava.runtime.eval.Upvalue> upvalues = new java.util.ArrayList<>();
-    public java.util.List<org.luava.runtime.eval.Upvalue> getUpvalues() { return upvalues; }
-    public void setUpvalues(java.util.List<org.luava.runtime.eval.Upvalue> upvalues) { this.upvalues = upvalues != null ? upvalues : new java.util.ArrayList<>(); }
+    // Lazily materialized: most LuaFunctions are LuaClosures, which store
+    // their upvalues/params in arrays and never read these lists on the hot
+    // path. Eagerly allocating two ArrayLists in the superclass constructor
+    // then discarding them (as LuaClosure does) was pure garbage on the hottest
+    // allocation site (one closure per call in the closures benchmark).
+    protected java.util.List<org.luava.runtime.eval.Upvalue> upvalues;
+    public java.util.List<org.luava.runtime.eval.Upvalue> getUpvalues() {
+        java.util.List<org.luava.runtime.eval.Upvalue> list = upvalues;
+        if (list == null) {
+            list = new java.util.ArrayList<>();
+            upvalues = list;
+        }
+        return list;
+    }
+    public void setUpvalues(java.util.List<org.luava.runtime.eval.Upvalue> upvalues) {
+        this.upvalues = upvalues != null ? upvalues : new java.util.ArrayList<>();
+    }
     /** Replace upvalue at 0-based index; subclasses may override to update internal arrays. */
     public void replaceUpvalue(int index, org.luava.runtime.eval.Upvalue uv) {
-        upvalues.set(index, uv);
+        getUpvalues().set(index, uv);
     }
-    protected java.util.List<String> params = new java.util.ArrayList<>();
-    public java.util.List<String> getParams() { return params; }
-    public void setParams(java.util.List<String> params) { this.params = params != null ? params : new java.util.ArrayList<>(); }
+    protected java.util.List<String> params;
+    public java.util.List<String> getParams() {
+        java.util.List<String> list = params;
+        if (list == null) {
+            list = new java.util.ArrayList<>();
+            params = list;
+        }
+        return list;
+    }
+    public void setParams(java.util.List<String> params) {
+        this.params = params != null ? params : new java.util.ArrayList<>();
+    }
     protected boolean stripped = false;
     public boolean isStripped() { return stripped; }
     public void setStripped(boolean stripped) { this.stripped = stripped; }

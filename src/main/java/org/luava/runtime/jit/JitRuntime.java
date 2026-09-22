@@ -132,16 +132,35 @@ public final class JitRuntime {
      * might still resolve) so the generated code deopts to the interpreter.
      * Mirrors the interpreter's {@code executeSelfCached} table fast lane.
      */
-    public static LuaValue selfMethod(long[] p, byte[] t, LuaValue[] o, int objIdx, LuaValue key) {
+    public static LuaValue selfMethod(org.luava.runtime.bytecode.LuaClosure self,
+            long[] p, byte[] t, LuaValue[] o, int objIdx, LuaValue key) {
         if (t[objIdx] != org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT) {
             return null;
         }
         LuaValue obj = o[objIdx];
-        if (!(obj instanceof org.luava.runtime.LuaTable tbl)) {
-            return null;
+        if (obj instanceof org.luava.runtime.LuaTable tbl) {
+            LuaValue m = tbl.rawget(key);
+            return m.isNil() ? null : m;
         }
-        LuaValue m = tbl.rawget(key);
-        return m.isNil() ? null : m;
+        // `str:method()` resolves through the string type metatable (PUC's
+        // luaT_gettmbyobj), which is shared and read-only in Lua. Mirroring
+        // that lookup here lets `str:gmatch(...)`, `str:sub(...)` and friends
+        // run in compiled code; a miss still deopts to the interpreter.
+        if (obj instanceof org.luava.runtime.LuaString && key instanceof org.luava.runtime.LuaString) {
+            org.luava.runtime.LuaTable mt = self.getState() != null
+                    ? self.getState().basicMetatable(org.luava.runtime.LuaType.STRING)
+                    : org.luava.runtime.LuaValue.getBasicMetatable(org.luava.runtime.LuaType.STRING);
+            if (mt == null) {
+                return null;
+            }
+            LuaValue index = mt.rawget(org.luava.runtime.LuaValue.Meta.INDEX);
+            if (!(index instanceof org.luava.runtime.LuaTable idx)) {
+                return null;
+            }
+            LuaValue m = idx.rawget(key);
+            return m.isNil() ? null : m;
+        }
+        return null;
     }
 
     /**
@@ -170,6 +189,163 @@ public final class JitRuntime {
 
     private static boolean isConcatable(org.luava.runtime.LuaValue v) {
         return v.isString() || v.isNumber();
+    }
+
+    /**
+     * Inline {@code string.gmatch(s, p)} iterator setup for the JIT: calls
+     * the shared {@code StringLib.GMATCH} builtin on registers
+     * {@code [argBase, argBase+nArgs)} and returns its result triple. The
+     * generated code has already identity-guarded the function register
+     * against {@code StringLib.GMATCH}.
+     */
+    public static org.luava.runtime.Varargs gmatchSetup(long[] p, byte[] t, LuaValue[] o,
+            int argBase, int nArgs) {
+        LuaValue[] args = new LuaValue[nArgs];
+        for (int i = 0; i < nArgs; i++) {
+            args[i] = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, argBase + i);
+        }
+        LuaValue res = org.luava.runtime.standard.StringLib.GMATCH.call(args);
+        return res instanceof org.luava.runtime.Varargs va ? va
+                : org.luava.runtime.Varargs.of(res);
+    }
+
+    /**
+     * Writes the iterator-setup results ({@code func, state, control}) into
+     * {@code R[dst..dst+nRes-1]}, nil-filling any register beyond the values
+     * the factory returned. The generic-for compiler reserves four registers
+     * ({@code R[A..A+3]}), so the 4th (the to-be-closed slot) is nil for the
+     * built-in factories, exactly as PUC's {@code luaD_poscall} would fill.
+     */
+    public static void unpackTForSetup(long[] p, byte[] t, LuaValue[] o,
+            org.luava.runtime.Varargs triple, int dst, int nRes) {
+        LuaValue[] vals = triple != null ? triple.getValuesUnsafe() : null;
+        for (int i = 0; i < nRes; i++) {
+            org.luava.runtime.LuaValue v = (vals != null && i < vals.length && vals[i] != null)
+                    ? vals[i] : org.luava.runtime.LuaNil.NIL;
+            org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, dst + i, v);
+        }
+    }
+
+    /**
+     * {@code OP_TFORPREP}: registers the loop's 4th slot as a to-be-closed
+     * variable, exactly like the interpreter. Runs once per loop entry, so a
+     * helper call is negligible. {@code idx} is the absolute R[A+3] index.
+     */
+    public static void tforPrep(org.luava.runtime.bytecode.LuaClosure self,
+            long[] p, byte[] t, LuaValue[] o, int idx) {
+        org.luava.runtime.LuaState state = self.getState();
+        LuaValue val = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, idx);
+        state.pushTbc(idx, val, "(for state)");
+    }
+
+    /**
+     * {@code OP_TFORCALL} fast lane for the built-in generic-for iterators.
+     * Runs the step and writes the {@code c} result registers
+     * {@code R[A+4..]}; throws a structural {@link DeoptSignal} (before any
+     * side effect) when the iterator is not one the compiled body can
+     * complete atomically, so the interpreter re-executes exactly once.
+     */
+    public static void tforCall(long[] p, byte[] t, LuaValue[] o, int funcIdx, int c, int pc) {
+        LuaValue f = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx);
+        int nVars = Math.max(1, c);
+        int dst = funcIdx + 4;
+        if (f == org.luava.runtime.standard.BaseLib.NEXT) {
+            LuaValue tv = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + 1);
+            if (!(tv instanceof org.luava.runtime.LuaTable tbl)) {
+                throw new DeoptSignal(pc, true);
+            }
+            LuaValue ctrl = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + 2);
+            storeResults(p, t, o, dst, nVars, tbl.next(ctrl));
+            return;
+        }
+        if (f == org.luava.runtime.standard.BaseLib.IPAIRSAUX) {
+            LuaValue tv = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + 1);
+            LuaValue ctrl = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + 2);
+            if (!(tv instanceof org.luava.runtime.LuaTable tbl) || !ctrl.isNumber()) {
+                throw new DeoptSignal(pc, true);
+            }
+            // PUC ipairs reads through the normal index path, so an
+            // __index metamethod must run interpreted (it may yield).
+            org.luava.runtime.LuaTable mt = tbl.getMetatable();
+            if (mt != null && !mt.rawget(org.luava.runtime.LuaValue.Meta.INDEX).isNil()) {
+                throw new DeoptSignal(pc, true);
+            }
+            long i = ctrl.toLong() + 1;
+            LuaValue val = tbl.rawget(org.luava.runtime.LuaInteger.valueOf(i));
+            if (val.isNil()) {
+                storeResults(p, t, o, dst, nVars, null);
+            } else {
+                storeResults(p, t, o, dst, nVars,
+                        org.luava.runtime.Varargs.of(org.luava.runtime.LuaInteger.valueOf(i), val));
+            }
+            return;
+        }
+        if (f instanceof org.luava.runtime.standard.LuaPattern.GmatchIterator gi) {
+            storeResults(p, t, o, dst, nVars, gi.next());
+            return;
+        }
+        // A custom iterator closure or any unrecognized callable: deopt
+        // before writing anything so the interpreter re-executes exactly once.
+        throw new DeoptSignal(pc, true);
+    }
+
+    /** Writes {@code n} result registers from a call result (null = nil). */
+    private static void storeResults(long[] p, byte[] t, LuaValue[] o, int dst, int n,
+            org.luava.runtime.LuaValue res) {
+        if (res instanceof org.luava.runtime.Varargs va) {
+            LuaValue[] vals = va.getValuesUnsafe();
+            for (int i = 0; i < n; i++) {
+                org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, dst + i,
+                        i < vals.length && vals[i] != null ? vals[i] : org.luava.runtime.LuaNil.NIL);
+            }
+        } else {
+            org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, dst,
+                    res != null ? res : org.luava.runtime.LuaNil.NIL);
+            for (int i = 1; i < n; i++) {
+                org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, dst + i,
+                        org.luava.runtime.LuaNil.NIL);
+            }
+        }
+    }
+
+    /**
+     * Inline {@code tostring(x)} for the JIT. Returns the rendered
+     * {@link LuaValue}, or {@code null} when the result is not safe to
+     * compute outside the interpreter: a metatable on the value (its
+     * {@code __tostring} would run), a metatable on the number type (its
+     * format override), or any object other than a plain string. The caller
+     * deopts on {@code null}.
+     */
+    public static org.luava.runtime.LuaValue tostringInline(
+            org.luava.runtime.bytecode.LuaClosure self, long[] p, byte[] t, LuaValue[] o, int argIdx) {
+        org.luava.runtime.LuaState state = self.getState();
+        byte tag = t[argIdx];
+        if (tag == org.luava.runtime.bytecode.BytecodeVM.TYPE_INT) {
+            if (state.basicMetatable(org.luava.runtime.LuaType.NUMBER) != null) {
+                return null;
+            }
+            return org.luava.runtime.LuaString.valueOf(Long.toString(p[argIdx]));
+        }
+        if (tag == org.luava.runtime.bytecode.BytecodeVM.TYPE_FLOAT) {
+            if (state.basicMetatable(org.luava.runtime.LuaType.NUMBER) != null) {
+                return null;
+            }
+            return org.luava.runtime.LuaString.valueOf(
+                    org.luava.runtime.LuaFloat.valueOf(Double.longBitsToDouble(p[argIdx])).toLuaString());
+        }
+        if (tag == org.luava.runtime.bytecode.BytecodeVM.TYPE_BOOLEAN) {
+            return org.luava.runtime.LuaString.valueOf(p[argIdx] != 0 ? "true" : "false");
+        }
+        if (tag == org.luava.runtime.bytecode.BytecodeVM.TYPE_NIL) {
+            return org.luava.runtime.LuaString.valueOf("nil");
+        }
+        if (tag == org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT) {
+            LuaValue v = o[argIdx];
+            if (v instanceof org.luava.runtime.LuaString s && s.getMetatable() == null) {
+                return s;
+            }
+        }
+        return null;
     }
 
     /**

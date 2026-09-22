@@ -686,6 +686,93 @@ public class JitCoverageTest {
         }
     }
 
+    @Test
+    void genericForLoopsCompileAndMatchInterpreter() {
+        // Generic-for (TFORPREP/TFORCALL/TFORLOOP) is now in the subset for the
+        // built-in iterators (pairs/ipairs/gmatch): the setup call and each
+        // iterator step are emitted inline under identity guards, and an
+        // unrecognized iterator deopts structurally before any side effect.
+        String[] bodies = {
+            "local t={a=1,b=2,c=3} local s=0 for k,v in pairs(t) do s=s+v end return s",
+            "local t={10,20,30} local s=0 for i,v in ipairs(t) do s=s+v end return s",
+            "local s='a,b,c' local n=0 for w in s:gmatch('%a') do n=n+1 end return n",
+            "local t={} for i=1,200 do t[i]=i end local s=0 for k,v in pairs(t) do s=s+v end return s",
+            "local t={} for i=1,200 do t[i]=i end local s=0 for i,v in ipairs(t) do s=s+v end return s",
+            // break out of a compiled generic-for
+            "local s=0 for k,v in pairs({1,2,3,4,5}) do if k==3 then break end s=s+v end return s",
+            // nested generic-for
+            "local n=0 for k,v in pairs({1,2}) do for i,w in ipairs({1,2}) do n=n+w end end return n",
+            // custom iterator closure: must deopt and still be correct
+            "local function it(s,c) if c<3 then return c+1 end end local s=0 for v in it,nil,0 do s=s+v end return s",
+            // __pairs metamethod: pairsFast returns null, so deopt to handler
+            "local t=setmetatable({},{__pairs=function() return function() return nil end end}) "
+                    + "local n=0 for k,v in pairs(t) do n=n+1 end return n",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+    }
+
+    @Test
+    void genericForProtoActuallyCompiles() {
+        LuaState state = new LuaState();
+        LuaClosure f = (LuaClosure) state.eval(
+                "local function f(t) local s=0 for k,v in pairs(t) do s=s+v end return s end return f");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("f"), f);
+        state.eval("local t={} for i=1,100 do t[i]=i end for k=1,400 do f(t) end");
+        assertTrue(awaitCompiled(f.proto, 5000),
+                "a pairs loop must be inside the JIT subset");
+
+        LuaState s2 = new LuaState();
+        LuaClosure g = (LuaClosure) s2.eval(
+                "local function g(str) local n=0 for w in str:gmatch('%a') do n=n+1 end return n end return g");
+        s2.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("g"), g);
+        s2.eval("for k=1,400 do g('a,b,c') end");
+        assertTrue(awaitCompiled(g.proto, 5000),
+                "a gmatch loop must be inside the JIT subset (string SELF lane)");
+        assertEquals(3L, s2.eval("return g('a,b,c')").toLong());
+    }
+
+    @Test
+    void tostringIntrinsicCompilesAndMatchesInterpreter() {
+        // `tostring(x)` with a global callee is emitted inline under an
+        // identity guard on the shared BaseLib.TOSTRING singleton. Primitive
+        // and plain-string arguments render exactly; a __tostring metatable or
+        // a number-format override deopts.
+        String[] bodies = {
+            "local s='' for i=1,200 do s=tostring(i)..tostring(i/2)..tostring(true)..tostring(nil) end return #s",
+            "local s='' for i=1,200 do s=s..tostring(i) end return #s",
+            "local t=setmetatable({},{__tostring=function() return 'M' end}) "
+                    + "local s='' for i=1,200 do s=s..tostring(t) end return s",
+            // reassigned tostring must not be replaced by the intrinsic
+            "tostring=function(x) return 'Z' end local s='' for i=1,200 do s=s..tostring(i) end return s",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+        LuaState state = new LuaState();
+        LuaClosure f = (LuaClosure) state.eval(
+                "local function f(n) local s='' for i=1,n do s=tostring(i) end return #s end return f");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("f"), f);
+        state.eval("for k=1,400 do f(50) end");
+        assertTrue(awaitCompiled(f.proto, 5000),
+                "a hot tostring loop must be inside the JIT subset");
+    }
+
+    @Test
+    void stringReceiverMethodCallCompilesAndMatchesInterpreter() {
+        // `str:method()` resolves through the shared string metatable; the
+        // compiled SELF lane handles it so string-method-heavy loops compile.
+        String[] bodies = {
+            "local function f(s) local n=0 for w in s:gmatch('%a') do n=n+1 end return n end return f('a,b,c')",
+            "local function f(s) local n=0 for i=1,50 do n=n+#s:sub(1, 2) end return n end return f('abcdef')",
+            "local s='hello world' local n=0 for i=1,100 do n=n+s:byte(1) end return n",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+    }
+
     /**
      * Polls until {@code proto.jitCode} is set (or the timeout elapses).
      * Background tier-up latency is not deterministic under a loaded test

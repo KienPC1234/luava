@@ -3428,19 +3428,34 @@ public final class BytecodeVM {
         // virtual dispatch per iteration (500k+/s in gmatch loops).
         if (f instanceof org.luava.runtime.standard.LuaPattern.GmatchIterator gi) {
             LuaValue res = gi.next();
-            int nVars = Math.max(1, c);
-            if (res instanceof Varargs va) {
-                LuaValue[] vals = va.getValuesUnsafe();
-                for (int i = 0; i < nVars; i++) {
-                    setLuaValue(pStack, tStack, oStack, base + a + 4 + i, (i < vals.length) ? vals[i] : LuaNil.NIL);
-                }
-            } else {
-                setLuaValue(pStack, tStack, oStack, base + a + 4, res != null ? res : LuaNil.NIL);
-                for (int i = 1; i < nVars; i++) {
-                    setLuaValue(pStack, tStack, oStack, base + a + 4 + i, LuaNil.NIL);
-                }
-            }
+            writeTForResults(pStack, tStack, oStack, base + a + 4, c, res);
             return;
+        }
+        // Fast lane for the shared built-in iterators. `next` (pairs) and
+        // `ipairsaux` (ipairs) are the overwhelmingly common generic-for
+        // iterators and need no re-entrant Lua call or argument boxing: a
+        // direct raw step produces the exact same values as invoking them.
+        if (f == org.luava.runtime.standard.BaseLib.NEXT) {
+            LuaValue tv = getLuaValue(pStack, tStack, oStack, base + a + 1);
+            LuaValue ctrl = getLuaValue(pStack, tStack, oStack, base + a + 2);
+            if (tv instanceof org.luava.runtime.LuaTable tbl) {
+                writeTForResults(pStack, tStack, oStack, base + a + 4, c, tbl.next(ctrl));
+                return;
+            }
+        } else if (f == org.luava.runtime.standard.BaseLib.IPAIRSAUX) {
+            LuaValue tv = getLuaValue(pStack, tStack, oStack, base + a + 1);
+            LuaValue ctrl = getLuaValue(pStack, tStack, oStack, base + a + 2);
+            if (tv instanceof org.luava.runtime.LuaTable tbl && ctrl.isNumber()) {
+                long i = ctrl.toLong() + 1;
+                LuaValue val = tbl.get(org.luava.runtime.LuaInteger.valueOf(i));
+                if (val.isNil()) {
+                    writeTForResults(pStack, tStack, oStack, base + a + 4, c, null);
+                } else {
+                    writeTForResults(pStack, tStack, oStack, base + a + 4, c,
+                            Varargs.of(org.luava.runtime.LuaInteger.valueOf(i), val));
+                }
+                return;
+            }
         }
         LuaValue s = getLuaValue(pStack, tStack, oStack, base + a + 1);
         LuaValue var = getLuaValue(pStack, tStack, oStack, base + a + 2);
@@ -3456,16 +3471,27 @@ public final class BytecodeVM {
         } finally {
             org.luava.runtime.eval.CallStack.clearNextCallIf(ctx.callState, "for iterator");
         }
+        writeTForResults(pStack, tStack, oStack, base + a + 4, c, res);
+    }
+
+    /**
+     * Writes the {@code max(1, c)} result registers of an {@code OP_TFORCALL}
+     * starting at {@code dst}. A {@link Varargs} spreads its values (missing
+     * ones nil); any other value (or null) is a single result followed by
+     * nils. Shared by the interpreter's generic-for paths.
+     */
+    private static void writeTForResults(long[] pStack, byte[] tStack, LuaValue[] oStack,
+            int dst, int c, LuaValue res) {
         int nVars = Math.max(1, c);
         if (res instanceof Varargs va) {
             LuaValue[] vals = va.getValuesUnsafe();
             for (int i = 0; i < nVars; i++) {
-                setLuaValue(pStack, tStack, oStack, base + a + 4 + i, (i < vals.length) ? vals[i] : LuaNil.NIL);
+                setLuaValue(pStack, tStack, oStack, dst + i, (i < vals.length) ? vals[i] : LuaNil.NIL);
             }
         } else {
-            setLuaValue(pStack, tStack, oStack, base + a + 4, res != null ? res : LuaNil.NIL);
+            setLuaValue(pStack, tStack, oStack, dst, res != null ? res : LuaNil.NIL);
             for (int i = 1; i < nVars; i++) {
-                setLuaValue(pStack, tStack, oStack, base + a + 4 + i, LuaNil.NIL);
+                setLuaValue(pStack, tStack, oStack, dst + i, LuaNil.NIL);
             }
         }
     }
