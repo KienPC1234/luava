@@ -169,11 +169,45 @@ public final class PackageLib {
             return LuaNil.NIL;
         });
 
+        // searcher 5: virtual resources (classpath/JAR/in-memory). Only active
+        // when the host registered a LuaResourceLoader; otherwise this is a
+        // no-op that adds no error text, so PUC search semantics are
+        // unchanged. It is appended after the standard searchers so their
+        // indices (and error-message ordering) stay PUC-compatible.
+        LuaFunction searcherResource = LuaFunction.of(args -> {
+            LuaValue modName = args.length > 0 ? args[0] : LuaNil.NIL;
+            org.luava.runtime.standard.LuaResourceLoader loader = state.getResourceLoader();
+            if (loader == null) {
+                return LuaNil.NIL;
+            }
+            String nameStr = modName.toLuaString();
+            String resPath = state.getResourcePath();
+            if (resPath == null || resPath.isEmpty()) {
+                return LuaNil.NIL;
+            }
+            String dotted = nameStr.replace(".", "/");
+            for (String template : resPath.split(";", -1)) {
+                if (template.isEmpty()) {
+                    continue;
+                }
+                String candidate = template.replace("?", dotted);
+                String logical = candidate.startsWith("classpath:") ? candidate.substring("classpath:".length()) : candidate;
+                String source = loader.read(logical);
+                if (source == null) {
+                    continue;
+                }
+                LuaFunction chunk = state.compile(source, "@" + candidate, globals);
+                return Varargs.of(chunk, LuaString.valueOf(candidate));
+            }
+            return LuaNil.NIL;
+        });
+
         LuaTable searchers = new LuaTable();
         searchers.rawset(org.luava.runtime.LuaInteger.valueOf(1), searcherPreload);
         searchers.rawset(org.luava.runtime.LuaInteger.valueOf(2), searcherLua);
         searchers.rawset(org.luava.runtime.LuaInteger.valueOf(3), searcherC);
         searchers.rawset(org.luava.runtime.LuaInteger.valueOf(4), searcherCroot);
+        searchers.rawset(org.luava.runtime.LuaInteger.valueOf(5), searcherResource);
         pkg.rawset(LuaString.interned("searchers"), searchers);
 
         pkg.rawset(LuaString.interned("loadlib"), LuaFunction.of(args -> {

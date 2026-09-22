@@ -227,11 +227,57 @@ public final class LuaState {
     private JavaAccessPolicy javaAccessPolicy = JavaAccessPolicy.DEFAULT;
 
     /**
+     * Optional host-provided resource loader for {@code require}. When set,
+     * Lua modules are resolved through it (classpath, JAR, in-memory, ...)
+     * after the normal filesystem search. Null by default.
+     */
+    private volatile org.luava.runtime.standard.LuaResourceLoader resourceLoader;
+    /**
+     * Search template used for resource-loaded modules, mirroring
+     * {@code package.path} syntax (e.g. {@code scripts/?.lua}). A segment may
+     * be prefixed with {@code classpath:}, which is stripped before the
+     * loader sees it, so {@code classpath:scripts/?.lua} also works.
+     */
+    private volatile String resourcePath = "?.lua;?/init.lua";
+
+    /**
      * Replaces the Java interop host-access policy. Use
      * {@link JavaAccessPolicy#UNRESTRICTED} only for fully trusted scripts;
      * the default blocks process execution, reflection, filesystem and
      * network classes.
      */
+    /**
+     * Registers a virtual resource loader for {@code require}, enabling Lua
+     * modules packaged inside a JAR or any non-filesystem store. The loader
+     * is consulted after the filesystem searchers; returning null falls
+     * through. Use {@link org.luava.runtime.standard.LuaResourceLoader#classpath()}
+     * for the common "scripts live in my JAR" case.
+     */
+    public LuaState resourceLoader(org.luava.runtime.standard.LuaResourceLoader loader) {
+        this.resourceLoader = loader;
+        return this;
+    }
+
+    /** Returns the active resource loader, or null when none is registered. */
+    public org.luava.runtime.standard.LuaResourceLoader getResourceLoader() {
+        return resourceLoader;
+    }
+
+    /**
+     * Overrides the {@code require} search path for resource-loaded modules.
+     * Syntax mirrors {@code package.path}; each segment must carry the
+     * {@code classpath:} prefix that {@link #getResourceLoader()} strips
+     * before resolving. Defaults to {@code classpath:?.lua;classpath:?/init.lua}.
+     */
+    public LuaState resourcePath(String path) {
+        this.resourcePath = path;
+        return this;
+    }
+
+    public String getResourcePath() {
+        return resourcePath;
+    }
+
     public LuaState javaPolicy(JavaAccessPolicy policy) {
         this.javaAccessPolicy = (policy != null) ? policy : JavaAccessPolicy.DEFAULT;
         return this;
@@ -516,6 +562,13 @@ public final class LuaState {
         }
     }
 
+    /**
+     * Registers a module built by hand from a {@link LuaTable}. Unlike
+     * {@link #registerModule(Object)} the table shape is arbitrary, so no
+     * typed {@code ModuleInfo} is recorded and this module is intentionally
+     * absent from {@link #generateEmmyDocs()}/{@link #exportEmmyDocs(Path)};
+     * use the annotation path for documented modules.
+     */
     public void registerModule(String moduleName, Consumer<LuaTable> configurator) {
         LuaTable table = new LuaTable();
         configurator.accept(table);
@@ -772,7 +825,7 @@ public final class LuaState {
      * {@code -Dluava.jit.sync=true}.
      *
      * <p>This is the process-wide default; per-state control is
-     * {@link #jitEnabled(boolean)} / {@link #isJitEnabled()}. A state's own
+     * {@link #jitEnabled(Boolean)} / {@link #isJitEnabled()}. A state's own
      * setting wins over this field.
      */
     public static volatile boolean ENABLE_JIT = !"false".equalsIgnoreCase(System.getProperty("luava.jit", "true"));

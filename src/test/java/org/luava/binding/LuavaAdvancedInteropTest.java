@@ -15,6 +15,7 @@ import org.luava.binding.annotation.LuaMethod;
 import org.luava.binding.annotation.LuaModule;
 import org.luava.binding.annotation.LuaParam;
 import org.luava.binding.annotation.LuaReturn;
+import org.luava.runtime.LuaException;
 import org.luava.runtime.LuaState;
 import org.luava.runtime.LuaValue;
 
@@ -116,6 +117,45 @@ public class LuavaAdvancedInteropTest {
         state.exportEmmyDocs(dir);
         String back = java.nio.file.Files.readString(dir.resolve("Calc.lua"));
         assertTrue(back.contains("---@class Calc"));
+    }
+
+    /** A class with a computed read-only field (annotation on a getter). */
+    @LuaModule(name = "Cfg", description = "Config")
+    public static class ComputedFieldService {
+        @LuaField(name = "REVISION", description = "Build revision")
+        public String revision() {
+            return "r42";
+        }
+
+        @LuaMethod
+        public long ping() {
+            return 1;
+        }
+    }
+
+    /**
+     * {@code @LuaField} on a zero-argument method is a computed read-only
+     * field: it is exposed to Lua and included in the generated docs, instead
+     * of being silently ignored (its {@code @Target} allows methods).
+     */
+    @Test
+    void luaFieldOnMethodIsAComputedField() {
+        state.registerModule(new ComputedFieldService());
+        assertEquals("r42", state.eval("return Cfg.REVISION").toLuaString());
+        String docs = state.generateEmmyDocs();
+        assertTrue(docs.contains("---@field readonly REVISION string"), docs);
+    }
+
+    /**
+     * Binding a bare {@code Class} can only read static fields. An instance
+     * {@code @LuaField} must fail with a clear Lua error, never leak a raw
+     * NullPointerException from {@code Field.get(null)}.
+     */
+    @Test
+    void bindingClassWithInstanceFieldFailsClearly() {
+        LuaException e = assertThrows(LuaException.class,
+                () -> new LuaState().registerModule(CalcService.class));
+        assertTrue(e.getMessage().contains("register an instance"), e.getMessage());
     }
 
     @Test

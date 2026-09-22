@@ -21,7 +21,6 @@ import org.luava.runtime.LuaUserdata;
 import org.luava.runtime.LuaValue;
 
 import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -66,14 +65,21 @@ public final class ModuleBinder {
         List<FieldInfo> fieldInfos = new ArrayList<>();
         List<MethodInfo> methodInfos = new ArrayList<>();
 
-        MethodHandles.Lookup lookup = MethodHandles.lookup();
-
-        // 1. Scan Fields
+        // 1. Scan Fields. A @LuaField on an instance field requires an
+        // instance to read; binding a bare Class (instance == null) is only
+        // valid for static fields. Report that clearly instead of leaking an
+        // unchecked NullPointerException from Field.get(null).
         for (Field field : clazz.getDeclaredFields()) {
             LuaField fieldAnno = field.getAnnotation(LuaField.class);
             if (fieldAnno != null) {
                 field.setAccessible(true);
                 String fieldName = !fieldAnno.name().isEmpty() ? fieldAnno.name() : field.getName();
+                boolean isStatic = Modifier.isStatic(field.getModifiers());
+                if (instance == null && !isStatic) {
+                    throw new LuaException("Cannot bind instance field '" + fieldName
+                            + "' of " + clazz.getName()
+                            + " from a Class; register an instance instead of the class");
+                }
                 try {
                     Object val = field.get(instance);
                     table.rawset(LuaString.valueOf(fieldName), LuaDataConverter.toLua(val));
@@ -89,11 +95,40 @@ public final class ModuleBinder {
             }
         }
 
-        // 2. Scan Methods
+        // 2. Scan Methods. A @LuaField on a getter method is a computed
+        // read-only field: the zero-argument accessor is evaluated once at
+        // bind time and its value exposed like a plain field. (Previously the
+        // annotation was silently ignored on methods, even though the
+        // annotation's @Target allows them.)
         java.util.Map<String, List<Method>> methodsByName = new java.util.LinkedHashMap<>();
         java.util.Map<String, Boolean> methodIsMethod = new java.util.HashMap<>();
 
         for (Method method : clazz.getDeclaredMethods()) {
+            LuaField accessorAnno = method.getAnnotation(LuaField.class);
+            if (accessorAnno != null) {
+                if (method.getParameterCount() != 0) {
+                    throw new LuaException("@LuaField on method '" + method.getName()
+                            + "' must take no arguments (a computed field accessor)");
+                }
+                method.setAccessible(true);
+                String fieldName = !accessorAnno.name().isEmpty() ? accessorAnno.name() : method.getName();
+                try {
+                    Object val = method.invoke(instance);
+                    table.rawset(LuaString.valueOf(fieldName), LuaDataConverter.toLua(val));
+                    fieldInfos.add(new FieldInfo(
+                        fieldName,
+                        mapJavaTypeToLuaType(method.getReturnType()),
+                        accessorAnno.description(),
+                        true
+                    ));
+                } catch (java.lang.reflect.InvocationTargetException e) {
+                    Throwable cause = e.getCause() != null ? e.getCause() : e;
+                    throw new LuaException("Computed field '" + fieldName + "' accessor failed: " + cause.getMessage());
+                } catch (IllegalAccessException e) {
+                    throw new LuaException("Failed to access computed field " + fieldName + ": " + e.getMessage());
+                }
+                continue;
+            }
             LuaMethod methodAnno = method.getAnnotation(LuaMethod.class);
             if (methodAnno != null) {
                 method.setAccessible(true);
@@ -191,7 +226,25 @@ public final class ModuleBinder {
                         javaArgs[fixed] = varArray;
                     }
 
-                    Object res = bestMatch.invoke(Modifier.isStatic(bestMatch.getModifiers()) ? null : instance, javaArgs);
+                    // Cache the unreflected handle per method so repeated calls
+                    // do not pay Method.invoke reflection (AGENTS.md §II.2).
+                    // An instance-method handle takes the receiver as its
+                    // leading argument; a static handle takes none.
+                    MethodHandle mh = LuaDataConverter.samHandle(bestMatch);
+                    Object res;
+                    if (mh != null) {
+                        Object[] effective;
+                        if (Modifier.isStatic(bestMatch.getModifiers())) {
+                            effective = javaArgs;
+                        } else {
+                            effective = new Object[javaArgs.length + 1];
+                            effective[0] = instance;
+                            System.arraycopy(javaArgs, 0, effective, 1, javaArgs.length);
+                        }
+                        res = mh.invokeWithArguments(effective);
+                    } else {
+                        res = bestMatch.invoke(Modifier.isStatic(bestMatch.getModifiers()) ? null : instance, javaArgs);
+                    }
                     if (bestMatch.getReturnType() == void.class || bestMatch.getReturnType() == Void.class) {
                         return LuaNil.NIL;
                     }
@@ -247,12 +300,4 @@ public final class ModuleBinder {
         return clazz.getSimpleName();
     }
 
-    private static Object getDefaultValue(Class<?> type) {
-        if (type == boolean.class) return false;
-        if (type == int.class) return 0;
-        if (type == long.class) return 0L;
-        if (type == double.class) return 0.0;
-        if (type == float.class) return 0.0f;
-        return null;
-    }
 }
