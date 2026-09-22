@@ -7,8 +7,7 @@
 Luava is a pure-Java implementation of **Lua 5.4** for the JVM: lexer,
 parser, AST, register-based bytecode compiler, register VM interpreter,
 hybrid tiered JIT, sandboxing and deep Java interop. It ships as a single
-self-contained jar with **no runtime dependency beyond the JDK** (ASM is
-shaded and relocated), and uses no JNI, FFM or preview features.
+self-contained jar with **no runtime dependency beyond the JDK**.
 
 Pipeline: `Lua source → Lexer → Parser → AST → BytecodeCompiler → LuaProto → BytecodeVM.execute()`.
 
@@ -20,7 +19,9 @@ Pipeline: `Lua source → Lexer → Parser → AST → BytecodeCompiler → LuaP
 
 Published on **Maven Central** as
 [`io.github.kienpc1234:luava`](https://central.sonatype.com/artifact/io.github.kienpc1234/luava).
-Requires **JDK 21+** (stock LTS, no `--enable-preview`).
+
+**Requirements:** a stock **JDK 21+** (no `--enable-preview`, no JNI/FFM, no
+extra flags) and Maven 3.9+ / Gradle only if you build from source.
 
 **Maven**
 
@@ -124,10 +125,10 @@ state.registerFunction("add", Long.class, Long.class, (a, b) -> a + b);
 state.registerFunction("onEvent", String.class, (Consumer<String>) log::info);
 
 // Live collections: scripts read and mutate the original Java object
-List<String> names = new ArrayList<>();
+List<String> names = new ArrayList<>(List.of("first"));
 state.setLive("names", names);
-state.eval("names[1] = 'first'; names.add('second')");
-// names == ["first", "second"]
+state.eval("names.add('second'); names[1] = 'changed'");
+// names == ["changed", "second"]
 ```
 
 ## Safe embedding (untrusted scripts)
@@ -137,8 +138,8 @@ Both guards are one-liners:
 ```java
 LuaState sandboxed = new LuaState()
         .sandbox()                          // drop os/io/package + strict Java policy
-        .instructionLimit(10_000_000)       // or .timeout(Duration.ofSeconds(1))
-        .setLive("api", myService);
+        .instructionLimit(10_000_000);      // or .timeout(Duration.ofSeconds(1))
+sandboxed.setLive("api", myService);        // set/setLive/register* are not chainable
 sandboxed.eval(userScript);                 // while true do end -> Lua error, host survives
 ```
 
@@ -355,9 +356,11 @@ tests/lua-5.4.9-tests/         # upstream PUC-Rio suite (do not modify)
 
 ## Contributing and design notes
 
-Internal contributor rules live in [`AGENTS.md`](AGENTS.md); the register-VM
-design and JIT roadmap live in [`plan.md`](plan.md). The Lua 5.4 reference
-manual is under `docs/`.
+The task-oriented [**Usage Guide**](docs/USAGE.md) covers embedding,
+sandboxing, Java interop, module loading, performance tuning and common
+pitfalls with runnable examples. Internal contributor rules live in
+[`AGENTS.md`](AGENTS.md); the register-VM design and JIT roadmap live in
+[`plan.md`](plan.md). The Lua 5.4 reference manual is under `docs/`.
 
 ## License
 

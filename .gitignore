@@ -26,3 +26,7 @@ pom.xml.releaseBackup
 .env.*
 PUBLISHING.md
 scripts/release.sh
+
+# Maintainer-only encrypted backup of release secrets (GPG key, tokens).
+# NEVER commit this: the repository is public.
+.private-backup/
