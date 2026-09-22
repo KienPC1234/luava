@@ -63,6 +63,17 @@ public class OfficialSuiteEvaluationTest {
                                     throw new LuaException(res.length > 1 ? res[1].toLuaString() : "error in coroutine");
                                 }
                             }
+                        } else if ("all.lua".equals(name)) {
+                            // all.lua is the PUC driver that runs every other
+                            // suite through its dump/undump dofile wrapper. Run
+                            // it in user-test mode (_U), which sets _soft/_port/
+                            // _nomsg and skips the C-only harness ("T") and the
+                            // stand-alone-interpreter block; the remaining
+                            // per-file coverage still executes on Luava.
+                            org.luava.runtime.LuaTable g = state.getGlobals();
+                            g.rawset(org.luava.runtime.LuaString.valueOf("_U"), org.luava.runtime.LuaBoolean.TRUE);
+                            g.rawset(org.luava.runtime.LuaString.valueOf("_nomsg"), org.luava.runtime.LuaBoolean.TRUE);
+                            state.eval(content, "@" + name);
                         } else {
                             state.eval(content, "@" + name);
                         }
@@ -81,6 +92,11 @@ public class OfficialSuiteEvaluationTest {
                 });
 
                 int timeoutSec = (name.equals("calls.lua") || name.equals("verybig.lua") || name.equals("constructs.lua") || name.equals("gc.lua") || name.equals("db.lua") || name.equals("cstack.lua")) ? 60 : 25;
+                if (name.equals("all.lua")) {
+                    // all.lua re-runs every suite through dump/undump; it needs
+                    // far more wall time than a single file.
+                    timeoutSec = 300;
+                }
                 try {
                     String outcome = future.get(timeoutSec, java.util.concurrent.TimeUnit.SECONDS);
                     results.put(name, outcome);
@@ -118,14 +134,19 @@ public class OfficialSuiteEvaluationTest {
         }
         System.out.printf("\nTOTAL: %d, PASSED: %d, FAILED: %d\n\n", results.size(), passed, failed);
         // NOTE: excluded by design:
-        //   heavy.lua  - deliberate memory-overflow stress.
-        //   all.lua    - needs the C test harness ('T') and interactive driver.
-        //   main.lua   - purely a stand-alone interpreter test; it spawns the
-        //                CLI via os.execute and would exercise the reference C
-        //                binary, not Luava. An embedded engine has no CLI to
-        //                test, so it is not counted.
+        //   heavy.lua  - a collection of deliberate memory-overflow/too-long
+        //                stress functions; only `toomanyidx` is active and it
+        //                intentionally exhausts the heap. It passes on Luava
+        //                (~14 s) but is not a conformance suite and needs a
+        //                large heap, so it is not counted.
+        //   main.lua   - purely a stand-alone CLI test: it spawns `lua` via
+        //                os.execute and checks the reference interpreter's
+        //                flags/REPL/BOM/LUA_INIT behaviour. An embedded engine
+        //                has no stand-alone binary to test, so it is out of
+        //                scope (the Luava CLI is covered by MainTest).
         // files.lua is run in the suite's own embedded mode (_port), which
         // skips only its arg[0]-driven CLI block; the rest executes on Luava.
+        // all.lua runs in user-test mode (_U), exercising the dump/undump path.
         org.junit.jupiter.api.Assertions.assertFalse(results.isEmpty(),
                 "Official suite ran 0 files: harness misconfiguration hides regressions");
         org.junit.jupiter.api.Assertions.assertEquals(0, failed,
@@ -133,7 +154,11 @@ public class OfficialSuiteEvaluationTest {
     }
 
     private static boolean isExcluded(String name) {
-        return name.equals("heavy.lua") || name.equals("all.lua") || name.equals("main.lua");
+        // all.lua is included and run in _U mode (see the runner body). It is
+        // the PUC driver, so it re-executes the whole suite through the
+        // dump/undump path and catches round-trip regressions the per-file
+        // runs miss.
+        return name.equals("heavy.lua") || name.equals("main.lua");
     }
 
     /**
