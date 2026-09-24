@@ -6,7 +6,7 @@ Java interop. One jar, no runtime dependency beyond the JDK.
 
     source -> Lexer -> Parser -> AST -> BytecodeCompiler -> LuaProto -> BytecodeVM.execute()
 
-Status: 0.1.0-alpha. The API may change before 1.0.
+Status: 0.2.0-beta ("Concord"). The API may change before 1.0.
 
 ## Install
 
@@ -21,18 +21,18 @@ Maven:
 <dependency>
     <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava</artifactId>
-    <version>0.1.0-alpha</version>
+    <version>0.2.0-beta</version>
 </dependency>
 ```
 
 Gradle:
 
 ```kotlin
-implementation("io.github.kienpc1234:luava:0.1.0-alpha")
+implementation("io.github.kienpc1234:luava:0.2.0-beta")
 ```
 
 ```groovy
-implementation 'io.github.kienpc1234:luava:0.1.0-alpha'
+implementation 'io.github.kienpc1234:luava:0.2.0-beta'
 ```
 
 The artifact has zero transitive dependencies.
@@ -43,14 +43,14 @@ Download the jar from the
 [GitHub release](https://github.com/KienPC1234/luava/releases/latest):
 
 ```bash
-javac -cp luava-0.1.0-alpha.jar MyApp.java
-java  -cp luava-0.1.0-alpha.jar:. MyApp
+javac -cp luava-0.2.0-beta.jar MyApp.java
+java  -cp luava-0.2.0-beta.jar:. MyApp
 ```
 
 Build from source:
 
 ```bash
-mvn package          # target/luava-0.1.0-alpha.jar
+mvn package          # target/luava-0.2.0-beta.jar
 mvn test             # PUC Lua 5.4.9 suites + unit tests
 ```
 
@@ -174,9 +174,9 @@ that does nothing when no loader is set.
 ## CLI and REPL
 
 ```bash
-java -jar luava-0.1.0-alpha.jar script.lua arg1 arg2
-java -jar luava-0.1.0-alpha.jar -e "print(1 + 2)"
-java -jar luava-0.1.0-alpha.jar            # interactive REPL (also on a TTY)
+java -jar luava-0.2.0-beta.jar script.lua arg1 arg2
+java -jar luava-0.2.0-beta.jar -e "print(1 + 2)"
+java -jar luava-0.2.0-beta.jar            # interactive REPL (also on a TTY)
 ```
 
 A script sees the standard `arg` table (`arg[0]` is the script name). Embedding
@@ -224,7 +224,7 @@ Knobs:
 ## Conformance
 
 - 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass, asserted by
-  `OfficialSuiteEvaluationTest`, so a regression fails the build. 227 unit tests
+  `OfficialSuiteEvaluationTest`, so a regression fails the build. 234 unit tests
   run alongside, including a byte-for-byte differential suite against stock PUC
   Lua 5.4 and a fixed stdlib sweep under JIT both on and off.
 - `all.lua`, the PUC driver, runs in user-test mode (`_U`): it re-runs every
