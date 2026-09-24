@@ -34,6 +34,215 @@ public final class JitRuntime {
         return (LuaValue) jc.objHandle.invokeExact(callee, up, p, t, o, base);
     }
 
+    // ------------------------------------------------------------------
+    // Register-window rollback (plan.md §5.A.2)
+    //
+    // A compiled callee runs straight on the shared register stack, so it
+    // overwrites the caller's argument registers (its own parameter window
+    // aliases them). On a nested deopt the interpreter resumes the caller at
+    // the call pc and re-reads those registers, so the callee's prefix writes
+    // must be rolled back. Only the argument span [from, from+max(nArgs,
+    // numParams)) can overlap caller state: callee locals live above it and
+    // the function/result register below it. A compiled TAILCALL shifts the
+    // arguments onto the caller's own frame, so its snapshot covers the whole
+    // pre-shift caller window. The snapshot lives in a per-thread
+    // grow-on-demand raw-triple stack; nesting is safe because a callee's
+    // snapshot sits above every live outer snapshot.
+    // ------------------------------------------------------------------
+
+    private static final class SnapshotStack {
+        long[] p = new long[128];
+        byte[] t = new byte[128];
+        LuaValue[] o = new LuaValue[128];
+        int top;
+
+        void ensure(int extra) {
+            if (top + extra > p.length) {
+                int n = Math.max(p.length * 2, top + extra);
+                p = java.util.Arrays.copyOf(p, n);
+                t = java.util.Arrays.copyOf(t, n);
+                o = java.util.Arrays.copyOf(o, n);
+            }
+        }
+    }
+
+    private static final ThreadLocal<SnapshotStack> SNAPSHOTS =
+            ThreadLocal.withInitial(SnapshotStack::new);
+
+    private static int clampSpan(long[] p, int from, int n) {
+        int c = Math.min(n, p.length - from);
+        return c < 0 ? 0 : c;
+    }
+
+    /** Pushes {@code n} raw triples at {@code from}; returns a cursor. */
+    private static int pushWindow(long[] p, byte[] t, LuaValue[] o, int from, int n) {
+        int count = clampSpan(p, from, n);
+        SnapshotStack s = SNAPSHOTS.get();
+        s.ensure(count);
+        int at = s.top;
+        for (int i = 0; i < count; i++) {
+            s.p[at + i] = p[from + i];
+            s.t[at + i] = t[from + i];
+            s.o[at + i] = o[from + i];
+        }
+        s.top = at + count;
+        return at;
+    }
+
+    private static void restoreWindow(int cursor, long[] p, byte[] t, LuaValue[] o, int from, int n) {
+        int count = clampSpan(p, from, n);
+        SnapshotStack s = SNAPSHOTS.get();
+        for (int i = 0; i < count; i++) {
+            p[from + i] = s.p[cursor + i];
+            t[from + i] = s.t[cursor + i];
+            o[from + i] = s.o[cursor + i];
+        }
+    }
+
+    private static void popWindow(int cursor) {
+        SNAPSHOTS.get().top = cursor;
+    }
+
+    /** Argument span a compiled call can clobber; see the section comment. */
+    private static int callWindow(JitCode jc, int nArgs) {
+        return Math.max(nArgs, jc.numParams);
+    }
+
+    /**
+     * Requests compilation of a callee discovered at a compiled call site.
+     * Without this, a callee reached only from already-compiled code (e.g. a
+     * method called in a hot loop whose enclosing chunk already tiered up)
+     * never gets its interpreter-side hot count bumped, so it stays
+     * interpreted forever. Idempotent; the call site still deopts this time
+     * and enters the compiled callee once it is ready.
+     */
+    public static void requestCallee(org.luava.runtime.bytecode.LuaProto proto) {
+        try {
+            org.luava.runtime.jit.JitCompiler.requestCompile(proto);
+        } catch (Throwable t) {
+            proto.jitDisabled = true;
+        }
+    }
+
+    /**
+     * The entire general (non-self, non-fused) compiled call, kept out of
+     * generated code so a call site is one {@code INVOKESTATIC}: generated
+     * code cannot branch cheaply, and inlining the callee guard, arity
+     * nil-fill, capacity guard and both return protocols bloated every
+     * calling kernel enough to lose C2 optimization of its hot loop.
+     *
+     * <p>Checks the callee is a pure compiled closure, requests compilation
+     * if not yet done, nil-fills missing parameters, snapshots the argument
+     * window, invokes under the callee's return protocol, and writes the
+     * result triple to {@code argBase-1}. A failure the compiled code cannot
+     * complete atomically throws a structural {@link DeoptSignal}; a nested
+     * deopt restores the window before propagating.
+     */
+    public static void callFast(LuaValue callee, long[] p, byte[] t, LuaValue[] o,
+            int argBase, int nArgs, int resumePc, boolean resultUsed) throws Throwable {
+        if (!(callee instanceof LuaClosure closure)) {
+            throw new DeoptSignal(resumePc, true);
+        }
+        org.luava.runtime.bytecode.LuaProto proto = closure.proto;
+        JitCode jc = proto.jitCode;
+        if (jc == null) {
+            requestCallee(proto);
+            throw new DeoptSignal(resumePc, true);
+        }
+        if (!jc.pure) {
+            throw new DeoptSignal(resumePc, true);
+        }
+        if (resultUsed && jc.returnsVoid) {
+            throw new DeoptSignal(resumePc, true);
+        }
+        int numParams = proto.numParams;
+        if (nArgs < numParams) {
+            nilFill(p, t, o, argBase + nArgs, argBase + numParams);
+        }
+        if (argBase + proto.maxStackSize > p.length) {
+            throw new DeoptSignal(resumePc, false);
+        }
+        int win = callWindow(jc, nArgs);
+        int cursor = pushWindow(p, t, o, argBase, win);
+        int dst = argBase - 1;
+        try {
+            if (jc.returnsInt) {
+                long r = (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals, p, t, o, argBase);
+                p[dst] = r;
+                t[dst] = org.luava.runtime.bytecode.BytecodeVM.TYPE_INT;
+                o[dst] = null;
+            } else {
+                LuaValue r = (LuaValue) jc.objHandle.invokeExact(closure, (Object[]) closure.upvals,
+                        p, t, o, argBase);
+                org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, dst, r);
+            }
+        } catch (DeoptSignal d) {
+            restoreWindow(cursor, p, t, o, argBase, win);
+            throw d;
+        } finally {
+            popWindow(cursor);
+        }
+    }
+
+    /**
+     * Compiled tail call with rollback. The generated code shifts the
+     * arguments down onto the caller's own frame before invoking, so the
+     * snapshot must cover the caller's whole pre-shift window and be taken
+     * before the shift. On a nested deopt the interpreter re-executes the
+     * tail call from intact registers.
+     */
+    public static long invokeTailSnap(JitCode jc, LuaClosure callee, long[] p, byte[] t, LuaValue[] o,
+            int base, int a, int nArgs, int callerMaxStack) throws Throwable {
+        int win = Math.max(callerMaxStack, a + 1 + nArgs);
+        int cursor = pushWindow(p, t, o, base, win);
+        try {
+            shiftTailArgs(p, t, o, base, a, nArgs, jc.numParams);
+            return (long) jc.handle.invokeExact(callee, (Object[]) callee.upvals, p, t, o, base);
+        } catch (DeoptSignal d) {
+            restoreWindow(cursor, p, t, o, base, win);
+            throw d;
+        } finally {
+            popWindow(cursor);
+        }
+    }
+
+    /** Object-returning variant of {@link #invokeTailSnap}. */
+    public static LuaValue invokeTailObjSnap(JitCode jc, LuaClosure callee, long[] p, byte[] t, LuaValue[] o,
+            int base, int a, int nArgs, int callerMaxStack) throws Throwable {
+        int win = Math.max(callerMaxStack, a + 1 + nArgs);
+        int cursor = pushWindow(p, t, o, base, win);
+        try {
+            shiftTailArgs(p, t, o, base, a, nArgs, jc.numParams);
+            return (LuaValue) jc.objHandle.invokeExact(callee, (Object[]) callee.upvals, p, t, o, base);
+        } catch (DeoptSignal d) {
+            restoreWindow(cursor, p, t, o, base, win);
+            throw d;
+        } finally {
+            popWindow(cursor);
+        }
+    }
+
+    /**
+     * Moves {@code nArgs} argument triples from {@code base+a+1..} down to
+     * {@code base..} and nil-fills missing parameters, mirroring the
+     * interpreter's tail-call frame reuse.
+     */
+    private static void shiftTailArgs(long[] p, byte[] t, LuaValue[] o, int base, int a, int n, int numParams) {
+        for (int i = 0; i < n; i++) {
+            int src = base + a + 1 + i;
+            int dst = base + i;
+            p[dst] = p[src];
+            t[dst] = t[src];
+            o[dst] = o[src];
+        }
+        for (int i = n; i < numParams; i++) {
+            int dst = base + i;
+            p[dst] = 0;
+            t[dst] = 0;
+            o[dst] = null;
+        }
+    }
+
     /**
      * Stores an already-floored double into register {@code idx} with PUC
      * {@code math.floor} subtype semantics: an integral value that fits a Lua
@@ -306,6 +515,33 @@ public final class JitRuntime {
                         org.luava.runtime.LuaNil.NIL);
             }
         }
+    }
+
+    /**
+     * Inline {@code setmetatable(t, mt)} for the JIT intrinsic. Returns the
+     * mutated table, or {@code null} to deopt when the shape is not one the
+     * compiled lane completes atomically: a non-table first argument (the
+     * interpreter must raise the exact bad-argument error) or a non-table,
+     * non-nil second argument. A {@code __gc}/{@code __mode} metatable is also
+     * rejected: it registers JVM-wide, non-idempotent bookkeeping that a
+     * restart-from-entry would double-apply. The plain method-table case (the
+     * OOP constructor idiom) has no such effect and stays inline.
+     */
+    public static LuaValue setmetatableInline(long[] p, byte[] t, LuaValue[] o, int tblIdx, int mtIdx) {
+        if (t[tblIdx] != org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT
+                || !(o[tblIdx] instanceof org.luava.runtime.LuaTable table)) {
+            return null;
+        }
+        LuaValue mt = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, mtIdx);
+        if (!mt.isNil() && !(mt instanceof org.luava.runtime.LuaTable)) {
+            return null;
+        }
+        if (mt instanceof org.luava.runtime.LuaTable mtTable
+                && (!mtTable.rawget(org.luava.runtime.LuaValue.Meta.GC).isNil()
+                        || !mtTable.rawget(org.luava.runtime.LuaValue.Meta.MODE).isNil())) {
+            return null;
+        }
+        return org.luava.runtime.standard.BaseLib.setmetatableCore(table, mt);
     }
 
     /**

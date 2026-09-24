@@ -158,6 +158,35 @@ public class LuavaBugfixRegressionTest {
     }
 
     @Test
+    void outOfMemoryIsCaughtByPcallAsNotEnoughMemory() {
+        // PUC raises a pre-allocated "not enough memory" (LUA_ERRMEM) so pcall
+        // catches an allocation failure instead of the raw OutOfMemoryError
+        // escaping to the host (heavy.lua relies on this). A raw LuaFunction
+        // (not the guarded wrapper) lets the OOME reach the VM exactly as a
+        // real allocator failure would.
+        LuaState s = new LuaState();
+        s.getGlobals().rawset(LuaString.valueOf("boom"),
+                LuaFunction.of(args -> { throw new OutOfMemoryError("Java heap space"); }));
+        LuaValue r = s.eval(
+                "local ok, err = pcall(boom); "
+                + "return tostring(ok) .. ':' .. tostring(err)");
+        assertEquals("false:not enough memory", r.toLuaString());
+        // The state stays usable after the protected failure.
+        assertEquals(3, s.eval("return 1 + 2").toLong());
+    }
+
+    @Test
+    void outOfMemoryAtHostBoundaryBecomesLuaError() {
+        // An allocation failure that escapes the whole chunk must not leak the
+        // raw OutOfMemoryError: the host boundary reports PUC's memory error.
+        LuaState s = new LuaState();
+        s.getGlobals().rawset(LuaString.valueOf("boom"),
+                LuaFunction.of(args -> { throw new OutOfMemoryError("Java heap space"); }));
+        LuaException ex = assertThrows(LuaException.class, () -> s.eval("boom()"));
+        assertTrue(ex.getMessage().contains("not enough memory"), ex.getMessage());
+    }
+
+    @Test
     void evalWithTimeoutDoesNotLeakRunawayWorker() throws Exception {
         LuaState s = new LuaState();
         AtomicLong ticks = new AtomicLong();
@@ -437,5 +466,89 @@ public class LuavaBugfixRegressionTest {
         assertTrue(t instanceof LuaException, "leaked " + t.getClass().getName());
         // The control-flow signals still pass through untouched.
         assertThrows(LuaException.class, () -> s.eval("error('lua error')"));
+    }
+
+    @Test
+    void standardLibraryArgumentValidationMatchesPuc() {
+        // A differential sweep against stock PUC 5.4 found the engine silently
+        // accepting invalid arguments (luaL_checkany / luaL_checklstring were
+        // not enforced) and rejecting valid coercions. Each case below was a
+        // real divergence; pin the outcome (OK vs ERR) and the exact message.
+        LuaState s = new LuaState();
+        // luaL_checkany: a missing value argument must raise "value expected".
+        assertTrue(raises(s, "getmetatable()", "bad argument #1 to 'getmetatable' (value expected)"));
+        assertTrue(raises(s, "math.type()", "bad argument #1 to 'type' (value expected)"));
+        assertTrue(raises(s, "math.tointeger()", "bad argument #1 to 'tointeger' (value expected)"));
+        assertTrue(raises(s, "rawequal()", "bad argument #1 to 'rawequal' (value expected)"));
+        // luaL_checklstring: only strings and numbers coerce; nil/bool/table raise.
+        assertTrue(raises(s, "string.len(nil)", "bad argument #1 to 'len' (string expected, got nil)"));
+        assertTrue(raises(s, "string.upper(true)", "bad argument #1 to 'upper' (string expected, got boolean)"));
+        assertTrue(raises(s, "string.byte({})", "bad argument #1 to 'byte' (string expected, got table)"));
+        assertTrue(raises(s, "string.format(nil)", "bad argument #1 to 'format' (string expected, got nil)"));
+        assertEquals("1", s.eval("return tostring(string.len(5))").toLuaString());
+        // luaL_checkinteger coerces numeric strings (math.ult/math.random).
+        assertEquals("true", s.eval("return tostring(math.ult('1','2'))").toLuaString());
+        assertEquals("3", s.eval("return tostring(math.random('3','3'))").toLuaString());
+        assertTrue(raises(s, "math.randomseed(nil)", "bad argument #1 to 'randomseed' (number expected, got nil)"));
+        // A numeric __tostring result is accepted (lua_isstring is true).
+        assertEquals("5", s.eval("return tostring(setmetatable({},{__tostring=function() return 5 end}))").toLuaString());
+        // os.getenv: a missing/nil name raises; a number coerces.
+        assertTrue(raises(s, "os.getenv()", "bad argument #1 to 'getenv' (string expected, got no value)"));
+        assertTrue(raises(s, "os.getenv(nil)", "bad argument #1 to 'getenv' (string expected, got nil)"));
+        // coroutine.isyieldable: only an absent argument means "current thread";
+        // an explicit nil is a bad thread.
+        assertTrue(raises(s, "coroutine.isyieldable(nil)",
+                "bad argument #1 to 'isyieldable' (thread expected, got nil)"));
+        // load: a number is a text chunk; a non-string/non-function raises.
+        assertTrue(raises(s, "load(nil)", "bad argument #1 to 'load' (function expected, got nil)"));
+        assertTrue(raises(s, "load(true)", "bad argument #1 to 'load' (function expected, got boolean)"));
+        assertTrue(s.eval("return load(5) == nil").toBoolean());
+        // table.unpack uses luaL_len: a string unpacks its bytes; a number raises.
+        assertEquals("3", s.eval("return tostring(select('#', table.unpack('abc')))").toLuaString());
+        assertTrue(raises(s, "table.unpack(5)", "attempt to get length of a number value"));
+        // utf8.char coerces a numeric string.
+        assertEquals("A", s.eval("return utf8.char('65')").toLuaString());
+        assertTrue(raises(s, "utf8.char(65.5)",
+                "bad argument #1 to 'char' (number has no integer representation)"));
+    }
+
+    @Test
+    void argumentErrorNamesTheCallSiteLikePuc() {
+        // PUC's luaL_argerror names the offending function from the call site
+        // (or pushglobalfuncname for a C-invoked call). Direct field access
+        // names the short field, a local alias names the local, a global call
+        // through pcall resolves the qualified name, and a function invoked
+        // from C (a table.sort comparator) resolves to the qualified global.
+        LuaState s = new LuaState();
+        assertEquals("bad argument #1 to 'insert' (table expected, got nil)",
+                luaError(s, "table.insert(nil, 1)"));
+        assertEquals("bad argument #1 to 'f1' (table expected, got nil)",
+                luaError(s, "local f1 = table.insert f1(nil, 1)"));
+        assertEquals("bad argument #1 to 'table.insert' (table expected, got nil)",
+                stripLocation(s.eval("local ok, e = pcall(table.insert, nil, 1) return tostring(e)").toLuaString()));
+        assertEquals("bad argument #1 to 'table.sort' (table expected, got number)",
+                luaError(s, "table.sort({1,2,3}, table.sort)"));
+        assertEquals("bad argument #2 to 'string.format' (number has no integer representation)",
+                stripLocation(s.eval("local ok, e = pcall(string.format, '%d', 2^63) return tostring(e)").toLuaString()));
+    }
+
+    private static boolean raises(LuaState s, String expr, String messageFragment) {
+        String script = "local ok, e = pcall(function() return " + expr + " end) "
+                + "return tostring(ok) .. '\\0' .. tostring(e)";
+        String r = s.eval(script).toLuaString();
+        int sep = r.indexOf('\0');
+        return "false".equals(r.substring(0, sep)) && r.indexOf(messageFragment) >= 0;
+    }
+
+    /** Runs {@code statement} under pcall and returns the error text with any
+     * {@code source:line:} prefix stripped, so the assertion can compare the
+     * PUC argument-error tail. */
+    private static String luaError(LuaState s, String statement) {
+        return stripLocation(s.eval(
+                "local ok, e = pcall(function() " + statement + " end) return tostring(e)").toLuaString());
+    }
+
+    private static String stripLocation(String message) {
+        return message.replaceFirst("^.*?:\\d+: ", "");
     }
 }

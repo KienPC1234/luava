@@ -631,6 +631,13 @@ public final class LuaState {
             throw e;
         } catch (StackOverflowError e) {
             throw new LuaException("stack overflow");
+        } catch (OutOfMemoryError oom) {
+            // PUC reports a failed allocation as the Lua-level error "not
+            // enough memory" (LUA_ERRMEM), catchable by pcall. Build it from
+            // the pre-allocated message so this boundary need not allocate
+            // under pressure (a fresh message could re-OOM and leak the raw
+            // OutOfMemoryError to the host).
+            throw new LuaException(LuaString.MEMORY_ERROR);
         } catch (Throwable t) {
             String msg = t.getMessage() != null ? t.getMessage() : t.toString();
             throw new LuaException("internal error: " + t.getClass().getSimpleName() + ": " + msg);

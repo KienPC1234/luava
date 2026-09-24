@@ -99,7 +99,9 @@ public class MainTest {
 
     @Test
     void versionAndUsage() {
-        assertTrue(run("", "-v").out().contains("Lua 5.4"));
+        String v = run("", "-v").out();
+        assertTrue(v.contains("Luava"), v);
+        assertTrue(v.contains("Lua 5.4"), v);
         assertTrue(run("", "-h").out().contains("usage: luava"));
         assertEquals(1, run("", "-e").status());
     }

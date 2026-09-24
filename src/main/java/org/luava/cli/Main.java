@@ -60,7 +60,7 @@ public final class Main {
                 return evalChunk(state, args[1], "=(command line)");
             }
             if ("-v".equals(first) || "--version".equals(first)) {
-                System.out.println("Luava " + version() + " (Lua 5.4)");
+                System.out.println(versionLine());
                 return 0;
             }
             if ("-i".equals(first) || "--interactive".equals(first)) {
@@ -132,7 +132,7 @@ public final class Main {
      * prints {@code 3}, mirroring the reference {@code lua} interpreter.
      */
     private static int repl(LuaState state, BufferedReader in) {
-        System.out.println("Luava " + version() + " (Lua 5.4) — Ctrl-D to exit");
+        System.out.println(versionLine() + " — Ctrl-D to exit");
         StringBuilder buffer = new StringBuilder();
         boolean pending = false;
         while (true) {
@@ -245,6 +245,33 @@ public final class Main {
         Package pkg = Main.class.getPackage();
         String v = pkg != null ? pkg.getImplementationVersion() : null;
         return v != null ? v : "dev";
+    }
+
+    /**
+     * Release code name from the manifest, or empty when running from a plain
+     * classpath (no manifest entry). Appended to the {@code -v}/{@code --version}
+     * output so a jar self-identifies its release.
+     */
+    private static String codename() {
+        // Package does not expose Implementation-Codename as an accessor, so
+        // read it from the jar manifest directly.
+        try {
+            java.io.InputStream in = Main.class.getResourceAsStream("/META-INF/MANIFEST.MF");
+            if (in != null) {
+                try (java.io.InputStream stream = in) {
+                    java.util.jar.Manifest mf = new java.util.jar.Manifest(stream);
+                    return mf.getMainAttributes().getValue("Implementation-Codename");
+                }
+            }
+        } catch (java.io.IOException ignored) {
+        }
+        return null;
+    }
+
+    private static String versionLine() {
+        String c = codename();
+        String name = (c != null && !c.isEmpty()) ? c + " " : "";
+        return "Luava " + version() + " " + name + "(Lua 5.4)";
     }
 
     private static void printUsage() {

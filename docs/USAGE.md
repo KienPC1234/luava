@@ -29,11 +29,11 @@ If you only want to run scripts or poke at Lua 5.4 syntax, the engine jar is
 executable:
 
 ```bash
-java -jar luava-0.1.0-alpha.jar script.lua arg1 arg2   # arg[0] is the script name
-java -jar luava-0.1.0-alpha.jar -e "print(1 + 2)"      # evaluate a string
-java -jar luava-0.1.0-alpha.jar                        # interactive multi-line REPL
-java -jar luava-0.1.0-alpha.jar -v                     # version
-java -jar luava-0.1.0-alpha.jar -h                     # help
+java -jar luava-0.2.0-beta.jar script.lua arg1 arg2   # arg[0] is the script name
+java -jar luava-0.2.0-beta.jar -e "print(1 + 2)"      # evaluate a string
+java -jar luava-0.2.0-beta.jar                        # interactive multi-line REPL
+java -jar luava-0.2.0-beta.jar -v                     # version
+java -jar luava-0.2.0-beta.jar -h                     # help
 ```
 
 This is a convenience front end; embedding through `LuaState` (below) is the

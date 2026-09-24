@@ -45,7 +45,9 @@ public final class DebugLib {
         debug.rawset(LuaString.interned("getregistry"), LuaFunction.of(args -> registry));
 
         debug.rawset(LuaString.interned("getinfo"), LuaFunction.of(args -> {
-            if (args.length == 0) throw new LuaException("bad argument to 'debug.getinfo'");
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "getinfo", "number expected, got no value");
+            }
             LuaCoroutine targetCoro = null;
             int argIdx = 0;
             if (args[0] instanceof LuaCoroutine co) {
@@ -221,6 +223,14 @@ public final class DebugLib {
                 return LuaString.valueOf(sb.toString());
             }
 
+            // PUC's luaL_traceback walks down to the C function that entered
+            // the main chunk (the host pcall), so a main-thread traceback ends
+            // with a `[C]: in ?` line. A coroutine's stack bottom is the C
+            // resumer, which lua_getstack does not expose, so coroutine
+            // tracebacks have no such trailing frame.
+            LuaCoroutine walked = targetCoro != null ? targetCoro : LuaCoroutine.running();
+            boolean mainStack = (walked == null || walked.isMainThread());
+
             int LEVELS1 = 10;
             int LEVELS2 = 11;
             if (totalFrames <= LEVELS1 + LEVELS2) {
@@ -236,6 +246,9 @@ public final class DebugLib {
                 for (int i = totalFrames - LEVELS2; i < totalFrames; i++) {
                     formatTracebackFrame(sb, org.luava.runtime.eval.CallStack.getFrame(targetCoro, startLevel + i));
                 }
+            }
+            if (mainStack) {
+                sb.append("\n\t[C]: in ?");
             }
             return LuaString.valueOf(sb.toString());
         }));
@@ -793,7 +806,7 @@ public final class DebugLib {
         }
     }
 
-    private static String findGlobalFuncName(LuaFunction fn, Environment env) {
+    public static String findGlobalFuncName(LuaFunction fn, Environment env) {
         if (fn == null) return null;
         LuaTable globals = env != null ? env.getGlobals() : null;
         if (globals == null) {

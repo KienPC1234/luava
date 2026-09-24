@@ -22,7 +22,40 @@ public abstract class LuaFunction extends LuaValue {
 
     @Override
     public LuaValue call(LuaValue... args) {
-        return invoke(args);
+        return callWithCFrame(args);
+    }
+
+    /**
+     * Invokes this function from host/Java code with PUC {@code lua_call}
+     * frame semantics: unless this is a Lua closure (which pushes its own VM
+     * frame), a fresh nameless C frame is pushed for the duration. PUC's
+     * {@code luaL_argerror} then sees the callee as frame 0 and resolves its
+     * qualified name via {@code pushglobalfuncname} (e.g. a {@code
+     * setmetatable} passed as a {@code string.gsub} replacement reports
+     * {@code 'setmetatable'}, not the enclosing {@code 'gsub'}). A fresh frame
+     * is pushed even when the same function is already running, because
+     * {@code lua_call} is reentrant (e.g. {@code table.sort(t, table.sort)}).
+     */
+    protected LuaValue callWithCFrame(LuaValue[] args) {
+        if (this instanceof org.luava.runtime.bytecode.LuaClosure
+                || org.luava.runtime.eval.CallStack.depth() == 0) {
+            return invoke(args);
+        }
+        // A frame already pushed for this exact function with no call-site
+        // name is the one we (or the pcall fast path) created; reuse it rather
+        // than nesting a duplicate. A named frame is a real call site (e.g.
+        // table.sort(t, table.sort): the outer 'sort' frame), so a fresh
+        // callee frame is still pushed, matching lua_call's reentrancy.
+        org.luava.runtime.eval.CallStack.Frame top = org.luava.runtime.eval.CallStack.topFrame();
+        if (top != null && top.function == this && top.name == null) {
+            return invoke(args);
+        }
+        org.luava.runtime.eval.CallStack.push(this, null, -1);
+        try {
+            return invoke(args);
+        } finally {
+            org.luava.runtime.eval.CallStack.pop();
+        }
     }
 
     protected String source = "=[Lua]";

@@ -418,6 +418,22 @@ public final class LuaTable extends LuaValue {
         modCount++;
         lastReturnedKey = null;
         nextIterator = null;
+        // String-key fast lane: the dominant field/element write shape
+        // (t.x = v, t["k"] = v). Strings are never nil, never float-
+        // normalized, never integer-keyed and never wrapped as WeakKey, so
+        // the normalizeKey + isNil + isInteger(isFloat) virtual chain in the
+        // generic path is pure overhead. Mirrors rawget's lane. Weak tables
+        // keep the generic path (values must be wrapped).
+        if (key instanceof LuaString && !weakKeys && !weakValues) {
+            if (value == null || value == LuaNil.NIL || value.isNil()) {
+                if (hashPart.containsKey(key)) {
+                    hashPart.put(key, LuaNil.NIL);
+                }
+            } else {
+                hashPart.put(key, value);
+            }
+            return;
+        }
         key = normalizeKey(key);
         if (key == null || key.isNil()) {
             throw new LuaException("table index is nil");
@@ -827,7 +843,8 @@ public final class LuaTable extends LuaValue {
             LuaValue handler = metatable.rawget(LuaValue.Meta.TOSTRING);
             if (!handler.isNil()) {
                 LuaValue res = handler.call(this);
-                if (!res.isString()) {
+                // luaL_tolstring accepts a numeric result too (lua_isstring).
+                if (!res.isString() && !res.isNumber()) {
                     throw new LuaException("'__tostring' must return a string");
                 }
                 return res.toLuaString();

@@ -42,7 +42,7 @@ public final class Utf8Lib {
             return v.isString() ? (LuaString) v : LuaString.valueOf(v.toLuaString());
         }
         throw new LuaException("bad argument #" + arg + " to 'utf8." + func
-                + "' (string expected, got " + (v.isNil() ? "no value" : v.typeName()) + ")");
+                + "' (string expected, got " + v.typeName() + ")");
     }
 
     /**
@@ -110,12 +110,14 @@ public final class Utf8Lib {
             java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
             for (int i = 0; i < args.length; i++) {
                 LuaValue arg = args[i];
-                if (!arg.isInteger() && !arg.isNumber()) {
-                    throw new LuaException("bad argument #" + (i + 1) + " to 'utf8.char' (number expected, got " + arg.typeName() + ")");
+                // luaL_checkinteger coerces a numeric string ("65" -> 'A').
+                LuaInteger ci = arg.toLuaIntegerCoercingStrings();
+                if (ci == null) {
+                    throw LuaValue.argError(i + 1, "utf8.char", arg.integerConversionError());
                 }
-                long codePoint = arg.toLong();
+                long codePoint = ci.toLong();
                 if (codePoint < 0 || codePoint > MAXUTF) {
-                    throw new LuaException("bad argument #" + (i + 1) + " to 'utf8.char' (value out of range)");
+                    throw LuaValue.argError(i + 1, "utf8.char", "value out of range");
                 }
                 if (codePoint < 0x80) {
                     baos.write((int) codePoint);
@@ -189,8 +191,12 @@ public final class Utf8Lib {
         }));
 
         utf8.rawset(LuaString.interned("offset"), LuaFunction.of(args -> {
-            if (args.length < 2) throw new LuaException("bad argument to 'utf8.offset'");
-            byte[] bytes = args[0].toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+            // luaL_checklstring(L,1) runs before luaL_checkinteger(L,2), so a
+            // missing/nil first argument is blamed before the position.
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "offset", "string expected, got no value");
+            }
+            byte[] bytes = checkString(args[0], 1, "offset").toLuaString().getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
             int len = bytes.length;
             long n = checkInteger(args, 1, "offset");
             long posi = (n >= 0) ? 1 : len + 1;

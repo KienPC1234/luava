@@ -564,11 +564,128 @@ public class JitCoverageTest {
     }
 
     @Test
-    void impureProtoWithCallsCompilesButDeoptsCalls() {
+    void setmetatableConstructorCompilesAndMatchesInterpreter() {
+        // `return setmetatable({...}, Class)` (the OOP factory idiom) used to
+        // be rejected because the general call made the proto a calling impure
+        // leaf with no loop; inlining the builtin removes the call, so the
+        // factory compiles as an object-returning impure leaf. Semantics must
+        // stay exact: protected metatables raise, bad arguments raise, a
+        // reassigned/shadowed global must not use the intrinsic, and __gc
+        // registration still runs.
+        String[] bodies = {
+            "local C={} C.__index=C local function mk(x) return setmetatable({x=x}, C) end "
+                    + "local s=0 for i=1,200 do local o=mk(i) s=s+o.x end return s",
+            "local function mk() local t=setmetatable({}, nil) return t end "
+                    + "local n=0 for i=1,200 do if mk()~=nil then n=n+1 end end return n",
+            "local function mk() return setmetatable({}, {__gc=function() end}) end "
+                    + "for i=1,200 do mk() end return 1",
+            "local function mk() return setmetatable({a=1}, {__index={b=2}}) end "
+                    + "local s=0 for i=1,200 do s=s+mk().b end return s",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+        // A protected metatable must raise via the exact interpreter path.
+        assertSameWithAndWithoutJit(
+                "local p=setmetatable({},{__metatable='x'}) "
+                        + "local function f() return pcall(setmetatable, p, {}) end "
+                        + "local r for i=1,300 do r=f() end return tostring(r)",
+                2);
+        // Non-table targets and non-table metatables raise the exact error.
+        assertSameWithAndWithoutJit(
+                "local function f(a,b) return pcall(setmetatable, a, b) end "
+                        + "local r for i=1,300 do r=f(5, {}) end return tostring(r)",
+                2);
+        // The constructor shape genuinely compiles (not just correct by deopt).
+        LuaState state = new LuaState().jitEnabled(true);
+        LuaClosure mk = (LuaClosure) state.eval(
+                "local C={} C.__index=C "
+                        + "local function mk(x,y) return setmetatable({x=x,y=y}, C) end return mk");
+        state.getGlobals().rawset(org.luava.runtime.LuaString.valueOf("mk"), mk);
+        state.eval("local s=0 for i=1,400 do local o=mk(i,i+1) s=s+o.x end");
+        assertTrue(awaitCompiled(mk.proto, 5000),
+                "a setmetatable constructor should be inside the JIT subset");
+    }
+
+    @Test
+    void objectReturningCallProtocolCompilesAndMatchesInterpreter() {
+        // Plan.md §5.A: a pure object-returning callee is now entered from
+        // compiled code under a boxed (object) call protocol, and an impure
+        // caller may enter a pure compiled callee. The callee's parameter
+        // window aliases the caller's argument registers, so a nested deopt
+        // rolls that window back before the interpreter re-executes the call.
+        // Every body must stay bit-identical whether the callee writes its
+        // parameters (clobbering the window) or not.
+        String[] bodies = {
+            // object-returning callee, argument-preserving
+            "local function f(x) return {v=x} end "
+                    + "local s=0 for i=1,300 do s=s+f(i).v end return s",
+            // object-returning callee that rewrites its parameter BEFORE a
+            // deopting metatable lookup (the clobber shape)
+            "local o=setmetatable({},{__index=function(_,k) return k end}) "
+                    + "local function f(x) x=x+1000 return {v=(o[x] or 0)} end "
+                    + "local s=0 for i=1,300 do s=s+f(i).v end return s",
+            // tail-forward-only proto: `return f(...)`
+            "local function f(x) return {v=x*2} end local function g(x) return f(x) end "
+                    + "local s=0 for i=1,300 do s=s+g(i).v end return s",
+            // impure caller entering a pure object callee
+            "local t={} local function f(x) return {v=x} end "
+                    + "for i=1,300 do t[i]=f(i).v end local s=0 for i=1,300 do s=s+t[i] end return s",
+            // nested: object callee calls another object callee
+            "local function h(x) return {v=x+1} end local function f(x) return h(x) end "
+                    + "local s=0 for i=1,300 do s=s+f(i).v end return s",
+        };
+        for (String code : bodies) {
+            assertSameWithAndWithoutJit(hot(code), 2);
+        }
+        // The OOP benchmark shape genuinely compiles all of new/dot/length/add.
+        LuaState state = new LuaState().jitEnabled(true);
+        state.eval("Vec={} Vec.__index=Vec "
+                + "function Vec.new(x,y) return setmetatable({x=x,y=y},Vec) end "
+                + "function Vec:dot(o) return self.x*o.x+self.y*o.y end "
+                + "function Vec:add(o) return Vec.new(self.x+o.x, self.y+o.y) end");
+        LuaClosure add = (LuaClosure) state.get("Vec").get(org.luava.runtime.LuaString.valueOf("add"));
+        state.eval("local a=Vec.new(1.0,2.0) local b=Vec.new(3.0,4.0) local acc=0.0 "
+                + "for i=1,400 do local c=a:add(b) acc=acc+c:dot(a) end");
+        assertTrue(awaitCompiled(add.proto, 5000),
+                "Vec:add (object-return tail call) should be inside the JIT subset");
+    }
+
+    @Test
+    void parameterWritingSelfRecursionRollsBackArguments() {
+        // A self-recursive proto that WRITES its parameter must not use the
+        // prologue-free self-recursion entry (no window rollback): the callee's
+        // window aliases the caller's argument registers, so a nested deopt
+        // would re-read a clobbered parameter. The compiler must route such a
+        // proto through the snapshot-wrapped general path, and results must
+        // stay exact.
+        String code = "local obj=setmetatable({},{__index=function(_,k) return k end}) "
+                + "local function f(x,n) x=x+1000 if n<=0 then return x end "
+                + "  return (obj[x] or 0)+f(x,n-1) end "
+                + "local function outer(a,b) return f(a,b) end "
+                + "for i=1,300 do outer(i,5) end "
+                + "return outer(3,5);";
+        assertSameWithAndWithoutJit("local function run() " + code + " end "
+                + "local function hot() return run() end "
+                + "for i=1,400 do hot() end return run()", 2);
+        // The unsafe prologue-free entry must not be generated for this proto.
+        LuaState state = new LuaState();
+        LuaClosure f = (LuaClosure) state.eval(
+                "local obj=setmetatable({},{__index=function(_,k) return k end}) "
+                        + "local function f(x,n) x=x+1000 if n<=0 then return x end "
+                        + "  return (obj[x] or 0)+f(x,n-1) end return f");
+        org.luava.runtime.jit.JitCompiler.prewarm(f);
+        assertTrue(f.proto.jitCode != null, "the self-recursive proto should compile");
+        assertTrue(f.proto.jitCode.returnsInt, "expected the integer protocol");
+    }
+
+    @Test
+    void impureProtoWithCallsCompilesAndEntersPureCallees() {
         // An impure proto (table/upvalue writes + a general call) may compile:
-        // every CALL deopts before entering the callee, so the interpreter
-        // re-executes the call with the committed prefix intact. Results must
-        // be identical and no write may be double-applied.
+        // its general calls enter only pure compiled callees, with the
+        // argument window rolled back on a nested deopt; a builtin/impure
+        // callee deopts structurally at the call with the committed prefix
+        // intact. Results must be identical and no write double-applied.
         String[] bodies = {
             "local t={} for i=1,200 do t[i]=i*i end local s=0 for i=1,200 do s=s+t[i] end return s",
             "local x=0 local function bump() x=x+1 end for i=1,200 do bump() end return x",

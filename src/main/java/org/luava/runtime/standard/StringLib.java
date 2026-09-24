@@ -39,6 +39,24 @@ public final class StringLib {
     }
 
     /**
+     * {@code luaL_checklstring}: a string is accepted as-is, a number is
+     * converted to its Lua string form, and anything else raises the PUC
+     * "string expected, got X" error. A missing argument reports "no value".
+     * This is distinct from {@code toLuaString()}, which stringifies any value
+     * (so {@code string.len(nil)} would silently return 3 instead of raising).
+     */
+    static String checkString(LuaValue[] args, int idx, String func) {
+        if (idx >= args.length) {
+            throw LuaValue.argError(idx + 1, func, "string expected, got no value");
+        }
+        LuaValue v = args[idx];
+        if (v.isString() || v.isNumber()) {
+            return v.toLuaString();
+        }
+        throw LuaValue.argError(idx + 1, func, "string expected, got " + v.typeName());
+    }
+
+    /**
      * Shared stateless {@code string.gmatch} builtin (see
      * {@code BaseLib.TOSTRING}): one JVM-wide instance so the VM can
      * recognize and inline it on hot paths.
@@ -64,33 +82,29 @@ public final class StringLib {
     public static void fillInto(LuaTable stringTable, LuaTable globals) {
 
         stringTable.rawset(LuaString.interned("len"), LuaFunction.of(args -> {
-            if (args.length == 0) throw new LuaException("bad argument to 'string.len'");
-            if (args[0] instanceof LuaString ls) {
-                return LuaInteger.valueOf(ls.value().length());
-            }
-            return LuaInteger.valueOf(args[0].toLuaString().length());
+            String s = checkString(args, 0, "len");
+            return LuaInteger.valueOf(s.length());
         }));
 
         stringTable.rawset(LuaString.interned("lower"), LuaFunction.of(args -> {
-            if (args.length == 0) throw new LuaException("bad argument to 'string.lower'");
-            return LuaString.valueOf(args[0].toLuaString().toLowerCase());
+            return LuaString.valueOf(checkString(args, 0, "lower").toLowerCase());
         }));
 
         stringTable.rawset(LuaString.interned("upper"), LuaFunction.of(args -> {
-            if (args.length == 0) throw new LuaException("bad argument to 'string.upper'");
-            return LuaString.valueOf(args[0].toLuaString().toUpperCase());
+            return LuaString.valueOf(checkString(args, 0, "upper").toUpperCase());
         }));
 
         stringTable.rawset(LuaString.interned("reverse"), LuaFunction.of(args -> {
-            if (args.length == 0) throw new LuaException("bad argument to 'string.reverse'");
-            return LuaString.valueOf(new StringBuilder(args[0].toLuaString()).reverse().toString());
+            return LuaString.valueOf(new StringBuilder(checkString(args, 0, "reverse")).reverse().toString());
         }));
 
         stringTable.rawset(LuaString.interned("rep"), LuaFunction.of(args -> {
-            if (args.length < 2) throw new LuaException("bad argument to 'string.rep'");
-            String s = args[0].toLuaString();
+            String s = checkString(args, 0, "rep");
+            if (args.length < 2 || args[1].isNil()) {
+                throw LuaValue.argError(2, "rep", "number expected, got " + (args.length < 2 ? "no value" : "nil"));
+            }
             LuaInteger nVal = args[1].toLuaIntegerCoercingStrings();
-            if (nVal == null) throw new LuaException("bad argument #2 to 'string.rep' (" + args[1].integerConversionError() + ")");
+            if (nVal == null) throw LuaValue.argError(2, "rep", args[1].integerConversionError());
             long n = nVal.toLong();
             String sep = (args.length > 2 && !args[2].isNil()) ? args[2].toLuaString() : "";
             if (n <= 0) return LuaString.interned("");
@@ -141,8 +155,7 @@ public final class StringLib {
         }));
 
         stringTable.rawset(LuaString.interned("byte"), LuaFunction.of(args -> {
-            if (args.length == 0) throw new LuaException("bad argument to 'string.byte'");
-            String s = (args[0] instanceof LuaString ls) ? ls.value() : args[0].toLuaString();
+            String s = checkString(args, 0, "byte");
             int len = s.length();
             long start = (args.length > 1 && !args[1].isNil()) ? checkInteger(args, 1, "byte") : 1;
             long end = (args.length > 2 && !args[2].isNil()) ? checkInteger(args, 2, "byte") : start;
@@ -195,8 +208,7 @@ public final class StringLib {
         }));
 
         stringTable.rawset(LuaString.interned("format"), LuaFunction.of(args -> {
-            if (args.length == 0) throw new LuaException("bad argument #1 to 'string.format' (string expected, got no value)");
-            String fmt = args[0].toLuaString();
+            String fmt = checkString(args, 0, "format");
             StringBuilder b = new StringBuilder();
             int top = args.length - 1;
             int argIdx = 1;
@@ -566,7 +578,7 @@ public final class StringLib {
             if (d >= -9223372036854775808.0 && d < 9223372036854775808.0 && Math.floor(d) == d) {
                 return (long) d;
             }
-            throw new LuaException("bad argument #" + argIdx + " to 'string.format' (number has no integer representation)");
+            throw LuaValue.argError(argIdx, "format", "number has no integer representation");
         }
         if (v.isString()) {
             // luaL_checkinteger coerces numeric strings through Lua's own
@@ -575,11 +587,11 @@ public final class StringLib {
             if (parsed != null) {
                 LuaInteger ci = parsed.toLuaInteger();
                 if (ci != null) return ci.toLong();
-                throw new LuaException("bad argument #" + argIdx + " to 'string.format' (number has no integer representation)");
+                throw LuaValue.argError(argIdx, "format", "number has no integer representation");
             }
         }
-        throw new LuaException("bad argument #" + argIdx + " to 'string.format' (number expected, got "
-                + (v.isString() ? "string" : v.typeName()) + ")");
+        throw LuaValue.argError(argIdx, "format", "number expected, got "
+                + (v.isString() ? "string" : v.typeName()));
     }
 
     private static double checkFormatNumber(LuaValue v, int argIdx) {
@@ -592,8 +604,8 @@ public final class StringLib {
                 return parsed.toDouble();
             }
         }
-        throw new LuaException("bad argument #" + argIdx + " to 'string.format' (number expected, got "
-                + (v.isString() ? "string" : v.typeName()) + ")");
+        throw LuaValue.argError(argIdx, "format", "number expected, got "
+                + (v.isString() ? "string" : v.typeName()));
     }
 
     private static String formatInteger(String spec, String flags, int width, int prec, long n) {

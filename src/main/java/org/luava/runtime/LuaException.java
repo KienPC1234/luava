@@ -12,12 +12,46 @@ public class LuaException extends RuntimeException {
     private String customMessage;
     private int line = -1;
     private boolean decorated = false;
+    /**
+     * True when the message is already complete and must not receive the
+     * VM's {@code source:line:} prefix or operand descriptor. PUC raises
+     * {@code luaG_runerror} from inside a C function (e.g. {@code luaL_len}'s
+     * "attempt to get length of a X value"); since the current frame is C,
+     * {@code luaG_runerror} adds neither the Lua line nor the operand
+     * description. Library {@code luaL_error}/{@code luaL_argerror} messages
+     * are not marked, so they still get the caller-location prefix.
+     */
+    private boolean noDecorate = false;
     private final java.util.List<org.luava.runtime.eval.CallStack.Frame> luaFrames;
 
     public LuaException(String message) {
         super(message);
         this.errorObject = message != null ? LuaString.valueOf(message) : LuaNil.NIL;
         this.luaFrames = captureLuaFrames();
+        this.noDecorate = raisedFromCFunction(message);
+    }
+
+    /**
+     * PUC's {@code luaG_runerror}/{@code luaG_typeerror} add the
+     * {@code source:line:} prefix and operand descriptor only when the
+     * <em>current</em> frame is a Lua function ({@code isLua(ci)}); from a C
+     * function (e.g. {@code luaL_len} inside {@code table.unpack}) they add
+     * neither. The VM later decorates any undecorated error with the caller's
+     * fault site, so mark the C-origin type errors here to suppress that.
+     * {@code luaL_error}/{@code luaL_argerror} messages ("bad argument ...",
+     * "invalid value ...", "module not found") are built by those helpers with
+     * the caller location and must keep their decoration.
+     */
+    private static boolean raisedFromCFunction(String message) {
+        if (message == null || !message.startsWith("attempt to ")) {
+            return false;
+        }
+        try {
+            org.luava.runtime.eval.CallStack.Frame top = org.luava.runtime.eval.CallStack.topFrame();
+            return top != null && top.function != null && "C".equals(top.function.getWhat());
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     public LuaException(LuaValue errorObject) {
@@ -74,6 +108,14 @@ public class LuaException extends RuntimeException {
 
     public void setDecorated(boolean decorated) {
         this.decorated = decorated;
+    }
+
+    public boolean isNoDecorate() {
+        return noDecorate;
+    }
+
+    public void setNoDecorate(boolean noDecorate) {
+        this.noDecorate = noDecorate;
     }
 
     public int getLine() {

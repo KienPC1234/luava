@@ -10,6 +10,13 @@ package org.luava.runtime;
 
 public final class LuaString extends LuaValue {
     public static final LuaString EMPTY = new LuaString("");
+    /**
+     * Pre-allocated PUC memory-error message ({@code MEMERRMSG}). When the JVM
+     * heap is exhausted, building the error message must not allocate again or
+     * the second {@code OutOfMemoryError} escapes past {@code pcall}. PUC
+     * solves this with a pre-created message string; this is the same idea.
+     */
+    public static final LuaString MEMORY_ERROR = new LuaString("not enough memory");
     private static final LuaString[] ASCII_CACHE = new LuaString[256];
     static {
         for (int i = 0; i < 256; i++) {

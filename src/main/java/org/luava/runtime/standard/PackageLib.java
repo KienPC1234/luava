@@ -220,7 +220,8 @@ public final class PackageLib {
         // require(modname)
         globals.rawset(LuaString.interned("require"), LuaFunction.of(args -> {
             if (args.length == 0 || (!args[0].isString() && !args[0].isInteger() && !args[0].isFloat())) {
-                throw new LuaException("bad argument #1 to 'require' (string expected)");
+                throw LuaValue.argError(1, "require", "string expected, got "
+                        + (args.length == 0 ? "no value" : args[0].typeName()));
             }
             String nameStr = args[0].toLuaString();
             LuaString modName = LuaString.valueOf(nameStr);

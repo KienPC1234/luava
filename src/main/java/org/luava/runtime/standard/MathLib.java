@@ -127,7 +127,9 @@ public final class MathLib {
         }));
 
         math.rawset(LuaString.interned("type"), LuaFunction.of(args -> {
-            if (args.length == 0) return LuaNil.NIL;
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "math.type", "value expected");
+            }
             LuaValue v = args[0];
             if (v.isInteger()) return LuaString.interned("integer");
             if (v.isFloat()) return LuaString.interned("float");
@@ -135,7 +137,9 @@ public final class MathLib {
         }));
 
         math.rawset(LuaString.interned("tointeger"), LuaFunction.of(args -> {
-            if (args.length == 0) return LuaNil.NIL;
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "math.tointeger", "value expected");
+            }
             LuaValue v = args[0];
             if (v.isInteger()) return v;
             if (v.isFloat()) {
@@ -159,8 +163,12 @@ public final class MathLib {
         }));
 
         math.rawset(LuaString.interned("fmod"), LuaFunction.of(args -> {
-            LuaValue xv = checkNumberValue(args, 0, "fmod");
+            // PUC calls fmod(luaL_checknumber(L,1), luaL_checknumber(L,2));
+            // C leaves argument evaluation order unspecified, and the reference
+            // build checks #2 before #1. Mirror that so a missing/nil argument
+            // is blamed identically (math.fmod() -> #2, math.fmod(nil,2) -> #1).
             LuaValue yv = checkNumberValue(args, 1, "fmod");
+            LuaValue xv = checkNumberValue(args, 0, "fmod");
             if (xv.isInteger() && yv.isInteger()) {
                 long y = yv.toLong();
                 if (y == 0) {
@@ -228,7 +236,9 @@ public final class MathLib {
 
         math.rawset(LuaString.interned("randomseed"), LuaFunction.of(args -> {
             long s1, s2;
-            if (args.length == 0 || args[0].isNil()) {
+            // PUC tests lua_isnone(L,1): only an absent argument reseeds from
+            // the clock; an explicit nil is a bad integer argument.
+            if (args.length == 0) {
                 s1 = System.currentTimeMillis();
                 s2 = System.identityHashCode(globals);
             } else {
@@ -276,7 +286,9 @@ public final class MathLib {
             throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number expected, got " + (args.length <= index ? "no value" : "nil") + ")");
         }
         LuaValue v = args[index];
-        LuaInteger integer = v.toLuaInteger();
+        // luaL_checkinteger coerces a numeric string through lua_tointegerx
+        // (math.ult("1","2") and math.random("3") are valid in PUC).
+        LuaInteger integer = v.toLuaIntegerCoercingStrings();
         if (integer == null) {
             if (v.toLuaNumber() != null) {
                 throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number has no integer representation)");

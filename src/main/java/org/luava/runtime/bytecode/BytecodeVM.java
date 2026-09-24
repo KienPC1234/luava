@@ -953,6 +953,12 @@ public final class BytecodeVM {
                 errVal = ue.getOriginalError();
             } else if (ctx.thrown instanceof LuaException le && le.getErrorObject() != null) {
                 errVal = le.getErrorObject();
+            } else if (ctx.thrown instanceof OutOfMemoryError) {
+                // Allocation-free: the heap is still full here, so building a
+                // fresh message (or even ctx.thrown.toString()) can throw a
+                // second OOME inside this teardown and escape the protected
+                // call. Use the pre-allocated PUC message instead.
+                errVal = LuaString.MEMORY_ERROR;
             } else {
                 String msg = ctx.thrown.getMessage() != null ? ctx.thrown.getMessage() : ctx.thrown.toString();
                 errVal = LuaString.valueOf(msg);
@@ -1021,6 +1027,10 @@ public final class BytecodeVM {
      * {@code source:line: msg} form.
      */
     private static void decorateFault(LuaException le, VmContext ctx, int faultPc) {
+        if (le.isNoDecorate()) {
+            le.setDecorated(true);
+            return;
+        }
         attachBytecodeDesc(le, ctx.proto, faultPc, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
         int curLine = (ctx.proto.lineInfo != null && ctx.proto.lineInfo.length > 0 && faultPc < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[faultPc] : -1;
         String msg = le.getMessage();
@@ -1388,6 +1398,8 @@ public final class BytecodeVM {
             int inlined = -1;
             if (func == org.luava.runtime.standard.BaseLib.TOSTRING && nActualArgs == 1) {
                 inlined = inlineTostring1(state, ctx, funcIdx, nResults);
+            } else if (func == org.luava.runtime.standard.CoroutineLib.RESUME) {
+                inlined = inlineResume(ctx, funcIdx, nActualArgs, nResults);
             } else if (func == org.luava.runtime.standard.StringLib.GMATCH
                     && (nActualArgs == 2 || nActualArgs == 3)) {
                 inlined = inlineGmatch(ctx, funcIdx, nActualArgs, nResults);
@@ -2571,11 +2583,46 @@ public final class BytecodeVM {
     }
 
     /**
-     * Frameless inline for the shared {@code string.gmatch} builtin.
-     * Same contract as {@link #inlineTostring1}: returns the new top, or -1
-     * to run the generic path (bad argument types or exotic result shapes,
-     * preserving the exact arg-error behavior).
+     * Frameless inline for the shared {@code coroutine.resume} builtin. Mirrors
+     * {@code CoroutineLib.resumeImpl}: the first argument must be a coroutine
+     * (otherwise the generic path raises the exact type error), the remaining
+     * arguments are passed through, and the result is
+     * {@code (true, ...)} or {@code (false, err)}. Returns the new top, or -1
+     * to fall back.
      */
+    private static int inlineResume(VmContext ctx, int funcIdx, int nActualArgs, int nResults) {
+        if (nActualArgs < 1) {
+            return -1;
+        }
+        LuaValue target = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1);
+        if (!(target instanceof org.luava.runtime.concurrency.LuaCoroutine co)) {
+            return -1;
+        }
+        int argCount = nActualArgs - 1;
+        LuaValue[] resumeArgs;
+        if (argCount <= 0) {
+            resumeArgs = org.luava.runtime.concurrency.LuaCoroutine.EMPTY_VALUES;
+        } else {
+            resumeArgs = new LuaValue[argCount];
+            for (int i = 0; i < argCount; i++) {
+                resumeArgs[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 2 + i);
+            }
+        }
+        LuaValue[] results = co.resume(resumeArgs);
+        int n = results.length;
+        if (nResults >= 0) {
+            for (int i = 0; i < nResults; i++) {
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i,
+                        i < n ? results[i] : LuaNil.NIL);
+            }
+            return funcIdx + nResults;
+        }
+        for (int i = 0; i < n; i++) {
+            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i, results[i]);
+        }
+        return funcIdx + n;
+    }
+
     private static int inlineGmatch(VmContext ctx, int funcIdx, int nArgs, int nResults) {
         if (nResults > 1) {
             return -1;

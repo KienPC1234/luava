@@ -235,7 +235,14 @@ public final class OsLib {
         }));
 
         os.rawset(LuaString.interned("getenv"), LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isString()) return LuaNil.NIL;
+            // luaL_checkstring: a number coerces, anything else raises; a
+            // missing argument reports "no value".
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "getenv", "string expected, got no value");
+            }
+            if (!args[0].isString() && !args[0].isNumber()) {
+                throw LuaValue.argError(1, "getenv", "string expected, got " + args[0].typeName());
+            }
             String val = System.getenv(args[0].toLuaString());
             return (val != null) ? LuaString.valueOf(val) : LuaNil.NIL;
         }));

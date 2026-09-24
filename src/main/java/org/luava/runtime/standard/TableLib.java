@@ -54,11 +54,14 @@ public final class TableLib {
     public static void fillInto(LuaTable tableMod, LuaTable globals) {
 
         tableMod.rawset(LuaString.interned("insert"), LuaFunction.of(args -> {
-            if (args.length < 2 || args.length > 3) {
-                throw new LuaException("wrong number of arguments to 'table.insert'");
+            // PUC order: aux_getn validates argument #1 (table expected) BEFORE
+            // the arity switch, so table.insert() blames argument #1 with
+            // "got no value" and only 4+ args report the arity error.
+            if (args.length == 0 || !args[0].isTable()) {
+                throw LuaValue.argError(1, "insert", "table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
-            if (!args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'table.insert' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
+            if (args.length < 2 || args.length > 3) {
+                throw new LuaException("wrong number of arguments to 'insert'");
             }
             LuaTable t = (LuaTable) args[0];
             long len = luaLen(t);
@@ -70,7 +73,7 @@ public final class TableLib {
             } else {
                 pos = checkInteger(args, 1, "insert");
                 if (pos < 1 || pos > len + 1) {
-                    throw new LuaException("bad argument #2 to 'table.insert' (position out of bounds)");
+                    throw LuaValue.argError(2, "insert", "position out of bounds");
                 }
                 val = args[2];
                 for (long i = len + 1; i > pos; i--) {
@@ -84,13 +87,13 @@ public final class TableLib {
 
         tableMod.rawset(LuaString.interned("remove"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'table.remove' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
+                throw LuaValue.argError(1, "remove", "table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
             LuaTable t = (LuaTable) args[0];
             long len = luaLen(t);
             long pos = (args.length > 1 && !args[1].isNil()) ? checkInteger(args, 1, "remove") : len;
             if (pos != len && (pos < 1 || pos > len + 1)) {
-                throw new LuaException("bad argument #2 to 'table.remove' (position out of bounds)");
+                throw LuaValue.argError(2, "remove", "position out of bounds");
             }
             LuaValue removed = t.get(LuaInteger.valueOf(pos));
             for (; pos < len; pos++) {
@@ -102,7 +105,7 @@ public final class TableLib {
 
         tableMod.rawset(LuaString.interned("concat"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'table.concat' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
+                throw LuaValue.argError(1, "concat", "table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
             LuaTable t = (LuaTable) args[0];
             String sep = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "";
@@ -147,10 +150,13 @@ public final class TableLib {
         }));
 
         tableMod.rawset(LuaString.interned("unpack"), LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'table.unpack' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
+            // PUC's tunpack uses luaL_len(L,1), so any value with a length
+            // works: a string unpacks its bytes, and a non-length value raises
+            // "attempt to get length of a X value" rather than a type error.
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "unpack", "table expected, got no value");
             }
-            LuaTable t = (LuaTable) args[0];
+            LuaValue t = args[0];
             long start = (args.length > 1 && !args[1].isNil()) ? checkInteger(args, 1, "unpack") : 1;
             long end = (args.length > 2 && !args[2].isNil()) ? checkInteger(args, 2, "unpack") : luaLen(t);
 
@@ -182,17 +188,19 @@ public final class TableLib {
         }));
 
         tableMod.rawset(LuaString.interned("move"), LuaFunction.of(args -> {
-            if (args.length < 4 || !args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'table.move' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
-            }
-            LuaTable a1 = (LuaTable) args[0];
+            // PUC's tmove checks arguments #2/#3/#4 (integers) before the
+            // tables, so table.move() blames argument #2, not #1.
             long f = checkInteger(args, 1, "move");
             long e = checkInteger(args, 2, "move");
             long t = checkInteger(args, 3, "move");
+            if (args.length < 1 || !args[0].isTable()) {
+                throw LuaValue.argError(1, "move", "table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
+            }
+            LuaTable a1 = (LuaTable) args[0];
             LuaTable a2;
             if (args.length > 4 && !args[4].isNil()) {
                 if (!args[4].isTable()) {
-                    throw new LuaException("bad argument #5 to 'table.move' (table expected, got " + args[4].typeName() + ")");
+                    throw LuaValue.argError(5, "move", "table expected, got " + args[4].typeName());
                 }
                 a2 = (LuaTable) args[4];
             } else {
@@ -201,11 +209,11 @@ public final class TableLib {
 
             if (e >= f) {
                 if (f <= 0 && e >= Long.MAX_VALUE + f) {
-                    throw new LuaException("bad argument #3 to 'table.move' (too many elements to move)");
+                    throw LuaValue.argError(3, "move", "too many elements to move");
                 }
                 long n = e - f + 1;
                 if (t > Long.MAX_VALUE - n + 1) {
-                    throw new LuaException("bad argument #4 to 'table.move' (destination wrap around)");
+                    throw LuaValue.argError(4, "move", "destination wrap around");
                 }
                 if (t > f && t <= e && a1 == a2) {
                     for (long i = n - 1; i >= 0; i--) {
@@ -224,12 +232,11 @@ public final class TableLib {
 
         tableMod.rawset(LuaString.interned("sort"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'table.sort' (table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
+                throw LuaValue.argError(1, "sort", "table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
             LuaTable t = (LuaTable) args[0];
             if (args.length > 1 && !args[1].isNil() && !args[1].isFunction()) {
-                throw new LuaException("bad argument #2 to 'table.sort' (function expected, got "
-                        + args[1].typeName() + ")");
+                throw LuaValue.argError(2, "sort", "function expected, got " + args[1].typeName());
             }
             LuaFunction comp = (args.length > 1 && !args[1].isNil()) ? (LuaFunction) args[1] : null;
             long lenLong = luaLen(t);
@@ -238,7 +245,7 @@ public final class TableLib {
                 return org.luava.runtime.Varargs.EMPTY;
             }
             if (lenLong > Integer.MAX_VALUE - 2) {
-                throw new LuaException("bad argument #1 to 'table.sort' (array too big)");
+                throw LuaValue.argError(1, "sort", "array too big");
             }
             int len = (int) lenLong;
             List<LuaValue> items = new ArrayList<>(len);
@@ -270,6 +277,10 @@ public final class TableLib {
 
     private static boolean sortComp(LuaValue a, LuaValue b, LuaFunction comp) {
         if (comp == null) return a.luaLessThan(b);
+        // PUC invokes the comparator through lua_call; LuaFunction.call pushes
+        // the nameless C frame that luaL_argerror needs (a comparator passed as
+        // table.sort itself then resolves to 'table.sort', not the enclosing
+        // call-site name 'sort').
         return comp.call(a, b).toBoolean();
     }
 

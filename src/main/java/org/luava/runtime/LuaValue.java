@@ -948,13 +948,34 @@ public abstract class LuaValue {
 
     public static LuaException argError(int argNum, String funcName, String extramsg) {
         org.luava.runtime.eval.CallStack.Frame frame = org.luava.runtime.eval.CallStack.getFrame(0);
-        if (frame != null && frame.isMethod) {
-            argNum--;
-            if (argNum == 0) {
-                return new LuaException("calling '" + funcName + "' on bad self (" + extramsg + ")");
+        // PUC's luaL_argerror names the offending function from lua_getinfo "n"
+        // on the current frame: a direct Lua call carries the call-site name
+        // (table.insert -> 'insert', local f = string.rep -> 'f'), while a
+        // C-invoked call pushed by LuaFunction.call (a comparator run by
+        // table.sort, a function run by pcall) has no call-site name and falls
+        // back to pushglobalfuncname, an identity search over the globals/
+        // loaded tables (table.insert -> 'table.insert'). Prefer the frame name,
+        // then the qualified name, then the builtin's own name.
+        String name = funcName;
+        boolean method = false;
+        if (frame != null) {
+            method = frame.isMethod;
+            if (frame.name != null && !frame.name.isEmpty() && !"?".equals(frame.name)) {
+                name = frame.name;
+            } else if (frame.function != null) {
+                String global = org.luava.runtime.standard.DebugLib.findGlobalFuncName(frame.function, frame.env);
+                if (global != null) {
+                    name = global;
+                }
             }
         }
-        return new LuaException("bad argument #" + argNum + " to '" + funcName + "' (" + extramsg + ")");
+        if (method) {
+            argNum--;
+            if (argNum == 0) {
+                return new LuaException("calling '" + name + "' on bad self (" + extramsg + ")");
+            }
+        }
+        return new LuaException("bad argument #" + argNum + " to '" + name + "' (" + extramsg + ")");
     }
 
     @Override

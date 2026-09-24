@@ -103,6 +103,21 @@ public final class BaseLib {
     });
 
     /**
+     * Pre-built {@code (false, "not enough memory")} result. Constructed once
+     * at class load, never during allocation pressure, so a protected call can
+     * report a memory error without the handler itself allocating (PUC's
+     * {@code MEMERRMSG} trick). {@link Varargs} is immutable, so a shared
+     * singleton is safe.
+     */
+    private static final Varargs MEMORY_ERROR_RESULT =
+            Varargs.of(LuaBoolean.FALSE, LuaString.MEMORY_ERROR);
+
+    /** Allocation-free memory-error result; see {@link #MEMORY_ERROR_RESULT}. */
+    static Varargs memoryErrorResult() {
+        return MEMORY_ERROR_RESULT;
+    }
+
+    /**
      * Inline fast path for the {@code pairs(t)} iterator-setup call, shared
      * with the JIT. Returns {@code null} when {@code t} has an
      * {@code __pairs} metamethod (the interpreter must run the handler), else
@@ -133,8 +148,18 @@ public final class BaseLib {
         if (args.length < 2) {
             throw new LuaException("bad argument #2 to 'setmetatable' (nil or table expected, got no value)");
         }
-        LuaTable t = (LuaTable) args[0];
-        LuaValue mt = args[1];
+        return setmetatableCore((LuaTable) args[0], args[1]);
+    }
+
+    /**
+     * Shared core of {@code setmetatable} with already-validated argument
+     * arity/types except for the {@code oldMt} protection rule, which raises
+     * the exact PUC error. The JIT intrinsic mirrors this method so a
+     * compiled constructor observes identical metatable/GC registration
+     * semantics; a shape it cannot complete atomically deopts to the
+     * interpreter instead.
+     */
+    public static LuaValue setmetatableCore(LuaTable t, LuaValue mt) {
         LuaTable oldMt = t.getMetatable();
         if (oldMt != null) {
             LuaValue protectedVal = oldMt.rawget(LuaString.interned("__metatable"));
@@ -167,10 +192,13 @@ public final class BaseLib {
             LuaValue handler = mt.rawget(LuaString.interned("__tostring"));
             if (!handler.isNil()) {
                 LuaValue res = handler.call(v);
-                if (!res.isString()) {
+                // luaL_tolstring tests lua_isstring, which is true for numbers
+                // too (a number coerces to a string), so a numeric __tostring
+                // result is accepted and rendered, not rejected.
+                if (!res.isString() && !res.isNumber()) {
                     throw new LuaException("'__tostring' must return a string");
                 }
-                return res;
+                return LuaString.valueOf(res.toLuaString());
             }
         }
         return LuaString.valueOf(v.toLuaString());
@@ -382,6 +410,13 @@ public final class BaseLib {
                 return Varargs.of(LuaBoolean.FALSE, le.getErrorObject());
             } catch (StackOverflowError soe) {
                 return Varargs.of(LuaBoolean.FALSE, LuaString.interned("stack overflow"));
+            } catch (OutOfMemoryError oom) {
+                // PUC raises a pre-allocated "not enough memory" so the handler
+                // itself need not allocate. Building a fresh message here would
+                // re-enter the allocator and let a second OOME escape past the
+                // protected call (and kill the host). Mirrors luaD_throw's
+                // LUA_ERRMEM path.
+                return memoryErrorResult();
             } catch (Throwable t) {
                 String msg = t.getMessage() != null ? t.getMessage() : t.toString();
                 return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf(msg));
@@ -452,6 +487,10 @@ public final class BaseLib {
                 } catch (Throwable t) {
                     return Varargs.of(LuaBoolean.FALSE, LuaString.interned("error in error handling"));
                 }
+            } catch (OutOfMemoryError oom) {
+                // See pcall: use the pre-allocated message and a pre-allocated
+                // result so the handler cannot re-OOM.
+                return memoryErrorResult();
             } catch (Throwable t) {
                 try {
                     String msg = t.getMessage() != null ? t.getMessage() : t.toString();
@@ -471,7 +510,9 @@ public final class BaseLib {
         }));
 
         globals.rawset(LuaString.interned("select"), LuaFunction.of(args -> {
-            if (args.length == 0) throw new LuaException("bad argument #1 to 'select'");
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "select", "number expected, got no value");
+            }
             LuaValue selector = args[0];
             if (selector.isString() && "#".equals(selector.toLuaString())) {
                 return LuaInteger.valueOf(args.length - 1);
@@ -480,7 +521,7 @@ public final class BaseLib {
             // argument #1 with the integer-representation text otherwise.
             LuaInteger selInt = selector.toLuaIntegerCoercingStrings();
             if (selInt == null) {
-                throw new LuaException("bad argument #1 to 'select' (" + selector.integerConversionError() + ")");
+                throw LuaValue.argError(1, "select", selector.integerConversionError());
             }
             long idx = selInt.toLong();
             // PUC luaB_select: clamp then require 1 <= i, reporting
@@ -492,7 +533,7 @@ public final class BaseLib {
                 idx = n;
             }
             if (idx < 1) {
-                throw new LuaException("bad argument #1 to 'select' (index out of range)");
+                throw LuaValue.argError(1, "select", "index out of range");
             }
             int start = (int) idx;
             if (start > args.length - 1) {
@@ -507,7 +548,9 @@ public final class BaseLib {
         globals.rawset(LuaString.interned("setmetatable"), SETMETATABLE);
 
         globals.rawset(LuaString.interned("getmetatable"), LuaFunction.of(args -> {
-            if (args.length == 0) return LuaNil.NIL;
+            if (args.length == 0) {
+                throw LuaValue.argError(1, "getmetatable", "value expected");
+            }
             LuaTable mt = args[0].getMetatable();
             if (mt == null) return LuaNil.NIL;
             LuaValue protectedVal = mt.rawget(LuaString.interned("__metatable"));
@@ -516,22 +559,38 @@ public final class BaseLib {
         }));
 
         globals.rawset(LuaString.interned("rawget"), LuaFunction.of(args -> {
-            if (args.length < 2 || !args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'rawget' (table expected)");
+            if (args.length < 1 || !args[0].isTable()) {
+                String got = args.length == 0 ? "no value" : args[0].typeName();
+                throw LuaValue.argError(1, "rawget", "table expected, got " + got);
+            }
+            if (args.length < 2) {
+                throw LuaValue.argError(2, "rawget", "value expected");
             }
             return ((LuaTable) args[0]).rawget(args[1]);
         }));
 
         globals.rawset(LuaString.interned("rawset"), LuaFunction.of(args -> {
-            if (args.length < 3 || !args[0].isTable()) {
-                throw new LuaException("bad argument #1 to 'rawset' (table expected)");
+            if (args.length < 1 || !args[0].isTable()) {
+                String got = args.length == 0 ? "no value" : args[0].typeName();
+                throw LuaValue.argError(1, "rawset", "table expected, got " + got);
+            }
+            if (args.length < 2) {
+                throw LuaValue.argError(2, "rawset", "value expected");
+            }
+            if (args.length < 3) {
+                throw LuaValue.argError(3, "rawset", "value expected");
             }
             ((LuaTable) args[0]).rawset(args[1], args[2]);
             return args[0];
         }));
 
         globals.rawset(LuaString.interned("rawequal"), LuaFunction.of(args -> {
-            if (args.length < 2) return LuaBoolean.FALSE;
+            if (args.length < 1) {
+                throw LuaValue.argError(1, "rawequal", "value expected");
+            }
+            if (args.length < 2) {
+                throw LuaValue.argError(2, "rawequal", "value expected");
+            }
             // Lua 5.4: raw equality still compares numbers by mathematical
             // value across the integer/float subtypes (1 == 1.0), but never
             // consults metamethods. luaEquals handles the numeric case; its
@@ -585,13 +644,13 @@ public final class BaseLib {
         }));
 
         globals.rawset(LuaString.interned("load"), LuaFunction.of(args -> {
-            if (args.length == 0) {
-                return Varargs.of(LuaNil.NIL, LuaString.interned("bad argument #1 to 'load'"));
-            }
+            // luaB_load uses lua_tolstring(L,1): a string or number loads as a
+            // chunk (with the number coerced), a function is a reader, and
+            // anything else raises luaL_checktype(LUA_TFUNCTION).
             String code;
-            if (args[0].isString()) {
+            if (args.length > 0 && (args[0].isString() || args[0].isNumber())) {
                 code = args[0].toLuaString();
-            } else if (args[0].isFunction()) {
+            } else if (args.length > 0 && args[0].isFunction()) {
                 StringBuilder sb = new StringBuilder();
                 while (true) {
                     LuaValue chunk;
@@ -613,7 +672,8 @@ public final class BaseLib {
                 }
                 code = sb.toString();
             } else {
-                return Varargs.of(LuaNil.NIL, LuaString.interned("string or function expected in 'load'"));
+                throw LuaValue.argError(1, "load", "function expected, got "
+                        + (args.length == 0 ? "no value" : args[0].typeName()));
             }
 
             String mode = (args.length >= 3 && !args[2].isNil()) ? args[2].toLuaString() : "bt";
@@ -693,7 +753,9 @@ public final class BaseLib {
                 try {
                     bytes = Files.readAllBytes(filePath);
                 } catch (IOException e) {
-                    return Varargs.of(LuaNil.NIL, LuaString.valueOf("cannot open " + filename + ": " + e.getMessage()));
+                    String osMsg = (e instanceof java.nio.file.NoSuchFileException) ? "No such file or directory"
+                            : (e.getMessage() != null ? e.getMessage() : e.toString());
+                    return Varargs.of(LuaNil.NIL, LuaString.valueOf("cannot open " + filename + ": " + osMsg));
                 }
             }
 
@@ -747,7 +809,13 @@ public final class BaseLib {
             LuaValue res = loadfileFunc.call(args);
             if (res instanceof Varargs va) {
                 if (va.first().isNil()) {
-                    throw new LuaException(va.arg(2).toLuaString());
+                    // PUC's luaB_dofile does `return lua_error(L)`: the message
+                    // comes from luaL_loadfile and is rethrown by lua_error,
+                    // which (unlike luaL_error) adds no source:line prefix, so
+                    // the caller's location must not be prepended here.
+                    LuaException le = new LuaException(va.arg(2).toLuaString());
+                    le.setNoDecorate(true);
+                    throw le;
                 }
                 return va.first().call();
             }

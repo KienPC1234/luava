@@ -12,7 +12,7 @@
     -->
     <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava</artifactId>
-    <version>0.1.0-alpha</version>
+    <version>0.2.0-beta</version>
     <packaging>jar</packaging>
 
     <name>Luava</name>
@@ -46,6 +46,14 @@
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!--
+          Release code name, surfaced in the jar manifest and the CLI's -v.
+          "Concord" is the 0.2.0-beta release: exact Lua 5.4 standard-library
+          semantics, the object-return JIT call protocol and register-window
+          rollback.
+        -->
+        <luava.codename>Concord</luava.codename>
 
         <junit.jupiter.version>5.10.2</junit.jupiter.version>
         <asm.version>9.7</asm.version>
@@ -137,6 +145,7 @@
                                         <Implementation-Title>Luava</Implementation-Title>
                                         <Implementation-Version>${project.version}</Implementation-Version>
                                         <Implementation-Vendor>Ha Tri Kien</Implementation-Vendor>
+                                        <Implementation-Codename>${luava.codename}</Implementation-Codename>
                                     </manifestEntries>
                                 </transformer>
                             </transformers>
