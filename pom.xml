@@ -12,7 +12,7 @@
     -->
     <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava</artifactId>
-    <version>0.2.0-beta</version>
+    <version>0.2.1-beta</version>
     <packaging>jar</packaging>
 
     <name>Luava</name>
@@ -49,9 +49,9 @@
 
         <!--
           Release code name, surfaced in the jar manifest and the CLI's -v.
-          "Concord" is the 0.2.0-beta release: exact Lua 5.4 standard-library
-          semantics, the object-return JIT call protocol and register-window
-          rollback.
+          "Concord" covers the 0.2.x line: exact Lua 5.4 standard-library
+          semantics, the object-return JIT call protocol, register-window
+          rollback and the CLI -i script/REPL fix (0.2.1-beta).
         -->
         <luava.codename>Concord</luava.codename>
 

@@ -105,4 +105,14 @@ public class MainTest {
         assertTrue(run("", "-h").out().contains("usage: luava"));
         assertEquals(1, run("", "-e").status());
     }
+
+    @Test
+    void interactiveRunsTheScriptBeforeTheRepl(@TempDir Path dir) throws Exception {
+        Path script = dir.resolve("pre.lua");
+        Files.writeString(script, "print('from-script', #arg, arg[1])");
+        Run r = run("print('from-repl')\n", "-i", script.toString(), "extra");
+        assertEquals(0, r.status());
+        assertTrue(r.out().contains("from-script\t1\textra"), r.out());
+        assertTrue(r.out().contains("from-repl"), r.out());
+    }
 }

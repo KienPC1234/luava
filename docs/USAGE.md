@@ -1,27 +1,8 @@
 # Luava Usage Guide
 
-A task-oriented cookbook for embedding the Luava Lua 5.4 engine. Each section
-is a self-contained scenario. API details live in the Javadoc; this guide
-shows the idiomatic way to do common things.
-
-- [Running Lua from the command line](#running-lua-from-the-command-line)
-- [Getting a state](#getting-a-state)
-- [Evaluating scripts](#evaluating-scripts)
-- [Passing values between Java and Lua](#passing-values-between-java-and-lua)
-- [Calling Lua from Java](#calling-lua-from-java)
-- [Exposing Java to Lua](#exposing-java-to-lua)
-- [Live objects (mutations flow both ways)](#live-objects-mutations-flow-both-ways)
-- [Annotations: `@LuaModule` / `@LuaMethod` / `@LuaField`](#annotations)
-- [Functional interfaces (SAM)](#functional-interfaces-sam)
-- [Loading scripts from a JAR or custom source](#loading-scripts-from-a-jar-or-custom-source)
-- [Running untrusted scripts safely](#running-untrusted-scripts-safely)
-- [Limiting time and instructions](#limiting-time-and-instructions)
-- [Coroutines and concurrency](#coroutines-and-concurrency)
-- [Performance tuning](#performance-tuning)
-- [EmmyLua stubs for IDEs](#emmylua-stubs-for-ides)
-- [Common pitfalls](#common-pitfalls)
-
----
+A cookbook for embedding the Luava Lua 5.4 engine. Each section is a
+self-contained scenario. API details live in the Javadoc; this guide shows how
+to do common things.
 
 ## Running Lua from the command line
 
@@ -29,15 +10,33 @@ If you only want to run scripts or poke at Lua 5.4 syntax, the engine jar is
 executable:
 
 ```bash
-java -jar luava-0.2.0-beta.jar script.lua arg1 arg2   # arg[0] is the script name
-java -jar luava-0.2.0-beta.jar -e "print(1 + 2)"      # evaluate a string
-java -jar luava-0.2.0-beta.jar                        # interactive multi-line REPL
-java -jar luava-0.2.0-beta.jar -v                     # version
-java -jar luava-0.2.0-beta.jar -h                     # help
+java -jar luava-0.2.1-beta.jar script.lua arg1 arg2   # run a file (arg[0] = script name)
+java -jar luava-0.2.1-beta.jar -e "print(1 + 2)"      # evaluate a string
+java -jar luava-0.2.1-beta.jar -i script.lua          # run, then enter the REPL
+java -jar luava-0.2.1-beta.jar                        # interactive multi-line REPL
+java -jar luava-0.2.1-beta.jar -v                     # version (e.g. "Luava 0.2.1-beta Concord (Lua 5.4)")
+java -jar luava-0.2.1-beta.jar -h                     # usage
 ```
+
+Flags (only the first argument is inspected, so pass flags before the script):
+
+| Flag | Meaning |
+| :--- | :--- |
+| `-e stat` / `-E stat` | Execute the string `stat` and exit (`-E` is accepted as an alias). |
+| `-i` / `--interactive` | Enter the REPL after running the script (or immediately if none). |
+| `-v` / `--version` | Print the engine version and code name, then exit. |
+| `-h` / `--help` | Print the usage text, then exit. |
+| *(none)* | Start the interactive multi-line REPL. |
+
+Running a file exposes the standard Lua `arg` table: `arg[0]` is the script
+name and `arg[1..]` the arguments after it (`#arg` matches the reference CLI).
+
+The REPL keeps reading with a `>>` continuation prompt until the chunk is
+complete, and each finished expression is printed, so typing `1 + 2` shows `3`.
 
 This is a convenience front end; embedding through `LuaState` (below) is the
 primary use and the only way to control sandboxing, JIT and interop.
+
 
 ## Getting a state
 
@@ -47,10 +46,10 @@ import org.luava.runtime.LuaState;
 LuaState state = new LuaState();
 ```
 
-One `LuaState` owns its globals, JIT settings, security policy and explicit
-finalizer ownership. **Use one state per thread or per tenant**; states never
-share mutable state. Creating a state is cheap after the first (the stdlib is
-lazily filled), but do not create one per call — keep it and reuse it.
+One `LuaState` owns its globals, JIT settings, security policy and finalizer
+ownership. Use one state per thread or per tenant; states never share mutable
+state. Creating a state is cheap after the first (the stdlib is lazily filled),
+but do not create one per call. Keep it and reuse it.
 
 ## Evaluating scripts
 
@@ -72,9 +71,9 @@ var chunk = state.compile("return a + b", "chunk", state.getGlobals());
 state.getGlobals().rawset(LuaString.valueOf("a"), LuaInteger.valueOf(1));
 ```
 
-`eval` is fine for one-shot scripts, but a server handling many requests
-should `compile` the script at startup and reuse the closure (or, better,
-expose it as a Lua function and `call` it).
+`eval` is fine for one-shot scripts, but a server handling many requests should
+`compile` the script at startup and reuse the closure (or, better, expose it as
+a Lua function and `call` it).
 
 ## Passing values between Java and Lua
 
@@ -90,17 +89,17 @@ int    p = state.get("port", Integer.class);
 String n = state.get("name", String.class);
 ```
 
-Java `Map`, `List`, `Set` and arrays passed with `set` become **copies**
-(snapshots) as Lua tables:
+Java `Map`, `List`, `Set` and arrays passed with `set` become copies (snapshots)
+as Lua tables:
 
 ```java
 state.set("scores", List.of(10, 20, 30));
 state.eval("return scores[2]").toLong();   // 20
 ```
 
-Lua tables passed to a Java method expecting `Map`/`List`/array are converted
-at the call boundary. `Object` converts numbers to `Long`/`Double`, booleans
-to `Boolean`, strings to `String`, tables to `Map`.
+Lua tables passed to a Java method expecting `Map`/`List`/array are converted at
+the call boundary. `Object` converts numbers to `Long`/`Double`, booleans to
+`Boolean`, strings to `String`, tables to `Map`.
 
 ## Calling Lua from Java
 
@@ -119,15 +118,15 @@ LuaValue fn = state.get("greet");
 LuaValue r = fn.call(LuaString.valueOf("world"));
 ```
 
-Errors surface as `org.luava.runtime.LuaException`. Wrap calls in
-`pcall` in Lua, or catch `LuaException` in Java, when the script can fail.
+Errors surface as `org.luava.runtime.LuaException`. Wrap calls in `pcall` in Lua,
+or catch `LuaException` in Java, when the script can fail.
 
 ## Exposing Java to Lua
 
 There are four levels, from quickest to most structured.
 
-**1. Typed host functions** (no manual boxing; arguments are converted to the
-declared types and mismatches raise a Lua error):
+1. Typed host functions (no manual boxing; arguments are converted to the
+   declared types and mismatches raise a Lua error):
 
 ```java
 state.registerFunction("answer", () -> 42);
@@ -136,7 +135,7 @@ state.registerFunction("log", String.class, (java.util.function.Consumer<String>
 state.registerFunction("lookup", String.class, (java.util.function.Function<String, Integer>) this::lookup);
 ```
 
-**2. A raw invokable**, when you want full control:
+2. A raw invokable, when you want full control:
 
 ```java
 import org.luava.runtime.LuaValue;
@@ -148,13 +147,13 @@ state.registerFunction("sum", args -> {
 });
 ```
 
-**3. A live object** (see next section):
+3. A live object (see the next section):
 
 ```java
 state.setLive("service", myService);
 ```
 
-**4. A bound module** (annotations, below).
+4. A bound module (see the annotations section).
 
 You can also let a script import a class directly:
 
@@ -168,8 +167,8 @@ Reflection through `java.import(...)` is filtered by the access policy (see
 
 ## Live objects (mutations flow both ways)
 
-`setLive` exposes a Java object **without copying**. Collections and arrays
-support indexing and mutation from Lua, and the changes are visible in Java:
+`setLive` exposes a Java object without copying. Collections and arrays support
+indexing and mutation from Lua, and the changes are visible in Java:
 
 ```java
 List<String> names = new ArrayList<>(List.of("first"));
@@ -190,12 +189,12 @@ state.eval("nums[1] = 99");            // nums[0] == 99
 long len = state.eval("return #nums").toLong();   // 3
 ```
 
-Index assignment on a live `List` uses `List.set`, so it **replaces** an
-existing slot and does not append: `list[1] = x` on an empty list is an
-out-of-bounds error. Use `list.add(x)` to grow it. `Map` assignment is a
-`put`, so it creates or replaces a key.
+Index assignment on a live `List` uses `List.set`, so it replaces an existing
+slot and does not append: `list[1] = x` on an empty list is an out-of-bounds
+error. Use `list.add(x)` to grow it. `Map` assignment is a `put`, so it creates
+or replaces a key.
 
-For a plain object, scripts read/write public fields and call public methods:
+For a plain object, scripts read and write public fields and call public methods:
 
 ```java
 state.setLive("player", player);
@@ -242,9 +241,9 @@ print(v.VERSION)       -- computed field
 print(Vec:length())
 ```
 
-`@LuaField` on a zero-argument method is a read-only computed field.
-Binding a bare `Class` (rather than an instance) can read only **static**
-fields; an instance `@LuaField` then raises a clear error.
+`@LuaField` on a zero-argument method is a read-only computed field. Binding a
+bare `Class` (rather than an instance) can read only static fields; an instance
+`@LuaField` then raises a clear error.
 
 ## Functional interfaces (SAM)
 
@@ -317,13 +316,13 @@ try {
 - `sandbox()` removes `os`, `io`, `package`, `require`, `dofile`, `loadfile`,
   `java`/`luajava` and `debug`, and switches the Java bridge to a strict
   allowlist.
-- `deny("os", "io")` / `allow("os")` give fine-grained control.
+- `deny("os", "io")` / `allow("os")` give finer control.
 - The Java bridge is separately filtered by `JavaAccessPolicy`; tune with
   `javaPolicy(...)`, `javaAllow("java.util.*")`, `javaDeny("com.acme.*")`.
 
-**Important:** `JavaAccessPolicy.DEFAULT` filters the **Java bridge only**. A
-fresh state still exposes the Lua `os`/`io`/`package` libraries. For truly
-untrusted input, always use `sandbox()` *and* a guard.
+`JavaAccessPolicy.DEFAULT` filters the Java bridge only. A fresh state still
+exposes the Lua `os`/`io`/`package` libraries. For untrusted input, always use
+`sandbox()` and a guard.
 
 ## Limiting time and instructions
 
@@ -334,9 +333,9 @@ state.evalWithTimeout(src, Duration.ofMillis(500));          // one-shot, throws
 state.clearGuard();                                          // remove the guard
 ```
 
-A tripped guard raises a **catchable** Lua error, so `pcall` in Lua and
+A tripped guard raises a catchable Lua error, so `pcall` in Lua and
 `LuaException` in Java both work. While a guard or a debug hook is active, the
-JIT is bypassed (correct, just not accelerated) — the safe default.
+JIT is bypassed (correct, just not accelerated).
 
 ## Coroutines and concurrency
 
@@ -349,7 +348,7 @@ end)
 print(coroutine.resume(co))   -- true 1
 ```
 
-For parallel host workloads, use **one `LuaState` per thread**:
+For parallel host workloads, use one `LuaState` per thread:
 
 ```java
 try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
@@ -367,6 +366,12 @@ States do not share globals or policy, so this is safe by construction.
 ## Performance tuning
 
 The tiered JIT is on by default and needs no configuration for typical use.
+The interpreter is always the fallback and the deopt target; hot Lua functions
+whose shape passes a static subset analysis tier up to one JVM method per proto
+(unboxed `long` flow, direct self-recursion, type guards with resume-at-pc
+deopt). Coroutines, debug hooks and execution timeouts never enter JIT code.
+
+Per-state control:
 
 ```java
 state.jitEnabled(false);            // disable JIT for this state (untrusted)
@@ -374,14 +379,24 @@ state.jitEnabled(true);             // force on
 state.jitEnabled(null);             // follow the process-wide default
 ```
 
-Process-wide / build-time switches:
+Process-wide and build-time switches (JVM `-D` flags, read once at startup):
 
 | Property | Effect |
 | :--- | :--- |
-| `-Dluava.jit=false` | Disable the JIT process-wide. |
-| `-Dluava.jit.sync=true` | Compile on the calling thread (deterministic measurement). |
-| `-Dluava.jit.hotThreshold=N` | Calls before a function is compiled (default 50). |
-| `-Dluava.jit.loopThreshold=N` | Loop trip count before tier-up (default 8192). |
+| `-Dluava.jit=false` | Disable the JIT process-wide (same as `jitEnabled(false)` for every state). |
+| `-Dluava.jit.sync=true` | Compile on the calling thread instead of a background thread (deterministic measurement). |
+| `-Dluava.jit.hotThreshold=N` | Function-call count before a proto is compiled (default 50). |
+| `-Dluava.jit.loopThreshold=N` | Loop trip count that requests tier-up from `FORPREP` (default 8192). |
+| `-Dluava.jit.debug=true` | Log tier-up decisions to stderr (eligible / not eligible, per proto). |
+
+Notes:
+
+- Compiled classes are bounded by an LRU cache (512), so Metaspace cannot leak.
+- Lower `hotThreshold`/`loopThreshold` to force compilation sooner in tests
+  (`-Dluava.jit.hotThreshold=1 -Dluava.jit.loopThreshold=1` compiles almost
+  everything); raise them to reduce compile overhead on short-lived workloads.
+- While an `instructionLimit`, `timeout` or a debug hook is active, the JIT is
+  bypassed for correctness — the script still runs, just interpreted.
 
 To remove first-request latency in a server, pre-warm after loading scripts:
 
@@ -389,9 +404,10 @@ To remove first-request latency in a server, pre-warm after loading scripts:
 import org.luava.runtime.jit.JitCompiler;
 
 JitCompiler.prewarm((org.luava.runtime.bytecode.LuaClosure) chunk);
+// or walk a whole closure tree: JitCompiler.prewarm(function)
 ```
 
-Repeated `eval` of the same chunk name + source reuses the compiled proto
+Repeated `eval` of the same chunk name and source reuses the compiled proto
 tree, so a per-request `eval` of an unchanged script still accumulates JIT
 hotness.
 
@@ -411,18 +427,18 @@ Only annotation-bound modules are documented; a module built by hand with
 
 ## Common pitfalls
 
-- **One `LuaState` per thread.** Sharing a single state across threads is not
-  supported; create one per thread/tenant.
-- **`set` copies, `setLive` references.** Use `setLive` when you need
-  mutations to reach the original object.
-- **Numeric conversion.** Lua 5.4 has integer and float subtypes. Reading a
-  float with `toLong()` truncates; use `toDouble()` or `math.type` in Lua when
-  the distinction matters.
-- **Errors are `LuaException`.** Unchecked Java exceptions must not reach the
-  host, so the interop layer wraps them; catch `LuaException` at the boundary.
-- **`os`/`io` are not removed by `JavaAccessPolicy.DEFAULT`.** They are Lua
+- One `LuaState` per thread. Sharing a single state across threads is not
+  supported; create one per thread or tenant.
+- `set` copies, `setLive` references. Use `setLive` when you need mutations to
+  reach the original object.
+- Numeric conversion. Lua 5.4 has integer and float subtypes. Reading a float
+  with `toLong()` truncates; use `toDouble()` or `math.type` in Lua when the
+  distinction matters.
+- Errors are `LuaException`. Unchecked Java exceptions must not reach the host,
+  so the interop layer wraps them; catch `LuaException` at the boundary.
+- `os` and `io` are not removed by `JavaAccessPolicy.DEFAULT`. They are Lua
   libraries; only `sandbox()` (or `deny`) removes them.
-- **A `Class` binding reads static fields only.** Pass an instance for
-  instance state.
-- **`require` needs a searcher.** Filesystem by default; register a
-  `resourceLoader` for JAR/classpath/virtual modules.
+- A `Class` binding reads static fields only. Pass an instance for instance
+  state.
+- `require` needs a searcher. Filesystem by default; register a
+  `resourceLoader` for JAR, classpath or virtual modules.

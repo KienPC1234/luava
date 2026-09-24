@@ -6,7 +6,7 @@ Java interop. One jar, no runtime dependency beyond the JDK.
 
     source -> Lexer -> Parser -> AST -> BytecodeCompiler -> LuaProto -> BytecodeVM.execute()
 
-Status: 0.2.0-beta ("Concord"). The API may change before 1.0.
+Status: 0.2.1-beta ("Concord"). The API may change before 1.0.
 
 ## Install
 
@@ -21,18 +21,18 @@ Maven:
 <dependency>
     <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava</artifactId>
-    <version>0.2.0-beta</version>
+    <version>0.2.1-beta</version>
 </dependency>
 ```
 
 Gradle:
 
 ```kotlin
-implementation("io.github.kienpc1234:luava:0.2.0-beta")
+implementation("io.github.kienpc1234:luava:0.2.1-beta")
 ```
 
 ```groovy
-implementation 'io.github.kienpc1234:luava:0.2.0-beta'
+implementation 'io.github.kienpc1234:luava:0.2.1-beta'
 ```
 
 The artifact has zero transitive dependencies.
@@ -43,14 +43,14 @@ Download the jar from the
 [GitHub release](https://github.com/KienPC1234/luava/releases/latest):
 
 ```bash
-javac -cp luava-0.2.0-beta.jar MyApp.java
-java  -cp luava-0.2.0-beta.jar:. MyApp
+javac -cp luava-0.2.1-beta.jar MyApp.java
+java  -cp luava-0.2.1-beta.jar:. MyApp
 ```
 
 Build from source:
 
 ```bash
-mvn package          # target/luava-0.2.0-beta.jar
+mvn package          # target/luava-0.2.1-beta.jar
 mvn test             # PUC Lua 5.4.9 suites + unit tests
 ```
 
@@ -174,14 +174,18 @@ that does nothing when no loader is set.
 ## CLI and REPL
 
 ```bash
-java -jar luava-0.2.0-beta.jar script.lua arg1 arg2
-java -jar luava-0.2.0-beta.jar -e "print(1 + 2)"
-java -jar luava-0.2.0-beta.jar            # interactive REPL (also on a TTY)
+java -jar luava-0.2.1-beta.jar script.lua arg1 arg2   # run a file
+java -jar luava-0.2.1-beta.jar -e "print(1 + 2)"      # evaluate a string
+java -jar luava-0.2.1-beta.jar -i script.lua          # run, then REPL
+java -jar luava-0.2.1-beta.jar                        # interactive REPL (also on a TTY)
+java -jar luava-0.2.1-beta.jar -v                     # version + code name
 ```
 
-A script sees the standard `arg` table (`arg[0]` is the script name). Embedding
-through `LuaState` remains the primary use; the
-[Usage Guide](docs/USAGE.md) has runnable examples.
+Flags: `-e stat`/`-E stat` (run a string), `-i`/`--interactive` (REPL),
+`-v`/`--version`, `-h`/`--help`. A script sees the standard `arg` table
+(`arg[0]` is the script name). Embedding through `LuaState` remains the primary
+use; the [Usage Guide](docs/USAGE.md) has runnable examples and a full flag
+table.
 
 ## Execution model
 
@@ -218,13 +222,15 @@ Knobs:
   first-request latency; tier-up otherwise compiles on a background thread
   (`-Dluava.jit.sync=true` for deterministic measurement).
 - Compiled classes are bounded by an LRU cache (512), so Metaspace cannot leak.
-- Hotness thresholds use `-Dluava.jit.hotThreshold=N` and
-  `-Dluava.jit.loopThreshold=N`.
+- Hotness thresholds use `-Dluava.jit.hotThreshold=N` (default 50) and
+  `-Dluava.jit.loopThreshold=N` (default 8192); `-Dluava.jit.debug=true` logs
+  tier-up decisions to stderr. See the
+  [Usage Guide](docs/USAGE.md#performance-tuning).
 
 ## Conformance
 
 - 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass, asserted by
-  `OfficialSuiteEvaluationTest`, so a regression fails the build. 234 unit tests
+  `OfficialSuiteEvaluationTest`, so a regression fails the build. 235 unit tests
   run alongside, including a byte-for-byte differential suite against stock PUC
   Lua 5.4 and a fixed stdlib sweep under JIT both on and off.
 - `all.lua`, the PUC driver, runs in user-test mode (`_U`): it re-runs every

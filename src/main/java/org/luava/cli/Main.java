@@ -64,6 +64,15 @@ public final class Main {
                 return 0;
             }
             if ("-i".equals(first) || "--interactive".equals(first)) {
+                // PUC's lua -i [script args]: run the script first (when given),
+                // then enter the REPL with the same state.
+                if (args.length > 1) {
+                    String[] scriptArgs = java.util.Arrays.copyOfRange(args, 1, args.length);
+                    int status = runFile(state, scriptArgs[0], scriptArgs);
+                    if (status != 0) {
+                        return status;
+                    }
+                }
                 return repl(state, in);
             }
             if ("-h".equals(first) || "--help".equals(first)) {
