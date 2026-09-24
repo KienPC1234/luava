@@ -176,7 +176,15 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>${maven.surefire.plugin.version}</version>
                 <configuration>
-                    <argLine>-Xmx2g</argLine>
+                    <!--
+                      Pin the test JVM to UTC via argLine (a real launch flag):
+                      systemPropertyVariables is applied too late, after the
+                      JVM has already cached the default TimeZone. This makes
+                      timezone-dependent Lua calls (os.time{...}, non-"!" 
+                      os.date) reproducible on any machine and on CI; the
+                      conformance sweep expected output was captured under UTC.
+                    -->
+                    <argLine>-Xmx2g -Duser.timezone=UTC</argLine>
                     <systemPropertyVariables>
                         <suite>${suite}</suite>
                     </systemPropertyVariables>
