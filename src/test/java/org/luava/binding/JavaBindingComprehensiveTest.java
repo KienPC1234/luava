@@ -99,6 +99,106 @@ public class JavaBindingComprehensiveTest {
         assertEquals(2L, res.toLong());
     }
 
+    /** Sink that records what a Java method actually received. */
+    public static class SeqSink {
+        public String seen = "none";
+
+        public void list(List<?> l) {
+            seen = l + " size=" + l.size();
+        }
+
+        public void map(Map<?, ?> m) {
+            seen = String.valueOf(m);
+        }
+
+        public void ints(int[] a) {
+            seen = java.util.Arrays.toString(a);
+        }
+    }
+
+    /**
+     * A Lua table converts to a Java sequence only when its non-nil keys are
+     * exactly {@code 1..n}. A sparse or mixed-key table has no faithful
+     * sequence form, and the old code used {@code #} and silently dropped the
+     * extra elements ({@code {[1]='a',[3]='c'}} became {@code ["a"]}).
+     */
+    @Test
+    void nonSequenceTableIsRejectedInsteadOfLosingElements() {
+        SeqSink sink = new SeqSink();
+        state.setLive("sink", sink);
+
+        // Dense sequences still convert.
+        state.eval("sink.list({10, 20, 30})");
+        assertEquals("[10, 20, 30] size=3", sink.seen);
+        state.eval("sink.ints({7, 8, 9})");
+        assertEquals("[7, 8, 9]", sink.seen);
+
+        // Sparse, mixed-key and holed tables must raise, not truncate.
+        LuaException sparse = assertThrows(LuaException.class,
+                () -> state.eval("sink.list({[1]='a', [3]='c'})"));
+        assertTrue(sparse.getMessage().contains("non-sequence"), sparse.getMessage());
+        assertThrows(LuaException.class, () -> state.eval("sink.list({1, 2, x=5})"));
+        assertThrows(LuaException.class, () -> state.eval("sink.ints({1, 2, x=3})"));
+        assertThrows(LuaException.class, () -> state.eval("sink.list({1, nil, 3})"));
+
+        // Every entry is still reachable by asking for a Map.
+        state.eval("sink.map({1, 2, x=5})");
+        assertTrue(sink.seen.contains("x=5"), sink.seen);
+        assertTrue(sink.seen.contains("1=1"), sink.seen);
+    }
+
+    /** Holder whose collections are reached through a public field. */
+    public static class LiveHolder {
+        public List<String> list = new ArrayList<>(List.of("a", "b"));
+        public Map<String, Object> map = new HashMap<>(Map.of("k", 1));
+        public int[] nums = {10, 20, 30};
+    }
+
+    /**
+     * A collection reached <em>through a live object's field</em> must stay
+     * live too: writes have to reach Java. It used to be snapshotted into a
+     * table, so {@code h.list[1] = x} silently changed nothing.
+     */
+    @Test
+    void collectionReachedThroughLiveFieldStaysMutable() {
+        LiveHolder h = new LiveHolder();
+        state.setLive("h", h);
+
+        state.eval("h.list[1] = 'Z'");
+        assertEquals(List.of("Z", "b"), h.list, "list element write must reach Java");
+
+        state.eval("h.map['new'] = 7");
+        assertEquals(7L, ((Number) h.map.get("new")).longValue(),
+                "map put through a live field must reach Java");
+
+        state.eval("h.nums[2] = 99");
+        assertEquals(99, h.nums[1], "array element write through a live field must reach Java");
+
+        // Reads still work and the length operator is available.
+        assertEquals("Z", state.eval("return h.list[1]").toLuaString());
+        assertEquals(2L, state.eval("return #h.list").toLong());
+    }
+
+    /**
+     * Iterating a live collection still works: live userdata supports
+     * {@code ipairs} (only {@code pairs} requires a table), and a collection
+     * nested inside a table snapshot keeps its own liveness.
+     */
+    @Test
+    void liveCollectionsStillIterateAndNestLive() {
+        LiveHolder h = new LiveHolder();
+        state.setLive("h", h);
+        assertEquals(2L, state.eval(
+                "local n = 0 for i, v in ipairs(h.list) do n = n + 1 end return n").toLong());
+
+        // Nested list: the inner element read is live, so a write reaches Java.
+        List<List<String>> nested = new ArrayList<>();
+        nested.add(new ArrayList<>(List.of("x")));
+        state.setLive("nested", nested);
+        state.eval("nested[1][1] = 'y'");
+        assertEquals("y", nested.get(0).get(0), "nested element write must reach Java");
+    }
+
     @Test
     void testLiveListProxyMutations() {
         List<String> list = new ArrayList<>();

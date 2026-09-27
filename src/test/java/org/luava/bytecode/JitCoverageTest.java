@@ -16,7 +16,13 @@ import org.luava.runtime.bytecode.LuaClosure;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import org.luava.runtime.bytecode.LuaProto;
+import org.luava.runtime.jit.LuaToJvmTranslator;
 
 /**
  * JIT coverage and configuration regression tests. The generated code is a
@@ -423,6 +429,50 @@ public class JitCoverageTest {
         LuaState state = new LuaState().instructionLimit(50_000_000);
         LuaValue r = state.eval("local x=0 for i=1,1000 do x=x+i*2 end return x");
         assertEquals(1001000, r.toLong());
+    }
+
+    @Test
+    void armedCountHookFiresEvenWhenLoopIsCompiled() {
+        // Regression: a numeric `for` longer than JIT_LOOP_THRESHOLD entered
+        // the OSR kernel from doForPrep without checking hooks, so a compiled
+        // function ran its hot loop past an armed count hook: debug.sethook
+        // observed 0 firings instead of thousands. The JIT gate also read
+        // `ctx.co` instead of `ctx.thread` (the thread the interpreter polls).
+        String script = ""
+                + "local n = 0\n"
+                + "local function f()\n"
+                + "  debug.sethook(function() n = n + 1 end, '', 10)\n"
+                + "  local s = 0\n"
+                + "  for i = 1, 200000 do s = s + i end\n"
+                + "  debug.sethook()\n"
+                + "  return s\n"
+                + "end\n"
+                + "for k = 1, 80 do f() end\n"   // warm f past the hot/loop thresholds
+                + "n = 0\n"
+                + "f()\n"
+                + "return n";
+        // Same on both paths: hook firing must not depend on compile state.
+        long off = new LuaState().jitEnabled(false).eval(script).toLong();
+        long on = new LuaState().jitEnabled(true).eval(script).toLong();
+        assertTrue(off > 1000, "interpreter must fire the count hook, got " + off);
+        assertEquals(off, on, "a compiled loop must fire the count hook like the interpreter");
+    }
+
+    @Test
+    void armedCountHookFiresForLargeSingleCallNumericLoop() {
+        // The OSR fast path (a numeric for longer than JIT_LOOP_THRESHOLD
+        // reached from one call) used to enter the kernel with a hook armed.
+        String script = ""
+                + "local n = 0\n"
+                + "debug.sethook(function() n = n + 1 end, '', 10)\n"
+                + "local s = 0\n"
+                + "for i = 1, 200000 do s = s + i end\n"
+                + "debug.sethook()\n"
+                + "return n";
+        long off = new LuaState().jitEnabled(false).eval(script).toLong();
+        long on = new LuaState().jitEnabled(true).eval(script).toLong();
+        assertTrue(off > 1000, "interpreter must fire the count hook, got " + off);
+        assertEquals(off, on, "the OSR path must not skip an armed hook");
     }
 
     @Test
@@ -958,6 +1008,68 @@ public class JitCoverageTest {
     }
 
     @Test
+    void singleCallWhileLoopTiersUpOnStack() {
+        // A chunk called once with a large `while` loop has no call hotness and
+        // no FORPREP trip count; only back-edge profiling plus OSR can compile
+        // it during that single call. `luava.jit.sync=true` makes the
+        // mid-loop compile deterministic (the background compiler may or may
+        // not finish in time otherwise).
+        String prevSync = System.getProperty("luava.jit.sync");
+        System.setProperty("luava.jit.sync", "true");
+        try {
+            String def = "local function work(n) local i=0 local s=0 "
+                    + "while i<n do s=s+i i=i+1 end return s end ";
+            assertEquals(19999900000L, run(def + "return work(200000)", false, 1).toLong());
+            assertSameWithAndWithoutJit(def + "return work(200000)", 1);
+
+            LuaState state = new LuaState().jitEnabled(true);
+            LuaClosure fn = (LuaClosure) state.eval(def + "return work");
+            assertEquals(19999900000L,
+                    fn.call(org.luava.runtime.LuaInteger.valueOf(200000)).toLong());
+            assertTrue(fn.proto.jitCode != null, "single-call while loop should tier up");
+            assertTrue(fn.proto.jitCode.osrHandle != null && fn.proto.jitCode.osrTargets != null,
+                    "a while-loop proto must expose an OSR entry");
+
+            // Float-bounded numeric fors must stay correct: OSR must not enter
+            // a for body (the compiled FORLOOP has no per-iteration int guard),
+            // and a backward goto inside an enclosing for must not either.
+            String nested = "local function nested(a,b) local acc=0 "
+                    + "for x=a,b,1.0 do local i=0 "
+                    + "::again:: i=i+1 if i<2000 then goto again end acc=acc+x end "
+                    + "return acc end return tostring(nested(0.0, 40.0))";
+            assertSameWithAndWithoutJit(nested, 1);
+        } finally {
+            if (prevSync == null) {
+                System.clearProperty("luava.jit.sync");
+            } else {
+                System.setProperty("luava.jit.sync", prevSync);
+            }
+        }
+    }
+
+    @Test
+    void jitGenericForClosesToBeClosedState() {
+        // Regression: a generic-for pushes an implicit to-be-closed
+        // `(for state)` at TFORPREP. The compiled kernel closes it via OP_CLOSE
+        // on a normal loop exit, but an early `return` from inside the loop
+        // used to skip that: closeOnJitReturn closed open upvalues only, so
+        // `__close` never ran and the tbc entry leaked (observed: closed=1
+        // after 600 calls instead of 600). The kernel return path must close
+        // pending tbc entries exactly as the interpreter's OP_RETURN does.
+        LuaState state = new LuaState().jitEnabled(true);
+        LuaFunction f = (LuaFunction) state.eval(
+                "local closed=0 "
+                + "local closer=setmetatable({}, {__close=function() closed=closed+1 end}) "
+                + "local t={10,20,30,40} "
+                + "local function run() for k,v in next,t,nil,closer do "
+                + "if v==20 then return v end end return 0 end "
+                + "return function(n) local r=0 for i=1,n do r=run() end return r..':'..closed end");
+        // Call via a hot loop so `run` compiles, then assert the count grows
+        // by one __close per call (not just the cold first call).
+        assertEquals("20:200", f.call(org.luava.runtime.LuaInteger.valueOf(200)).toLuaString());
+    }
+
+    @Test
     void repeatedEvalOfCachedChunkTiersUp() {
         // The same chunk name is served from the proto cache; repeated eval
         // must keep returning the same value and (now) tier the chunk up.
@@ -999,6 +1111,267 @@ public class JitCoverageTest {
         // metadata but reject the old heavyweight allocation.
         assertTrue(perCall < 4000,
                 "host call allocates " + perCall + " bytes/call (expected < 4000)");
+    }
+
+    /**
+     * An OOP method reached through a table {@code __index} must run in the
+     * compiled kernel, not deopt every call. Before this, {@code selfMethod}
+     * only did a raw lookup, so the canonical {@code obj:method()} shape (data
+     * on the instance, methods on the class table) deopted at every call; the
+     * small guard budget then disarmed the whole hot loop and it ran
+     * interpreted. Interpreted and compiled results must agree, and the
+     * top-level kernel must survive.
+     */
+    @Test
+    void selfMethodThroughTableIndexKeepsLoopCompiled() {
+        String body = "local Vec={} Vec.__index=Vec "
+                + "function Vec.new(x,y) return setmetatable({x=x,y=y},Vec) end "
+                + "function Vec:dot(o) return self.x*o.x+self.y*o.y end "
+                + "local a=Vec.new(1.0,2.0) local b=Vec.new(3.0,4.0) "
+                + "local acc=0.0 for i=1,200 do acc=acc+a:dot(b) end "
+                + "assert(acc>0) return 1";
+        // Wrap so the caller can hot-loop it and still compare a value.
+        assertSameWithAndWithoutJit(
+                "local function f() " + body + " end "
+                        + "local r for k=1,300 do r=f() end return r",
+                2);
+
+        // The top-level chunk's own kernel must not be disarmed. `eval` reuses
+        // the cached proto, so repeated runs accumulate on one proto.
+        LuaState on = new LuaState().jitEnabled(true);
+        LuaClosure main = (LuaClosure) on.compile(body, "chunk", null);
+        for (int i = 0; i < 300; i++) {
+            on.eval(body);
+        }
+        assertFalse(main.proto.jitDisabled,
+                "method calls through table __index must not disarm the kernel");
+        assertTrue(main.proto.jitCode != null && main.proto.jitCode.deopts == 0,
+                "the OOP loop kernel must stay compiled with no guard deopts");
+    }
+
+    /**
+     * A float compared against an integer immediate ({@code s < 100}) must not
+     * deopt: {@code emitCmpImm} previously used {@code emitGuardInt}, which
+     * failed on the float register and disarmed the kernel after the guard
+     * budget. Results must stay identical, including NaN ordering.
+     */
+    @Test
+    void floatCompareAgainstImmediateKeepsLoopCompiled() {
+        assertSameWithAndWithoutJit(
+                "local s=0.0 local n=0 for i=1,300 do s=s+s end if s<100 then n=1 end return n",
+                2);
+        assertSameWithAndWithoutJit(
+                "local s=0.0 local n=0 for i=1,300 do s=s+s end if 100>=s then n=1 end return n",
+                2);
+        // NaN must compare false for every predicate (Lua semantics): the
+        // float lane picks DCMPG vs DCMPL per predicate for exactly this.
+        for (String op : new String[] {">", "<", ">=", "<="}) {
+            assertSameWithAndWithoutJit(
+                    "local v=0/0 for i=1,300 do v=v+0 end "
+                            + "local n=0 if v " + op + " 0 then n=1 end return n",
+                    2);
+        }
+        assertSameWithAndWithoutJit(
+                "local v=1/0 local n=0 for i=1,300 do v=v+0 end "
+                        + "if v > 0 then n=n+1 end if v <= 0 then n=n+10 end return n",
+                2);
+
+        LuaState on = new LuaState().jitEnabled(true);
+        LuaClosure main = (LuaClosure) on.compile(
+                "local s=0.0 local n=0 for i=1,300 do s=s+s end if s<100 then n=1 end return n",
+                "chunk", null);
+        for (int i = 0; i < 300; i++) {
+            on.eval("local s=0.0 local n=0 for i=1,300 do s=s+s end if s<100 then n=1 end return n");
+        }
+        assertFalse(main.proto.jitDisabled,
+                "a float-vs-immediate compare must not disarm the kernel");
+        assertTrue(main.proto.jitCode != null && main.proto.jitCode.deopts == 0,
+                "the float-compare kernel must stay compiled with no guard deopts");
+    }
+
+    /**
+     * An object-returning proto that contains a call must still compile.
+     * {@code emitCall} pushes the callee and self {@code LuaProto} refs to
+     * feed an {@code IF_ACMPNE}, but the object-returning / parameter-writing
+     * tier jumps straight to the general call with a {@code GOTO}, which does
+     * not consume them. The two edges into {@code generalCall} then disagreed
+     * on operand-stack depth, so ASM's {@code COMPUTE_FRAMES} threw
+     * {@code ArrayIndexOutOfBoundsException} in {@code Frame.merge},
+     * {@code JitCompiler} caught it and marked the proto {@code jitDisabled} —
+     * a whole class of functions silently lost the JIT while still returning
+     * correct results. Assert the kernel is genuinely live and that results
+     * match the interpreter.
+     */
+    @Test
+    void objectReturningProtoWithCallStillCompiles() {
+        String[] bodies = {
+            "local function g() return 1 end local s=0.0 for i=1,300 do s=s+g() end return s",
+            "local function g() return 1 end local s=0.0 for i=1,300 do s=s+g() end return s>0",
+            "local function g() return 1 end local t={} for i=1,300 do t[i]=g() end return 'x'..t[3]",
+            "local function g(x) x=x+1 return x end local s=0 for i=1,300 do s=s+g(s) end return s",
+        };
+        for (String body : bodies) {
+            assertSameWithAndWithoutJit("local function f() " + body + " end "
+                    + "local r for k=1,300 do r=f() end return r", 2);
+        }
+
+        // The top-level chunk must keep a live kernel, not a silently disabled
+        // one. `eval` reuses the cached proto, so runs accumulate on it.
+        for (String body : bodies) {
+            LuaState on = new LuaState().jitEnabled(true);
+            LuaClosure main = (LuaClosure) on.compile(body, "chunk", null);
+            for (int i = 0; i < 300; i++) {
+                on.eval(body);
+            }
+            assertFalse(main.proto.jitDisabled,
+                    "object-returning proto with a call must not be disabled: " + body);
+            assertTrue(main.proto.jitCode != null,
+                    "object-returning proto with a call must be compiled: " + body);
+        }
+    }
+
+    /**
+     * {@code OP_NOT} pushed the object array before {@code isTruthy}, whose
+     * descriptor is {@code (long[], byte[], int)Z}; the reference was never
+     * consumed, so the operand stack stayed one deeper for the rest of the
+     * body. At a loop back-edge ASM's {@code COMPUTE_FRAMES} then saw two
+     * depths for one target and threw, and {@code JitCompiler} silently
+     * marked the proto {@code jitDisabled}. A bare "not" inside a loop is the
+     * canonical trigger.
+     */
+    @Test
+    void notOperatorKeepsLoopCompiled() {
+        String[] bodies = {
+            "local s=0 for i=1,300 do if not false then s=s+1 end end return s",
+            "local t={} for i=1,300 do if not t[i] then t[i]=1 end end return t[1]",
+            "local s=0 repeat s=s+1 until not (s<300) return s",
+        };
+        for (String body : bodies) {
+            assertSameWithAndWithoutJit(body, 1);
+        }
+        for (String body : bodies) {
+            LuaState on = new LuaState().jitEnabled(true);
+            LuaClosure main = (LuaClosure) on.compile(body, "chunk", null);
+            for (int i = 0; i < 300; i++) {
+                on.eval(body);
+            }
+            assertFalse(main.proto.jitDisabled,
+                    "a loop using `not` must not be disabled: " + body);
+            assertTrue(main.proto.jitCode != null,
+                    "a loop using `not` must be compiled: " + body);
+        }
+    }
+
+    /**
+     * {@code SETI}/{@code SETTABLE} used local 9 as a {@code LuaValue}
+     * scratch, but a fused-callee proto keeps its int flag "upvalue b holds
+     * self" in local 9. The two collided and the verifier rejected the class
+     * ("Bad local variable type"), silently disabling the proto. The table
+     * write must not touch locals 9+.
+     */
+    @Test
+    void tableWriteDoesNotClashWithFusedCalleeSlot() {
+        String body = "local gcinfo = function() return 0 end\n"
+                + "local function dosteps(siz)\n"
+                + "  local a = {}\n"
+                + "  for i=1,300 do a[i] = {{}}; local b = {} end\n"
+                + "  local x = gcinfo()\n"
+                + "  assert(gcinfo() < siz)\n"
+                + "  return #a + x\n"
+                + "end\n"
+                + "return dosteps(10)";
+        assertSameWithAndWithoutJit(body, 1);
+        LuaState on = new LuaState().jitEnabled(true);
+        LuaClosure main = (LuaClosure) on.compile(body, "chunk", null);
+        for (int i = 0; i < 300; i++) {
+            on.eval(body);
+        }
+        org.luava.runtime.bytecode.LuaProto dosteps = null;
+        for (org.luava.runtime.bytecode.LuaProto p : main.proto.protos) {
+            if ("dosteps".equals(p.name)) {
+                dosteps = p;
+            }
+        }
+        assertNotNull(dosteps, "dosteps proto must exist");
+        assertFalse(dosteps.jitDisabled,
+                "a proto writing tables next to a fused callee must not be disabled");
+        assertTrue(dosteps.jitCode != null,
+                "a proto writing tables next to a fused callee must be compiled");
+    }
+
+    /** A throwaway loader that exposes {@code defineClass}. */
+    private static final class KernelLoader extends ClassLoader {
+        KernelLoader() {
+            super(JitCoverageTest.class.getClassLoader());
+        }
+
+        Class<?> define(String name, byte[] bytes) {
+            return defineClass(name, bytes, 0, bytes.length);
+        }
+    }
+
+    /**
+     * The JVM verifier rejects malformed kernels with a {@code VerifyError}
+     * that {@code JitCompiler} catches and turns into {@code jitDisabled} —
+     * results stay correct, so a bad kernel is invisible without this gate.
+     * Every translated kernel in the corpus must survive both ASM
+     * {@code COMPUTE_FRAMES} and the JVM verifier. Two real bugs used to slip
+     * through here: {@code OP_NOT} leaving a reference on the operand stack
+     * and a table write clashing with a fused-callee local.
+     */
+    @Test
+    void everyTranslatedKernelPassesTheJvmVerifier() throws Exception {
+        String[] sources = {
+            "local function g() return 1 end local s=0 for i=1,300 do "
+                    + "if not false then s=s+g() end end return s",
+            "local t={} for i=1,300 do if not t[i] then t[i]=i end t[i+1]={} end return t[1]",
+            "::l1:: a[1]=1; goto l2; ::l2:: if not a[6] then a[6]=true; goto l1 end",
+            "local gcinfo=function() return 0 end local function f(siz) local a={} "
+                    + "for i=1,100 do a[i]={{}}; local b={} end assert(gcinfo()<siz) return #a end "
+                    + "return f(1)",
+            "local function f(n) if n<=0 then return 0 end return n+f(n-1) end return f(50)",
+            "local s='' for i=1,300 do s=s..i end return #s",
+            "local s=0.0 for i=1,300 do s=s+ (i>10 and 1.5 or 0.5) end return s",
+        };
+        int checked = 0;
+        int seq = 0;
+        for (String src : sources) {
+            LuaClosure closure = (LuaClosure) new LuaState().compile(src, "verify" + (seq++), null);
+            for (LuaProto proto : collect(closure.proto)) {
+                String internal = "org/luava/runtime/jit/VerifyGen$" + (seq++);
+                LuaToJvmTranslator.Translation tr = LuaToJvmTranslator.translate(proto, internal, true);
+                if (tr == null) {
+                    continue;
+                }
+                checked++;
+                assertVerified(internal.replace('/', '.'), tr.bytes(), proto.name);
+            }
+        }
+        assertTrue(checked > 0, "the gate must actually exercise kernels");
+    }
+
+    /** Defines the kernel and forces the verifier over every method body. */
+    private static void assertVerified(String name, byte[] bytes, String protoName) throws Exception {
+        Class<?> cls;
+        try {
+            cls = new KernelLoader().define(name, bytes);
+        } catch (VerifyError | ClassFormatError e) {
+            throw new AssertionError("ASM emitted an invalid kernel for " + protoName, e);
+        }
+        for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
+            // Resolving a method handle forces the verifier over the body.
+            MethodHandles.lookup().findStatic(cls, m.getName(),
+                    MethodType.methodType(m.getReturnType(), m.getParameterTypes()));
+        }
+    }
+
+    private static java.util.List<LuaProto> collect(LuaProto root) {
+        java.util.List<LuaProto> out = new java.util.ArrayList<>();
+        out.add(root);
+        for (LuaProto child : root.protos) {
+            out.addAll(collect(child));
+        }
+        return out;
     }
 
     /**

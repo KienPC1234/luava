@@ -101,6 +101,17 @@ Lua tables passed to a Java method expecting `Map`/`List`/array are converted at
 the call boundary. `Object` converts numbers to `Long`/`Double`, booleans to
 `Boolean`, strings to `String`, tables to `Map`.
 
+A table converts to a `List`, `Set` or array only when its non-nil keys are
+exactly `1..n`. A sparse or mixed-key table (`{[1]='a',[3]='c'}`, `{1,2,x=5}`,
+`{1,nil,3}`) has no faithful sequence form, so the call raises instead of
+silently sending a shorter collection with elements dropped — ask for a `Map`
+to keep every entry.
+
+Numbers must fit the Java parameter. `2^31` cannot be passed to an `int`
+parameter (neither as a float nor as an integer literal); it used to wrap
+around to a negative value. Fractional values are still truncated toward zero
+(`3.9` into an `int` gives `3`), matching Java's cast.
+
 ## Calling Lua from Java
 
 ```java
@@ -201,7 +212,25 @@ state.setLive("player", player);
 state.eval("player.name = 'neo'; player.sendMessage('hi')");
 ```
 
-Use `setLive` when identity matters; use `set` when you want a snapshot.
+Liveness does not stop at the first level. A collection reached through a live
+object's field, or read out of a live `List`/`Map`/array, is also live:
+
+```java
+state.setLive("player", player);       // player.items is a List
+state.eval("player.items[1] = 'sword'");   // reaches Java
+```
+
+Iterate a live collection with `ipairs` (or index it directly); `pairs` needs a
+table, because a live collection is userdata, not a table:
+
+```lua
+for i, v in ipairs(names) do print(i, v) end   -- works on live userdata
+```
+
+Method results keep the snapshot rule: a collection a Java method *returns* is
+materialised as a Lua table, exactly as with `set`. Only values that come from
+state you exposed live stay live. So use `setLive` when identity matters and
+`set` when you want a copy.
 
 ## Annotations
 
@@ -267,7 +296,25 @@ state.eval("onClick()");
 
 Works with `Runnable`, `Consumer<T>`, `Function<T,R>`, `BiFunction<T,U,R>`,
 `Predicate<T>`, `Comparator<T>`, and any single-abstract-method interface.
-Overload selection scores exact matches above widening above SAM conversion.
+Overload selection scores exact matches above numeric widening above SAM
+conversion, accounts for numeric range, boxing, inheritance/interface
+distance, null specificity and a varargs penalty, then applies Java
+specificity; an incomparable tie raises an ambiguity error.
+
+Build a Java object implementing several interfaces at once with the
+LuaJ-compatible form (the handler table is always last):
+
+```lua
+-- Default policy allows java.lang/java.util; java.io.* is denied unless
+-- the host widens the policy.
+local obj = java.proxy('java.lang.Runnable', 'java.util.Comparator', {
+  run     = function(self) ... end,
+  compare = function(self, x, y) return x - y end,
+})
+-- obj is usable wherever either interface is expected:
+java.instanceof(obj, 'java.lang.Runnable')   --> true
+-- luajava.createProxy is an alias
+```
 
 ## Loading scripts from a JAR or custom source
 

@@ -84,39 +84,48 @@ public class PerformanceBenchmarkTest {
 
         // 1. COLD RUN
         System.out.println("\n[PHASE 1: COLD RUN (No Warmup)]");
-        long t1 = measure(state, loopCode);
-        long t2 = measure(state, tableCode);
-        long t3 = measure(state, coCode);
-        long t4 = measure(state, interopCode);
-        System.out.printf("  - 100,000 Iterations Arithmetic Loop : %6.2f ms\n", t1 / 1_000_000.0);
-        System.out.printf("  - 50,000 Table Set & Get             : %6.2f ms\n", t2 / 1_000_000.0);
-        System.out.printf("  - 1,000 Coroutine Context Switches   : %6.2f ms\n", t3 / 1_000_000.0);
-        System.out.printf("  - 50,000 Java Reflection Interop     : %6.2f ms\n", t4 / 1_000_000.0);
+        Timed t1 = measure(state, loopCode);
+        Timed t2 = measure(state, tableCode);
+        Timed t3 = measure(state, coCode);
+        Timed t4 = measure(state, interopCode);
+
+        // The workload results are the test: a benchmark that only prints
+        // timings can never fail, and would pass even if every loop returned
+        // garbage. Check the arithmetic before reporting the speed.
+        assertEquals(5000050000L, t1.value().toLong(), "arithmetic loop result");
+        assertEquals(2500050000L, t2.value().toLong(), "table set/get result");
+        assertEquals(500500L, t3.value().toLong(), "coroutine switch result");
+        assertEquals(2500100000L, t4.value().toLong(), "Java interop result");
+
+        System.out.printf("  - 100,000 Iterations Arithmetic Loop : %6.2f ms\n", t1.nanos() / 1_000_000.0);
+        System.out.printf("  - 50,000 Table Set & Get             : %6.2f ms\n", t2.nanos() / 1_000_000.0);
+        System.out.printf("  - 1,000 Coroutine Context Switches   : %6.2f ms\n", t3.nanos() / 1_000_000.0);
+        System.out.printf("  - 50,000 Java Reflection Interop     : %6.2f ms\n", t4.nanos() / 1_000_000.0);
 
         // 2. JIT WARMUP (5 rounds)
         System.out.println("\n[PHASE 2: JIT WARMUP (5 rounds to trigger C2 HotSpot compilation)]");
         for (int i = 0; i < 5; i++) {
-            state.eval(loopCode);
-            state.eval(tableCode);
-            state.eval(coCode);
-            state.eval(interopCode);
+            assertEquals(5000050000L, state.eval(loopCode).toLong(), "arithmetic loop result");
+            assertEquals(2500050000L, state.eval(tableCode).toLong(), "table set/get result");
+            assertEquals(500500L, state.eval(coCode).toLong(), "coroutine switch result");
+            assertEquals(2500100000L, state.eval(interopCode).toLong(), "Java interop result");
         }
         System.out.println("  ✓ Warmup complete. C2 JIT optimization triggered.");
 
         // 3. JIT HOT RUN (average of 5 rounds)
         System.out.println("\n[PHASE 3: STEADY-STATE JIT HOT RUN (Average of 5 runs)]");
-        double hotLoop = averageOf5(state, loopCode);
-        double hotTable = averageOf5(state, tableCode);
-        double hotCo = averageOf5(state, coCode);
-        double hotInterop = averageOf5(state, interopCode);
+        double hotLoop = averageOf5(state, loopCode, 5000050000L);
+        double hotTable = averageOf5(state, tableCode, 2500050000L);
+        double hotCo = averageOf5(state, coCode, 500500L);
+        double hotInterop = averageOf5(state, interopCode, 2500100000L);
         System.out.printf("  - 100,000 Iterations Arithmetic Loop : %6.2f ms (%.1fx faster than cold)\n",
-                hotLoop, (t1 / 1_000_000.0) / Math.max(0.1, hotLoop));
+                hotLoop, (t1.nanos() / 1_000_000.0) / Math.max(0.1, hotLoop));
         System.out.printf("  - 50,000 Table Set & Get             : %6.2f ms (%.1fx faster than cold)\n",
-                hotTable, (t2 / 1_000_000.0) / Math.max(0.1, hotTable));
+                hotTable, (t2.nanos() / 1_000_000.0) / Math.max(0.1, hotTable));
         System.out.printf("  - 1,000 Coroutine Context Switches   : %6.2f ms (%.1fx faster than cold)\n",
-                hotCo, (t3 / 1_000_000.0) / Math.max(0.1, hotCo));
+                hotCo, (t3.nanos() / 1_000_000.0) / Math.max(0.1, hotCo));
         System.out.printf("  - 50,000 Java Reflection Interop     : %6.2f ms (%.1fx faster than cold)\n",
-                hotInterop, (t4 / 1_000_000.0) / Math.max(0.1, hotInterop));
+                hotInterop, (t4.nanos() / 1_000_000.0) / Math.max(0.1, hotInterop));
 
         System.out.println("=================================================\n");
     }
@@ -159,7 +168,10 @@ public class PerformanceBenchmarkTest {
             """;
 
         LuaValue res = state.eval(nestedCoroScript);
-        assertTrue(res.toLong() > 0);
+        // Deterministic: leaf yields 1..100 (sum 5050) through two levels of
+        // intermediate yields, so the grand total is exactly 111100. `> 0`
+        // would also pass if the nesting silently degraded to one level.
+        assertEquals(111100L, res.toLong(), "nested coroutine chain result");
     }
 
     @Test
@@ -193,16 +205,21 @@ public class PerformanceBenchmarkTest {
         assertTrue(allPassed.get(), "All concurrent threads must execute correctly");
     }
 
-    private long measure(LuaState state, String code) {
+    /** Timing plus the value it produced, so the workload is checked too. */
+    private record Timed(long nanos, LuaValue value) {}
+
+    private Timed measure(LuaState state, String code) {
         long start = System.nanoTime();
-        state.eval(code);
-        return System.nanoTime() - start;
+        LuaValue value = state.eval(code);
+        return new Timed(System.nanoTime() - start, value);
     }
 
-    private double averageOf5(LuaState state, String code) {
+    private double averageOf5(LuaState state, String code, long expected) {
         long total = 0;
         for (int i = 0; i < 5; i++) {
-            total += measure(state, code);
+            Timed t = measure(state, code);
+            assertEquals(expected, t.value().toLong(), "steady-state result for: " + code);
+            total += t.nanos();
         }
         return (total / 5.0) / 1_000_000.0;
     }

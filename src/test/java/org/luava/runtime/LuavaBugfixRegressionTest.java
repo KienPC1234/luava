@@ -532,6 +532,33 @@ public class LuavaBugfixRegressionTest {
                 stripLocation(s.eval("local ok, e = pcall(string.format, '%d', 2^63) return tostring(e)").toLuaString()));
     }
 
+    @Test
+    void stdoutWritesRawLuaBytesWithoutReencoding() {
+        // A Lua string is a byte container: writing it to stdout must emit the
+        // exact bytes. io.write went through PrintStream.print(String), which
+        // re-encoded with the platform charset, so utf8.char(233) (C3 A9) came
+        // out as C3 83 C2 A9 and string.char(0xE9) (E9) as C3 A9.
+        java.io.PrintStream oldOut = System.out;
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        byte[] got;
+        try {
+            // A UTF-8 stream, like the real default: a buggy write(String)
+            // would re-encode the already-encoded Lua bytes through it.
+            System.setOut(new java.io.PrintStream(buf, true, java.nio.charset.StandardCharsets.UTF_8));
+            LuaState s = new LuaState();
+            s.eval("io.write(utf8.char(233)) "
+                    + "io.write(string.char(0xE9)) "
+                    + "print(utf8.char(233))");
+        } finally {
+            System.out.flush();
+            System.setOut(oldOut);
+            got = buf.toByteArray();
+        }
+        byte[] want = {(byte) 0xC3, (byte) 0xA9, (byte) 0xE9, (byte) 0xC3, (byte) 0xA9, (byte) 0x0A};
+        org.junit.jupiter.api.Assertions.assertArrayEquals(want, got,
+                "io.write/print must emit raw Lua bytes");
+    }
+
     private static boolean raises(LuaState s, String expr, String messageFragment) {
         String script = "local ok, e = pcall(function() return " + expr + " end) "
                 + "return tostring(ok) .. '\\0' .. tostring(e)";
