@@ -18,7 +18,6 @@ import org.luava.runtime.LuaUserdata;
 import org.luava.runtime.LuaValue;
 
 import java.lang.reflect.Array;
-import java.lang.reflect.Proxy;
 
 public final class JavaInteropLib {
     private JavaInteropLib() {}
@@ -65,59 +64,37 @@ public final class JavaInteropLib {
             return newFn.call(ctorArgs);
         }));
 
-        // 3. java.proxy
-        javaMod.rawset(LuaString.valueOf("proxy"), LuaFunction.ofGuarded(args -> {
+        // 3. java.proxy / luajava.createProxy
+        // LuaJ-compatible form: java.proxy("Iface1", "Iface2", ..., table).
+        // The handler is always the last argument; every preceding argument is
+        // an interface (string name or Class userdata).
+        LuaFunction proxyFn = LuaFunction.ofGuarded(args -> {
             if (args.length < 2) {
-                throw new LuaException("java.proxy expects (interfaceNameOrClass, tableOrFunction)");
+                throw new LuaException("java.proxy expects (interface..., tableOrFunction)");
             }
-            Class<?> iface;
-            if (args[0].isString()) {
-                iface = loadClass(args[0].toLuaString());
-            } else if (args[0].isUserdata() && ((LuaUserdata) args[0]).getJavaInstance() instanceof Class<?> c) {
-                checkClass(c);
-                iface = c;
-            } else {
-                throw new LuaException("bad argument #1 to 'java.proxy' (interface expected)");
+            LuaValue handler = args[args.length - 1];
+            Class<?>[] ifaces = new Class<?>[args.length - 1];
+            for (int i = 0; i < ifaces.length; i++) {
+                ifaces[i] = resolveInterface(args[i], "java.proxy");
             }
 
-            if (!iface.isInterface()) {
-                throw new LuaException(iface.getName() + " is not an interface");
-            }
-
-            LuaValue handler = args[1];
-            if (handler.isFunction()) {
-                Object proxy = LuaDataConverter.toJava(handler, iface);
+            if (handler.isTable()) {
+                Object proxy = org.luava.runtime.interop.DynamicProxyBridge.createProxy(ifaces, (LuaTable) handler);
                 return new LuaUserdata(proxy);
-            } else if (handler.isTable()) {
-                LuaTable table = (LuaTable) handler;
-                Object proxy = Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface}, (p, method, mArgs) -> {
-                    String mName = method.getName();
-                    if ("equals".equals(mName)) return mArgs != null && mArgs.length == 1 && mArgs[0] == p;
-                    if ("hashCode".equals(mName)) return System.identityHashCode(p);
-                    if ("toString".equals(mName)) return table.toLuaString();
-
-                    LuaValue member = table.get(LuaString.valueOf(mName));
-                    if (member.isNil() || !member.isFunction()) {
-                        throw new LuaException("Method '" + mName + "' not implemented in Lua table for interface " + iface.getName());
-                    }
-
-                    int count = (mArgs != null ? mArgs.length : 0);
-                    LuaValue[] luaArgs = new LuaValue[count + 1];
-                    luaArgs[0] = table; // pass self
-                    for (int i = 0; i < count; i++) {
-                        luaArgs[i + 1] = LuaDataConverter.toLua(mArgs[i]);
-                    }
-                    LuaValue result = member.call(luaArgs);
-                    if (method.getReturnType() == void.class || method.getReturnType() == Void.class) {
-                        return null;
-                    }
-                    return LuaDataConverter.toJava(result, method.getReturnType());
-                });
+            } else if (handler.isFunction()) {
+                if (ifaces.length != 1) {
+                    // A bare Lua function can only stand in for one SAM
+                    // interface; there is no method-name dispatch across many.
+                    throw new LuaException("java.proxy with a function handler accepts exactly one interface (got " + ifaces.length + ")");
+                }
+                Object proxy = LuaDataConverter.toJava(handler, ifaces[0]);
                 return new LuaUserdata(proxy);
             } else {
-                throw new LuaException("bad argument #2 to 'java.proxy' (function or table expected)");
+                throw new LuaException("bad argument to 'java.proxy' (function or table expected as last argument)");
             }
-        }));
+        });
+        javaMod.rawset(LuaString.valueOf("proxy"), proxyFn);
+        javaMod.rawset(LuaString.valueOf("createProxy"), proxyFn);
 
         // 4. java.array
         javaMod.rawset(LuaString.valueOf("array"), LuaFunction.ofGuarded(args -> {
@@ -174,6 +151,23 @@ public final class JavaInteropLib {
 
             return LuaBoolean.valueOf(targetClass.isInstance(inst));
         }));
+    }
+
+    /** Resolves one interface argument (string name or Class userdata). */
+    private static Class<?> resolveInterface(LuaValue arg, String ctx) {
+        Class<?> iface;
+        if (arg.isString()) {
+            iface = loadClass(arg.toLuaString());
+        } else if (arg.isUserdata() && ((LuaUserdata) arg).getJavaInstance() instanceof Class<?> c) {
+            checkClass(c);
+            iface = c;
+        } else {
+            throw new LuaException("bad argument to '" + ctx + "' (interface name or Class expected)");
+        }
+        if (!iface.isInterface()) {
+            throw new LuaException(iface.getName() + " is not an interface");
+        }
+        return iface;
     }
 
     /** Loads a class after checking it against the active access policy. */

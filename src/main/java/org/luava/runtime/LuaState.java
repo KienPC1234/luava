@@ -913,9 +913,26 @@ public final class LuaState {
      * triggering a compile for no benefit. Used for protos that are hot
      * because of a loop (top-level chunks, {@code while}/{@code repeat}, or a
      * function called only once).
+     *
+     * <p>Every backward edge counts: numeric {@code for} also requests at
+     * {@code FORPREP} from the known trip count (zero per-iteration cost),
+     * while {@code while}/{@code repeat} and backward {@code goto} count at
+     * the jump itself through {@code ctx.jitBackEdgeCountdown}. Generic-for
+     * counts too but is excluded from on-stack replacement.
      */
     public static final int JIT_LOOP_THRESHOLD =
             Integer.getInteger("luava.jit.loopThreshold", 8192);
+
+    /**
+     * On-stack replacement for hot loops (plan.md). When a proto has a
+     * compiled kernel, a loop that crosses {@link #JIT_LOOP_THRESHOLD}
+     * back-edges jumps straight into the kernel at the loop header instead of
+     * waiting for the next call, so a chunk invoked once with a huge loop
+     * still gets compiled work. Opt out with {@code -Dluava.jit.osr=false}
+     * (the kernel then only runs from a subsequent call/entry).
+     */
+    public static final boolean ENABLE_OSR =
+            !"false".equalsIgnoreCase(System.getProperty("luava.jit.osr", "true"));
 
     /**
      * Per-state JIT override. {@code null} means "follow the global

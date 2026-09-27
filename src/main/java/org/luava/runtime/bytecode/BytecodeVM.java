@@ -220,7 +220,11 @@ public final class BytecodeVM {
         // Hoisted: coroutine is constant for the whole execute() invocation
         // (resume continues the same thread/CURRENT; nested coroutines get
         // their own execute()). Saves a ThreadLocal lookup per instruction.
-        return runLoop(state, ctx);
+        try {
+            return runLoop(state, ctx);
+        } catch (OsrUnwind ou) {
+            return ctx.osrTopResult;
+        }
     }
 
     /**
@@ -253,7 +257,13 @@ public final class BytecodeVM {
     }
 
     private static LuaValue[] runTopLevelJit(LuaState state, VmContext ctx, LuaClosure closure) {
-        if (!state.isJitEnabled() || (ctx.co != null && ctx.co.hooksActive) || state.loopGuard != null) {
+        // Hooks must be observable: the interpreter polls ctx.thread, so the
+        // JIT gate must read the same thread. It used ctx.co, which is null on
+        // a host entry (ctx.thread is the main thread then), so a compiled
+        // function entered from the host silently ran past an armed count/line
+        // hook (debug.sethook observed 0 firings instead of the interpreted
+        // counts).
+        if (!state.isJitEnabled() || ctx.thread.hooksActive || state.loopGuard != null) {
             return null;
         }
         JitCode jc = closure.proto.jitCode;
@@ -346,7 +356,15 @@ public final class BytecodeVM {
             return;
         }
         LuaProto proto = ctx.proto;
-        if (proto.loopCompileRequested || proto.jitCode != null || proto.jitDisabled) {
+        if (proto.jitCode != null) {
+            // Kernel ready: enter at the body start (the FORLOOP back-edge
+            // target) once this loop already requested a compile.
+            if (proto.loopCompileRequested) {
+                attemptOsr(state, ctx, ctx.pc);
+            }
+            return;
+        }
+        if (proto.loopCompileRequested || proto.jitDisabled) {
             return;
         }
         proto.loopCompileRequested = true;
@@ -623,6 +641,9 @@ public final class BytecodeVM {
                 case OpCode.OP_JMP -> {
                     int sj = ((inst >>> Instruction.POS_sJ) & Instruction.MASK_sJ) - Instruction.OFFSET_sJ;
                     ctx.pc += sj;
+                    if (sj < 0) {
+                        maybeOsr(state, ctx);
+                    }
                 }
                 case OpCode.OP_EQ -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
@@ -892,6 +913,7 @@ public final class BytecodeVM {
                     if (ctx.tStack[ctx.base + a + 4] != TYPE_NIL) {
                         copyReg(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 2, ctx.base + a + 4);
                         ctx.pc -= bx;
+                        maybeOsr(state, ctx);
                     }
                 }
                 case OpCode.OP_SETLIST -> ctx.pc = executeSetList(ctx.code, ctx.pc, inst, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, ctx.top);
@@ -947,7 +969,9 @@ public final class BytecodeVM {
         state.closeUpvalues(ctx.thread, ctx.savedStackTop);
         LuaValue errVal = null;
         if (ctx.thrown != null) {
-            if (ctx.thrown instanceof org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal) {
+            if (ctx.thrown instanceof OsrUnwind) {
+                errVal = null;
+            } else if (ctx.thrown instanceof org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal) {
                 errVal = null;
             } else if (ctx.thrown instanceof org.luava.runtime.eval.LuaUnwindException ue) {
                 errVal = ue.getOriginalError();
@@ -1286,6 +1310,9 @@ public final class BytecodeVM {
     private static void closeOnJitReturn(LuaState state, VmContext ctx, int base) {
         if (ctx.thread.getOpenUpvaluesHead() != null) {
             state.closeUpvalues(ctx.thread, base);
+        }
+        if (ctx.thread.getTbcHead() != null) {
+            state.closeTbc(ctx.thread, base, null);
         }
     }
 
@@ -1992,8 +2019,115 @@ public final class BytecodeVM {
     }
 
     /**
+     * Stackless control signal that unwinds {@code runLoop} after an OSR
+     * kernel completed a top-level frame on the stack; the boxed host result
+     * is in {@code ctx.osrTopResult}. Like {@link DeoptSignal} it carries no
+     * message, cause or stack trace (thrown once per completed OSR, never per
+     * edge).
+     */
+    static final class OsrUnwind extends Error {
+        OsrUnwind() { super(null, null, false, false); }
+    }
+
+    private static final OsrUnwind OSR_UNWIND = new OsrUnwind();
+
+    /**
+     * One tiny void call per loop back-edge. The countdown lives in
+     * {@code ctx.jitBackEdges}, so the dispatch loop only gains a call+branch;
+     * the real work is in {@link #attemptOsr}. Keeping the inline site to a
+     * single call is required: any larger change to the near-8KB
+     * {@code runLoop} crosses a C2 code-shape cliff and regresses unrelated
+     * loops (measured on 01_arith at JIT-off).
+     */
+    private static void maybeOsr(LuaState state, VmContext ctx) {
+        if (ctx.jitBackEdges == 0) {
+            ctx.jitBackEdges = LuaState.JIT_LOOP_THRESHOLD;
+        } else if (--ctx.jitBackEdges <= 0) {
+            ctx.jitBackEdges = LuaState.JIT_LOOP_THRESHOLD;
+            if (state.isJitEnabled() && state.loopGuard == null && !ctx.thread.hooksActive) {
+                LuaProto proto = ctx.proto;
+                JitCode jc = proto.jitCode;
+                if (jc == null) {
+                    if (!proto.jitDisabled && !proto.loopCompileRequested) {
+                        proto.loopCompileRequested = true;
+                        try {
+                            JitCompiler.requestCompile(proto);
+                        } catch (Throwable t) {
+                            proto.jitDisabled = true;
+                        }
+                    }
+                } else if (proto.loopCompileRequested) {
+                    attemptOsr(state, ctx, ctx.pc);
+                }
+            }
+        }
+    }
+
+    /** Enters a ready OSR kernel at {@code loopPc} (numeric-for, while/goto, tfor). */
+    private static void attemptOsr(LuaState state, VmContext ctx, int loopPc) {
+        if (!LuaState.ENABLE_OSR) {
+            return;
+        }
+        // A compiled kernel cannot fire line/count hooks, so entering one
+        // while a hook is armed would silently skip it. maybeOsr guards this,
+        // but doForPrep called attemptOsr directly, so a numeric `for` longer
+        // than JIT_LOOP_THRESHOLD entered the kernel even with a hook armed
+        // (debug.sethook observed 0 firings for the loop). Guard here too: this
+        // is the only way into compiled code from the interpreter.
+        if (ctx.thread.hooksActive) {
+            return;
+        }
+        LuaProto proto = ctx.proto;
+        JitCode jc = proto.jitCode;
+        if (jc == null || jc.osrHandle == null) {
+            return;
+        }
+        boolean[] targets = jc.osrTargets;
+        if (targets == null || loopPc < 0 || loopPc >= targets.length || !targets[loopPc]) {
+            return;
+        }
+        try {
+            ctx.thread.ensureStackCapacity(ctx.base + proto.maxStackSize + 64);
+            long[] p = ctx.thread.getPrimitiveStack();
+            byte[] t = ctx.thread.getTypeStack();
+            LuaValue[] o = ctx.thread.getObjectStack();
+            boolean voidKernel = jc.returnsInt && jc.returnsVoid;
+            int nReturns = voidKernel ? 0 : 1;
+            if (!jc.returnsInt) {
+                LuaValue r = (LuaValue) jc.osrHandle.invokeExact(ctx.closure, (Object[]) ctx.closure.upvals, p, t, o, ctx.base, loopPc);
+                ctx.pStack = p; ctx.tStack = t; ctx.oStack = o;
+                setLuaValue(p, t, o, ctx.base, r);
+            } else {
+                long r = (long) jc.osrHandle.invokeExact(ctx.closure, (Object[]) ctx.closure.upvals, p, t, o, ctx.base, loopPc);
+                ctx.pStack = p; ctx.tStack = t; ctx.oStack = o;
+                if (!voidKernel) { p[ctx.base] = r; t[ctx.base] = TYPE_INT; o[ctx.base] = null; }
+            }
+            closeOnJitReturn(state, ctx, ctx.base);
+            if (ctx.callDepth > 0) {
+                returnToCallerRaw(state, ctx, ctx.base, nReturns);
+                return;
+            }
+            ctx.osrTopResult = boxTopLevelResults(ctx, ctx.base, nReturns);
+            throw OSR_UNWIND;
+        } catch (OsrUnwind ou) {
+            throw ou;
+        } catch (DeoptSignal d) {
+            if (disarms(d, jc, proto)) { proto.jitCode = null; proto.jitDisabled = true; }
+            ctx.pc = d.pc;
+        } catch (StackOverflowError soe) {
+            proto.jitCode = null; proto.jitDisabled = true; ctx.pc = loopPc;
+        } catch (RuntimeException | Error t) {
+            proto.jitCode = null; proto.jitDisabled = true; throw t;
+        } catch (Throwable t) {
+            proto.jitCode = null; proto.jitDisabled = true;
+        }
+    }
+
+    /**
      * {@code OP_FORPREP} handler (runs once per loop, so call overhead is
-     * free). Initializes the numeric loop counter or skips the loop.
+     * free). Initializes the numeric loop counter or skips the loop, then
+     * requests a compile and attempts numeric-for OSR when the trip count is
+     * already large.
      */
     private static void doForPrep(LuaState state, VmContext ctx, int a, int inst) {
         int bx = (inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx;
@@ -2018,6 +2152,12 @@ public final class BytecodeVM {
                 // entry, so the dispatch hot path pays nothing.
                 if (count >= LuaState.JIT_LOOP_THRESHOLD) {
                     requestLoopCompile(state, ctx);
+                    // A synchronous compile just made the kernel available;
+                    // enter it at the body start (the FORLOOP back-edge target)
+                    // so a single-call numeric for gets compiled work too.
+                    // doForPrep is out of line, so this call does not grow the
+                    // dispatch loop past its C2 code-shape cliff.
+                    attemptOsr(state, ctx, ctx.pc);
                 }
             }
         } else {

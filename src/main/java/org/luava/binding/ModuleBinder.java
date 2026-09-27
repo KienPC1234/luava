@@ -17,7 +17,6 @@ import org.luava.runtime.LuaFunction;
 import org.luava.runtime.LuaNil;
 import org.luava.runtime.LuaString;
 import org.luava.runtime.LuaTable;
-import org.luava.runtime.LuaUserdata;
 import org.luava.runtime.LuaValue;
 
 import java.lang.invoke.MethodHandle;
@@ -169,35 +168,7 @@ public final class ModuleBinder {
                 LuaValue[] effectiveArgs = new LuaValue[args.length - offset];
                 System.arraycopy(args, offset, effectiveArgs, 0, effectiveArgs.length);
 
-                Method bestMatch = null;
-                int bestScore = -1;
-
-                for (Method m : candidates) {
-                    Class<?>[] paramTypes = m.getParameterTypes();
-                    if (!m.isVarArgs() && paramTypes.length != effectiveArgs.length) continue;
-                    if (m.isVarArgs() && effectiveArgs.length < paramTypes.length - 1) continue;
-
-                    int score = 0;
-                    int fixed = m.isVarArgs() ? paramTypes.length - 1 : paramTypes.length;
-                    boolean ok = true;
-                    for (int i = 0; i < fixed; i++) {
-                        int s = scoreArg(paramTypes[i], effectiveArgs[i]);
-                        if (s < 0) { ok = false; break; }
-                        score += s;
-                    }
-                    if (ok && m.isVarArgs()) {
-                        Class<?> varType = paramTypes[fixed].getComponentType();
-                        for (int i = fixed; i < effectiveArgs.length; i++) {
-                            int s = scoreArg(varType, effectiveArgs[i]);
-                            if (s < 0) { ok = false; break; }
-                            score += s;
-                        }
-                    }
-                    if (ok && score > bestScore) {
-                        bestScore = score;
-                        bestMatch = m;
-                    }
-                }
+                Method bestMatch = (Method) OverloadResolver.resolve(candidates, effectiveArgs);
 
                 if (bestMatch == null) {
                     throw new LuaException("No matching overload for bound method '" + methodName + "' with " + effectiveArgs.length + " arguments");
@@ -259,32 +230,6 @@ public final class ModuleBinder {
 
         ModuleInfo info = new ModuleInfo(moduleName, moduleDesc, fieldInfos, methodInfos);
         return new ModuleBindingResult(table, info);
-    }
-
-    private static int scoreArg(Class<?> target, LuaValue val) {
-        if (val == null || val.isNil()) return target.isPrimitive() ? 1 : 5;
-        if (target == Object.class) return 2;
-        if (target.isInstance(val)) return 10;
-        if (val.isInteger()) {
-            if (target == long.class || target == Long.class) return 10;
-            if (target == int.class || target == Integer.class) return 9;
-            if (target == short.class || target == Short.class || target == byte.class || target == Byte.class) return 8;
-            if (target == double.class || target == Double.class || target == float.class || target == Float.class) return 7;
-        }
-        if (val.isFloat()) {
-            if (target == double.class || target == Double.class) return 10;
-            if (target == float.class || target == Float.class) return 9;
-        }
-        if (val.isBoolean() && (target == boolean.class || target == Boolean.class)) return 10;
-        if (val.isString() && (target == String.class || CharSequence.class.isAssignableFrom(target))) return 10;
-        if (val.isString() && target.isEnum()) return 8;
-        if (val.isFunction() && target.isInterface() && LuaDataConverter.findSingleAbstractMethod(target) != null) return 9;
-        if (val.isTable() && (target.isArray() || target == List.class || target == Map.class)) return 8;
-        if (val.isUserdata()) {
-            Object inst = ((LuaUserdata) val).getJavaInstance();
-            if (inst != null && target.isInstance(inst)) return 10;
-        }
-        return -1;
     }
 
     public record ModuleBindingResult(LuaTable table, ModuleInfo info) {}

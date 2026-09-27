@@ -33,6 +33,20 @@ public final class VmContext {
     /** Resume pc installed by a JIT deopt (executeCallOp applies it after
      * pushing the interpreter frame); -1 when the call runs from scratch. */
     public int jitResumePc = -1;
+    /**
+     * Back-edges remaining before the next loop tier-up/OSR check, held in the
+     * out-of-line {@code tryBackEdge} helper rather than inline in
+     * {@code runLoop}: growing that near-8KB dispatch method pushed it across
+     * a C2 code-shape cliff (a numeric-for loop regressed ~25% at JIT-off even
+     * though the added code never executed there). 0 means "unarmed".
+     */
+    public int jitBackEdges;
+    /**
+     * Boxed top-level result of an OSR kernel that returned to the host; the
+     * interpreter returns it from {@code runLoop}. Null after an OSR kernel
+     * returned into an interpreter caller (the helper already resumed it).
+     */
+    public LuaValue[] osrTopResult;
     public boolean varargPrepRan;
     /** Scratch in/out slot for tiny helpers (e.g. callable resolution). */
     public int scratch0;

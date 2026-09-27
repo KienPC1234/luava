@@ -47,9 +47,21 @@ public final class LuaToJvmTranslator implements Opcodes {
     private static final String EXEC_OBJ_NAME = "execObj";
     private static final String EXEC_OBJ_DESC =
             "(Lorg/luava/runtime/bytecode/LuaClosure;[Ljava/lang/Object;[J[B[Lorg/luava/runtime/LuaValue;I)Lorg/luava/runtime/LuaValue;";
+    private static final String EXEC_OSR_NAME = "execOsr";
+    private static final String EXEC_OBJ_OSR_NAME = "execObjOsr";
+    private static final String EXEC_OSR_DESC =
+            "(Lorg/luava/runtime/bytecode/LuaClosure;[Ljava/lang/Object;[J[B[Lorg/luava/runtime/LuaValue;II)J";
+    private static final String EXEC_OBJ_OSR_DESC =
+            "(Lorg/luava/runtime/bytecode/LuaClosure;[Ljava/lang/Object;[J[B[Lorg/luava/runtime/LuaValue;II)Lorg/luava/runtime/LuaValue;";
 
-    /** Result of a successful translation. */
-    public record Translation(String internalName, byte[] bytes) {}
+    /**
+     * Result of a successful translation.
+     *
+     * @param osrTargets per-pc flags marking the loop instructions at which
+     *     on-stack replacement may enter {@code execOsr}; null when the proto
+     *     has no in-subset loop or no OSR entry was emitted.
+     */
+    public record Translation(String internalName, byte[] bytes, boolean[] osrTargets) {}
 
     /** Descriptor of the prologue-free recursive entry (verified closures). */
     static String innerDesc(int fusedBCount) {
@@ -72,12 +84,34 @@ public final class LuaToJvmTranslator implements Opcodes {
 
     /** Returns null when the proto is outside the integer-subset. */
     public static Translation translate(LuaProto proto, String internalName) {
+        return translate(proto, internalName, false);
+    }
+
+    /**
+     * @param wantOsr when true, also emits an {@code execOsr} entry that
+     *     branches into the loop body at the instruction labels, enabling
+     *     on-stack replacement for hot loops.
+     */
+    public static Translation translate(LuaProto proto, String internalName, boolean wantOsr) {
         Info info = analyze(proto);
         if (info == null) {
             return null;
         }
         boolean pure = info.pure();
         int len = proto.code.length;
+        // Loop instructions at which OSR may enter: a jump back-edge or a
+        // numeric/generic loop step. Any such pc is only reachable after FORPREP
+        // or a prior body execution, so register state is initialized.
+        boolean[] osrTargets = wantOsr ? loopHeadFlags(proto.code) : null;
+        boolean anyOsr = false;
+        if (osrTargets != null) {
+            for (boolean t : osrTargets) {
+                if (t) {
+                    anyOsr = true;
+                    break;
+                }
+            }
+        }
         ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_FRAMES | ClassWriter.COMPUTE_MAXS);
         cw.visit(V21, ACC_PUBLIC | ACC_FINAL | ACC_SUPER, internalName, null, "java/lang/Object", null);
 
@@ -146,19 +180,34 @@ public final class LuaToJvmTranslator implements Opcodes {
                 }
             }
         }
-        MethodVisitor mv;
-        if (info.returnsInt()) {
-            mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC, EXEC_NAME, EXEC_DESC, null, null);
+        boolean returnsInt = info.returnsInt();
+        if (anyOsr) {
+            // The body lives once, in execOsr, whose extra pc parameter drives
+            // a jump table into the loop header. exec keeps its six-argument
+            // ABI and forwards at pc 0, so existing callers and MethodHandles
+            // are unchanged and the body is not duplicated.
+            MethodVisitor mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC,
+                    returnsInt ? EXEC_NAME : EXEC_OBJ_NAME,
+                    returnsInt ? EXEC_DESC : EXEC_OBJ_DESC, null, null);
+            mv.visitCode();
+            emitOsrForward(mv, internalName, returnsInt);
+            mv.visitMaxs(0, 0);
+            mv.visitEnd();
+            emitOsrBody(cw, internalName, proto, osrTargets, info, fusedUp, fusedDef, skipStore,
+                    fusedBList, fusedBCount, pure, selfSafe);
         } else {
-            mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC, EXEC_OBJ_NAME, EXEC_OBJ_DESC, null, null);
+            osrTargets = null;
+            MethodVisitor mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC,
+                    returnsInt ? EXEC_NAME : EXEC_OBJ_NAME,
+                    returnsInt ? EXEC_DESC : EXEC_OBJ_DESC, null, null);
+            mv.visitCode();
+            emitPrologue(mv, fusedBList, fusedBCount);
+            emitBody(mv, internalName, proto, newLabels(len), fusedUp, fusedDef, skipStore, fusedBList,
+                    fusedBCount, returnsInt, info.returnsVoid(), pure, info.types(), selfSafe);
+            mv.visitMaxs(0, 0);
+            mv.visitEnd();
         }
-        mv.visitCode();
-        emitPrologue(mv, fusedBList, fusedBCount);
-        emitBody(mv, internalName, proto, newLabels(len), fusedUp, fusedDef, skipStore, fusedBList,
-                fusedBCount, info.returnsInt(), info.returnsVoid(), pure, info.types(), selfSafe);
-        mv.visitMaxs(0, 0);
-        mv.visitEnd();
-        if (info.returnsInt() && fusedBCount > 0) {
+        if (returnsInt && fusedBCount > 0) {
             // Prologue-free recursive entry. Sound only because every caller
             // passes down entry-verified closures for the same upvalue array
             // (self-recursion on one closure); anything else uses exec.
@@ -177,7 +226,140 @@ public final class LuaToJvmTranslator implements Opcodes {
             mi.visitEnd();
         }
         cw.visitEnd();
-        return new Translation(internalName, cw.toByteArray());
+        return new Translation(internalName, cw.toByteArray(), osrTargets);
+    }
+
+    /**
+     * Flags the loop headers at which OSR may enter: the backward target of a
+     * {@code JMP} (while/repeat/goto), a {@code FORLOOP} (numeric-for step) or
+     * a {@code TFORLOOP} (generic-for step). The interpreter invokes the OSR
+     * entry after applying the back-edge, so {@code ctx.pc} is exactly this
+     * target (the loop body start). {@code FORPREP}/{@code TFORPREP} are loop
+     * setup and run before any body state exists, so their targets are not
+     * counted here.
+     *
+     * <p>All three are int-safe only when they are not nested inside a
+     * different for body: entering a nested header would skip the enclosing
+     * {@code FORPREP} guard, and the kernel's numeric {@code FORLOOP} has no
+     * per-iteration tag guard, so a float outer {@code for} could be
+     * corrupted. A for's own header lies at depth 1; depth &gt; 1 means an
+     * outer for encloses it. A pc that a backward {@code JMP} can also reach
+     * is dropped because that JMP could target a float for. Only targets
+     * inside {@code [0, len)} are flagged.
+     */
+    private static boolean[] loopHeadFlags(int[] code) {
+        boolean[] flags = new boolean[code.length];
+        boolean[] jmpTarget = new boolean[code.length];
+        boolean[] loopHeader = new boolean[code.length];
+        int[] forDepth = new int[code.length];
+        for (int pc = 0; pc < code.length; pc++) {
+            int op = Instruction.getOp(code[pc]);
+            if (op == OpCode.OP_FORPREP) {
+                int end = pc + 1 + Instruction.getBx(code[pc]);
+                for (int t = pc + 1; t <= end && t < code.length; t++) {
+                    forDepth[t]++;
+                }
+            } else if (op == OpCode.OP_TFORPREP) {
+                int end = pc + 2 + Instruction.getBx(code[pc]);
+                for (int t = pc + 1; t <= end && t < code.length; t++) {
+                    forDepth[t]++;
+                }
+            }
+        }
+        for (int pc = 0; pc < code.length; pc++) {
+            int op = Instruction.getOp(code[pc]);
+            if (op == OpCode.OP_FORLOOP || op == OpCode.OP_TFORLOOP) {
+                int h = pc + 1 - Instruction.getBx(code[pc]);
+                if (h >= 0 && h < code.length) {
+                    loopHeader[h] = true;
+                }
+            } else if (op == OpCode.OP_JMP && Instruction.getsJ(code[pc]) < 0) {
+                int t = pc + 1 + Instruction.getsJ(code[pc]);
+                if (t >= 0 && t < code.length) {
+                    jmpTarget[t] = true;
+                }
+            }
+        }
+        for (int pc = 0; pc < code.length; pc++) {
+            if (loopHeader[pc]) {
+                flags[pc] = !jmpTarget[pc] && forDepth[pc] <= 1;
+            } else if (jmpTarget[pc]) {
+                // A while/repeat/goto header: safe only outside every
+                // enclosing for, where the kernel can never run an outer
+                // FORLOOP whose guard it skipped.
+                flags[pc] = forDepth[pc] == 0;
+            }
+        }
+        return flags;
+    }
+
+    /** {@code exec} forwarding to {@code execOsr(..., pc = 0)}. */
+    private static void emitOsrForward(MethodVisitor mv, String owner, boolean returnsInt) {
+        mv.visitVarInsn(ALOAD, 0);
+        mv.visitVarInsn(ALOAD, 1);
+        mv.visitVarInsn(ALOAD, 2);
+        mv.visitVarInsn(ALOAD, 3);
+        mv.visitVarInsn(ALOAD, 4);
+        mv.visitVarInsn(ILOAD, 5);
+        mv.visitInsn(ICONST_0);
+        mv.visitMethodInsn(INVOKESTATIC, owner, returnsInt ? EXEC_OSR_NAME : EXEC_OBJ_OSR_NAME,
+                returnsInt ? EXEC_OSR_DESC : EXEC_OBJ_OSR_DESC, false);
+        mv.visitInsn(returnsInt ? LRETURN : ARETURN);
+    }
+
+    /**
+     * Emits the single body in {@code execOsr}, dispatching on the trailing
+     * {@code pc} parameter (slot 6) through a jump table so a hot loop can
+     * enter compilation on the stack instead of waiting for the next call.
+     * The pc is consumed before the body runs, so the body's long scratch slot
+     * 6 is free afterwards. The default branch restarts at pc 0 (the ordinary
+     * function entry), which the interpreter never selects because it only
+     * calls {@code execOsr} at a flagged loop pc.
+     */
+    private static void emitOsrBody(ClassWriter cw, String internalName, LuaProto proto,
+            boolean[] osrTargets, Info info, int[] fusedUp, int[] fusedDef, boolean[] skipStore,
+            int[] fusedBList, int fusedBCount, boolean pure, boolean selfSafe) {
+        int len = proto.code.length;
+        Label[] labels = newLabels(len);
+        MethodVisitor mv = cw.visitMethod(ACC_PUBLIC | ACC_STATIC,
+                info.returnsInt() ? EXEC_OSR_NAME : EXEC_OBJ_OSR_NAME,
+                info.returnsInt() ? EXEC_OSR_DESC : EXEC_OBJ_OSR_DESC, null, null);
+        mv.visitCode();
+        emitPrologue(mv, fusedBList, fusedBCount);
+        java.util.ArrayList<Integer> targets = new java.util.ArrayList<>();
+        for (int pc = 0; pc < osrTargets.length; pc++) {
+            if (osrTargets[pc]) {
+                targets.add(pc);
+            }
+        }
+        int[] keys = new int[targets.size()];
+        Label[] tramp = new Label[targets.size()];
+        for (int i = 0; i < targets.size(); i++) {
+            keys[i] = targets.get(i);
+            tramp[i] = new Label();
+        }
+        // Entry trampolines normalize the long scratch slot 6 before joining
+        // the body, so the verifier sees a long at every body label even though
+        // pc arrived as int in slot 6. The default (unknown pc 0 from exec's
+        // forwarder, or any non-target) enters the ordinary pc-0 body; the
+        // interpreter only calls execOsr at a flagged loop pc.
+        Label defaultTramp = new Label();
+        mv.visitVarInsn(ILOAD, 6); // pc parameter (slot 6, int)
+        mv.visitLookupSwitchInsn(defaultTramp, keys, tramp);
+        mv.visitLabel(defaultTramp);
+        mv.visitInsn(LCONST_0);
+        mv.visitVarInsn(LSTORE, 6);
+        mv.visitJumpInsn(GOTO, labels[0]);
+        for (int i = 0; i < targets.size(); i++) {
+            mv.visitLabel(tramp[i]);
+            mv.visitInsn(LCONST_0);
+            mv.visitVarInsn(LSTORE, 6);
+            mv.visitJumpInsn(GOTO, labels[targets.get(i)]);
+        }
+        emitBody(mv, internalName, proto, labels, fusedUp, fusedDef, skipStore, fusedBList,
+                fusedBCount, info.returnsInt(), info.returnsVoid(), pure, info.types(), selfSafe);
+        mv.visitMaxs(0, 0);
+        mv.visitEnd();
     }
 
     private static void emitPrologue(MethodVisitor mv, int[] fusedBList, int fusedBCount) {
@@ -511,9 +693,13 @@ public final class LuaToJvmTranslator implements Opcodes {
                 }
                 case OpCode.OP_NOT -> {
                     // Pure truthiness, no guard needed (mirrors isTruthy).
+                    // isTruthy takes exactly (long[], byte[], int): the object
+                    // array must NOT be pushed, or the reference is stranded on
+                    // the operand stack and every control-flow join afterwards
+                    // carries an extra slot (ASM Frame.merge then throws and
+                    // JitCompiler silently disables the whole proto).
                     mv.visitVarInsn(ALOAD, 2);
                     mv.visitVarInsn(ALOAD, 3);
-                    mv.visitVarInsn(ALOAD, 4);
                     emitIndex(mv, b);
                     mv.visitMethodInsn(INVOKESTATIC, "org/luava/runtime/bytecode/BytecodeVM", "isTruthy",
                             "([J[BI)Z", false);
@@ -2645,17 +2831,44 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitInsn(LALOAD);
     }
 
+    /**
+     * Compare {@code R[a]} against a small integer immediate. The register may
+     * hold an integer or a float (e.g. {@code acc > 0} with a float
+     * accumulator), so mirror {@link #emitCmpRR}: an int lane for
+     * {@code TYPE_INT} and a double lane otherwise. The previous
+     * {@code emitGuardInt} deopted on every float-vs-immediate comparison and,
+     * after the small guard budget, disarmed the whole kernel — which is what
+     * pushed the OOP hot loop back to the interpreter.
+     */
     private static void emitCmpImm(
             MethodVisitor mv, int a, int sb, int k, int pc, Label[] labels, int jumpIfTrue, int jumpIfFalse) {
-        emitGuardInt(mv, a, pc);
-        mv.visitVarInsn(ALOAD, 2);
+        emitGuardNumber(mv, a, pc);
+        Label intLane = new Label();
+        Label condTrue = new Label();
+        Label condFalse = new Label();
+        mv.visitVarInsn(ALOAD, 3);
         emitIndex(mv, a);
-        mv.visitInsn(LALOAD);
+        mv.visitInsn(BALOAD);
+        ldcInt(mv, TYPE_INT);
+        mv.visitJumpInsn(IF_ICMPEQ, intLane);
+        // Float lane: promote to double. Lua's comparisons treat NaN as false
+        // for every predicate, so the DCMP variant must push a value that
+        // fails the "true" branch: DCMPG pushes +1 for NaN (fails IFLE/IFLT),
+        // DCMPL pushes -1 (fails IFGT/IFGE). Using one variant unconditionally
+        // would make `nan > 0` or `nan <= 0` wrong.
+        int dcmpl = (jumpIfTrue == IFGT || jumpIfTrue == IFGE) ? DCMPL : DCMPG;
+        emitLoadDouble(mv, a);
+        mv.visitLdcInsn((double) sb);
+        mv.visitInsn(dcmpl);
+        mv.visitJumpInsn(jumpIfTrue, condTrue);
+        mv.visitJumpInsn(GOTO, condFalse);
+        mv.visitLabel(intLane);
+        emitLoadP(mv, a);
         mv.visitLdcInsn((long) sb);
         mv.visitInsn(LCMP);
-        Label condTrue = new Label();
         mv.visitJumpInsn(jumpIfTrue, condTrue);
-        // Condition false: cond == false; skip-next iff false != (k==1).
+        // Condition false: skip-next iff false != (k==1).
+        mv.visitLabel(condFalse);
         if (k == 1) {
             mv.visitJumpInsn(GOTO, labels[pc + 2]);
         } else {
@@ -3059,21 +3272,28 @@ public final class LuaToJvmTranslator implements Opcodes {
         emitDeopt(mv, resumePc, true);
         mv.visitLabel(isClosure);
         // Same proto -> direct INVOKESTATIC; else a pure JIT proto -> helper.
-        mv.visitVarInsn(ALOAD, 8);
-        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
-        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
-                "Lorg/luava/runtime/bytecode/LuaProto;");
-        mv.visitVarInsn(ALOAD, 0);
-        mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
-                "Lorg/luava/runtime/bytecode/LuaProto;");
         Label selfProto = new Label();
         Label generalCall = new Label();
         if (!callerReturnsInt || !selfSafe) {
             // Object-returning callers, and parameter-writing protos whose
             // direct self call has no window rollback, use the general
-            // snapshot-wrapped path.
+            // snapshot-wrapped path. The proto comparison is not emitted here
+            // at all: it would push two refs that only IF_ACMPNE consumes, and
+            // a GOTO past it would carry them onto the operand stack, leaving
+            // the two edges into `generalCall` with different stack depths.
+            // That inconsistency is invisible to the emitter but makes ASM's
+            // COMPUTE_FRAMES throw ArrayIndexOutOfBounds in Frame.merge, so
+            // every object-returning proto containing a call silently failed
+            // to compile (JitCompiler caught it and set jitDisabled).
             mv.visitJumpInsn(GOTO, generalCall);
         } else {
+            mv.visitVarInsn(ALOAD, 8);
+            mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/bytecode/LuaClosure");
+            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
+                    "Lorg/luava/runtime/bytecode/LuaProto;");
+            mv.visitVarInsn(ALOAD, 0);
+            mv.visitFieldInsn(GETFIELD, "org/luava/runtime/bytecode/LuaClosure", "proto",
+                    "Lorg/luava/runtime/bytecode/LuaProto;");
             mv.visitJumpInsn(IF_ACMPNE, generalCall);
             mv.visitLabel(selfProto);
             emitDirectInvoke(mv, owner, proto, a, nArgs, resumePc);
@@ -3514,17 +3734,13 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ASTORE, 8);
         mv.visitVarInsn(ALOAD, 8);
         emitGuardPlainTable(mv, pc);
-        mv.visitInsn(POP);
+        // Receiver stays on the stack (locals 9+ are fused-callee slots in pure
+        // protos and must not be scratch), so load the index and box the value
+        // directly.
         mv.visitVarInsn(ALOAD, 2);
         emitIndex(mv, b);
         mv.visitInsn(LALOAD);
-        mv.visitVarInsn(LSTORE, 6);
         emitBoxValue(mv, proto, c, c, k, pc);
-        mv.visitVarInsn(ASTORE, 9);
-        mv.visitVarInsn(ALOAD, 8);
-        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/LuaTable");
-        mv.visitVarInsn(LLOAD, 6);
-        mv.visitVarInsn(ALOAD, 9);
         mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawsetInt",
                 "(JLorg/luava/runtime/LuaValue;)V", false);
         mv.visitJumpInsn(GOTO, done);
@@ -3536,14 +3752,9 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ASTORE, 8);
         mv.visitVarInsn(ALOAD, 8);
         emitGuardPlainTable(mv, pc);
-        mv.visitInsn(POP);
         mv.visitVarInsn(ALOAD, 4);
         emitIndex(mv, b);
         mv.visitInsn(AALOAD);
-        mv.visitVarInsn(ASTORE, 9);
-        mv.visitVarInsn(ALOAD, 8);
-        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/LuaTable");
-        mv.visitVarInsn(ALOAD, 9);
         emitBoxValue(mv, proto, c, c, k, pc);
         mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawset",
                 "(Lorg/luava/runtime/LuaValue;Lorg/luava/runtime/LuaValue;)V", false);
@@ -3558,13 +3769,12 @@ public final class LuaToJvmTranslator implements Opcodes {
         mv.visitVarInsn(ASTORE, 8);
         mv.visitVarInsn(ALOAD, 8);
         emitGuardPlainTable(mv, pc);
-        mv.visitInsn(POP);
-        emitBoxValue(mv, proto, c, c, k, pc);
-        mv.visitVarInsn(ASTORE, 9);
-        mv.visitVarInsn(ALOAD, 8);
-        mv.visitTypeInsn(CHECKCAST, "org/luava/runtime/LuaTable");
+        // Receiver stays on the stack; the key and value follow, so no scratch
+        // local is needed. Local 9 must stay free: a fused-callee proto uses it
+        // as the int flag "upvalue b holds self", and reusing it here for a
+        // LuaValue made the verifier see Top where an int was required.
         mv.visitLdcInsn((long) b);
-        mv.visitVarInsn(ALOAD, 9);
+        emitBoxValue(mv, proto, c, c, k, pc);
         mv.visitMethodInsn(INVOKEVIRTUAL, "org/luava/runtime/LuaTable", "rawsetInt",
                 "(JLorg/luava/runtime/LuaValue;)V", false);
     }

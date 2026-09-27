@@ -156,7 +156,8 @@ public final class JitCompiler {
                 return null;
             }
             String name = "org/luava/runtime/jit/Gen$" + CLASS_SEQ.getAndIncrement();
-            LuaToJvmTranslator.Translation tr = LuaToJvmTranslator.translate(proto, name);
+            LuaToJvmTranslator.Translation tr =
+                    LuaToJvmTranslator.translate(proto, name, org.luava.runtime.LuaState.ENABLE_OSR);
             if (tr == null) {
                 proto.jitDisabled = true;
                 return null;
@@ -169,13 +170,28 @@ public final class JitCompiler {
                 java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "exec",
                         MethodType.methodType(long.class, LuaClosure.class, Object[].class,
                                 long[].class, byte[].class, org.luava.runtime.LuaValue[].class, int.class));
-                code = new JitCode(proto, mh, null, info.pure(), true, info.returnsVoid());
+                java.lang.invoke.MethodHandle osr = null;
+                if (tr.osrTargets() != null) {
+                    osr = MethodHandles.lookup().findStatic(cls, "execOsr",
+                            MethodType.methodType(long.class, LuaClosure.class, Object[].class,
+                                    long[].class, byte[].class, org.luava.runtime.LuaValue[].class,
+                                    int.class, int.class));
+                }
+                code = new JitCode(proto, mh, null, osr, tr.osrTargets(), info.pure(), true,
+                        info.returnsVoid());
             } else {
                 java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "execObj",
                         MethodType.methodType(org.luava.runtime.LuaValue.class, LuaClosure.class,
                                 Object[].class, long[].class, byte[].class,
                                 org.luava.runtime.LuaValue[].class, int.class));
-                code = new JitCode(proto, null, mh, info.pure(), false);
+                java.lang.invoke.MethodHandle osr = null;
+                if (tr.osrTargets() != null) {
+                    osr = MethodHandles.lookup().findStatic(cls, "execObjOsr",
+                            MethodType.methodType(org.luava.runtime.LuaValue.class, LuaClosure.class,
+                                    Object[].class, long[].class, byte[].class,
+                                    org.luava.runtime.LuaValue[].class, int.class, int.class));
+                }
+                code = new JitCode(proto, null, mh, osr, tr.osrTargets(), info.pure(), false, false);
             }
             proto.jitCode = code;
             CACHE.put(proto, code);

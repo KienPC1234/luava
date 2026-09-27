@@ -24,6 +24,8 @@ import java.lang.reflect.Array;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -85,6 +87,15 @@ public final class LuaDataConverter {
         }
     }
 
+    /**
+     * Snapshot conversion: a Java {@code List}/{@code Map}/{@code Set}/array
+     * becomes a fresh {@link LuaTable} (a copy), so Java cannot observe
+     * writes made in Lua. This is the documented {@code state.set} behaviour.
+     *
+     * <p>Anything the host already exposed live (via {@code setLive}) flows
+     * through {@link #toLuaLive} instead, so nested collections stay live and
+     * mutations are visible in Java.
+     */
     public static LuaValue toLua(Object obj) {
         if (obj == null) return LuaNil.NIL;
         if (obj instanceof LuaValue lv) return lv;
@@ -146,6 +157,20 @@ public final class LuaDataConverter {
         return new LuaUserdata(obj);
     }
 
+    /**
+     * Live conversion: a Java {@code List}/{@code Map}/{@code Set}/array
+     * becomes a {@link LuaUserdata} that reads and writes the original
+     * object, so mutations made in Lua are visible in Java. This is the
+     * {@code state.setLive} contract, and it is also what every value
+     * <em>stored in</em> a live object uses — public fields, {@code List}
+     * elements, {@code Map} values and array elements — so liveness does not
+     * stop at the first level.
+     *
+     * <p>Method and SAM <em>results</em> deliberately keep the snapshot
+     * behaviour of {@link #toLua}: a returned collection is a value the host
+     * computed, and the documented contract is that it materialises as a Lua
+     * table.
+     */
     public static LuaValue toLuaLive(Object obj) {
         if (obj == null) return LuaNil.NIL;
         if (obj instanceof LuaValue lv) return lv;
@@ -262,15 +287,15 @@ public final class LuaDataConverter {
         // numeric strings convert, everything else is an error (never a
         // silent 0).
         if (targetType == byte.class || targetType == Byte.class) {
-            return (T) Byte.valueOf((byte) toLongChecked(val));
+            return (T) Byte.valueOf((byte) toIntegralChecked(val, Byte.MIN_VALUE, Byte.MAX_VALUE, "byte"));
         }
 
         if (targetType == short.class || targetType == Short.class) {
-            return (T) Short.valueOf((short) toLongChecked(val));
+            return (T) Short.valueOf((short) toIntegralChecked(val, Short.MIN_VALUE, Short.MAX_VALUE, "short"));
         }
 
         if (targetType == int.class || targetType == Integer.class) {
-            return (T) Integer.valueOf((int) toLongChecked(val));
+            return (T) Integer.valueOf((int) toIntegralChecked(val, Integer.MIN_VALUE, Integer.MAX_VALUE, "int"));
         }
 
         if (targetType == long.class || targetType == Long.class) {
@@ -284,6 +309,38 @@ public final class LuaDataConverter {
 
         if (targetType == double.class || targetType == Double.class) {
             return (T) Double.valueOf(toDoubleChecked(val));
+        }
+
+        // Arbitrary-precision and erased numeric targets. Lua numbers reach
+        // Java as long/double, so an exact-width target is built from that.
+        if (targetType == BigInteger.class) {
+            if (val.isInteger()) {
+                return (T) BigInteger.valueOf(val.toLong());
+            }
+            if (val.isFloat()) {
+                return (T) BigDecimal.valueOf(val.toDouble()).toBigInteger();
+            }
+            return (T) new BigInteger(val.toLuaString());
+        }
+
+        if (targetType == BigDecimal.class) {
+            if (val.isInteger()) {
+                return (T) BigDecimal.valueOf(val.toLong());
+            }
+            if (val.isFloat()) {
+                return (T) BigDecimal.valueOf(val.toDouble());
+            }
+            return (T) new BigDecimal(val.toLuaString());
+        }
+
+        if (targetType == Number.class) {
+            if (val.isInteger()) {
+                return (T) Long.valueOf(val.toLong());
+            }
+            if (val.isFloat()) {
+                return (T) Double.valueOf(val.toDouble());
+            }
+            return (T) Long.valueOf(toLongChecked(val));
         }
 
         // Enums
@@ -327,7 +384,7 @@ public final class LuaDataConverter {
             }
             if (val.isTable()) {
                 LuaTable table = (LuaTable) val;
-                int len = table.rawlen();
+                int len = requireSequence(table, targetType);
                 Object array = Array.newInstance(compType, len);
                 for (int i = 1; i <= len; i++) {
                     Array.set(array, i - 1, toJava(table.rawget(LuaInteger.valueOf(i)), compType));
@@ -344,7 +401,7 @@ public final class LuaDataConverter {
             }
             if (val.isTable()) {
                 LuaTable table = (LuaTable) val;
-                int len = table.rawlen();
+                int len = requireSequence(table, targetType);
                 List<Object> list = new ArrayList<>(len);
                 for (int i = 1; i <= len; i++) {
                     list.add(toJava(table.rawget(LuaInteger.valueOf(i)), Object.class));
@@ -361,7 +418,7 @@ public final class LuaDataConverter {
             }
             if (val.isTable()) {
                 LuaTable table = (LuaTable) val;
-                int len = table.rawlen();
+                int len = requireSequence(table, targetType);
                 Set<Object> set = new HashSet<>(len);
                 for (int i = 1; i <= len; i++) {
                     set.add(toJava(table.rawget(LuaInteger.valueOf(i)), Object.class));
@@ -405,11 +462,79 @@ public final class LuaDataConverter {
      * and float values convert (floats truncate toward zero), numeric strings
      * convert, anything else raises a Lua error rather than becoming 0.
      */
+    /**
+     * Returns the length of a Lua table being converted to a Java sequence
+     * ({@code List}, {@code Set} or array), or throws when the table is not a
+     * sequence.
+     *
+     * <p>Only tables whose non-nil keys are exactly {@code 1..n} convert. A
+     * sparse or mixed-key table ({@code {[1]='a',[3]='c'}}, {@code {1,2,x=5}},
+     * {@code {1,nil,3}}) has no faithful Java sequence form, and {@code
+     * #rawlen} would silently emit a shorter collection with elements dropped:
+     * the host would receive a plausible but wrong value. Asking for a
+     * {@code Map} instead preserves every entry.
+     */
+    private static int requireSequence(LuaTable table, Class<?> targetType) {
+        int len = table.rawlen();
+        for (LuaValue key : table.keys()) {
+            if (key.isInteger()) {
+                long i = key.toLong();
+                if (i >= 1 && i <= len) {
+                    continue;
+                }
+            }
+            throw new LuaException("cannot convert a Lua table with non-sequence key "
+                    + key.toLuaString() + " to " + targetType.getSimpleName()
+                    + " (it would drop elements; use Map to keep every entry)");
+        }
+        return len;
+    }
+
+    /**
+     * Coerces a Lua number to a Java {@code long}, rejecting values that do
+     * not fit or are not finite. Java's {@code (long)} cast silently saturates
+     * (NaN becomes 0, ±infinity becomes ±Long.MAX) and Lua values arrive as
+     * doubles up to 2^63, so a plain cast would hand the host a plausible but
+     * wrong number.
+     */
     static long toLongChecked(LuaValue val) {
         if (val.isInteger()) return val.toLong();
-        if (val.isFloat()) return (long) val.toDouble();
+        if (val.isFloat()) {
+            double d = val.toDouble();
+            // (double) Long.MAX_VALUE == 2^63 exactly, so the upper bound is
+            // exclusive while the lower bound is inclusive (-2^63 is a long).
+            if (d != d || d < -0x1p63 || d >= 0x1p63) {
+                throw new LuaException("number " + val.toLuaString() + " is out of long range");
+            }
+            return (long) d;
+        }
         if (val.isString()) return val.toLong(); // throws on non-numeric strings
         throw new LuaException("number expected, got " + val.typeName());
+    }
+
+    /**
+     * Coerces a Lua number to an integral Java type in {@code [min, max]},
+     * truncating toward zero (Java's cast semantics) but raising instead of
+     * wrapping when the value does not fit. Fractional values are truncated,
+     * which is the documented behaviour; out-of-range values are not a
+     * truncation but a wraparound, and those are refused.
+     */
+    static long toIntegralChecked(LuaValue val, long min, long max, String typeName) {
+        if (val.isFloat()) {
+            double d = val.toDouble();
+            if (d != d || d == Double.POSITIVE_INFINITY || d == Double.NEGATIVE_INFINITY
+                    || d < min || d > max) {
+                throw new LuaException("number " + val.toLuaString()
+                        + " is out of range for " + typeName);
+            }
+            return (long) d;
+        }
+        long v = val.isString() ? val.toLong() : toLongChecked(val);
+        if (v < min || v > max) {
+            throw new LuaException("number " + val.toLuaString()
+                    + " is out of range for " + typeName);
+        }
+        return v;
     }
 
     /**
@@ -530,6 +655,14 @@ public final class LuaDataConverter {
         try {
             method.setAccessible(true);
             MethodHandle mh = MethodHandles.lookup().unreflect(method);
+            // Callers already pack varargs into the trailing array via
+            // convertArgs, so the handle must be fixed-arity. A varargs
+            // collector would re-spread that array as extra arguments and
+            // mis-unbox it (e.g. int[] into Number), which is exactly the bug
+            // that made Java varargs methods uncallable from Lua.
+            if (mh.isVarargsCollector()) {
+                mh = mh.asFixedArity();
+            }
             MethodHandle prev = SAM_HANDLE_CACHE.putIfAbsent(method, mh);
             return prev != null ? prev : mh;
         } catch (IllegalAccessException e) {

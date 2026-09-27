@@ -349,7 +349,26 @@ public final class JitRuntime {
         LuaValue obj = o[objIdx];
         if (obj instanceof org.luava.runtime.LuaTable tbl) {
             LuaValue m = tbl.rawget(key);
-            return m.isNil() ? null : m;
+            if (!m.isNil()) {
+                return m;
+            }
+            // `obj:method` where the method lives in a table `__index` (the
+            // canonical OOP shape: instances carry data, the class table
+            // carries methods). Without this the compiled loop deopts on every
+            // method call and runs interpreted. Mirror the interpreter's
+            // fast path: one raw level into a table `__index`; a function
+            // `__index` or a deeper chain returns null so the interpreter
+            // runs it with full semantics.
+            org.luava.runtime.LuaTable mt = tbl.getMetatable();
+            if (mt == null) {
+                return null;
+            }
+            LuaValue handler = mt.rawget(org.luava.runtime.LuaValue.Meta.INDEX);
+            if (handler instanceof org.luava.runtime.LuaTable idx) {
+                LuaValue viaIdx = idx.rawget(key);
+                return viaIdx.isNil() ? null : viaIdx;
+            }
+            return null;
         }
         // `str:method()` resolves through the string type metatable (PUC's
         // luaT_gettmbyobj), which is shared and read-only in Lua. Mirroring

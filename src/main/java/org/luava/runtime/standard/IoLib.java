@@ -514,7 +514,12 @@ public final class IoLib {
         public void write(String data) throws IOException {
             checkOpen();
             if (out == null) throw new IOException("Bad file descriptor");
-            out.print(data);
+            // Byte fidelity: a Lua string is a byte container, so write the
+            // raw Latin-1 bytes. `PrintStream.print(String)` re-encodes with
+            // the platform charset, which double-encodes any byte >= 0x80
+            // (utf8.char(233) came out as C3 83 C2 A9 instead of C3 A9).
+            // Every other handle and `print` already do this.
+            out.write(data.getBytes(StandardCharsets.ISO_8859_1));
             out.flush();
         }
     }

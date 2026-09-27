@@ -148,7 +148,7 @@ public final class LuaUserdata extends LuaValue {
             int idx = (int) key.toLong() - 1; // 1-based
             int len = Array.getLength(instance);
             if (idx >= 0 && idx < len) {
-                return LuaDataConverter.toLua(Array.get(instance, idx));
+                return LuaDataConverter.toLuaLive(Array.get(instance, idx));
             }
             return LuaNil.NIL;
         }
@@ -157,7 +157,7 @@ public final class LuaUserdata extends LuaValue {
         if (instance instanceof List<?> list && key.isInteger()) {
             int idx = (int) key.toLong() - 1;
             if (idx >= 0 && idx < list.size()) {
-                return LuaDataConverter.toLua(list.get(idx));
+                return LuaDataConverter.toLuaLive(list.get(idx));
             }
             return LuaNil.NIL;
         }
@@ -166,7 +166,7 @@ public final class LuaUserdata extends LuaValue {
         if (instance instanceof Map<?, ?> map && !key.isNil()) {
             Object javaKey = LuaDataConverter.toJava(key, Object.class);
             if (map.containsKey(javaKey)) {
-                return LuaDataConverter.toLua(map.get(javaKey));
+                return LuaDataConverter.toLuaLive(map.get(javaKey));
             }
         }
 
@@ -185,7 +185,7 @@ public final class LuaUserdata extends LuaValue {
                 Field f = findField(clazz, name, true);
                 if (f != null) {
                     try {
-                        return LuaDataConverter.toLua(f.get(null));
+                        return LuaDataConverter.toLuaLive(f.get(null));
                     } catch (IllegalAccessException e) {
                         throw new LuaException("Access error for static field " + name + ": " + e.getMessage());
                     }
@@ -205,7 +205,7 @@ public final class LuaUserdata extends LuaValue {
                 Field f = findField(clazz, name, false);
                 if (f != null) {
                     try {
-                        return LuaDataConverter.toLua(f.get(instance));
+                        return LuaDataConverter.toLuaLive(f.get(instance));
                     } catch (IllegalAccessException e) {
                         throw new LuaException("Access error for field " + name + ": " + e.getMessage());
                     }
@@ -391,16 +391,7 @@ public final class LuaUserdata extends LuaValue {
     private static LuaFunction createConstructorFunction(Class<?> clazz) {
         return LuaFunction.of(args -> {
             List<Constructor<?>> ctors = CTOR_CACHE.computeIfAbsent(clazz, c -> Arrays.asList(c.getConstructors()));
-            Constructor<?> bestMatch = null;
-            int bestScore = -1;
-
-            for (Constructor<?> ctor : ctors) {
-                int score = scoreParameters(ctor.getParameterTypes(), ctor.isVarArgs(), args);
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestMatch = ctor;
-                }
-            }
+            Constructor<?> bestMatch = (Constructor<?>) org.luava.binding.OverloadResolver.resolve(ctors, args);
 
             if (bestMatch == null) {
                 throw new LuaException("No matching constructor found for class " + clazz.getName() + " with " + args.length + " arguments");
@@ -446,16 +437,7 @@ public final class LuaUserdata extends LuaValue {
 
     private static LuaFunction createMethodInvoker(Object target, String methodName, List<Method> candidates) {
         return LuaFunction.of(args -> {
-            Method bestMatch = null;
-            int bestScore = -1;
-
-            for (Method m : candidates) {
-                int score = scoreParameters(m.getParameterTypes(), m.isVarArgs(), args);
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestMatch = m;
-                }
-            }
+            Method bestMatch = (Method) org.luava.binding.OverloadResolver.resolve(candidates, args);
 
             if (bestMatch == null) {
                 throw new LuaException("No matching method for '" + methodName + "' with " + args.length + " arguments on " +
@@ -543,85 +525,6 @@ public final class LuaUserdata extends LuaValue {
         effective[0] = target;
         System.arraycopy(javaArgs, 0, effective, 1, javaArgs.length);
         return effective;
-    }
-
-    private static int scoreParameters(Class<?>[] paramTypes, boolean isVarArgs, LuaValue[] args) {
-        if (!isVarArgs) {
-            if (paramTypes.length != args.length) return -1;
-            int total = 0;
-            for (int i = 0; i < paramTypes.length; i++) {
-                int s = scoreArg(paramTypes[i], args[i]);
-                if (s < 0) return -1;
-                total += s;
-            }
-            return total;
-        } else {
-            int fixedCount = paramTypes.length - 1;
-            if (args.length < fixedCount) return -1;
-            int total = 0;
-            for (int i = 0; i < fixedCount; i++) {
-                int s = scoreArg(paramTypes[i], args[i]);
-                if (s < 0) return -1;
-                total += s;
-            }
-            Class<?> varArgComponent = paramTypes[fixedCount].getComponentType();
-            for (int i = fixedCount; i < args.length; i++) {
-                int s = scoreArg(varArgComponent, args[i]);
-                if (s < 0) return -1;
-                total += s;
-            }
-            return total;
-        }
-    }
-
-    private static int scoreArg(Class<?> target, LuaValue val) {
-        if (val == null || val.isNil()) {
-            return target.isPrimitive() ? 1 : 5;
-        }
-
-        // Exact class matches
-        if (target == Object.class) return 2;
-        if (target.isInstance(val)) return 10;
-
-        // Numbers
-        if (val.isInteger()) {
-            if (target == long.class || target == Long.class) return 10;
-            if (target == int.class || target == Integer.class) return 9;
-            if (target == short.class || target == Short.class || target == byte.class || target == Byte.class) return 8;
-            if (target == double.class || target == Double.class || target == float.class || target == Float.class) return 7;
-        }
-        if (val.isFloat()) {
-            if (target == double.class || target == Double.class) return 10;
-            if (target == float.class || target == Float.class) return 9;
-            if (target == long.class || target == int.class) return 5;
-        }
-
-        // Booleans
-        if (val.isBoolean() && (target == boolean.class || target == Boolean.class)) return 10;
-
-        // Strings
-        if (val.isString() && (target == String.class || target == CharSequence.class)) return 10;
-        if (val.isString() && target.isEnum()) return 8;
-
-        // SAM Interfaces
-        if (val.isFunction() && target.isInterface()) {
-            if (LuaDataConverter.findSingleAbstractMethod(target) != null) return 9;
-        }
-
-        // Tables to Collections / Arrays
-        if (val.isTable()) {
-            if (target.isArray()) return 8;
-            if (target == List.class || target == Collection.class) return 8;
-            if (target == Map.class) return 8;
-        }
-
-        // Userdata unwrap
-        if (val.isUserdata()) {
-            Object inst = ((LuaUserdata) val).getJavaInstance();
-            if (inst != null && target.isInstance(inst)) return 10;
-        }
-
-        return -1; // Incompatible
     }
 
     private static Object[] convertArgs(Class<?>[] paramTypes, boolean isVarArgs, LuaValue[] args) {

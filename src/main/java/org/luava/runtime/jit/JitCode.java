@@ -23,6 +23,20 @@ public final class JitCode {
     public final MethodHandle handle;
     /** Object-returning variant (null when the proto returns an integer). */
     public final MethodHandle objHandle;
+    /**
+     * On-stack replacement entry
+     * {@code (LuaClosure, Object[], long[], byte[], LuaValue[], int base, int pc)long}
+     * that branches into the kernel body at a loop-back-edge label. Null when
+     * the proto has no in-subset loop header, or when OSR is disabled.
+     */
+    public final MethodHandle osrHandle;
+    /**
+     * Per-pc flags of the loop headers at which {@link #osrHandle} may be
+     * entered; null when there is no OSR entry. The interpreter must check
+     * this before calling, because {@code execOsr} treats an unflagged pc as
+     * the ordinary pc-0 entry.
+     */
+    public final boolean[] osrTargets;
     public final int maxStack;
     public final int numParams;
     /** True when the proto has no observable side effects (pure integer
@@ -47,19 +61,21 @@ public final class JitCode {
     public int structuralDeopts;
 
     public JitCode(LuaProto proto, MethodHandle handle, boolean pure) {
-        this(proto, handle, null, pure, true, false);
+        this(proto, handle, null, null, null, pure, true, false);
     }
 
     public JitCode(LuaProto proto, MethodHandle handle, MethodHandle objHandle, boolean pure,
             boolean returnsInt) {
-        this(proto, handle, objHandle, pure, returnsInt, false);
+        this(proto, handle, objHandle, null, null, pure, returnsInt, false);
     }
 
-    public JitCode(LuaProto proto, MethodHandle handle, MethodHandle objHandle, boolean pure,
-            boolean returnsInt, boolean returnsVoid) {
+    public JitCode(LuaProto proto, MethodHandle handle, MethodHandle objHandle, MethodHandle osrHandle,
+            boolean[] osrTargets, boolean pure, boolean returnsInt, boolean returnsVoid) {
         this.proto = proto;
         this.handle = handle;
         this.objHandle = objHandle;
+        this.osrHandle = osrHandle;
+        this.osrTargets = osrTargets;
         this.maxStack = proto.maxStackSize;
         this.numParams = proto.numParams;
         this.pure = pure;

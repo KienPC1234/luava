@@ -135,8 +135,18 @@ trusted scripts.
   `@LuaReturn`.
 - Live collections and proxies: `List`, `Map`, `Set` and arrays passed with
   `setLive` are exposed as live userdata the script can mutate.
-- Overload resolution uses a precise type distance: exact match, then widening
-  primitive, then SAM lambda, then subtype, then varargs.
+- Overload resolution scores every argument (exact match, numeric range,
+  inheritance/interface distance, boxing, SAM adaptation, null specificity,
+  varargs penalty) and then applies Java specificity rules; a genuinely
+  incomparable tie raises an ambiguity error instead of silently picking the
+  first-declared method. Numeric arguments must fit the target (`2^31` into an
+  `int` raises, instead of wrapping to a negative value).
+- Lua tables convert to a Java sequence (`List`, `Set`, array) only when their
+  non-nil keys are exactly `1..n`; a sparse or mixed-key table raises instead
+  of silently dropping elements.
+- Multi-interface proxies: `java.proxy("Iface1", "Iface2", ..., handler)`
+  (also `luajava.createProxy`) mirrors LuaJ, as does the single-interface
+  `java.proxy(iface, tableOrFunction)`.
 - SAM conversion: a Lua function passed to a Java method expecting a
   single-method interface (`Runnable`, `Consumer<T>`, `Function<T,R>`,
   `Predicate<T>`, `Comparator<T>`, ...) becomes a dynamic proxy, and a Java SAM
