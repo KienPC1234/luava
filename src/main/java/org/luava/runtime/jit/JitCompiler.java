@@ -29,6 +29,8 @@ public final class JitCompiler {
     private static final JitCodeCache CACHE = new JitCodeCache();
     private static final LinkedBlockingQueue<LuaProto> QUEUE = new LinkedBlockingQueue<>();
     private static volatile boolean workerStarted;
+    /** One-shot "ASM is missing, you are running interpreted" notice. */
+    private static volatile boolean asmMissingReported;
 
     private JitCompiler() {}
 
@@ -201,10 +203,37 @@ public final class JitCompiler {
             return code;
         } catch (Throwable t) {
             proto.jitDisabled = true;
+            reportMissingAsm(t);
             if (debug) {
                 System.err.println("[jit] compile failed for " + proto.name + ": " + t);
             }
             return null;
+        }
+    }
+
+    /**
+     * The released jar shades ASM, so a normal consumer never sees this. It
+     * does happen when the engine is run from exploded classes (an IDE,
+     * {@code mvn exec}, a shaded-away build): {@code asm} is an optional
+     * dependency, so {@code org.luava.shaded.asm.Opcodes} is absent and every
+     * compile fails with a {@link NoClassDefFoundError}. That used to be
+     * completely silent - the proto is simply marked uncompilable and the
+     * engine runs interpreted, so a benchmark of the exploded classes
+     * measures the interpreter while reporting it as the JIT. Say so once.
+     */
+    private static void reportMissingAsm(Throwable t) {
+        if (asmMissingReported) {
+            return;
+        }
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof NoClassDefFoundError || c instanceof ClassNotFoundException) {
+                asmMissingReported = true;
+                System.err.println("[jit] disabled: the bytecode translator needs the shaded ASM "
+                        + "classes, which are absent on this classpath. Falling back to the "
+                        + "interpreter. Run against the packaged jar (target/luava-*.jar), which "
+                        + "includes them, or put asm on the classpath.");
+                return;
+            }
         }
     }
 

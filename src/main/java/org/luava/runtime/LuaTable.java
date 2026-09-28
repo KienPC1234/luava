@@ -10,12 +10,11 @@ package org.luava.runtime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 public final class LuaTable extends LuaValue {
-    private final Map<LuaValue, LuaValue> hashPart = new LinkedHashMap<>();
+    private final Map<LuaValue, LuaValue> hashPart = new HashMap<>();
     private final ArrayList<LuaValue> arrayPart = new ArrayList<>();
     private LuaTable metatable;
     // Cold-start hook: installed only on standard-library placeholder tables
@@ -101,9 +100,47 @@ public final class LuaTable extends LuaValue {
      */
     private long modCount = 0;
 
+    /**
+     * Cached first {@code __index} hop for metatable-backed reads, so a
+     * {@code self.x} / {@code obj:m()} miss costs one hash probe instead of
+     * two (the field, then the metatable's {@code __index} slot).
+     *
+     * <p>Guarded by the metatable's identity and {@link #readVersion()}, so
+     * {@code Mt.__index = other} or any string-keyed write to {@code Mt}
+     * misses. Integer-keyed writes do not bump {@code modCount}, which is
+     * sound here because {@code __index} is always a string key. A metatable
+     * that itself has a metatable reports -1 and is never cached.
+     *
+     * <p>Invalidated on this table's own {@code modCount++}, so
+     * {@code setmetatable} cannot leave a stale hop behind. The interpreter,
+     * the JIT and every library read go through {@link #get}, so one cache
+     * covers all three.
+     */
+    private transient LuaTable indexMt;
+    private transient LuaValue indexHandler;
+    private transient long indexMtVersion = -1L;
+
     /** VM site-cache guard; public for the bytecode package. */
     public long readVersion() {
         return metatable == null ? modCount : -1L;
+    }
+
+    /**
+     * The metatable's {@code __index}, memoized per (metatable, its version).
+     * Semantically identical to {@code mt.rawget(Meta.INDEX)} on a miss.
+     */
+    private LuaValue cachedIndexHandler(LuaTable mt) {
+        long mtVersion = mt.readVersion();
+        if (indexMt == mt && indexMtVersion == mtVersion) {
+            return indexHandler;
+        }
+        LuaValue handler = mt.rawget(LuaValue.Meta.INDEX);
+        if (mtVersion != -1L) {
+            indexMt = mt;
+            indexMtVersion = mtVersion;
+            indexHandler = handler;
+        }
+        return handler;
     }
     private transient Iterator<Map.Entry<LuaValue, LuaValue>> nextIterator = null;
     private transient LuaValue lastReturnedKey = null;
@@ -229,7 +266,7 @@ public final class LuaTable extends LuaValue {
             }
         }
         if (weakKeys) {
-            Map<LuaValue, LuaValue> newHash = new LinkedHashMap<>();
+            Map<LuaValue, LuaValue> newHash = new HashMap<>();
             for (Map.Entry<LuaValue, LuaValue> entry : hashPart.entrySet()) {
                 LuaValue k = entry.getKey();
                 if (k != null && isCollectable(k) && !(k instanceof WeakKey)) {
@@ -309,6 +346,10 @@ public final class LuaTable extends LuaValue {
     public void setMetatable(LuaTable mt) {
         this.metatable = mt;
         modCount++;
+        // The cached __index hop belonged to the previous metatable.
+        indexMt = null;
+        indexHandler = null;
+        indexMtVersion = -1L;
         updateWeakMode();
     }
 
@@ -615,7 +656,7 @@ public final class LuaTable extends LuaValue {
                 }
                 LuaTable mt = tbl.getMetatable();
                 if (mt == null) return LuaNil.NIL;
-                LuaValue handler = mt.rawget(LuaValue.Meta.INDEX);
+                LuaValue handler = tbl.cachedIndexHandler(mt);
                 if (handler.isNil()) return LuaNil.NIL;
                 if (handler.isFunction()) {
                     org.luava.runtime.eval.CallStack.setNextCall("index", true);

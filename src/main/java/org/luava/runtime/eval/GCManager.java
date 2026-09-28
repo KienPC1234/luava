@@ -15,7 +15,6 @@ import org.luava.runtime.LuaValue;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
@@ -53,6 +52,18 @@ public final class GCManager {
     private static final List<WeakTableEntry> WEAK_TABLES = new ArrayList<>();
     private static final List<StringRef> LARGE_STRINGS = new ArrayList<>();
     private static final AtomicLong uncollectedBytes = new AtomicLong();
+    /**
+     * Mark scratch, retained between collections. The live set of a state is
+     * roughly stable from one cycle to the next, so after the first cycle the
+     * mark phase reuses these buffers and allocates nothing. Only the
+     * collector thread touches them ({@code collectInternal} is called under
+     * this class's monitor), so no synchronisation is needed.
+     */
+    private static final IdentitySet<LuaValue> markLive = new IdentitySet<>();
+    private static final IdentitySet<Object> markVisited = new IdentitySet<>();
+    private static final IdentitySet<LuaValue> markLiveAll = new IdentitySet<>();
+    private static final IdentitySet<Object> markVisitedAll = new IdentitySet<>();
+    private static final ArrayDeque<LuaValue> worklistScratch = new ArrayDeque<>();
     private static volatile boolean runningFinalizer = false;
     private static volatile boolean gcRunning = true;
     private static boolean collecting = false;
@@ -212,10 +223,16 @@ public final class GCManager {
             uncollectedBytes.set(0);
 
         // 1. Mark phase from normal roots (excluding dead objects with finalizers)
-        Set<LuaValue> liveNormal = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
-        Set<Object> visitedNormal = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        // IdentitySet, not IdentityHashMap: open addressed with the identity
+        // hash cached per entry, so a large live set is re-marked without
+        // re-hashing on grow and without IdentityHashMap's resize cost.
+        IdentitySet<LuaValue> liveNormal = markLive;
+        IdentitySet<Object> visitedNormal = markVisited;
+        liveNormal.reset();
+        visitedNormal.reset();
         List<LuaTable> ephemeronsNormal = new ArrayList<>();
-        ArrayDeque<LuaValue> worklist = new ArrayDeque<>();
+        ArrayDeque<LuaValue> worklist = worklistScratch;
+        worklist.clear();
 
         markFromRoots(worklist, liveNormal, visitedNormal, ephemeronsNormal);
         drainWorklist(worklist, liveNormal, visitedNormal, ephemeronsNormal);
@@ -256,11 +273,16 @@ public final class GCManager {
             toRun.add(entry);
         }
 
-        // 4. Resurrect objects in toRun and mark all reachable from them
-        Set<LuaValue> liveAll = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
-        liveAll.addAll(liveNormal);
-        Set<Object> visitedAll = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
-        visitedAll.addAll(visitedNormal);
+        // 4. Resurrect objects in toRun and mark all reachable from them.
+        // The "all" sets start as copies of the normal ones: an object already
+        // proved live stays live. copyInto reuses the normal sets' storage, so
+        // this is the old addAll but without re-hashing every element.
+        IdentitySet<LuaValue> liveAll = markLiveAll;
+        IdentitySet<Object> visitedAll = markVisitedAll;
+        liveAll.reset();
+        visitedAll.reset();
+        liveNormal.copyInto(liveAll);
+        visitedNormal.copyInto(visitedAll);
         List<LuaTable> ephemeronsAll = new ArrayList<>(ephemeronsNormal);
 
         for (FinalizerEntry entry : toRun) {
@@ -330,6 +352,16 @@ public final class GCManager {
 
         return true;
         } finally {
+            // Drop the retained references. The scratch keeps its capacity
+            // (so the next cycle allocates nothing) but must not pin the
+            // objects it marked: a long string held in markLiveAll would keep
+            // its LARGE_STRINGS entry alive and inflate
+            // collectgarbage("count"), which gc.lua asserts on.
+            markLive.reset();
+            markVisited.reset();
+            markLiveAll.reset();
+            markVisitedAll.reset();
+            worklistScratch.clear();
             collecting = false;
         }
     }
@@ -398,8 +430,10 @@ public final class GCManager {
 
     public static synchronized boolean isReachable(LuaValue target) {
         if (target == null) return false;
-        Set<LuaValue> liveNormal = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
-        Set<Object> visitedNormal = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        // Local sets: isReachable is a query, not a collection, so it must not
+        // share (and reset) the mark scratch used by collectInternal.
+        IdentitySet<LuaValue> liveNormal = new IdentitySet<>();
+        IdentitySet<Object> visitedNormal = new IdentitySet<>();
         List<LuaTable> ephemeronsNormal = new ArrayList<>();
         ArrayDeque<LuaValue> worklist = new ArrayDeque<>();
         markFromRoots(worklist, liveNormal, visitedNormal, ephemeronsNormal);
