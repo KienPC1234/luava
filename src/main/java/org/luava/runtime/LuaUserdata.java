@@ -438,6 +438,22 @@ public final class LuaUserdata extends LuaValue {
     private static LuaFunction createMethodInvoker(Object target, String methodName, List<Method> candidates) {
         return LuaFunction.of(args -> {
             Method bestMatch = (Method) org.luava.binding.OverloadResolver.resolve(candidates, args);
+            LuaValue[] callArgs = args;
+
+            if (bestMatch == null) {
+                // Lua's `obj:m(...)` is defined as `obj.m(obj, ...)`: OP_SELF
+                // pushes the receiver as the first argument, and the function
+                // value it fetched is the same bound invoker `obj.m` returns.
+                // Retry with that leading self dropped, so the colon form
+                // reaches the method exactly like the dot form. Resolving the
+                // full argument list first keeps a genuine `obj.m(obj, ...)`
+                // overload (a self-taking method) working.
+                LuaValue[] withoutSelf = dropLeadingSelf(args, target);
+                if (withoutSelf != null) {
+                    bestMatch = (Method) org.luava.binding.OverloadResolver.resolve(candidates, withoutSelf);
+                    callArgs = withoutSelf;
+                }
+            }
 
             if (bestMatch == null) {
                 throw new LuaException("No matching method for '" + methodName + "' with " + args.length + " arguments on " +
@@ -445,7 +461,7 @@ public final class LuaUserdata extends LuaValue {
             }
 
             try {
-                Object[] javaArgs = convertArgs(bestMatch.getParameterTypes(), bestMatch.isVarArgs(), args);
+                Object[] javaArgs = convertArgs(bestMatch.getParameterTypes(), bestMatch.isVarArgs(), callArgs);
                 Object result = invokeResolved(bestMatch, target, javaArgs);
                 if (bestMatch.getReturnType() == void.class || bestMatch.getReturnType() == Void.class) {
                     return LuaNil.NIL;
@@ -455,6 +471,22 @@ public final class LuaUserdata extends LuaValue {
                 throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }
         });
+    }
+
+    /**
+     * Returns {@code args} without its first element when that element is the
+     * receiver this invoker is bound to, or null when it is not. Identity of
+     * the wrapped Java object is the test, not the userdata wrapper, so
+     * re-wrapping the same object still matches.
+     */
+    private static LuaValue[] dropLeadingSelf(LuaValue[] args, Object target) {
+        if (target == null || args.length == 0) {
+            return null;
+        }
+        if (!(args[0] instanceof LuaUserdata self) || self.instance != target) {
+            return null;
+        }
+        return Arrays.copyOfRange(args, 1, args.length);
     }
 
     /**

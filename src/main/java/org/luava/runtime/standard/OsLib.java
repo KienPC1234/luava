@@ -98,7 +98,7 @@ public final class OsLib {
                 return LuaInteger.valueOf(System.currentTimeMillis() / 1000L);
             }
             if (!(args[0] instanceof LuaTable t)) {
-                throw new LuaException("bad argument #1 to 'os.time' (table expected, got " + args[0].typeName() + ")");
+                throw LuaValue.argError(1, "os.time", "table expected, got " + args[0].typeName());
             }
 
             int year = getField(t, "year", -1, 1900);
@@ -125,16 +125,24 @@ public final class OsLib {
         }));
 
         os.rawset(LuaString.interned("difftime"), LuaFunction.of(args -> {
-            if (args.length < 2) throw new LuaException("bad argument to 'os.difftime'");
+            // l_checktime -> luaL_checkinteger on both operands, so a missing
+            // argument reports "number expected, got no value" at its own
+            // index rather than a message with no index at all.
+            if (args.length < 1) {
+                throw LuaValue.argError(1, "os.difftime", "number expected, got no value");
+            }
             // l_checktime -> luaL_checkinteger: both operands coerce numeric
             // strings and blame their argument index on failure.
             LuaInteger i1 = args[0].toLuaIntegerCoercingStrings();
             if (i1 == null) {
-                throw new LuaException("bad argument #1 to 'difftime' (" + args[0].integerConversionError() + ")");
+                throw LuaValue.argError(1, "os.difftime", args[0].integerConversionError());
+            }
+            if (args.length < 2) {
+                throw LuaValue.argError(2, "os.difftime", "number expected, got no value");
             }
             LuaInteger i2 = args[1].toLuaIntegerCoercingStrings();
             if (i2 == null) {
-                throw new LuaException("bad argument #2 to 'difftime' (" + args[1].integerConversionError() + ")");
+                throw LuaValue.argError(2, "os.difftime", args[1].integerConversionError());
             }
             return LuaFloat.valueOf((double) (i1.toLong() - i2.toLong()));
         }));
@@ -145,7 +153,7 @@ public final class OsLib {
                 // luaL_optlstring: a number is coerced to its Lua string form,
                 // so os.date(123) formats the string "123".
                 if (!args[0].isString() && !args[0].isNumber()) {
-                    throw new LuaException("bad argument #1 to 'os.date' (string expected, got " + args[0].typeName() + ")");
+                    throw LuaValue.argError(1, "os.date", "string expected, got " + args[0].typeName());
                 }
                 fmt = args[0].toLuaString();
             }
@@ -156,7 +164,7 @@ public final class OsLib {
                 // and blames argument #2 with the integer-representation text.
                 org.luava.runtime.LuaInteger i = args[1].toLuaIntegerCoercingStrings();
                 if (i == null) {
-                    throw new LuaException("bad argument #2 to 'date' (" + args[1].integerConversionError() + ")");
+                    throw LuaValue.argError(2, "os.date", args[1].integerConversionError());
                 }
                 epochSec = i.toLong();
             } else {
@@ -225,7 +233,7 @@ public final class OsLib {
                         }
                     }
                     if (spec == null) {
-                        throw new LuaException("bad argument #1 to 'os.date' (invalid conversion specifier '%" + fmt.substring(convStart) + "')");
+                        throw LuaValue.argError(1, "os.date", "invalid conversion specifier '%" + fmt.substring(convStart) + "'");
                     }
                     sIdx += opLen;
                     b.append(OsTime.formatSpec(spec, f, tmYear, dispYear, offSecs, zone, isUtc, dst));
@@ -286,7 +294,7 @@ public final class OsLib {
 
         os.rawset(LuaString.interned("remove"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isString()) {
-                throw new LuaException("bad argument #1 to 'os.remove' (string expected)");
+                throw LuaValue.argError(1, "os.remove", "string expected");
             }
             String filename = args[0].toLuaString();
             try {
@@ -332,13 +340,63 @@ public final class OsLib {
                 }
             }
             if (!knownCat) {
-                throw new LuaException("bad argument #2 to 'os.setlocale' (invalid option '" + catStr + "')");
+                throw LuaValue.argError(2, "os.setlocale", "invalid option '" + catStr + "'");
             }
-            if (loc == null || "C".equals(loc) || "".equals(loc) || "POSIX".equalsIgnoreCase(loc)) {
-                return LuaString.interned("C");
+            if ("".equals(loc)) {
+                // The query form: report the locale in effect. The JVM owns the
+                // process locale (file.encoding plus the default Locale), which
+                // is the closest honest answer to setlocale(LC_ALL, "") here.
+                return LuaString.valueOf(currentLocaleName());
             }
+            if (loc == null || isCLocale(loc)) {
+                // The C/POSIX family is what the JVM process actually runs in,
+                // so naming it back is accurate.
+                return LuaString.valueOf(normalizeCLocale(loc));
+            }
+            // Any other locale needs setlocale(LC_ALL, ...) to take effect for
+            // the process, which the JVM does not expose. PUC's contract for an
+            // unavailable locale is a nil return, so report that rather than
+            // claiming a switch that did not happen.
             return LuaNil.NIL;
         }));
+    }
+
+    /** True for the {@code C} / {@code POSIX} locale family, with any codeset. */
+    private static boolean isCLocale(String loc) {
+        String name = loc;
+        int dot = name.indexOf('.');
+        if (dot >= 0) {
+            name = name.substring(0, dot);
+        }
+        return "C".equalsIgnoreCase(name) || "POSIX".equalsIgnoreCase(name);
+    }
+
+    /** {@code C} / {@code POSIX} with no codeset, which is how PUC reports them. */
+    private static String normalizeCLocale(String loc) {
+        return (loc != null && isCLocale(loc) && loc.indexOf('.') < 0 && "POSIX".equalsIgnoreCase(loc))
+                ? "C"
+                : (loc == null ? "C" : loc);
+    }
+
+    /**
+     * The locale name in PUC's {@code language_COUNTRY.ENCODING} shape, or
+     * {@code "C"} when the JVM reports a neutral/default locale.
+     */
+    private static String currentLocaleName() {
+        java.util.Locale def = java.util.Locale.getDefault();
+        String lang = def.getLanguage();
+        if (lang == null || lang.isEmpty()) {
+            return "C";
+        }
+        StringBuilder sb = new StringBuilder(lang);
+        if (!def.getCountry().isEmpty()) {
+            sb.append('_').append(def.getCountry());
+        }
+        String enc = System.getProperty("file.encoding", "");
+        if (enc != null && !enc.isEmpty() && !enc.equalsIgnoreCase("ANSI_X3.4-1968")) {
+            sb.append('.').append(enc);
+        }
+        return sb.toString();
     }
 
     /**

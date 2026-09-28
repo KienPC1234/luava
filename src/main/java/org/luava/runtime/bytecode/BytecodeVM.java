@@ -487,7 +487,7 @@ public final class BytecodeVM {
                 case OpCode.OP_SETTABLE -> executeSetTable(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
                 case OpCode.OP_SETI -> executeSetI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
                 case OpCode.OP_SETFIELD -> executeSetField(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_NEWTABLE -> ctx.pc = executeNewTable(ctx.code, ctx.pc, ctx.tStack, ctx.oStack, ctx.base, a);
+                case OpCode.OP_NEWTABLE -> ctx.pc = executeNewTable(ctx.code, ctx.pc, ctx.tStack, ctx.oStack, ctx.base, a, inst);
                 case OpCode.OP_SELF -> executeSelfCached(ctx, state, ctx.pc, a, inst);
                 case OpCode.OP_ADD -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
@@ -2236,13 +2236,17 @@ public final class BytecodeVM {
         return newStack;
     }
 
-    private static int executeNewTable(int[] code, int pc, byte[] tStack, LuaValue[] oStack, int base, int a) {
+    private static int executeNewTable(int[] code, int pc, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+        // B carries PUC's `prelim`: the list-part length of the constructor.
+        // Honouring it reproduces luaH_resize's array pre-size, observable
+        // through rawlen, the # border and table.insert placement.
+        int arrayHint = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_EXTRAARG) {
             pc++;
         }
         int regA = base + a;
         tStack[regA] = TYPE_OBJECT;
-        oStack[regA] = new LuaTable();
+        oStack[regA] = new LuaTable(arrayHint, 0);
         return pc;
     }
 

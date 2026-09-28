@@ -469,10 +469,14 @@ public final class LuaDataConverter {
      *
      * <p>Only tables whose non-nil keys are exactly {@code 1..n} convert. A
      * sparse or mixed-key table ({@code {[1]='a',[3]='c'}}, {@code {1,2,x=5}},
-     * {@code {1,nil,3}}) has no faithful Java sequence form, and {@code
-     * #rawlen} would silently emit a shorter collection with elements dropped:
-     * the host would receive a plausible but wrong value. Asking for a
+     * {@code {1,nil,3}}) has no faithful Java sequence form, and
+     * {@code #rawlen} would silently emit a shorter collection with elements
+     * dropped: the host would receive a plausible but wrong value. Asking for a
      * {@code Map} instead preserves every entry.
+     *
+     * <p>Both directions of a hole are checked: a key past {@code #rawlen}
+     * (a sparse tail) and a nil slot inside {@code 1..#rawlen} (a hole in the
+     * middle, which would become a Java {@code null} element).
      */
     private static int requireSequence(LuaTable table, Class<?> targetType) {
         int len = table.rawlen();
@@ -486,6 +490,13 @@ public final class LuaDataConverter {
             throw new LuaException("cannot convert a Lua table with non-sequence key "
                     + key.toLuaString() + " to " + targetType.getSimpleName()
                     + " (it would drop elements; use Map to keep every entry)");
+        }
+        for (int i = 1; i <= len; i++) {
+            if (table.rawget(LuaInteger.valueOf(i)).isNil()) {
+                throw new LuaException("cannot convert a Lua table with a nil element at index "
+                        + i + " to " + targetType.getSimpleName()
+                        + " (it would become a null entry; use Map to keep every entry)");
+            }
         }
         return len;
     }

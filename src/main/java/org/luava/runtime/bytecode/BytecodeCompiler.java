@@ -1691,7 +1691,7 @@ public final class BytecodeCompiler {
 
         void compileTableConstructor(Expressions.TableConstructorExpr tce, int targetReg) {
             int nFields = tce.fields().size();
-            emit(Instruction.encodeABC(OpCode.OP_NEWTABLE, targetReg, 0, 0, 0), tce.line());
+            emit(Instruction.encodeABC(OpCode.OP_NEWTABLE, targetReg, constructorArrayHint(tce), 0, 0), tce.line());
             emit(Instruction.encodeAx(OpCode.OP_EXTRAARG, nFields), tce.line());
 
             int arrayIdx = 0;
@@ -1759,6 +1759,39 @@ public final class BytecodeCompiler {
                 pendingList.clear();
             }
             freeRegs(saveFreereg);
+        }
+
+        /**
+         * PUC's constructor pre-size hint ({@code prelim} in lparser.c, kept in
+         * {@code OP_NEWTABLE}'s B field): the number of positional entries in
+         * the list part, capped at 255 (the field is 8 bits).
+         *
+         * <p>Keyed entries are excluded, matching PUC: a record key never
+         * extends the array part ({@code rawlen({[1] = 1, [5] = 5})} is 1). A
+         * trailing multi-value expression (a call or {@code ...}) is excluded
+         * too, because its result count is only known at run time — the SETLIST
+         * that stores it grows the array part naturally.
+         */
+        int constructorArrayHint(Expressions.TableConstructorExpr tce) {
+            List<Expressions.TableField> fields = tce.fields();
+            int n = fields.size();
+            if (n == 0) {
+                return 0;
+            }
+            Expressions.TableField last = fields.get(n - 1);
+            boolean trailingMulti = last.key() == null
+                    && (last.value() instanceof Expressions.FunctionCallExpr
+                        || last.value() instanceof Expressions.VarargLiteral);
+            if (trailingMulti) {
+                n--;
+            }
+            int listItems = 0;
+            for (int i = 0; i < n; i++) {
+                if (fields.get(i).key() == null) {
+                    listItems++;
+                }
+            }
+            return Math.min(listItems, Instruction.MASK_B);
         }
 
         void flushListFields(int targetReg, List<Expressions.TableField> list, int arrayIdx, int line) {

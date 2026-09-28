@@ -18,8 +18,12 @@ public class LuaException extends RuntimeException {
      * {@code luaG_runerror} from inside a C function (e.g. {@code luaL_len}'s
      * "attempt to get length of a X value"); since the current frame is C,
      * {@code luaG_runerror} adds neither the Lua line nor the operand
-     * description. Library {@code luaL_error}/{@code luaL_argerror} messages
-     * are not marked, so they still get the caller-location prefix.
+     * description. This is an explicit opt-in via {@link #undecorated}: the
+     * alternative, guessing from the message text, silently dropped the
+     * caller location from every {@code luaL_error}-style message that a C
+     * helper rethrew verbatim (e.g. {@code io}'s "attempt to use a closed
+     * file", the string metatable's "attempt to add a 'string' with a
+     * 'number'"), all of which PUC does locate.
      */
     private boolean noDecorate = false;
     private final java.util.List<org.luava.runtime.eval.CallStack.Frame> luaFrames;
@@ -28,30 +32,18 @@ public class LuaException extends RuntimeException {
         super(message);
         this.errorObject = message != null ? LuaString.valueOf(message) : LuaNil.NIL;
         this.luaFrames = captureLuaFrames();
-        this.noDecorate = raisedFromCFunction(message);
     }
 
     /**
-     * PUC's {@code luaG_runerror}/{@code luaG_typeerror} add the
-     * {@code source:line:} prefix and operand descriptor only when the
-     * <em>current</em> frame is a Lua function ({@code isLua(ci)}); from a C
-     * function (e.g. {@code luaL_len} inside {@code table.unpack}) they add
-     * neither. The VM later decorates any undecorated error with the caller's
-     * fault site, so mark the C-origin type errors here to suppress that.
-     * {@code luaL_error}/{@code luaL_argerror} messages ("bad argument ...",
-     * "invalid value ...", "module not found") are built by those helpers with
-     * the caller location and must keep their decoration.
+     * A {@code luaG_runerror}/{@code luaG_typeerror} raised from a C frame:
+     * the message is final and must not gain a {@code source:line:} prefix
+     * from the enclosing Lua frame. Used only where PUC's C code really does
+     * raise from C (currently {@code table}'s {@code luaL_len} call sites).
      */
-    private static boolean raisedFromCFunction(String message) {
-        if (message == null || !message.startsWith("attempt to ")) {
-            return false;
-        }
-        try {
-            org.luava.runtime.eval.CallStack.Frame top = org.luava.runtime.eval.CallStack.topFrame();
-            return top != null && top.function != null && "C".equals(top.function.getWhat());
-        } catch (Throwable ignored) {
-            return false;
-        }
+    public static LuaException undecorated(String message) {
+        LuaException e = new LuaException(message);
+        e.noDecorate = true;
+        return e;
     }
 
     public LuaException(LuaValue errorObject) {

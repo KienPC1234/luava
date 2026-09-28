@@ -825,14 +825,18 @@ public final class BaseLib {
             return res.call();
         }));
 
-        final String[] gcMode = new String[] { "incremental" };
+        // Lua 5.4's default GC mode is generational; collectgarbage reports the
+        // mode in effect *before* the switch, so the initial value matters.
+        final String[] gcMode = new String[] { "generational" };
         final int[] gcParams = new int[] { 200, 100 }; // pause, stepmul
 
         globals.rawset(LuaString.interned("collectgarbage"), LuaFunction.of(args -> {
-            if (args.length > 0 && !args[0].isNil() && !args[0].isString()) {
-                throw new LuaException("bad argument #1 to 'collectgarbage' (string expected, got " + args[0].typeName() + ")");
+            // PUC luaL_optstring: a number is coerced to its Lua string form,
+            // so collectgarbage(5) reports an invalid option named "5".
+            if (args.length > 0 && !args[0].isNil() && !args[0].isString() && !args[0].isNumber()) {
+                throw LuaValue.argError(1, "collectgarbage", "string expected, got " + args[0].typeName());
             }
-            String opt = (args.length > 0 && args[0].isString()) ? args[0].toLuaString() : "collect";
+            String opt = (args.length > 0 && !args[0].isNil()) ? args[0].toLuaString() : "collect";
             // PUC: collectgarbage fails (returns nil) when called re-entrantly
             // from a finalizer; gc.lua asserts this non-reentrancy.
             if (org.luava.runtime.eval.GCManager.inFinalizer()) {
@@ -885,7 +889,7 @@ public final class BaseLib {
                     System.gc();
                     yield LuaInteger.valueOf(0);
                 }
-                default -> throw new LuaException("bad argument #1 to 'collectgarbage' (invalid option '" + opt + "')");
+                default -> throw LuaValue.argError(1, "collectgarbage", "invalid option '" + opt + "'");
             };
         }));
     }

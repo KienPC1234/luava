@@ -23,9 +23,19 @@ public final class TableLib {
     private TableLib() {}
 
     private static long luaLen(LuaValue val) {
-        LuaValue l = val.len();
+        LuaValue l;
+        try {
+            l = val.len();
+        } catch (LuaException e) {
+            // PUC's ltablib.c reaches the length through luaL_len, so a
+            // non-length value raises luaG_typeerror from a C frame: PUC's
+            // luaG_runerror adds neither the Lua line nor the operand
+            // description when the current frame is not a Lua function.
+            e.setNoDecorate(true);
+            throw e;
+        }
         if (!l.isInteger()) {
-            throw new LuaException("object length is not an integer");
+            throw LuaException.undecorated("object length is not an integer");
         }
         return l.toLong();
     }
@@ -259,6 +269,17 @@ public final class TableLib {
                 // Faithful port of C ltablib.c auxsort/partition: one comparator
                 // call per test, same invalid-order detection, same pivot logic.
                 auxsort(items, 1, len, comp, new int[]{0});
+            } catch (LuaException e) {
+                // The comparison that failed ran inside PUC's C sort loop, so
+                // luaG_ordererror raised from a C frame and added no
+                // source:line information. The comparator's own Lua error
+                // (sort.lua's "invalid order function") does carry one, so
+                // only demote a message that still has no location.
+                if (e.getLine() < 0 && !e.isDecorated() && e.getMessage() != null
+                        && e.getMessage().startsWith("attempt to compare")) {
+                    e.setNoDecorate(true);
+                }
+                throw e;
             } finally {
                 if (curCoro != null) curCoro.exitNonYieldable();
             }

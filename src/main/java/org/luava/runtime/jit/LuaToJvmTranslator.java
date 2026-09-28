@@ -561,9 +561,15 @@ public final class LuaToJvmTranslator implements Opcodes {
                     emitStoreValueReg(mv, a);
                 }
                 case OpCode.OP_NEWTABLE -> {
+                    // Same array pre-size the interpreter applies (B = the
+                    // constructor's list-part length); a tier that disagreed
+                    // with the interpreter on rawlen/# would be a real
+                    // interpreter/JIT divergence.
                     mv.visitTypeInsn(NEW, "org/luava/runtime/LuaTable");
                     mv.visitInsn(DUP);
-                    mv.visitMethodInsn(INVOKESPECIAL, "org/luava/runtime/LuaTable", "<init>", "()V", false);
+                    ldcInt(mv, Instruction.getB(inst));
+                    ldcInt(mv, 0);
+                    mv.visitMethodInsn(INVOKESPECIAL, "org/luava/runtime/LuaTable", "<init>", "(II)V", false);
                     mv.visitVarInsn(ASTORE, 8);
                     mv.visitVarInsn(ALOAD, 2);
                     emitIndex(mv, a);

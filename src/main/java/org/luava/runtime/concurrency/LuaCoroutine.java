@@ -595,10 +595,12 @@ public final class LuaCoroutine extends LuaValue {
     public static LuaValue[] yield(LuaValue... args) {
         LuaCoroutine current = CURRENT_COROUTINE.get();
         if (current == null || current.isMainThread) {
-            throw new LuaException("attempt to yield from outside a coroutine");
+            // PUC's lua_yield failure: raised from the C function, so
+            // luaG_runerror adds no source:line information.
+            throw LuaException.undecorated("attempt to yield from outside a coroutine");
         }
         if (current.nonYieldableCount > 0 || current.isClosing) {
-            throw new LuaException("attempt to yield across a C-call boundary");
+            throw LuaException.undecorated("attempt to yield across a C-call boundary");
         }
         current.handoffResult = (args != null && args.length > 0 ? args : EMPTY_VALUES);
         current.status = Status.SUSPENDED;

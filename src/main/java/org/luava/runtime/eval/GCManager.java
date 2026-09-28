@@ -334,20 +334,42 @@ public final class GCManager {
         }
     }
 
+    /**
+     * PUC {@code lua_gc(LUA_GCSTEP, data)}: adds {@code data} kilobytes to the
+     * collector's debt, runs a full cycle once that debt covers the live-heap
+     * estimate, and reports whether the step ended a cycle.
+     *
+     * <p>Two details from {@code lgc.c} matter and are reproduced here. With
+     * {@code data == 0} the step is a "small" one that only ends a cycle if one
+     * was already under way, so an idle {@code collectgarbage("step")} is
+     * false. And the step temporarily re-enables a stopped collector, so
+     * {@code collectgarbage"stop"} followed by steps still completes cycles -
+     * {@code gc.lua}'s {@code dosteps} depends on both.
+     */
     public static synchronized boolean step(long stepSizeKb) {
-        long pending = uncollectedBytes.get();
-        if (pending <= 0) {
-            return collect();
-        }
-        long stepBytes = (stepSizeKb <= 0) ? 1024 : stepSizeKb * 1024;
-        if (stepBytes >= pending) {
+        if (stepSizeKb > 0) {
+            uncollectedBytes.addAndGet(stepSizeKb * 1024);
+            if (uncollectedBytes.get() < gcThreshold) {
+                return false;
+            }
             uncollectedBytes.set(0);
             return collect();
-        } else {
-            uncollectedBytes.addAndGet(-stepBytes);
+        }
+        // data == 0: a small step against whatever debt already exists.
+        long pending = uncollectedBytes.get();
+        if (pending <= 0) {
             return false;
         }
+        if (pending <= SMALL_STEP_BYTES) {
+            uncollectedBytes.set(0);
+            return collect();
+        }
+        uncollectedBytes.addAndGet(-SMALL_STEP_BYTES);
+        return false;
     }
+
+    /** PUC {@code GCSTEPSIZE}: the debt retired by a {@code data == 0} step. */
+    private static final long SMALL_STEP_BYTES = 13L * 1024;
 
     public static synchronized void checkAndRunDeadFinalizers() {
         collect();

@@ -57,9 +57,23 @@ public final class LuaTable extends LuaValue {
         org.luava.runtime.eval.GCManager.onAlloc();
     }
 
+    /**
+     * PUC {@code luaH_resize} for a table constructor: the array part is
+     * pre-sized to {@code arrayCapacity} nil slots. Pre-sizing to the
+     * constructor's list-part length is observable: it fixes {@code rawlen}
+     * ({@code rawlen({1, 2, nil, 4})} is 4, not 2), the {@code #} border, and
+     * therefore where {@code table.insert} puts a new element.
+     *
+     * <p>{@code hashCapacity} is accepted for symmetry with PUC's signature
+     * but unused: {@link #hashPart} is a fixed map whose rehashing is driven
+     * by {@link #rehashThreshold}, not by a caller-supplied hint.
+     */
     public LuaTable(int arrayCapacity, int hashCapacity) {
         if (arrayCapacity > 0) {
             arrayPart.ensureCapacity(arrayCapacity);
+            for (int i = 0; i < arrayCapacity; i++) {
+                arrayPart.add(LuaNil.NIL);
+            }
         }
         org.luava.runtime.eval.GCManager.onAlloc();
     }

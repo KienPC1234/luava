@@ -866,6 +866,19 @@ public abstract class LuaValue {
             org.luava.runtime.eval.CallStack.setNextCall("le", true);
             return handler.call(this, other).toBoolean();
         }
+        // PUC ltm.c callorderTM: with no __le on either operand, `a <= b`
+        // falls back to `not (b < a)`, using __lt looked up on the reversed
+        // pair (its first operand, then its second) and negating the result.
+        // Only when neither __le nor __lt exists does the comparison fall
+        // through to the default `a > b`, which raises.
+        LuaValue lt = getBinaryHandler(this, other, "__lt");
+        if (lt != null) {
+            if (!(lt instanceof LuaFunction) && (lt.getMetatable() == null || lt.getMetatable().rawget(Meta.CALL).isNil())) {
+                throw new LuaException("attempt to call a " + lt.typeName() + " value (metamethod 'lt')");
+            }
+            org.luava.runtime.eval.CallStack.setNextCall("lt", true);
+            return !lt.call(other, this).toBoolean();
+        }
         if (typeName().equals(other.typeName())) {
             throw new LuaException("attempt to compare two " + typeName() + " values");
         }
@@ -949,23 +962,34 @@ public abstract class LuaValue {
     public static LuaException argError(int argNum, String funcName, String extramsg) {
         org.luava.runtime.eval.CallStack.Frame frame = org.luava.runtime.eval.CallStack.getFrame(0);
         // PUC's luaL_argerror names the offending function from lua_getinfo "n"
-        // on the current frame: a direct Lua call carries the call-site name
-        // (table.insert -> 'insert', local f = string.rep -> 'f'), while a
-        // C-invoked call pushed by LuaFunction.call (a comparator run by
-        // table.sort, a function run by pcall) has no call-site name and falls
-        // back to pushglobalfuncname, an identity search over the globals/
-        // loaded tables (table.insert -> 'table.insert'). Prefer the frame name,
+        // on the current frame, with two observable sources:
+        //
+        //   * called from a Lua function -> the call site's field name
+        //     (math.floor(...) -> 'floor', local f = table.insert -> 'f');
+        //   * called from C (pcall(f, ...), a table.sort comparator, a
+        //     pcall'd metamethod) -> no call site to inspect, so
+        //     pushglobalfuncname searches the globals / package.loaded for the
+        //     function value and yields the qualified name ('math.floor',
+        //     'table.insert').
+        //
+        // The recorded frame name is only usable for the first case: a C
+        // caller cannot have produced a call-site field name, so a name left
+        // on the frame in that case is a stale field from an outer Lua frame
+        // and must not win over the qualified lookup. Prefer the frame name,
         // then the qualified name, then the builtin's own name.
         String name = funcName;
         boolean method = false;
         if (frame != null) {
             method = frame.isMethod;
-            if (frame.name != null && !frame.name.isEmpty() && !"?".equals(frame.name)) {
+            boolean calledFromLua = isLuaFrame(frame);
+            if (calledFromLua && frame.name != null && !frame.name.isEmpty() && !"?".equals(frame.name)) {
                 name = frame.name;
             } else if (frame.function != null) {
                 String global = org.luava.runtime.standard.DebugLib.findGlobalFuncName(frame.function, frame.env);
                 if (global != null) {
                     name = global;
+                } else if (calledFromLua && frame.name != null && !frame.name.isEmpty()) {
+                    name = frame.name;
                 }
             }
         }
@@ -976,6 +1000,26 @@ public abstract class LuaValue {
             }
         }
         return new LuaException("bad argument #" + argNum + " to '" + name + "' (" + extramsg + ")");
+    }
+
+    /**
+     * True when the frame below {@code frame} is a Lua function, i.e. the call
+     * that reached this frame came from Lua bytecode and therefore has an
+     * inspectable call site. A C caller (pcall, a comparator, a metamethod
+     * trampoline) leaves {@code getFrame(1)} as a C function or absent.
+     */
+    private static boolean isLuaFrame(org.luava.runtime.eval.CallStack.Frame frame) {
+        if (frame.function != null && "C".equals(frame.function.getWhat())) {
+            org.luava.runtime.eval.CallStack.Frame caller = org.luava.runtime.eval.CallStack.getFrame(1);
+            if (caller == null) {
+                return false;
+            }
+            if (caller.function == null) {
+                return false;
+            }
+            return !"C".equals(caller.function.getWhat());
+        }
+        return true;
     }
 
     @Override

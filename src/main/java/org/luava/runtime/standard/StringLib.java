@@ -57,6 +57,41 @@ public final class StringLib {
     }
 
     /**
+     * PUC {@code lstrlib.c} {@code str_lower}/{@code str_upper}: case folding
+     * touches {@code 'A'..'Z'} only, and every other byte is copied verbatim.
+     * This matters because a Lua string is a byte string, not a Unicode
+     * sequence: {@link String#toLowerCase()} would apply full Unicode case
+     * mapping to the 0xC0-0xFF Latin-1 range, so {@code ("\xDF"):upper()}
+     * would return {@code "S"} (0x53) and corrupt any UTF-8 or binary payload.
+     *
+     * <p>Nothing is allocated on the overwhelmingly common all-ASCII path: the
+     * scan returns the receiver unchanged when it finds no foldable letter.
+     */
+    private static LuaValue asciiCase(String s, boolean upper) {
+        int n = s.length();
+        for (int i = 0; i < n; i++) {
+            char c = s.charAt(i);
+            if (c < 0x80) {
+                int folded = upper ? (c >= 'a' && c <= 'z' ? c - 32 : c)
+                                   : (c >= 'A' && c <= 'Z' ? c + 32 : c);
+                if (folded != c) {
+                    char[] out = s.toCharArray();
+                    out[i] = (char) folded;
+                    for (int j = i + 1; j < n; j++) {
+                        char d = out[j];
+                        if (d < 0x80) {
+                            out[j] = (char) (upper ? (d >= 'a' && d <= 'z' ? d - 32 : d)
+                                                   : (d >= 'A' && d <= 'Z' ? d + 32 : d));
+                        }
+                    }
+                    return LuaString.valueOf(new String(out));
+                }
+            }
+        }
+        return LuaString.valueOf(s);
+    }
+
+    /**
      * Shared stateless {@code string.gmatch} builtin (see
      * {@code BaseLib.TOSTRING}): one JVM-wide instance so the VM can
      * recognize and inline it on hot paths.
@@ -87,11 +122,11 @@ public final class StringLib {
         }));
 
         stringTable.rawset(LuaString.interned("lower"), LuaFunction.of(args -> {
-            return LuaString.valueOf(checkString(args, 0, "lower").toLowerCase());
+            return asciiCase(checkString(args, 0, "lower"), false);
         }));
 
         stringTable.rawset(LuaString.interned("upper"), LuaFunction.of(args -> {
-            return LuaString.valueOf(checkString(args, 0, "upper").toUpperCase());
+            return asciiCase(checkString(args, 0, "upper"), true);
         }));
 
         stringTable.rawset(LuaString.interned("reverse"), LuaFunction.of(args -> {
@@ -361,7 +396,10 @@ public final class StringLib {
                             }
                             b.append(s);
                         }
-                        default -> throw new LuaException("invalid conversion specification: '" + form + "'");
+                        // PUC's unknown-conversion branch: a conversion
+                        // character string.format does not implement. Distinct
+                        // from checkformat's "invalid conversion specification".
+                        default -> throw new LuaException("invalid conversion '" + form + "' to 'format'");
                     }
                 }
             }
@@ -559,6 +597,9 @@ public final class StringLib {
             }
         }
         if (idx != form.length() - 1 || !Character.isLetter(form.charAt(idx))) {
+            // PUC checkformat: the conversion character is known but the
+            // flags/width/precision do not fit it. Distinct from the
+            // unknown-conversion message below.
             throw new LuaException("invalid conversion specification: '" + form + "'");
         }
     }

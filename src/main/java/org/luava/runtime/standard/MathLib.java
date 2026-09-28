@@ -252,19 +252,19 @@ public final class MathLib {
 
     private static double checkNumber(LuaValue[] args, int index, String funcName) {
         if (args.length <= index || args[index].isNil()) {
-            throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number expected, got " + (args.length <= index ? "no value" : "nil") + ")");
+            throw LuaValue.argError(index + 1, funcName, "number expected, got " + (args.length <= index ? "no value" : "nil"));
         }
         LuaValue v = args[index];
         LuaValue num = v.toLuaNumber();
         if (num == null) {
-            throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number expected, got " + v.typeName() + ")");
+            throw LuaValue.argError(index + 1, funcName, "number expected, got " + v.typeName());
         }
         return num.toDouble();
     }
 
     private static LuaValue checkNumberValue(LuaValue[] args, int index, String funcName) {
         if (args.length <= index || args[index].isNil()) {
-            throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number expected, got " + (args.length <= index ? "no value" : "nil") + ")");
+            throw LuaValue.argError(index + 1, funcName, "number expected, got " + (args.length <= index ? "no value" : "nil"));
         }
         LuaValue v = args[index];
         if (v.isInteger() || v.isFloat()) {
@@ -276,14 +276,14 @@ public final class MathLib {
         // (e.g. math.abs("120") == 120.0, a float).
         LuaValue num = v.toLuaNumber();
         if (num == null) {
-            throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number expected, got " + v.typeName() + ")");
+            throw LuaValue.argError(index + 1, funcName, "number expected, got " + v.typeName());
         }
         return LuaFloat.valueOf(num.toDouble());
     }
 
     private static long checkInteger(LuaValue[] args, int index, String funcName) {
         if (args.length <= index || args[index].isNil()) {
-            throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number expected, got " + (args.length <= index ? "no value" : "nil") + ")");
+            throw LuaValue.argError(index + 1, funcName, "number expected, got " + (args.length <= index ? "no value" : "nil"));
         }
         LuaValue v = args[index];
         // luaL_checkinteger coerces a numeric string through lua_tointegerx
@@ -291,9 +291,9 @@ public final class MathLib {
         LuaInteger integer = v.toLuaIntegerCoercingStrings();
         if (integer == null) {
             if (v.toLuaNumber() != null) {
-                throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number has no integer representation)");
+                throw LuaValue.argError(index + 1, funcName, "number has no integer representation");
             }
-            throw new LuaException("bad argument #" + (index + 1) + " to '" + funcName + "' (number expected, got " + v.typeName() + ")");
+            throw LuaValue.argError(index + 1, funcName, "number expected, got " + v.typeName());
         }
         return integer.toLong();
     }

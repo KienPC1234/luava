@@ -566,6 +566,24 @@ public final class IoLib {
     }
 
     /**
+     * PUC {@code luaL_checklstring} for a filename: a string is taken as-is,
+     * a number is converted to its Lua string form ({@code io.open(42)} opens
+     * the file named {@code "42"}, it does not raise a type error), and
+     * anything else - including a missing argument - reports
+     * {@code "string expected, got ..."}.
+     */
+    private static String checkFilename(LuaValue[] args, int idx, String func) {
+        if (idx >= args.length) {
+            throw LuaValue.argError(idx + 1, func, "string expected, got no value");
+        }
+        LuaValue v = args[idx];
+        if (v.isString() || v.isNumber()) {
+            return v.toLuaString();
+        }
+        throw LuaValue.argError(idx + 1, func, "string expected, got " + v.typeName());
+    }
+
+    /**
      * Formats a Java I/O failure the way C's {@code strerror} would, as
      * {@code "path: message"} (glibc style) rather than Java's
      * {@code "path (message)"}.
@@ -597,9 +615,11 @@ public final class IoLib {
     }
 
     /**
-     * PUC's {@code opencheck} helper (liolib.c): raises
-     * {@code cannot open file '<name>' (<strerror>)} — the OS message that
-     * {@code io.open}'s failure tuple already carries as its second value.
+     * PUC's {@code fileerror} helper (liolib.c): raises
+     * {@code cannot open file '<name>' (<strerror>)}. {@code strerror} is the
+     * bare reason, but {@code io.open}'s failure tuple carries the glibc-style
+     * {@code "<name>: <strerror>"} (PUC's {@code luaL_fileresult} prefixes the
+     * name), so strip that prefix to avoid naming the file twice.
      * Used by io.input/output/lines, which call io.open internally and only
      * observe the nil first result.
      */
@@ -608,6 +628,12 @@ public final class IoLib {
         if (openResult instanceof Varargs va) {
             LuaValue m = va.arg(2);
             if (!m.isNil()) osMsg = m.toLuaString();
+        }
+        if (osMsg != null) {
+            String prefix = filename + ": ";
+            if (osMsg.startsWith(prefix)) {
+                osMsg = osMsg.substring(prefix.length());
+            }
         }
         if (osMsg == null) {
             return new LuaException("cannot open file '" + filename + "'");
@@ -820,13 +846,10 @@ public final class IoLib {
 
         // io.open
         io.rawset(LuaString.interned("open"), LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isString()) {
-                throw new LuaException("bad argument #1 to 'open' (string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
-            }
-            String filename = args[0].toLuaString();
+            String filename = checkFilename(args, 0, "open");
             String mode = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "r";
             if (!checkMode(mode)) {
-                throw new LuaException("bad argument #2 to 'open' (invalid mode)");
+                throw LuaValue.argError(2, "open", "invalid mode");
             }
 
             try {
@@ -851,13 +874,10 @@ public final class IoLib {
 
         // io.popen
         io.rawset(LuaString.interned("popen"), LuaFunction.of(args -> {
-            if (args.length == 0 || !args[0].isString()) {
-                throw new LuaException("bad argument #1 to 'popen' (string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()) + ")");
-            }
-            String cmd = args[0].toLuaString();
+            String cmd = checkFilename(args, 0, "popen");
             String mode = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "r";
             if (!"r".equals(mode) && !"w".equals(mode)) {
-                throw new LuaException("bad argument #2 to 'popen' (invalid mode)");
+                throw LuaValue.argError(2, "popen", "invalid mode");
             }
             try {
                 if ("r".equals(mode) && !OsTime.isWindows()) {
@@ -911,7 +931,7 @@ public final class IoLib {
         // io.type
         io.rawset(LuaString.interned("type"), LuaFunction.of(args -> {
             if (args.length == 0) {
-                throw new LuaException("bad argument #1 to 'type' (value expected)");
+                throw LuaValue.argError(1, "type", "value expected");
             }
             if (!(args[0] instanceof LuaUserdata ud) || !(ud.getUserdata() instanceof FileHandle fh)) {
                 return LuaNil.NIL;
@@ -927,13 +947,13 @@ public final class IoLib {
                 currentIn[0] = ud;
                 return ud;
             }
-            if (args[0].isString()) {
+            if (args[0].isString() || args[0].isNumber()) {
                 LuaValue openRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("r"));
                 if (openRes.isNil()) throw cannotOpen(args[0].toLuaString(), openRes);
                 currentIn[0] = (LuaUserdata) openRes;
                 return openRes;
             }
-            throw new LuaException("bad argument #1 to 'input' (FILE* expected, got " + args[0].typeName() + ")");
+            throw LuaValue.argError(1, "input", "FILE* expected, got " + args[0].typeName());
         }));
 
         io.rawset(LuaString.interned("output"), LuaFunction.of(args -> {
@@ -944,13 +964,13 @@ public final class IoLib {
                 currentOut[0] = ud;
                 return ud;
             }
-            if (args[0].isString()) {
+            if (args[0].isString() || args[0].isNumber()) {
                 LuaValue openRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("w"));
                 if (openRes.isNil()) throw cannotOpen(args[0].toLuaString(), openRes);
                 currentOut[0] = (LuaUserdata) openRes;
                 return openRes;
             }
-            throw new LuaException("bad argument #1 to 'output' (FILE* expected, got " + args[0].typeName() + ")");
+            throw LuaValue.argError(1, "output", "FILE* expected, got " + args[0].typeName());
         }));
 
         // io.close, io.flush, io.read, io.write, io.lines delegating
