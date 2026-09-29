@@ -662,7 +662,10 @@ public final class BaseLib {
                     if (chunk == null || chunk.isNil()) {
                         break;
                     }
-                    if (chunk.isString()) {
+                    // PUC's generic_reader uses luaL_checklstring: a number is
+                    // a valid piece (a number is a string to lua_tolstring),
+                    // anything else raises.
+                    if (chunk.isString() || chunk.isNumber()) {
                         String s = chunk.toLuaString();
                         if (s.isEmpty()) break;
                         sb.append(s);

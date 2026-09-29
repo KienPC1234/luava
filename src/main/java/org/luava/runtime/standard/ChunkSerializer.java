@@ -178,23 +178,78 @@ public final class ChunkSerializer {
     }
 
     public static LuaFunction undump(byte[] bytes, String chunkName, LuaValue envVal, LuaTable globals, Environment rootEnv) {
-        if (bytes == null || bytes.length < HEADER.length + 16) {
-            throw new LuaException("truncated binary chunk");
+        // PUC's luaU_undump derives the name used in every "bad binary format"
+        // message from the chunk name: '@'/'=' prefix stripped, a chunk that
+        // starts with the signature byte becomes "binary string", anything
+        // else is used as written.
+        String name;
+        if (chunkName != null && !chunkName.isEmpty()
+                && (chunkName.charAt(0) == '@' || chunkName.charAt(0) == '=')) {
+            name = chunkName.substring(1);
+        } else if (chunkName != null && !chunkName.isEmpty()
+                && chunkName.charAt(0) == HEADER[0]) {
+            name = "binary string";
+        } else {
+            name = "binary string";
         }
 
-        // Validate header
-        for (int i = 0; i < HEADER.length; i++) {
+        // Header validation in the same order and with the same wording as
+        // lundump.c's checkHeader. Each field is first read (a short read is
+        // "truncated chunk") and only then compared (a wrong value gets its own
+        // message), which is what checkliteral / checksize / loadByte do.
+        if (bytes == null || bytes.length < 4) {
+            throw new LuaException(name + ": bad binary format (truncated chunk)");
+        }
+        for (int i = 1; i < 4; i++) {
             if (bytes[i] != HEADER[i]) {
-                throw new LuaException("corrupted binary chunk header");
+                throw new LuaException(name + ": bad binary format (not a binary chunk)");
             }
+        }
+        if (bytes.length < 5) {
+            throw new LuaException(name + ": bad binary format (truncated chunk)");
+        }
+        if (bytes[4] != HEADER[4]) {
+            throw new LuaException(name + ": bad binary format (version mismatch)");
+        }
+        if (bytes.length < 6) {
+            throw new LuaException(name + ": bad binary format (truncated chunk)");
+        }
+        if (bytes[5] != HEADER[5]) {
+            throw new LuaException(name + ": bad binary format (format mismatch)");
+        }
+        if (bytes.length < 12) {
+            throw new LuaException(name + ": bad binary format (truncated chunk)");
+        }
+        for (int i = 0; i < 6; i++) {
+            if (bytes[6 + i] != HEADER[6 + i]) {
+                throw new LuaException(name + ": bad binary format (corrupted chunk)");
+            }
+        }
+        if (bytes.length < 15) {
+            throw new LuaException(name + ": bad binary format (truncated chunk)");
+        }
+        if (bytes[12] != HEADER[12]) {
+            throw new LuaException(name + ": bad binary format (Instruction size mismatch)");
+        }
+        if (bytes[13] != HEADER[13]) {
+            throw new LuaException(name + ": bad binary format (lua_Integer size mismatch)");
+        }
+        if (bytes[14] != HEADER[14]) {
+            throw new LuaException(name + ": bad binary format (lua_Number size mismatch)");
+        }
+        if (bytes.length < HEADER.length + 16) {
+            throw new LuaException(name + ": bad binary format (truncated chunk)");
         }
 
         // Validate LUAC_INT and LUAC_NUM
         ByteBuffer bb = ByteBuffer.wrap(bytes, HEADER.length, 16).order(ByteOrder.LITTLE_ENDIAN);
         long intCheck = bb.getLong();
         double numCheck = bb.getDouble();
-        if (intCheck != LUAC_INT || numCheck != LUAC_NUM) {
-            throw new LuaException("corrupted binary chunk check numbers");
+        if (intCheck != LUAC_INT) {
+            throw new LuaException(name + ": bad binary format (integer format mismatch)");
+        }
+        if (numCheck != LUAC_NUM) {
+            throw new LuaException(name + ": bad binary format (float format mismatch)");
         }
 
         // Check for LUAVA_V1 footer

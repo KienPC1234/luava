@@ -166,6 +166,10 @@ public final class IoLib {
             checkOpen();
             String argErr = argIndex > 0 ? "#" + argIndex : "";
             if (fmt.isInteger() || fmt.isFloat()) {
+                if (fmt.isFloat() && fmt.toDouble() != Math.floor(fmt.toDouble())) {
+                    throw new LuaException("bad argument " + argErr
+                            + " to 'read' (number has no integer representation)");
+                }
                 long n = fmt.toLong();
                 if (n < 0) {
                     throw new LuaException("bad argument " + argErr + " to 'read' (invalid format)");
@@ -181,7 +185,14 @@ public final class IoLib {
                 if (read <= 0) return LuaNil.NIL;
                 return LuaString.valueOf(new String(buf, 0, read, StandardCharsets.ISO_8859_1));
             }
-            String s = fmt.isString() ? fmt.toLuaString() : "l";
+            // A format that is neither a string nor a number must be rejected,
+            // not quietly treated as a line read: io.read({}) used to return
+            // nil and file:read({}) used to consume and return a whole line.
+            if (!fmt.isString()) {
+                throw new LuaException("bad argument " + argErr + " to 'read' (string expected, got "
+                        + fmt.typeName() + ")");
+            }
+            String s = fmt.toLuaString();
             if (s.startsWith("*")) s = s.substring(1);
             char format = !s.isEmpty() ? s.charAt(0) : 0;
             return switch (format) {
@@ -1019,7 +1030,8 @@ public final class IoLib {
                 for (int i = 0; i < args.length; i++) {
                     LuaValue arg = args[i];
                     if (!arg.isString() && !arg.isNumber()) {
-                        throw new LuaException("bad argument #" + (i + 1) + " to 'write' (string expected, got " + arg.typeName() + ")");
+                        throw LuaValue.argError(i + 1, "io.write",
+                                "string expected, got " + arg.typeName());
                     }
                     fh.write(writeArgString(arg));
                 }

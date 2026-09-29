@@ -115,10 +115,16 @@ public final class LuaTable extends LuaValue {
      * {@code setmetatable} cannot leave a stale hop behind. The interpreter,
      * the JIT and every library read go through {@link #get}, so one cache
      * covers all three.
+     *
+     * <p>The triple lives in one immutable object rather than three fields:
+     * the table is documented thread-confined, but {@code lazyFiller} is
+     * filled under {@code synchronized (this)}, and unlike a redundant (and
+     * idempotent) re-fill, observing a mismatched pair would hand back the
+     * wrong {@code __index} instead of merely recomputing it.
      */
-    private transient LuaTable indexMt;
-    private transient LuaValue indexHandler;
-    private transient long indexMtVersion = -1L;
+    private record IndexHop(LuaTable mt, long mtVersion, LuaValue handler) {}
+
+    private transient IndexHop indexHop;
 
     /** VM site-cache guard; public for the bytecode package. */
     public long readVersion() {
@@ -131,14 +137,13 @@ public final class LuaTable extends LuaValue {
      */
     private LuaValue cachedIndexHandler(LuaTable mt) {
         long mtVersion = mt.readVersion();
-        if (indexMt == mt && indexMtVersion == mtVersion) {
-            return indexHandler;
+        IndexHop hop = indexHop;
+        if (hop != null && hop.mt == mt && hop.mtVersion == mtVersion) {
+            return hop.handler;
         }
         LuaValue handler = mt.rawget(LuaValue.Meta.INDEX);
         if (mtVersion != -1L) {
-            indexMt = mt;
-            indexMtVersion = mtVersion;
-            indexHandler = handler;
+            indexHop = new IndexHop(mt, mtVersion, handler);
         }
         return handler;
     }
@@ -347,9 +352,7 @@ public final class LuaTable extends LuaValue {
         this.metatable = mt;
         modCount++;
         // The cached __index hop belonged to the previous metatable.
-        indexMt = null;
-        indexHandler = null;
-        indexMtVersion = -1L;
+        indexHop = null;
         updateWeakMode();
     }
 
@@ -512,20 +515,8 @@ public final class LuaTable extends LuaValue {
                 if (!hashPart.isEmpty()) hashPart.remove(key);
                 arrayPart.set((int) (idx - 1), toStore);
                 return;
-            } else if (!toSet.isNil()) {
-                // Gap insert (e.g. filling from 2, or reverse fill): grow
-                // the array part when dense enough, then retry above.
-                maybeRehashForInt();
-                int size = arrayPart.size();
-                if (idx == (long) size + 1) {
-                    arrayPart.add(toStore);
-                    if (!hashPart.isEmpty()) hashPart.remove(key);
-                    return;
-                } else if (idx >= 1 && idx <= size) {
-                    if (!hashPart.isEmpty()) hashPart.remove(key);
-                    arrayPart.set((int) (idx - 1), toStore);
-                    return;
-                }
+            } else if (!toSet.isNil() && storeIntGap(idx, key, toStore)) {
+                return;
             }
         }
 
@@ -555,9 +546,56 @@ public final class LuaTable extends LuaValue {
      */
     private int rehashThreshold = 64;
 
-    private void maybeRehashForInt() {
-        if (!weakKeys && !weakValues && hashPart.size() >= rehashThreshold) {
-            rehash();
+    /**
+     * Cold path of an integer store: the key falls outside the array part, so
+     * it may or may not belong there. PUC's {@code luaH_newkey} grows the array
+     * part and joins the key only when the new key falls inside the
+     * rehash-chosen size. Deliberately no {@code size + 1} append here: that
+     * would let a key the density test just excluded stretch the array anyway
+     * ({@code {1,2,3}} then {@code t[5]=1} must report {@code rawlen} 3, not
+     * 5). The append belongs to the fast path in {@link #rawset}, which runs
+     * before any growth.
+     *
+     * <p>Out of line on purpose: this runs at most once per store that is not
+     * a sequential append, and inlining it into {@code rawset} costs the two
+     * hot integer paths bytecode budget for no measurable gain.
+     *
+     * @return true if the key landed in the array part and the store is done
+     */
+    private boolean storeIntGap(long idx, LuaValue key, LuaValue toStore) {
+        maybeRehashForInt(idx);
+        int size = arrayPart.size();
+        if (idx >= 1 && idx <= size) {
+            if (!hashPart.isEmpty()) hashPart.remove(key);
+            arrayPart.set((int) (idx - 1), toStore);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * A new integer key outside the array part is a chance to absorb it, as
+     * PUC's {@code luaH_newkey} always does (it calls {@code rehash} for any
+     * integer key within MAXASIZE). Absorbing matters for observable
+     * behaviour, not just speed: a table built with a hole
+     * ({@code t[1],t[2],t[3],t[4],t[6]}) leaves the 6 in the hash part unless
+     * the array grows, and then {@code rawlen} reports 4 instead of 6,
+     * {@code #} picks a different border, and {@code table.insert} puts the
+     * new element at the wrong index.
+     *
+     * <p>The recount is bounded to keys near the array, where absorbing is the
+     * point: a key beyond {@code 2 * array + 2} would be rejected by
+     * {@link #rehash}'s own "more than half the slots used" test anyway, and
+     * recounting for it would make a sparse workload quadratic. The no-progress
+     * back-off inside {@code rehash} still covers the remaining sparse case.
+     */
+    private void maybeRehashForInt(long idx) {
+        if (weakKeys || weakValues) {
+            return;
+        }
+        long near = (long) arrayPart.size() * 2L + 2L;
+        if (idx <= near || hashPart.size() >= rehashThreshold) {
+            rehash(idx);
         }
     }
 
@@ -565,8 +603,15 @@ public final class LuaTable extends LuaValue {
      * keys stay in the hash part. Bounds memory on hostile sparse inserts. */
     private static final long MAX_ARRAY_SIZE = 1L << 24;
 
-    /** Smallest i with {@code key <= 2^i} (key >= 1). */
+    /**
+     * Density bucket for an array index: {@code ceil(log2(key))}, matching PUC's
+     * {@code nums[luaO_ceillog2(arrayindex(k))]}. Bucket {@code i} therefore
+     * holds the keys in {@code (2^(i-1), 2^i]}.
+     */
     private static int arrayBucket(long key) {
+        if (key <= 1) return 0;
+        // floor(log2(key - 1)) + 1 == ceil(log2(key)), which is what PUC's
+        // nums[luaO_ceillog2(k)] means; 32 - nlz(x) is already that for x.
         return 32 - Integer.numberOfLeadingZeros((int) Math.min(key - 1, 0x7FFFFFFFL));
     }
 
@@ -577,14 +622,17 @@ public final class LuaTable extends LuaValue {
      * Values and iteration completeness are preserved; only the internal
      * placement changes (pairs order is unspecified, as in C Lua).
      */
-    private void rehash() {
-        int[] nums = new int[25]; // nums[i] = # int keys in (2^(i-1), 2^i]
+    private void rehash(long pendingKey) {
+        // PUC sizes this array as nums[MAXABITS + 1] with MAXABITS = 31.
+        int[] nums = new int[32];
+        int na = 0; // number of keys eligible for the array part
         for (int i = 0; i < arrayPart.size(); i++) {
             LuaValue v = arrayPart.get(i);
             if (v instanceof WeakVal wv) v = wv.get();
             if (v != null && !v.isNil()) {
                 int b = arrayBucket(i + 1L);
                 if (b < nums.length) nums[b]++;
+                na++;
             }
         }
         for (LuaValue k : hashPart.keySet()) {
@@ -593,17 +641,34 @@ public final class LuaTable extends LuaValue {
                 if (idx >= 1 && idx <= MAX_ARRAY_SIZE) {
                     int b = arrayBucket(idx);
                     if (b < nums.length) nums[b]++;
+                    na++;
                 }
             }
         }
-        // Optimal size: largest 2^i with more than half its slots used.
-        int cumulative = 0;
+        // The key being inserted is not in either part yet, but PUC counts it
+        // too (luaH_newkey -> rehash(ek)). Without it a write that would
+        // exactly tip the density test the other way is misfiled: t[1..4]=v
+        // then t[6]=v would leave the 6 hashed and report rawlen 4 instead of
+        // 6, because keys 1..4 alone never beat half of 8 slots.
+        if (pendingKey >= 1 && pendingKey <= MAX_ARRAY_SIZE) {
+            int b = arrayBucket(pendingKey);
+            if (b < nums.length) nums[b]++;
+            na++;
+        }
+        // PUC's computesizes: walk candidate sizes while the *total* number of
+        // array-eligible keys can still fill more than half of it, and take
+        // the largest 2^i whose running prefix is more than half full. Testing
+        // the prefix (as a plain cumulative > half scan over every bucket does)
+        // keeps iterating after the total has fallen behind, so a table holding
+        // one distant key still had its array part stretched towards it.
         int optimal = 0;
-        for (int i = 0; i < nums.length; i++) {
-            cumulative += nums[i];
-            long half = (i == 0) ? 0 : (1L << (i - 1));
-            if (nums[i] > 0 && cumulative > half) {
-                optimal = 1 << i;
+        int a = 0;
+        for (int i = 0, twotoi = 1;
+             i < nums.length && twotoi > 0 && na > (twotoi / 2);
+             i++, twotoi *= 2) {
+            a += nums[i];
+            if (a > twotoi / 2) {
+                optimal = twotoi;
             }
         }
         if (optimal <= arrayPart.size()) {

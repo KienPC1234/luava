@@ -83,13 +83,22 @@ public final class CallStack {
 
     /**
      * Maximum Lua call depth. Frames live on the heap (pooled CallInfo +
-     * reused Frame objects), not the Java call stack, so thousands of
-     * levels are cheap and match C behavior for legitimate deep recursion
-     * (PUC Lua handles 8000+). Unbounded recursion still fails cleanly
-     * with "stack overflow" instead of OOMing the heap. Coroutine nesting
-     * has its own separate limit (MAX_NESTED_COROUTINES).
+     * reused Frame objects), not the Java call stack, so this counts Lua
+     * frames only and never risks a real {@code StackOverflowError}; the
+     * interpreter, the bytecode VM and JIT-compiled code all unwind through
+     * it the same way.
+     *
+     * <p>PUC's ceiling is a stack *slot* budget ({@code LUAI_MAXSTACK} =
+     * 1,000,000), so it works out to roughly 500k frames for a function with
+     * a couple of locals and fewer for one with many. A frame count cannot
+     * reproduce that exactly, so this is set to 600,000: deliberately above
+     * PUC's usable depth rather than below it. A limit that is too low turns
+     * legitimate deep recursion -- the official suite recurses to 100,000 --
+     * into a spurious {@code stack overflow}, while a deliberately permissive
+     * one only accepts more than PUC would. Runaway recursion still stops
+     * here with a clean error instead of exhausting the heap.
      */
-    public static final int MAX_CALL_DEPTH = 10000;
+    public static final int MAX_CALL_DEPTH = 600000;
     public static final int EXTRA_STACK_SLOTS = 50;
 
     public static final class ProtectedFrame {

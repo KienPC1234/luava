@@ -947,7 +947,15 @@ public final class BytecodeCompiler {
 
             if (hasClose && firstCloseReg != Integer.MAX_VALUE) {
                 int condReg = compileExprToAnyReg(rs.condition());
-                emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 1, 0), condLine);
+                // The repeat exits when the condition is true, so this TEST
+                // must skip the exit JMP when the condition is false: that is
+                // the k=1 polarity ("jump when true"), not a B operand. The
+                // old encodeABC(..., 1, 0) put the 1 in B, which the TEST
+                // handler never reads, so the exit jump fired on the wrong
+                // polarity, no exit was ever taken and the body's to-be-closed
+                // variable was registered once and closed once instead of per
+                // iteration (PUC closes it every pass).
+                emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0, 1), condLine);
                 int exitJmpTarget = emitJmp(condLine);
                 emit(Instruction.encodeABC(OpCode.OP_CLOSE, firstCloseReg, 0, 0), condLine);
                 int backJmp = emitJmp(condLine);

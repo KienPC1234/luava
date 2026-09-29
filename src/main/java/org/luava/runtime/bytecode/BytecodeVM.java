@@ -2399,6 +2399,12 @@ public final class BytecodeVM {
         int[] capArg = null;
         LuaValue[] capConst = null;
         int[] capUp = null;
+        // Registers captured by value at the OP_CLOSURE, and whether that
+        // closure has been seen. Capturing a register by value is only sound
+        // while nothing writes it afterwards; see the OP_CLOSURE case.
+        int[] capturedRegs = null;
+        int capturedCount = 0;
+        boolean sawClosure = false;
         for (int pc = 0; pc < code.length; pc++) {
             int inst = code[pc];
             int op = Instruction.getOp(inst);
@@ -2412,6 +2418,9 @@ public final class BytecodeVM {
                     kind[a] = kind[b];
                     arg[a] = arg[b];
                     konst[a] = konst[b];
+                    if (sawClosure && writesCaptured(a, capturedRegs, capturedCount)) {
+                        return null;
+                    }
                 }
                 case OpCode.OP_LOADK -> {
                     int bx = Instruction.getBx(inst);
@@ -2420,6 +2429,9 @@ public final class BytecodeVM {
                     }
                     kind[a] = 2;
                     konst[a] = proto.constants[bx];
+                    if (sawClosure && writesCaptured(a, capturedRegs, capturedCount)) {
+                        return null;
+                    }
                 }
                 case OpCode.OP_LOADNIL, OpCode.OP_CLEANUP -> {
                     int b = Instruction.getB(inst);
@@ -2428,6 +2440,9 @@ public final class BytecodeVM {
                     }
                     for (int j = 0; j <= b && a + j < regs; j++) {
                         kind[a + j] = 1;
+                        if (sawClosure && writesCaptured(a + j, capturedRegs, capturedCount)) {
+                            return null;
+                        }
                     }
                 }
                 case OpCode.OP_CLOSURE -> {
@@ -2457,10 +2472,38 @@ public final class BytecodeVM {
                         if (d.index < 0 || d.index >= regs || kind[d.index] == -1) {
                             return null;
                         }
+                        // A cell in the register this OP_CLOSURE is about to
+                        // write is the closure's own self-reference
+                        // (`local f; f = function() ... f ... end`), which is
+                        // the canonical recursive-local idiom. Capturing it as
+                        // a value here would freeze whatever the register holds
+                        // now -- nil -- and the closure would lose its own
+                        // binding. Bail to the generic path, which creates a
+                        // real open upvalue on that register, so the closure
+                        // sees its own assignment. The value snapshot is only
+                        // sound for a register OP_CLOSURE does not touch.
+                        if (d.index == a) {
+                            return null;
+                        }
                         capKind[i] = kind[d.index];
                         capArg[i] = arg[d.index];
                         capConst[i] = konst[d.index];
                     }
+                    // Remember every register captured by value at this point,
+                    // so a later write to one of them can bail out below.
+                    // Any in-stack capture is a reference in Lua: even a nil or
+                    // constant snapshot is wrong once the register changes,
+                    // because the closure must observe the cell, not the value
+                    // it held at creation. Sharing a parent upvalue (kind 3) is
+                    // already a reference and needs no check.
+                    capturedRegs = new int[descs.length];
+                    capturedCount = 0;
+                    for (int i = 0; i < descs.length; i++) {
+                        if (capKind[i] != 3) {
+                            capturedRegs[capturedCount++] = descs[i].index;
+                        }
+                    }
+                    sawClosure = true;
                 }
                 case OpCode.OP_RETURN1 -> {
                     if (closureReg == -1 || returned || a != closureReg) {
@@ -2490,6 +2533,20 @@ public final class BytecodeVM {
             return null;
         }
         return new LuaProto.FactoryInfo(childIdx, capKind, capArg, capConst, capUp);
+    }
+
+    /**
+     * True when {@code reg} is a register the factory closure already captured
+     * by value, so writing it after the {@code OP_CLOSURE} would leave the
+     * closure holding the pre-write value instead of the cell.
+     */
+    private static boolean writesCaptured(int reg, int[] capturedRegs, int count) {
+        for (int i = 0; i < count; i++) {
+            if (capturedRegs[i] == reg) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

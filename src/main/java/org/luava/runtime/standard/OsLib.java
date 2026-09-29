@@ -259,6 +259,14 @@ public final class OsLib {
             if (args.length == 0 || args[0].isNil()) {
                 return LuaBoolean.TRUE;
             }
+            // PUC's luaL_checkstring accepts a number too (it is a string to
+            // lua_tolstring), but rejects everything else. Without this guard
+            // toLuaString() silently stringifies a table or boolean and the
+            // shell actually runs it.
+            if (!args[0].isString() && !args[0].isNumber()) {
+                throw LuaValue.argError(1, "execute",
+                        "string expected, got " + args[0].typeName());
+            }
             String cmd = args[0].toLuaString();
             try {
                 OsTime.ShellRun run = OsTime.startShell(cmd, true);
@@ -294,7 +302,9 @@ public final class OsLib {
 
         os.rawset(LuaString.interned("remove"), LuaFunction.of(args -> {
             if (args.length == 0 || !args[0].isString()) {
-                throw LuaValue.argError(1, "os.remove", "string expected");
+                throw LuaValue.argError(1, "os.remove",
+                        "string expected, got "
+                        + (args.length == 0 ? "no value" : args[0].typeName()));
             }
             String filename = args[0].toLuaString();
             try {
