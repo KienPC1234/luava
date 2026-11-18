@@ -36,11 +36,12 @@ Mỗi merge xong phải chạy lại cổng chung trước khi merge tiếp theo
 
 | Worker | Trạng thái | Commit/nhánh | Ghi chú |
 |---|---|---|---|
-| W4 | done, đã merge | `8444eb1` | 374 test xanh; stats/close/evalAsync/5 cờ CLI |
-| W2 | done, đã merge (chờ đo lại) | `0d4ff11` | hết regression 3.6×; 03 = 1.019, 07 = 0.925 (chưa lặp lại lần 2) |
-| W1 | đang đo interleave | `/tmp/opencode/w1` `c34d4af` | kernel 1146→737B; fib còn chậm 6-9% ở lần đo đầu |
+| W4 | done, đã merge | `8444eb1` | 366 test xanh; stats/close/evalAsync/5 cờ CLI |
+| W2 | done, **đã revert** | `0d4ff11` → revert `8a35bf8` | 15 cặp: 03 = 1.005, 07 = 0.996, 10 = 1.019 → trung tính; giữ commit trong lịch sử để phục hồi |
+| W1 | done, đã merge | `3180fa2` | kernel 1146→306B, `inline (hot)`, fib -14.8% |
 | W3 | blocked (dưới bar 3%) | `w3/closure-alloc` `0252aba` | 05 = 0.987; phần còn lại ngoài scope hẹp |
 
 Quy tắc: kết quả dưới bar 3% **không merge**; giữ nhánh để gộp đo lại khi có
-thay đổi code-shape khác (W1/W3 cùng hướng). Kết quả W2 phải tái lập ≥3% trước
-khi coi là win thật, nếu không thì revert để tránh code vô ích (AGENTS §IV.4).
+thay đổi code-shape khác (W1/W3 cùng hướng). W2 là ví dụ ngược: đo 7 cặp cho
+`07 = 0.925` nhưng 15 cặp chỉ `0.996` — với nhiễu sàn ~13%, **7 cặp không đủ**
+để kết luận dưới 3%; chỉ revert sau khi có lượt đo thứ hai.
