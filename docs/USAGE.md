@@ -16,6 +16,7 @@ java -jar luava-0.2.5.jar -i script.lua          # run, then enter the REPL
 java -jar luava-0.2.5.jar                        # interactive multi-line REPL
 java -jar luava-0.2.5.jar -v                     # version (e.g. "Luava 0.2.5 Concord (Lua 5.4)")
 java -jar luava-0.2.5.jar -h                     # usage
+java -jar luava-0.2.5.jar --sandbox --profile script.lua   # prod smoke-test
 ```
 
 Flags (only the first argument is inspected, so pass flags before the script):
@@ -26,7 +27,17 @@ Flags (only the first argument is inspected, so pass flags before the script):
 | `-i` / `--interactive` | Enter the REPL after running the script (or immediately if none). |
 | `-v` / `--version` | Print the engine version and code name, then exit. |
 | `-h` / `--help` | Print the usage text, then exit. |
+| `--jit-off` | Disable the tiered JIT for this run (same as `state.jitEnabled(false)`). |
+| `--sync` | Compile JIT kernels on the calling thread (deterministic measurement). |
+| `--dump-bytecode` | Print the compiled bytecode (proto tree, opcode names), then run normally. |
+| `--profile` | Print `state.stats()` after the run (calls/jit/deopt/alloc). |
+| `--sandbox` | Strip `os`/`io`/`package`/`java` before running, for untrusted scripts. |
 | *(none)* | Start the interactive multi-line REPL. |
+
+Prod flags come first, before the script: `luava --sandbox --profile
+script.lua arg1`. `--dump-bytecode` is observational (exit status still
+reflects the run); `--profile` prints one line like
+`[profile] Stats[calls=1, jitHits=0, deoptCount=0, allocBytes=1024, instructions=12]`.
 
 Running a file exposes the standard Lua `arg` table: `arg[0]` is the script
 name and `arg[1..]` the arguments after it (`#arg` matches the reference CLI).
@@ -383,6 +394,73 @@ state.clearGuard();                                          // remove the guard
 A tripped guard raises a catchable Lua error, so `pcall` in Lua and
 `LuaException` in Java both work. While a guard or a debug hook is active, the
 JIT is bypassed (correct, just not accelerated).
+
+## Observing a state (stats)
+
+```java
+org.luava.runtime.Stats s = state.stats();
+System.out.println(s);
+// Stats[calls=3, jitHits=1, deoptCount=0, allocBytes=4096, instructions=57]
+```
+
+- `calls` counts top-level host entries (`eval` + `call`), not nested
+  Lua-to-Lua calls.
+- `jitHits` is the number of this state's cached protos currently holding a
+  compiled kernel (a live gauge: disarmed kernels drop back to zero).
+- `deoptCount` sums kernel deopts (regular + structural) over the cache.
+- `allocBytes` is the JVM-wide uncollected allocation debt (a shared gauge).
+- `instructions` is the total bytecode words compiled for this state.
+
+The CLI equivalent is `--profile`, which prints the same line after the run.
+
+## Lifecycle and async eval
+
+A state owns GC roots, so long-lived servers should release it explicitly.
+`LuaState` is `AutoCloseable`: `close()` drops the proto cache, clears any
+guard, and unregisters the state from the GC manager. Further `eval`/`call`/
+`compile` entries fail fast with a `LuaException`. It is idempotent.
+
+```java
+try (LuaState state = new LuaState().sandbox()
+        .instructionLimit(10_000_000)
+        .maxAllocationBytes(64 * 1024 * 1024)) {
+    state.setLive("api", readOnlyService);
+    state.eval("return api.handle(request)");
+}
+
+// Fire-and-forget from the host (blocking eval semantics unchanged):
+java.util.concurrent.CompletableFuture<org.luava.runtime.LuaValue> f =
+        state.evalAsync("return 6 * 7");
+```
+
+One state still serves one thread at a time: concurrent top-level `eval`
+calls on the *same* state are not supported — use one state per
+thread/tenant (see below) and `evalAsync` for handoff, not parallelism.
+
+## Production embedding checklist
+
+`examples/server-embed.lua` is the reference Lua side (sandbox-safe handler +
+`pcall` dispatch). The Java host side is one fluent chain:
+
+```java
+try (LuaState state = new LuaState()
+        .sandbox()                            // drop os/io/package/java
+        .instructionLimit(1_000_000)          // per-request budget
+        .maxAllocationBytes(16 * 1024 * 1024)
+        .jitEnabled(false)) {                 // optional: deterministic latency
+    state.setLive("db", readOnlyDb);
+    state.eval("local h = require('handler')");   // with resourceLoader, or:
+    LuaValue out = state.call("handle", path);    // handle = Lua function
+    System.out.println(state.stats());            // per-request observability
+}
+```
+
+Smoke-test the same config from the CLI before shipping:
+
+```bash
+java -jar luava.jar --sandbox --jit-off --profile handler.lua
+java -jar luava.jar --dump-bytecode handler.lua   # inspect what ships
+```
 
 ## Coroutines and concurrency
 

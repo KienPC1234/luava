@@ -428,6 +428,19 @@ public final class GCManager {
         }
     }
 
+    /**
+     * W4 embedding/ops lifecycle: drops every bookkeeping reference to
+     * {@code state} (collector roots and weak-table/finalizer ownership
+     * aside, which are already owner-scoped per collection). Purely additive:
+     * existing collections never call this. Idempotent and null-tolerant.
+     */
+    public static synchronized void unregisterState(LuaState state) {
+        if (state == null) {
+            return;
+        }
+        STATES.removeIf(ref -> ref.get() == null || ref.get() == state);
+    }
+
     public static synchronized boolean isReachable(LuaValue target) {
         if (target == null) return false;
         // Local sets: isReachable is a query, not a collection, so it must not

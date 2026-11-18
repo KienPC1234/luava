@@ -8,8 +8,13 @@
 package org.luava.cli;
 
 import org.luava.runtime.LuaException;
+import org.luava.runtime.LuaFunction;
 import org.luava.runtime.LuaState;
 import org.luava.runtime.LuaValue;
+import org.luava.runtime.bytecode.Instruction;
+import org.luava.runtime.bytecode.LuaClosure;
+import org.luava.runtime.bytecode.LuaProto;
+import org.luava.runtime.bytecode.OpCode;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -46,45 +51,51 @@ public final class Main {
     }
 
     static int run(String[] args, BufferedReader in) {
+        // W4 prod flags: leading long options consumed before the classic
+        // single-dash dispatch, so `luava --sandbox --profile script.lua`
+        // and `luava --jit-off -e "..."` both work. Only leading position
+        // is scanned; anything after the script name stays script args.
+        boolean jitOff = false;
+        boolean sync = false;
+        boolean dumpBytecode = false;
+        boolean profile = false;
+        boolean sandbox = false;
+        int i = 0;
+        boolean scanning = true;
+        while (scanning && i < args.length) {
+            switch (args[i]) {
+                case "--jit-off" -> { jitOff = true; i++; }
+                case "--sync" -> { sync = true; i++; }
+                case "--dump-bytecode" -> { dumpBytecode = true; i++; }
+                case "--profile" -> { profile = true; i++; }
+                case "--sandbox" -> { sandbox = true; i++; }
+                default -> scanning = false;
+            }
+        }
+        String[] rest = java.util.Arrays.copyOfRange(args, i, args.length);
+        // Synchronous tier-up must be decided before any state compiles, so
+        // the property is set before the state is even created.
+        if (sync) {
+            System.setProperty("luava.jit.sync", "true");
+        }
         LuaState state = new LuaState();
         try {
-            if (args.length == 0) {
-                return repl(state, in);
+            if (jitOff) {
+                state.jitEnabled(false);
             }
-            String first = args[0];
-            if ("-e".equals(first) || "-E".equals(first)) {
-                if (args.length < 2) {
-                    System.err.println("luava: '-e' needs an argument");
-                    return 1;
-                }
-                return evalChunk(state, args[1], "=(command line)");
+            if (sandbox) {
+                state.sandbox();
             }
-            if ("-v".equals(first) || "--version".equals(first)) {
-                System.out.println(versionLine());
-                return 0;
+            int status;
+            if (rest.length == 0) {
+                status = repl(state, in);
+            } else {
+                status = dispatch(state, rest, in, dumpBytecode);
             }
-            if ("-i".equals(first) || "--interactive".equals(first)) {
-                // PUC's lua -i [script args]: run the script first (when given),
-                // then enter the REPL with the same state.
-                if (args.length > 1) {
-                    String[] scriptArgs = java.util.Arrays.copyOfRange(args, 1, args.length);
-                    int status = runFile(state, scriptArgs[0], scriptArgs);
-                    if (status != 0) {
-                        return status;
-                    }
-                }
-                return repl(state, in);
+            if (profile) {
+                System.out.println("[profile] " + state.stats());
             }
-            if ("-h".equals(first) || "--help".equals(first)) {
-                printUsage();
-                return 0;
-            }
-            if (first.startsWith("-")) {
-                System.err.println("luava: unrecognized option '" + first + "'");
-                printUsage();
-                return 1;
-            }
-            return runFile(state, first, args);
+            return status;
         } catch (LuaException e) {
             printError(e);
             return 1;
@@ -94,7 +105,91 @@ public final class Main {
         }
     }
 
-    private static int runFile(LuaState state, String file, String[] args) {
+    /** Classic single-dash dispatch on the post-flag remainder. */
+    static int dispatch(LuaState state, String[] args, BufferedReader in, boolean dumpBytecode) {
+        if (args.length == 0) {
+            return repl(state, in);
+        }
+        String first = args[0];
+        if ("-e".equals(first) || "-E".equals(first)) {
+            if (args.length < 2) {
+                System.err.println("luava: '-e' needs an argument");
+                return 1;
+            }
+            return evalChunk(state, args[1], "=(command line)", dumpBytecode);
+        }
+        if ("-v".equals(first) || "--version".equals(first)) {
+            System.out.println(versionLine());
+            return 0;
+        }
+        if ("-i".equals(first) || "--interactive".equals(first)) {
+            // PUC's lua -i [script args]: run the script first (when given),
+            // then enter the REPL with the same state.
+            if (args.length > 1) {
+                String[] scriptArgs = java.util.Arrays.copyOfRange(args, 1, args.length);
+                int status = runFile(state, scriptArgs[0], scriptArgs, dumpBytecode);
+                if (status != 0) {
+                    return status;
+                }
+            }
+            return repl(state, in);
+        }
+        if ("-h".equals(first) || "--help".equals(first)) {
+            printUsage();
+            return 0;
+        }
+        if (first.startsWith("-")) {
+            System.err.println("luava: unrecognized option '" + first + "'");
+            printUsage();
+            return 1;
+        }
+        return runFile(state, first, args, dumpBytecode);
+    }
+
+    /**
+     * Prints one compiled chunk as human-readable bytecode (proto tree with
+     * opcode names and A/B/C fields, constants inline). Observational only:
+     * the chunk still executes afterwards, so exit status keeps reflecting
+     * the run, not the dump.
+     */
+    static void dumpBytecode(LuaState state, String source, String chunkName) {
+        final LuaFunction fn;
+        try {
+            fn = state.compile(source, chunkName, state.getGlobals());
+        } catch (LuaException e) {
+            System.err.println("luava: cannot dump bytecode: " + e.getMessage());
+            return;
+        }
+        if (fn instanceof LuaClosure lc) {
+            printProto(lc.proto, "");
+        } else {
+            System.out.println("; <host function, no bytecode>");
+        }
+    }
+
+    private static void printProto(LuaProto proto, String indent) {
+        String name = proto.name != null ? proto.name : "?";
+        System.out.println(indent + "proto <" + name + "> params=" + proto.numParams
+                + " stack=" + proto.maxStackSize + " code=" + proto.code.length
+                + " consts=" + proto.constants.length);
+        for (int pc = 0; pc < proto.code.length; pc++) {
+            int inst = proto.code[pc];
+            int op = Instruction.getOp(inst);
+            System.out.println(indent + "  [" + pc + "] " + OpCode.getOpName(op)
+                    + " A=" + Instruction.getA(inst)
+                    + " B=" + Instruction.getB(inst)
+                    + " C=" + Instruction.getC(inst));
+        }
+        for (int k = 0; k < proto.constants.length; k++) {
+            LuaValue c = proto.constants[k];
+            System.out.println(indent + "  K" + k + "=" + (c == null ? "nil" : c.toLuaString()));
+        }
+        for (LuaProto child : proto.protos) {
+            printProto(child, indent + "  ");
+        }
+    }
+
+    private static int runFile(LuaState state, String file, String[] args, boolean dumpBytecode) {
         Path path = Path.of(file);
         final String source;
         try {
@@ -109,7 +204,10 @@ public final class Main {
         // script name and arg[1..] the script arguments (PUC convention).
         state.getGlobals().rawset(
                 org.luava.runtime.LuaString.valueOf("arg"), buildArgTable(file, args));
-        return evalChunk(state, source, "@" + file);
+        if (dumpBytecode) {
+            dumpBytecode(state, source, "@" + file);
+        }
+        return evalChunk(state, source, "@" + file, false);
     }
 
     private static org.luava.runtime.LuaTable buildArgTable(String file, String[] args) {
@@ -123,7 +221,10 @@ public final class Main {
         return arg;
     }
 
-    private static int evalChunk(LuaState state, String source, String chunkName) {
+    private static int evalChunk(LuaState state, String source, String chunkName, boolean dumpBytecode) {
+        if (dumpBytecode) {
+            dumpBytecode(state, source, chunkName);
+        }
         try {
             state.eval(source, chunkName);
             return 0;
@@ -291,7 +392,13 @@ public final class Main {
                   -i        enter interactive mode after executing 'script'
                   -v        show version information
                   -h        show this help
+                  --jit-off        disable the tiered JIT for this run
+                  --sync           compile JIT kernels synchronously (deterministic runs)
+                  --dump-bytecode  print compiled bytecode, then run normally
+                  --profile        print state stats (calls/jit/deopt/alloc) after the run
+                  --sandbox        strip os/io/package/java before running (untrusted scripts)
                 With no script and no -e, an interactive REPL is started.
+                Prod flags come first: luava --sandbox --profile script.lua args...
                 """);
     }
 }

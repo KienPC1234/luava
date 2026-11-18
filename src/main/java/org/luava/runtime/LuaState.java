@@ -57,9 +57,18 @@ import java.util.function.Supplier;
  * concurrent servers; states do not share globals, security policy, value
  * metatables, or explicit finalizer ownership.
  */
-public final class LuaState {
+public final class LuaState implements AutoCloseable {
     private static final AtomicLong NEXT_GC_OWNER_ID = new AtomicLong(1);
     private final long gcOwnerId = NEXT_GC_OWNER_ID.getAndIncrement();
+    /**
+     * Additive host-observability counters (W4 embedding/ops). Incremented
+     * with behavior-neutral one-liners on existing paths; they never alter
+     * control flow. Read via {@link #stats()}.
+     */
+    private final AtomicLong statsCalls = new AtomicLong();
+    private final AtomicLong statsInstructions = new AtomicLong();
+    /** Set by {@link #close()}; further entries fail fast via {@link #ensureOpen()}. */
+    private volatile boolean closed;
     private final LuaTable globals = new LuaTable();
     private final LuaTable registry = new LuaTable();
     private final LuaCoroutine mainThread = LuaCoroutine.createMainThread();
@@ -599,6 +608,8 @@ public final class LuaState {
     }
 
     public LuaValue call(String functionName, Object... args) {
+        ensureOpen();
+        statsCalls.incrementAndGet();
         LuaValue fn = get(functionName);
         if (!fn.isFunction()) {
             throw new LuaException("global '" + functionName + "' is not a function");
@@ -649,6 +660,8 @@ public final class LuaState {
     }
 
     public LuaValue eval(String luaSource, String chunkName) {
+        ensureOpen();
+        statsCalls.incrementAndGet();
         LuaCoroutine prev = LuaCoroutine.running();
         if (prev == null) {
             LuaCoroutine.setCurrent(mainThread);
@@ -695,6 +708,7 @@ public final class LuaState {
     }
 
     public LuaValue evalWithTimeout(String luaSource, Duration timeout) throws TimeoutException {
+        ensureOpen();
         // A private hard guard makes the worker self-terminate on timeout
         // instead of leaking a virtual thread that spins forever. The guard
         // is installed before the worker starts and removed once the worker
@@ -813,6 +827,7 @@ public final class LuaState {
     }
 
     public LuaFunction compile(String luaSource, String chunkName, LuaValue env) {
+        ensureOpen();
         LuaValue chunkEnvVal = (env != null) ? env : globals;
         LuaTable chunkGlobals = (chunkEnvVal instanceof LuaTable t) ? t : globals;
 
@@ -865,6 +880,7 @@ public final class LuaState {
             synchronized (protoCache) {
                 protoCache.put(key, proto);
             }
+            statsInstructions.addAndGet(treeCodeSize(proto));
         }
         org.luava.runtime.eval.Upvalue envUpval = new org.luava.runtime.eval.Upvalue("_ENV", chunkEnvVal);
         return new org.luava.runtime.bytecode.LuaClosure(proto, new org.luava.runtime.eval.Upvalue[]{envUpval}, chunkGlobals, this);
@@ -1127,5 +1143,118 @@ public final class LuaState {
             if (lastError instanceof RuntimeException re) throw re;
             throw new LuaException(lastError.getMessage());
         }
+    }
+
+    // ---------------------------------------------------------------
+    // W4 embedding/ops surface (purely additive): observability, async
+    // entry, and lifecycle. None of the pre-existing paths above were
+    // reordered or re-semanticized; counters are side-effect-free
+    // increments and guards only fire on the new closed state.
+    // ---------------------------------------------------------------
+
+    /** Throws when this state was {@link #close() closed}. */
+    private void ensureOpen() {
+        if (closed) {
+            throw new LuaException("LuaState is closed");
+        }
+    }
+
+    /** Whether {@link #close()} has been called on this state. */
+    public boolean isClosed() {
+        return closed;
+    }
+
+    /**
+     * Returns an immutable observability snapshot for this state. Never
+     * touches the VM or JIT control paths: JIT gauges are scanned from this
+     * state's own proto cache, allocation debt is read from the GC manager.
+     */
+    public Stats stats() {
+        long jitHits = 0;
+        long deopts = 0;
+        synchronized (protoCache) {
+            for (org.luava.runtime.bytecode.LuaProto proto : protoCache.values()) {
+                long[] scanned = scanJitGauges(proto);
+                jitHits += scanned[0];
+                deopts += scanned[1];
+            }
+        }
+        return new Stats(
+                statsCalls.get(),
+                jitHits,
+                deopts,
+                org.luava.runtime.eval.GCManager.getUncollectedBytes(),
+                statsInstructions.get());
+    }
+
+    /**
+     * Walks one cached proto tree, returning {@code [compiledKernels,
+     * deopts]}. A kernel disarmed back to the interpreter ({@code jitCode ==
+     * null}) contributes nothing, so {@code jitHits} is a live gauge.
+     */
+    private static long[] scanJitGauges(org.luava.runtime.bytecode.LuaProto proto) {
+        long hits = 0;
+        long deopts = 0;
+        org.luava.runtime.jit.JitCode jc = proto.jitCode;
+        if (jc != null) {
+            hits = 1;
+            deopts = (long) jc.deopts + jc.structuralDeopts;
+        }
+        for (org.luava.runtime.bytecode.LuaProto child : proto.protos) {
+            long[] sub = scanJitGauges(child);
+            hits += sub[0];
+            deopts += sub[1];
+        }
+        return new long[]{hits, deopts};
+    }
+
+    /** Sums {@code code.length} over a proto tree (compiled-load pressure). */
+    private static long treeCodeSize(org.luava.runtime.bytecode.LuaProto proto) {
+        long size = proto.code.length;
+        for (org.luava.runtime.bytecode.LuaProto child : proto.protos) {
+            size += treeCodeSize(child);
+        }
+        return size;
+    }
+
+    /**
+     * Evaluates {@code luaSource} asynchronously, completing with the chunk
+     * result (a multi-value chunk completes with its {@link Varargs}). The
+     * blocking {@link #eval} semantics are unchanged; this is a thin host
+     * convenience. Failures complete exceptionally with the same
+     * {@link LuaException} the blocking call would throw.
+     */
+    public CompletableFuture<LuaValue> evalAsync(String luaSource) {
+        return evalAsync(luaSource, "chunk");
+    }
+
+    /**
+     * Named-chunk variant of {@link #evalAsync(String)}; {@code chunkName}
+     * shows up in error messages and tracebacks exactly as in
+     * {@link #eval(String, String)}.
+     */
+    public CompletableFuture<LuaValue> evalAsync(String luaSource, String chunkName) {
+        ensureOpen();
+        return CompletableFuture.supplyAsync(() -> eval(luaSource, chunkName));
+    }
+
+    /**
+     * Releases this state: drops the compiled-proto cache, clears any
+     * instruction/timeout guard, and unregisters from the GC manager so no
+     * collector root or finalizer bookkeeping pins it afterwards. Idempotent;
+     * further {@code eval}/{@code call}/{@code compile} entries fail fast
+     * with a {@link LuaException}.
+     */
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        clearGuard();
+        synchronized (protoCache) {
+            protoCache.clear();
+        }
+        org.luava.runtime.eval.GCManager.unregisterState(this);
     }
 }
