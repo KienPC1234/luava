@@ -16,25 +16,6 @@ import java.util.Map;
 public final class LuaTable extends LuaValue {
     private final Map<LuaValue, LuaValue> hashPart = new HashMap<>();
     private final ArrayList<LuaValue> arrayPart = new ArrayList<>();
-    // Unboxed numeric side-lanes parallel to arrayPart (triple-stack style),
-    // allocated LAZILY: null until the constructor pre-sizes or a rehash
-    // promotes. Rationale: JIT kernels call rawgetInt/rawsetInt per element
-    // and C2 must keep inlining them (PrintInlining-verified budgets); a
-    // sequentially appended table (the 03_table shape) therefore pays exactly
-    // one predictable null-check per store and keeps zero extra memory.
-    // Invariant: arrayPart ALWAYS holds the canonical boxed value (reads
-    // return the stored reference, zero allocation, identity preserved);
-    // arrayNums[i]/arrayKind[i] is a write-through classification cache.
-    // TAG_OBJ/TAG_NIL mirror the box; TAG_INT/TAG_FLOAT additionally record
-    // the raw bits for cold scans (rehash counting, borders) and future
-    // VM/JIT consumers. Every writer maintains the lanes; readers treat a
-    // null lane as "all boxed".
-    private static final byte TAG_NIL = 0;
-    private static final byte TAG_INT = 1;
-    private static final byte TAG_FLOAT = 2;
-    private static final byte TAG_OBJ = 3;
-    private long[] arrayNums = null;
-    private byte[] arrayKind = null;
     private LuaTable metatable;
     // Cold-start hook: installed only on standard-library placeholder tables
     // (null for every ordinary table). Plain tables pay one predictable
@@ -89,10 +70,8 @@ public final class LuaTable extends LuaValue {
     public LuaTable(int arrayCapacity, int hashCapacity) {
         if (arrayCapacity > 0) {
             arrayPart.ensureCapacity(arrayCapacity);
-            ensureLaneCap(arrayCapacity);
             for (int i = 0; i < arrayCapacity; i++) {
                 arrayPart.add(LuaNil.NIL);
-                // arrayKind slots are TAG_NIL by zero-init; no write needed.
             }
         }
         org.luava.runtime.eval.GCManager.onAlloc();
@@ -277,9 +256,6 @@ public final class LuaTable extends LuaValue {
     }
 
     private void convertToWeak() {
-        // Dual-write keeps the canonical boxes in arrayPart, so only the
-        // tags need downgrading before the wrap pass below.
-        materializeLanes();
         if (weakValues) {
             for (int i = 0; i < arrayPart.size(); i++) {
                 LuaValue v = arrayPart.get(i);
@@ -403,11 +379,6 @@ public final class LuaTable extends LuaValue {
         if (lazyFiller != null) {
             ensureFilledSlow();
         }
-        // Hot path kept byte-small on purpose: JIT kernels call this per
-        // element and C2 must inline it (see PrintInlining: 114 bytes). The
-        // canonical value lives boxed in arrayPart, so reads return the
-        // stored reference with zero allocation; the raw lanes are a
-        // write-through side cache for cold paths, never consulted here.
         if (idx >= 1 && idx <= arrayPart.size()) {
             LuaValue val = arrayPart.get((int) (idx - 1));
             if (val instanceof WeakVal wv) {
@@ -438,53 +409,13 @@ public final class LuaTable extends LuaValue {
         if (idx == arrayPart.size() + 1 && toSet != LuaNil.NIL) {
             arrayPart.add(toSet);
             if (!hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
-            // Single null-check when lanes were never promoted (the common
-            // append-built shape): zero extra memory and no stores.
-            if (arrayKind != null) {
-                ensureLaneCap(arrayPart.size());
-                laneWriteThrough(arrayPart.size() - 1, toSet);
-            }
             return;
         } else if (idx >= 1 && idx <= arrayPart.size()) {
             if (!hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
-            int i0 = (int) (idx - 1);
-            arrayPart.set(i0, toSet);
-            if (arrayKind != null) {
-                laneWriteThrough(i0, toSet);
-            }
+            arrayPart.set((int) (idx - 1), toSet);
             return;
         }
         rawset(LuaInteger.valueOf(idx), value);
-    }
-
-    /**
-     * Lane write-through for the {@code rawsetInt} hot path, kept as a
-     * separate tiny method so the caller's body stays small; C2 inlines this
-     * (~40 bytes) along with it. Straight classification, no weak wrapping:
-     * {@code rawsetInt} never wrapped (weak tables always carry a metatable
-     * and never reach the VM fast lane), and {@code toSet} is NIL-normalized
-     * by the caller, so only a reference comparison is needed for nil.
-     */
-    private void laneWriteThrough(int i0, LuaValue toSet) {
-        if (!weakKeys && !weakValues) {
-            if (toSet instanceof LuaInteger li) {
-                arrayNums[i0] = li.toLong();
-                arrayKind[i0] = TAG_INT;
-                return;
-            }
-            if (toSet instanceof LuaFloat lf) {
-                arrayNums[i0] = Double.doubleToRawLongBits(lf.toDouble());
-                arrayKind[i0] = TAG_FLOAT;
-                return;
-            }
-        }
-        if (toSet == LuaNil.NIL) {
-            arrayNums[i0] = 0L;
-            arrayKind[i0] = TAG_NIL;
-        } else {
-            arrayNums[i0] = 0L;
-            arrayKind[i0] = TAG_OBJ;
-        }
     }
 
     public LuaValue rawget(LuaValue key) {
@@ -514,9 +445,17 @@ public final class LuaTable extends LuaValue {
         if (key.isInteger()) {
             long idx = key.toLong();
             if (idx >= 1 && idx <= arrayPart.size()) {
-                LuaValue got = laneGet((int) (idx - 1));
-                if (got != null && !got.isNil()) {
-                    return got;
+                LuaValue val = arrayPart.get((int) (idx - 1));
+                if (val instanceof WeakVal wv) {
+                    LuaValue actual = wv.get();
+                    if (actual == null) {
+                        arrayPart.set((int) (idx - 1), LuaNil.NIL);
+                        return LuaNil.NIL;
+                    }
+                    return actual;
+                }
+                if (val != null && !val.isNil()) {
+                    return val;
                 }
             }
         }
@@ -569,21 +508,12 @@ public final class LuaTable extends LuaValue {
         if (key.isInteger()) {
             long idx = key.toLong();
             if (idx == arrayPart.size() + 1 && !toSet.isNil()) {
-                // Dual-write: canonical box first (baseline), then classify.
-                // ensureLaneCap is skipped while lanes were never promoted.
                 arrayPart.add(toStore);
                 if (!hashPart.isEmpty()) hashPart.remove(key);
-                if (arrayKind != null) {
-                    ensureLaneCap(arrayPart.size());
-                    laneClassify(arrayPart.size() - 1, toStore);
-                }
                 return;
             } else if (idx >= 1 && idx <= arrayPart.size()) {
                 if (!hashPart.isEmpty()) hashPart.remove(key);
                 arrayPart.set((int) (idx - 1), toStore);
-                if (arrayKind != null) {
-                    laneClassify((int) (idx - 1), toStore);
-                }
                 return;
             } else if (!toSet.isNil() && storeIntGap(idx, key, toStore)) {
                 return;
@@ -606,128 +536,6 @@ public final class LuaTable extends LuaValue {
             }
             LuaValue keyToStore = (weakKeys && isCollectable(key)) ? new WeakKey(key) : key;
             hashPart.put(keyToStore, toStore);
-        }
-    }
-
-    /**
-     * Lane helpers for the unboxed side-lanes. arrayPart always holds the
-     * canonical boxed value; these only maintain the raw classification
-     * cache. All of them tolerate null lanes ("all boxed").
-     */
-    private void ensureLaneCap(int size) {
-        if (arrayNums == null) {
-            int cap = Math.max(size, 8);
-            arrayNums = new long[cap];
-            arrayKind = new byte[cap];
-            return;
-        }
-        if (arrayNums.length < size) {
-            // 2x growth (not 1.5x): geometric waste stays ~1x final instead
-            // of ~2x, and append-heavy builds (t[i]=v in a loop) reallocate
-            // half as often. Peak over-commit is one extra array.
-            int cap = arrayNums.length * 2;
-            if (cap < size) {
-                cap = size;
-            }
-            if (cap < 8) {
-                cap = 8;
-            }
-            arrayNums = java.util.Arrays.copyOf(arrayNums, cap);
-            arrayKind = java.util.Arrays.copyOf(arrayKind, cap);
-        }
-    }
-
-    /**
-     * Border nil-test without boxing when lanes exist: raw lanes are never
-     * nil, so only {@code TAG_OBJ} needs the (virtual) check. Mirrors the old
-     * {@code arrayPart.get(i).isNil()} exactly, including the no-unwrap
-     * behaviour for dead weak values. Null lanes read the box directly.
-     */
-    private boolean laneIsNil(int i0) {
-        byte[] kinds = arrayKind;
-        if (kinds == null) {
-            LuaValue v = arrayPart.get(i0);
-            return v == null || v.isNil();
-        }
-        byte k = kinds[i0];
-        if (k == TAG_INT || k == TAG_FLOAT) {
-            return false;
-        }
-        if (k == TAG_NIL) {
-            return true;
-        }
-        LuaValue v = arrayPart.get(i0);
-        return v == null || v.isNil();
-    }
-
-    /**
-     * Dual-write read: arrayPart holds the canonical box, so this returns
-     * the stored reference exactly like the old direct {@code arrayPart.get}
-     * — zero allocation, identity preserved — with the same weak-value
-     * semantics (a dead {@code WeakVal} clears the slot and reads as nil).
-     */
-    private LuaValue laneGet(int i0) {
-        LuaValue v = arrayPart.get(i0);
-        if (v instanceof WeakVal wv) {
-            LuaValue actual = wv.get();
-            if (actual == null) {
-                arrayPart.set(i0, LuaNil.NIL);
-                if (arrayKind != null) {
-                    arrayKind[i0] = TAG_NIL;
-                }
-                return LuaNil.NIL;
-            }
-            return actual;
-        }
-        return v != null ? v : LuaNil.NIL;
-    }
-
-    /**
-     * Classify slot {@code i0} into the lanes (lanes only; the caller owns
-     * arrayPart). Integers and floats record raw bits; everything else
-     * mirrors the box. Weak tables stay fully boxed. No-op when lanes were
-     * never promoted.
-     */
-    private void laneClassify(int i0, LuaValue v) {
-        byte[] kinds = arrayKind;
-        if (kinds == null) {
-            return;
-        }
-        if (!weakKeys && !weakValues && v != null) {
-            if (v.isInteger()) {
-                arrayNums[i0] = v.toLong();
-                kinds[i0] = TAG_INT;
-                return;
-            }
-            if (v.isFloat()) {
-                arrayNums[i0] = Double.doubleToRawLongBits(v.toDouble());
-                kinds[i0] = TAG_FLOAT;
-                return;
-            }
-        }
-        if (v == null || v == LuaNil.NIL || v.isNil()) {
-            arrayNums[i0] = 0L;
-            kinds[i0] = TAG_NIL;
-        } else {
-            arrayNums[i0] = 0L;
-            kinds[i0] = TAG_OBJ;
-        }
-    }
-
-    /**
-     * Downgrade every raw lane to {@code TAG_OBJ}. Boxes are already
-     * canonical in arrayPart (dual-write), so no re-boxing is needed — only
-     * the tags change before the weak wrap pass. Plain tables never call this.
-     */
-    private void materializeLanes() {
-        byte[] kinds = arrayKind;
-        if (kinds == null) {
-            return;
-        }
-        for (int i = 0; i < arrayPart.size(); i++) {
-            if (kinds[i] == TAG_INT || kinds[i] == TAG_FLOAT) {
-                kinds[i] = TAG_OBJ;
-            }
         }
     }
 
@@ -760,9 +568,6 @@ public final class LuaTable extends LuaValue {
         if (idx >= 1 && idx <= size) {
             if (!hashPart.isEmpty()) hashPart.remove(key);
             arrayPart.set((int) (idx - 1), toStore);
-            if (arrayKind != null) {
-                laneClassify((int) (idx - 1), toStore);
-            }
             return true;
         }
         return false;
@@ -821,20 +626,7 @@ public final class LuaTable extends LuaValue {
         // PUC sizes this array as nums[MAXABITS + 1] with MAXABITS = 31.
         int[] nums = new int[32];
         int na = 0; // number of keys eligible for the array part
-        // Raw lanes are never nil and never weak-wrapped, so they count
-        // without unboxing; object slots keep the old unwrap-then-test.
-        // Null lanes (never promoted) count straight from the boxes.
-        byte[] kinds = arrayKind;
         for (int i = 0; i < arrayPart.size(); i++) {
-            if (kinds != null) {
-                byte k = kinds[i];
-                if (k == TAG_INT || k == TAG_FLOAT) {
-                    int b = arrayBucket(i + 1L);
-                    if (b < nums.length) nums[b]++;
-                    na++;
-                    continue;
-                }
-            }
             LuaValue v = arrayPart.get(i);
             if (v instanceof WeakVal wv) v = wv.get();
             if (v != null && !v.isNil()) {
@@ -886,16 +678,6 @@ public final class LuaTable extends LuaValue {
             return;
         }
         arrayPart.ensureCapacity(optimal);
-        // NOTE: no lane promotion here. Growing the lanes on every rehash
-        // taxes append-built tables (the sieve shape: 2M booleans would
-        // retain 18 MB of TAG_OBJ lanes plus 18 MB of growth garbage for
-        // zero benefit, since no hot path consults them). Lanes exist only
-        // when the constructor pre-sized them; if they do, extend the
-        // capacity (fresh slots are TAG_NIL by zero-fill) and keep
-        // classifying migrations below.
-        if (arrayKind != null) {
-            ensureLaneCap(optimal);
-        }
         while (arrayPart.size() < optimal) {
             arrayPart.add(LuaNil.NIL);
         }
@@ -909,11 +691,7 @@ public final class LuaTable extends LuaValue {
                     LuaValue v = e.getValue();
                     // Array-first reads make hash shadows invisible; drop
                     // nil ones, overwrite with live ones (same visible value).
-                    // Dual-write: canonical box first, then classify the lane
-                    // (a rehash both ways, boxed hash -> raw array, is exact).
-                    LuaValue sv = (v == null || v.isNil()) ? LuaNil.NIL : v;
-                    arrayPart.set((int) idx - 1, sv);
-                    laneClassify((int) idx - 1, sv);
+                    arrayPart.set((int) idx - 1, (v == null || v.isNil()) ? LuaNil.NIL : v);
                     it.remove();
                 }
             }
@@ -1014,7 +792,7 @@ public final class LuaTable extends LuaValue {
         // Mirror C luaH_getn/unbound_search: trim trailing nils, then if
         // t[n+1] is present (possibly in hashPart) search upward for a border.
         int n = arrayPart.size();
-        while (n > 0 && laneIsNil(n - 1)) {
+        while (n > 0 && arrayPart.get(n - 1).isNil()) {
             n--;
         }
         if (n > 0 && rawget(LuaInteger.valueOf((long) n + 1)).isNil()) {
@@ -1056,7 +834,8 @@ public final class LuaTable extends LuaValue {
                 return v == null || v.isNil();
             });
             for (int i = 0; i < arrayPart.size(); i++) {
-                LuaValue val = laneGet(i);
+                LuaValue val = arrayPart.get(i);
+                if (val instanceof WeakVal wv) val = wv.get();
                 if (val != null && !val.isNil()) {
                     return Varargs.of(LuaInteger.valueOf(i + 1), val);
                 }
@@ -1085,7 +864,8 @@ public final class LuaTable extends LuaValue {
             long k = currentKey.toLong();
             if (k >= 1 && k <= arrayPart.size()) {
                 for (int i = (int) k; i < arrayPart.size(); i++) {
-                    LuaValue val = laneGet(i);
+                    LuaValue val = arrayPart.get(i);
+                    if (val instanceof WeakVal wv) val = wv.get();
                     if (val != null && !val.isNil()) {
                         return Varargs.of(LuaInteger.valueOf(i + 1), val);
                     }
@@ -1160,9 +940,8 @@ public final class LuaTable extends LuaValue {
     public List<LuaValue> keys() {
         List<LuaValue> list = new ArrayList<>();
         for (int i = 0; i < arrayPart.size(); i++) {
-            // laneIsNil (no weak unwrap) matches the old boxed nil-test,
-            // including its treatment of dead weak values.
-            if (!laneIsNil(i)) {
+            LuaValue v = arrayPart.get(i);
+            if (v != null && !v.isNil()) {
                 list.add(LuaInteger.valueOf(i + 1));
             }
         }
@@ -1200,7 +979,8 @@ public final class LuaTable extends LuaValue {
 
     public void forEach(java.util.function.BiConsumer<LuaValue, LuaValue> consumer) {
         for (int i = 0; i < arrayPart.size(); i++) {
-            LuaValue v = laneGet(i);
+            LuaValue v = arrayPart.get(i);
+            if (v instanceof WeakVal wv) v = wv.get();
             if (v != null && !v.isNil()) {
                 consumer.accept(LuaInteger.valueOf(i + 1), v);
             }

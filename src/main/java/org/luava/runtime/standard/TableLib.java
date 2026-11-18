@@ -86,26 +86,11 @@ public final class TableLib {
                     throw LuaValue.argError(2, "insert", "position out of bounds");
                 }
                 val = args[2];
-                if (t.getMetatable() == null) {
-                    // Plain table: raw lane shift, no per-element key boxing.
-                    // Identical to the generic loop (no metatable to observe
-                    // the individual moves).
-                    for (long i = len + 1; i > pos; i--) {
-                        t.rawsetInt(i, t.rawgetInt(i - 1));
-                    }
-                    t.rawsetInt(pos, val);
-                    // PUC's table.insert returns zero values.
-                    return org.luava.runtime.Varargs.EMPTY;
-                }
                 for (long i = len + 1; i > pos; i--) {
                     t.set(LuaInteger.valueOf(i), t.get(LuaInteger.valueOf(i - 1)));
                 }
             }
-            if (t.getMetatable() == null) {
-                t.rawsetInt(pos, val);
-            } else {
-                t.set(LuaInteger.valueOf(pos), val);
-            }
+            t.set(LuaInteger.valueOf(pos), val);
             // PUC's table.insert returns zero values.
             return org.luava.runtime.Varargs.EMPTY;
         }));
@@ -119,15 +104,6 @@ public final class TableLib {
             long pos = (args.length > 1 && !args[1].isNil()) ? checkInteger(args, 1, "remove") : len;
             if (pos != len && (pos < 1 || pos > len + 1)) {
                 throw LuaValue.argError(2, "remove", "position out of bounds");
-            }
-            if (t.getMetatable() == null) {
-                // Plain table: raw lane shift, no per-element key boxing.
-                LuaValue removed = t.rawgetInt(pos);
-                for (; pos < len; pos++) {
-                    t.rawsetInt(pos, t.rawgetInt(pos + 1));
-                }
-                t.rawsetInt(pos, LuaNil.NIL);
-                return removed;
             }
             LuaValue removed = t.get(LuaInteger.valueOf(pos));
             for (; pos < len; pos++) {
@@ -206,16 +182,8 @@ public final class TableLib {
             }
             int icount = (int) count;
             LuaValue[] result = new LuaValue[icount];
-            if (t instanceof LuaTable lt && lt.getMetatable() == null) {
-                // Plain table: raw reads, no per-element key boxing.
-                // (A string `t` keeps the generic path below.)
-                for (int i = 0; i < icount; i++) {
-                    result[i] = lt.rawgetInt(start + i);
-                }
-            } else {
-                for (int i = 0; i < icount; i++) {
-                    result[i] = t.get(LuaInteger.valueOf(start + i));
-                }
+            for (int i = 0; i < icount; i++) {
+                result[i] = t.get(LuaInteger.valueOf(start + i));
             }
             return Varargs.of(result);
         }));
@@ -223,9 +191,7 @@ public final class TableLib {
         tableMod.rawset(LuaString.interned("pack"), LuaFunction.of(args -> {
             LuaTable t = new LuaTable();
             for (int i = 0; i < args.length; i++) {
-                // Fresh plain table: raw append, no key boxing. Nil holes
-                // fall through to rawset exactly as before.
-                t.rawsetInt(i + 1, args[i]);
+                t.rawset(LuaInteger.valueOf(i + 1), args[i]);
             }
             t.rawset(LuaString.interned("n"), LuaInteger.valueOf(args.length));
             return t;
@@ -259,20 +225,7 @@ public final class TableLib {
                 if (t > Long.MAX_VALUE - n + 1) {
                     throw LuaValue.argError(4, "move", "destination wrap around");
                 }
-                if (a1.getMetatable() == null && a2.getMetatable() == null) {
-                    // Plain tables: raw lane moves, no per-element key boxing.
-                    if (t > f && t <= e && a1 == a2) {
-                        for (long i = n - 1; i >= 0; i--) {
-                            if ((i & 0xFF) == 0) org.luava.runtime.LuaState.checkGuard();
-                            a2.rawsetInt(t + i, a1.rawgetInt(f + i));
-                        }
-                    } else {
-                        for (long i = 0; i < n; i++) {
-                            if ((i & 0xFF) == 0) org.luava.runtime.LuaState.checkGuard();
-                            a2.rawsetInt(t + i, a1.rawgetInt(f + i));
-                        }
-                    }
-                } else if (t > f && t <= e && a1 == a2) {
+                if (t > f && t <= e && a1 == a2) {
                     for (long i = n - 1; i >= 0; i--) {
                         if ((i & 0xFF) == 0) org.luava.runtime.LuaState.checkGuard();
                         a2.set(LuaInteger.valueOf(t + i), a1.get(LuaInteger.valueOf(f + i)));
@@ -305,12 +258,9 @@ public final class TableLib {
                 throw LuaValue.argError(1, "sort", "array too big");
             }
             int len = (int) lenLong;
-            boolean plain = t.getMetatable() == null;
             List<LuaValue> items = new ArrayList<>(len);
             for (int i = 1; i <= len; i++) {
-                // Plain table: raw reads, no per-element key boxing. A
-                // metatable could observe every access via __index.
-                items.add(plain ? t.rawgetInt(i) : t.get(LuaInteger.valueOf(i)));
+                items.add(t.get(LuaInteger.valueOf(i)));
             }
 
             org.luava.runtime.concurrency.LuaCoroutine curCoro = org.luava.runtime.concurrency.LuaCoroutine.running();
@@ -335,11 +285,7 @@ public final class TableLib {
             }
 
             for (int i = 0; i < len; i++) {
-                if (plain) {
-                    t.rawsetInt(i + 1, items.get(i));
-                } else {
-                    t.set(LuaInteger.valueOf(i + 1), items.get(i));
-                }
+                t.set(LuaInteger.valueOf(i + 1), items.get(i));
             }
             // PUC's table.sort returns zero values.
             return org.luava.runtime.Varargs.EMPTY;
