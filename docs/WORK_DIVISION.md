@@ -31,3 +31,16 @@ W3 chạm `JitRuntime.java` nhưng CHỈ hàm `buildClosure`; W1 không được
 
 W4 (additive, an toàn nhất) → W1 → W3 → W2 (rủi ro cao nhất, merge cuối).
 Mỗi merge xong phải chạy lại cổng chung trước khi merge tiếp theo.
+
+## Trạng thái (2026-11-19)
+
+| Worker | Trạng thái | Commit/nhánh | Ghi chú |
+|---|---|---|---|
+| W4 | done, đã merge | `8444eb1` | 374 test xanh; stats/close/evalAsync/5 cờ CLI |
+| W2 | done, đã merge (chờ đo lại) | `0d4ff11` | hết regression 3.6×; 03 = 1.019, 07 = 0.925 (chưa lặp lại lần 2) |
+| W1 | đang đo interleave | `/tmp/opencode/w1` `c34d4af` | kernel 1146→737B; fib còn chậm 6-9% ở lần đo đầu |
+| W3 | blocked (dưới bar 3%) | `w3/closure-alloc` `0252aba` | 05 = 0.987; phần còn lại ngoài scope hẹp |
+
+Quy tắc: kết quả dưới bar 3% **không merge**; giữ nhánh để gộp đo lại khi có
+thay đổi code-shape khác (W1/W3 cùng hướng). Kết quả W2 phải tái lập ≥3% trước
+khi coi là win thật, nếu không thì revert để tránh code vô ích (AGENTS §IV.4).
