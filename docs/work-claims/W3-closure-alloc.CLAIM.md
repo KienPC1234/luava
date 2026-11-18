@@ -2,7 +2,7 @@
 
 ```
 Owner: W3
-Status: claimed   # open | claimed | done | blocked
+Status: blocked   # open | claimed | done | blocked — xem ## Kết quả đo: 05 chỉ +1.2% < bar 3% sau 2 vòng, phần còn lại chứng minh nằm ngoài scope
 Branch: w3/closure-alloc
 ```
 
@@ -32,7 +32,33 @@ findOrCreateOpenUpvalue + new LuaClosure` mỗi `OP_CLOSURE`.
 - Interleave `05_closures` cải thiện, không regression task khác ngoài bar 3%.
 
 ## Kết quả đo (worker điền khi xong)
-- 05_closures: __ → __ | alloc/closure (JFR): __ → __
+- 05_closures (pinned core 5, 11 cặp, interleave B/A new/base):
+  JIT-on: 27.275 → 26.910 ms = **0.987 (+1.3%)**;
+  JIT-off (`-Dluava.jit=false`): 80.750 → 79.805 ms = **0.988 (+1.2%)**.
+  Dưới bar 3% → blocked (không bịa số; lần đo sớm 0.926 là nhiễu khi chạy
+  chung worker khác, đã loại bằng pin core + 11 cặp).
+- Commit: `0252aba` trên nhánh `w3/closure-alloc` (worktree /tmp/opencode/w3).
+  Diff vs `f34a97b`: 3 file vùng hẹp, +236/−42
+  (`BytecodeVM.java` executeClosure/factory, `Upvalue.java`, `JitRuntime.buildClosure`).
+- Cổng đúng đắn (trên đúng commit 0252aba): 31/31 PUC xanh cả JIT-on và
+  JIT-off; 363 unit test xanh; fuzz closure tự viết 2500 case: JIT-on/off
+  0 mismatch, PUC-vs-Luava 0 mismatch ngữ nghĩa. Không regression task khác
+  ngoài bar (full 10 task JIT-on: 0.972–1.000; JIT-off full-table lần đầu có
+  1.009–1.022 ở 4 task nhưng các task đó không chạy code đã sửa → nhiễu tải
+  chung, đã ghi nhận).
+- Phân rã chi phí JFR execution-sample trên 05_closures (new jar, 149 events):
+  factory path (callFactory+factoryBuild, in-scope) ~35% stacks; generic
+  child-call (`executeCallOp`/`invoke`/`tryJitCall`, vùng CALL cấm) ~58–72%;
+  `LuaClosure.<init>`+`onAlloc` ~11% (file cấm). Trong factory, dòng nóng nhất
+  là `Upvalue.closedInt` (36/149 events) = alloc cell tươi — bắt buộc semantics
+  (identity cho `upvalueid` + isolation `setupvalue`, đã chứng minh bằng probe).
+- Đã loại có lý do, không chạm: (1) share cell giữa closure — alias
+  setupvalue/upvalueid; (2) pool Upvalue/Upvalue[] sống — lifetime gắn closure,
+  reuse là unsound; (3) subclass Upvalue gọn — chỉ tiết kiệm zeroing ~1% tổng
+  mà rủi ro megamorphic + join/close/debug; (4) `onAlloc` AtomicLong,
+  `tryJitCall`, generic CALL — ngoài scope hẹp (file/vùng cấm).
+- Hướng cho worker sau (ngoài scope W3): muốn 05 vượt 3% phải đụng vùng cấm —
+  inline/lane cho child-call `c()` (CALL), hoặc `onAlloc` (GCManager).
 
 ## Checkpoint (model đổi — W3 tiếp tục trên worktree /tmp/opencode/w3, nhánh w3/closure-alloc)
 - Đã khảo sát: `05_closures` = factory 1-int-capture (`make_counter`), đã frameless
