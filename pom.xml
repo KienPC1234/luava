@@ -184,8 +184,15 @@
                       timezone-dependent Lua calls (os.time{...}, non-"!" 
                       os.date) reproducible on any machine and on CI; the
                       conformance sweep expected output was captured under UTC.
+
+                      -Dluava.jit.sync=true also belongs here: tier-up is
+                      asynchronous in production, so tests that wait for a
+                      proto to compile (`awaitCompiled`) raced the compiler
+                      thread and one of them failed on CI after 5 s. Compiling
+                      on the requesting thread makes those assertions
+                      deterministic without changing what they verify.
                     -->
-                    <argLine>-Xmx2g -Duser.timezone=UTC</argLine>
+                    <argLine>-Xmx2g -Duser.timezone=UTC -Dluava.jit.sync=true</argLine>
                     <systemPropertyVariables>
                         <suite>${suite}</suite>
                     </systemPropertyVariables>

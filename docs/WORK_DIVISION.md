@@ -38,10 +38,26 @@ Mỗi merge xong phải chạy lại cổng chung trước khi merge tiếp theo
 |---|---|---|---|
 | W4 | done, đã merge | `8444eb1` | 366 test xanh; stats/close/evalAsync/5 cờ CLI |
 | W2 | done, **đã revert** | `0d4ff11` → revert `8a35bf8` | 15 cặp: 03 = 1.005, 07 = 0.996, 10 = 1.019 → trung tính; giữ commit trong lịch sử để phục hồi |
-| W1 | done, đã merge | `3180fa2` | kernel 1146→306B, `inline (hot)`, fib -14.8% |
+| W1 | **đã revert** | `3180fa2` → revert | kernel 306B/fib −15% nhưng seed tham số = INT làm hàm gọi bằng float deopt mọi lần (`math.sqrt`) và bị disarm; xem ghi chú dưới |
 | W3 | blocked (dưới bar 3%) | `w3/closure-alloc` `0252aba` | 05 = 0.987; phần còn lại ngoài scope hẹp |
 
 Quy tắc: kết quả dưới bar 3% **không merge**; giữ nhánh để gộp đo lại khi có
 thay đổi code-shape khác (W1/W3 cùng hướng). W2 là ví dụ ngược: đo 7 cặp cho
 `07 = 0.925` nhưng 15 cặp chỉ `0.996` — với nhiễu sàn ~13%, **7 cặp không đủ**
 để kết luận dưới 3%; chỉ revert sau khi có lượt đo thứ hai.
+
+### Vì sao W1 bị revert (2026-11-19)
+
+Kernel nhỏ đạt được nhờ **int-only lane** dựa trên suy luận tĩnh seed tham số
+`T_INT`. Hệ quả: hàm gọi bằng float (`local function f(x) return
+math.sqrt(x*x+x) end` với `x = 2.5`) compile thành công nhưng **deopt ở mọi
+lần gọi** (`pc=2`, `up0tag=0`) rồi bị disarm sau 8 lần. Test cũ che lỗi vì JIT
+async: 400 lần gọi kết thúc trước khi kernel kịp compile.
+
+Đo trực tiếp: base `compiled: f` rồi chạy sạch; W1 `compiled: f` + 9 dòng deopt.
+Test `JitCoverageTest.sqrtIntrinsicProtoActuallyCompiles` đỏ trên CI và trên
+máy khi bật `-Dluava.jit.sync=true`.
+
+Hướng đúng nếu làm lại: phân biệt **provenance** (giá trị int chứng minh được
+từ `LOADI`/hằng int) với **giả định** (tham số), hoặc hai phiên bản kernel
+(int/param) chọn theo tag đối số tại call site. Không seed tham số là int.
