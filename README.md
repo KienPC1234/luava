@@ -83,6 +83,9 @@ ownership. Use one state per thread or per tenant; states share no mutable state
 | `state.registerModule(obj)` | Bind an `@LuaModule`-annotated class or instance. |
 | `state.registerClass(clazz)` | Expose a class under its simple name (e.g. `ArrayList`). |
 | `state.resourceLoader(loader)` | Resolve `require` from a JAR, classpath or virtual store. |
+| `state.evalAsync(src)` | Run a script on a virtual thread; returns `CompletableFuture<LuaValue>`. |
+| `state.stats()` | Snapshot of calls, JIT hits, deopts, allocated bytes, instructions. |
+| `state.close()` | Release the state's GC registration and cached code (`AutoCloseable`). |
 
 ```java
 state.registerFunction("answer", () -> 42);
@@ -192,10 +195,12 @@ java -jar luava-0.2.5.jar -v                     # version + code name
 ```
 
 Flags: `-e stat`/`-E stat` (run a string), `-i`/`--interactive` (REPL),
-`-v`/`--version`, `-h`/`--help`. A script sees the standard `arg` table
-(`arg[0]` is the script name). Embedding through `LuaState` remains the primary
-use; the [Usage Guide](docs/USAGE.md) has runnable examples and a full flag
-table.
+`-v`/`--version`, `-h`/`--help`, plus operations flags `--jit-off`, `--sync`
+(deterministic JIT tier-up), `--dump-bytecode`, `--profile` (print
+`state.stats()`), and `--sandbox` (drop `os`/`io`/`package` for smoke tests). A
+script sees the standard `arg` table (`arg[0]` is the script name). Embedding
+through `LuaState` remains the primary use; the
+[Usage Guide](docs/USAGE.md) has runnable examples and a full flag table.
 
 ## Execution model
 
@@ -240,7 +245,7 @@ Knobs:
 ## Conformance
 
 - 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass, asserted by
-  `OfficialSuiteEvaluationTest`, so a regression fails the build. 362 unit tests
+  `OfficialSuiteEvaluationTest`, so a regression fails the build. 366 unit tests
   run alongside, including a byte-for-byte differential suite against stock PUC
   Lua 5.4 and a fixed stdlib sweep under JIT both on and off.
 - `all.lua`, the PUC driver, runs in user-test mode (`_U`): it re-runs every
