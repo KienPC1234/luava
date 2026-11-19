@@ -55,3 +55,37 @@ jobs:
           name: surefire-reports
           path: target/surefire-reports/
           if-no-files-found: ignore
+
+  test-jit-off:
+    name: Build & test (JIT disabled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # The conformance gate is "green with JIT on *and* off"; running it only
+    # once meant the disabled path was verified by hand. JDK_JAVA_OPTIONS
+    # reaches the forked surefire JVM (LuaState reads -Dluava.jit at class
+    # initialisation, so a Maven-only property would arrive too late).
+    env:
+      JDK_JAVA_OPTIONS: -Dluava.jit=false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Full test suite (interpreter path)
+        run: mvn -B -ntp test
+
+      - name: Upload surefire reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: surefire-reports-jit-off
+          path: target/surefire-reports/
+          if-no-files-found: ignore

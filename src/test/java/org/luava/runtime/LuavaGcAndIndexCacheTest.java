@@ -252,9 +252,16 @@ public class LuavaGcAndIndexCacheTest {
                 local keep = {}
                 for i = 1, 200000 do keep[i % 64 + 1] = {i, tostring(i)} end
             """);
+        // The old version asserted `before >= 0`, a tautology: the test passed
+        // even if nothing was collected. Accounted memory is explicit (not JVM
+        // GC), so these three facts are deterministic and actually test the
+        // claim in the test name.
+        double peak = GCManager.getMemoryKb();
+        assertTrue(peak > before, "allocating 200k tables must raise accounted memory");
         GCManager.collect(s);
-        assertTrue(GCManager.getMemoryKb() >= 0, "memory accounting stays sane after collect");
-        assertTrue(before >= 0);
+        double after = GCManager.getMemoryKb();
+        assertTrue(after < peak, "collect must release accounted bytes: peak=" + peak + " after=" + after);
+        assertEquals(0L, GCManager.getUncollectedBytes(), "collect resets the pending counter");
     }
 
     @Test

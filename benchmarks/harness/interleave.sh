@@ -14,6 +14,21 @@
 # =============================================================================
 set -euo pipefail
 
+# Measurements must not be contaminated by a concurrent run: two benchmarks on
+# the same pinned core silently flip the ratio (observed: the same 04 pair read
+# 1.30 and 0.88 in the same afternoon). A lock file makes the rule enforceable
+# even when the competing run is in another shell.
+exec 9>"${TMPDIR:-/tmp}/luava-bench.lock"
+if ! flock -n 9; then
+    echo "refusing to measure: another interleave holds ${TMPDIR:-/tmp}/luava-bench.lock" >&2
+    exit 2
+fi
+
+# Synchronous tier-up by default: with background compilation the first
+# measured iterations depend on compiler thread scheduling. Callers can still
+# override LUAVA_JIT_SYNC= (empty) to measure the async path on purpose.
+export LUAVA_JIT_SYNC="${LUAVA_JIT_SYNC:--Dluava.jit.sync=true}"
+
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LUA_DIR="$(cd "$HARNESS_DIR/../lua" && pwd)"
 JAR_A="${1:?jarA required}"
