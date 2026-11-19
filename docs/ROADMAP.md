@@ -17,13 +17,14 @@ Profiled on the current jar (JFR `ExecutionSample` + `ObjectAllocationSample`):
 | `04_string_concat` | `tostringInline`, `LuaTable.get/rawget`, `TableLib.concat` | `LuaString`, `String`, `byte[]` |
 | `09_string_pattern` | `GmatchIterator.nextSimple`, `match_class`, `JitRuntime.tforCall` | `GmatchIterator` (1 per `gmatch` call), `LuaString`, `String`, `byte[]` |
 
-Kernel-side work is done: `execInner` fib is 306 B and C2 emits `inline (hot)`
-(was 1146 B / `hot method too big`), fib −14.8 %, arith −4.4 %.
-
-**Conclusion:** what is left is not dispatch width. It is the **string
-representation** (every Lua string is a `java.lang.String`, so byte-oriented
-work pays a decode/encode and a second object per value) and **call-site
-polymorphism**.
+Kernel-side work was attempted and reverted: a 306 B kernel (fib −14.8 %) was
+achieved by seeding parameters as `T_INT` for int-only lanes, but a function
+called with a float then deopted on every call and was disarmed. The lesson is
+in `plan.md` §5.C: only *provenance* (values produced by int literals) may
+justify an int-only lane, never a parameter guess. What is left is not dispatch
+width but the **string representation** (every Lua string is a
+`java.lang.String`, so byte-oriented work pays a decode/encode and a second
+object per value) and **call-site polymorphism**.
 
 ---
 
@@ -69,6 +70,7 @@ A2 together or not at all; A3 can ship alone if A1 slips.
 
 | Item | Work | Gate | Risk |
 |---|---|---|---|
+| B0 | Provenance-aware int lanes: only values produced by int literals get an int-only path; parameters stay numeric-generic, or the call site selects an int/generic kernel version by argument tags. This is the fix that would make the reverted 306 B kernel safe. | fib ≥ 10 % without any deopt storm on float-called functions | medium |
 | B1 | Polymorphic inline cache for `JitRuntime.selfMethod` and closure calls: monomorphic → 2–4 shape guard chain → megamorphic deopt. | 08 ≥ 3 % | medium |
 | B2 | Per-call-site type feedback (observed int/float/object mask) feeding the existing `analyze()` type lattice. | one loop task ≥ 5 % | medium |
 | B3 | Vararg in kernels (53 rejected protos): extend the `exec` ABI or read the caller window without copying. | coverage +3 % | high |
