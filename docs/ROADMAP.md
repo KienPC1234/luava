@@ -1,7 +1,7 @@
 # ROADMAP — Luava expansion plan
 
-Status: 2026-11-20, 0.2.6 ("Meridian").
-Conformance 31/31 PUC Lua 5.4.9 suites, 388 unit/security/conformance tests, JIT on/off/sync green.
+Status: 2026-11-20, 0.2.7 ("Bastion").
+Conformance 31/31 PUC Lua 5.4.9 suites, 411 unit/security/conformance tests, JIT sync/async/off green.
 
 This document covers **what to build next and in what order**. Measurement
 logs and per-item evidence stay in `plan.md` (maintainer notes, not shipped).
@@ -106,6 +106,10 @@ inlining and loop opts. Effort is better spent on Track A.
 
 Release train:
 
+* **0.2.7 ("Bastion")** — shipped: `ExecutionPolicy` pool guard enforcement,
+  `ISOLATED`/`STATEFUL` pool accounting and cross-pool ownership, `JavaCapability`
+  return attenuation with pre-allocation bounds, ordered `evalAsync` completion,
+  and three-mode CI verification (`sync JIT`, `async JIT`, `JIT off`).
 * **0.2.6 ("Meridian")** — shipped: byte-slice strings, pattern slices, unboxed
   `LuaTable` array lanes, guarded JIT kernels, stackless coroutines,
   `CompiledChunk`/`LuaStatePool`, security/crash fixes, and resource controls.

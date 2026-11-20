@@ -12,7 +12,7 @@
     -->
     <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava</artifactId>
-    <version>0.2.6</version>
+    <version>0.2.7</version>
     <packaging>jar</packaging>
 
     <name>Luava</name>
@@ -49,11 +49,12 @@
 
         <!--
           Release code name, surfaced in the jar manifest and the CLI's -v.
-          "Meridian" introduces 0.2.6: byte-slice strings and pattern engine,
-          unboxed table array lanes, guarded JIT kernels, stackless coroutines,
-          CompiledChunk/LuaStatePool, and resource/security hardening.
+          "Bastion" introduces 0.2.7: ExecutionPolicy pool guard retention,
+          ISOLATED/STATEFUL pool accounting and cross-pool ownership, JavaCapability
+          method allowlist with attenuated container bounds, async lifecycle
+          ordering, and three-mode CI verification (sync JIT, async JIT, JIT off).
         -->
-        <luava.codename>Meridian</luava.codename>
+        <luava.codename>Bastion</luava.codename>
         <luava.jit.sync>true</luava.jit.sync>
 
         <junit.jupiter.version>5.10.2</junit.jupiter.version>

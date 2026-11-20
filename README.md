@@ -6,8 +6,8 @@ Single shaded JAR with zero runtime dependencies beyond JDK 21+.
 
     source -> Lexer -> Parser -> AST -> BytecodeCompiler -> LuaProto -> BytecodeVM / JitCode
 
-- **Release**: `0.2.6` ("Meridian") on [Maven Central](https://central.sonatype.com/artifact/io.github.kienpc1234/luava) (`io.github.kienpc1234:luava:0.2.6`) and [GitHub Releases](https://github.com/KienPC1234/luava/releases/latest)
-- **Build & Test**: `mvn package` (`target/luava-0.2.6.jar`) and `mvn test`
+- **Release**: `0.2.7` ("Bastion") on [Maven Central](https://central.sonatype.com/artifact/io.github.kienpc1234/luava) (`io.github.kienpc1234:luava:0.2.7`) and [GitHub Releases](https://github.com/KienPC1234/luava/releases/latest)
+- **Build & Test**: `mvn package` (`target/luava-0.2.7.jar`) and `mvn test`
 - **Documentation**: [Usage Guide](docs/USAGE.md) (CLI flags, Java interop, sandboxing, tuning) and [Roadmap](docs/ROADMAP.md)
 
 ## Quick start
@@ -47,7 +47,7 @@ resource caps (one state per thread or tenant).
 
 ## Verification & Benchmarks
 
-- **Conformance**: 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` suites pass (`OfficialSuiteEvaluationTest`), alongside 410 unit, lifecycle, adversarial security, and PUC 5.4 differential tests across sync JIT (`-Dluava.jit.sync=true`), async JIT (`-Dluava.jit.sync=false`), and JIT OFF (`-Dluava.jit=false`).
+- **Conformance**: 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` suites pass (`OfficialSuiteEvaluationTest`), alongside 411 unit, lifecycle, adversarial security, and PUC 5.4 differential tests across sync JIT (`-Dluava.jit.sync=true`), async JIT (`-Dluava.jit.sync=false`), and JIT OFF (`-Dluava.jit=false`).
 
 Reproducible paired benchmark via `benchmarks/harness/audit_bench.sh` (11 interleaved pairs, pinned core 0 except coroutines, 6 warmup, 10 iters, OpenJDK 21.0.13.1 `-Dluava.jit.sync=true -XX:+UseG1GC -Xmx1g` on Intel Xeon Gold 5120T vs PUC Lua 5.4.8 C):
 

@@ -53,6 +53,7 @@ public final class LuaStatePool implements AutoCloseable {
     private final Object leaseLock = new Object();
     private final IdentityHashMap<LuaState, Lease> activeLeases = new IdentityHashMap<>();
     private final IdentityHashMap<LuaState, Boolean> managedStates = new IdentityHashMap<>();
+    private int initializingCount;
     private volatile boolean closed;
 
     /**
@@ -171,6 +172,7 @@ public final class LuaStatePool implements AutoCloseable {
         LuaState state = null;
         boolean closeOnRollback = true;
         boolean handoffSucceeded = false;
+        boolean creationReserved = false;
         try {
             if (closed) {
                 throw new LuaException("pool is closed");
@@ -180,10 +182,21 @@ public final class LuaStatePool implements AutoCloseable {
             if (state != null) {
                 fromIdle = true;
             } else {
+                synchronized (leaseLock) {
+                    if (closed) {
+                        throw new LuaException("pool is closed");
+                    }
+                    initializingCount++;
+                    creationReserved = true;
+                }
                 state = createFreshState();
             }
             long gen;
             synchronized (leaseLock) {
+                if (creationReserved) {
+                    initializingCount--;
+                    creationReserved = false;
+                }
                 if (!fromIdle && (managedStates.containsKey(state) || !state.tryClaimPool(this))) {
                     closeOnRollback = false;
                     throw new LuaException("pool factory returned a LuaState already managed by another pool or lease");
@@ -211,6 +224,11 @@ public final class LuaStatePool implements AutoCloseable {
             handoffSucceeded = true;
             return lease;
         } finally {
+            if (creationReserved) {
+                synchronized (leaseLock) {
+                    initializingCount--;
+                }
+            }
             if (!handoffSucceeded) {
                 if (state != null && closeOnRollback) {
                     retireState(state);
@@ -317,7 +335,7 @@ public final class LuaStatePool implements AutoCloseable {
         }
     }
 
-    /** Pre-creates up to {@code count} idle states respecting pool bounds. */
+    /** Pre-creates up to {@code count} idle states respecting both {@code maxIdle} and {@code maxTotal}. */
     public int warmIdle(int count) {
         int created = 0;
         int target = Math.min(Math.max(0, count), maxIdle);
@@ -327,13 +345,25 @@ public final class LuaStatePool implements AutoCloseable {
             }
             LuaState state = null;
             boolean closeOnRollback = true;
+            boolean slotReserved = false;
             try {
-                if (closed) {
-                    break;
+                synchronized (leaseLock) {
+                    if (closed
+                            || idle.size() >= target
+                            || managedStates.size() + initializingCount >= maxTotal) {
+                        break;
+                    }
+                    initializingCount++;
+                    slotReserved = true;
                 }
                 state = createFreshState();
                 long gen;
                 synchronized (leaseLock) {
+                    initializingCount--;
+                    slotReserved = false;
+                    if (closed || managedStates.size() >= maxTotal) {
+                        break;
+                    }
                     if (managedStates.containsKey(state) || !state.tryClaimPool(this)) {
                         closeOnRollback = false;
                         throw new LuaException("pool factory returned a LuaState already managed by another pool or lease");
@@ -352,6 +382,11 @@ public final class LuaStatePool implements AutoCloseable {
                     break;
                 }
             } finally {
+                if (slotReserved) {
+                    synchronized (leaseLock) {
+                        initializingCount--;
+                    }
+                }
                 if (state != null && closeOnRollback) {
                     retireState(state);
                 }
@@ -364,6 +399,13 @@ public final class LuaStatePool implements AutoCloseable {
     public int activeCount() {
         synchronized (leaseLock) {
             return activeLeases.size();
+        }
+    }
+
+    /** Total resident states currently managed by this pool (active plus idle). */
+    public int totalCount() {
+        synchronized (leaseLock) {
+            return managedStates.size();
         }
     }
 

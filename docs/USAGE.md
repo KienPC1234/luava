@@ -10,13 +10,13 @@ If you only want to run scripts or poke at Lua 5.4 syntax, the engine jar is
 executable:
 
 ```bash
-java -jar luava-0.2.6.jar script.lua arg1 arg2   # run a file (arg[0] = script name)
-java -jar luava-0.2.6.jar -e "print(1 + 2)"      # evaluate a string
-java -jar luava-0.2.6.jar -i script.lua          # run, then enter the REPL
-java -jar luava-0.2.6.jar                        # interactive multi-line REPL
-java -jar luava-0.2.6.jar -v                     # version (e.g. "Luava 0.2.6 Meridian (Lua 5.4)")
-java -jar luava-0.2.6.jar -h                     # usage
-java -jar luava-0.2.6.jar --sandbox --profile script.lua   # prod smoke-test
+java -jar luava-0.2.7.jar script.lua arg1 arg2   # run a file (arg[0] = script name)
+java -jar luava-0.2.7.jar -e "print(1 + 2)"      # evaluate a string
+java -jar luava-0.2.7.jar -i script.lua          # run, then enter the REPL
+java -jar luava-0.2.7.jar                        # interactive multi-line REPL
+java -jar luava-0.2.7.jar -v                     # version (e.g. "Luava 0.2.7 Bastion (Lua 5.4)")
+java -jar luava-0.2.7.jar -h                     # usage
+java -jar luava-0.2.7.jar --sandbox --profile script.lua   # prod smoke-test
 ```
 
 Flags (only the first argument is inspected, so pass flags before the script):

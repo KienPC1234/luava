@@ -26,6 +26,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -33,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -119,6 +121,24 @@ public class LuavaSecurityAuditSuiteTest {
 
         public List<Integer> oversizedList() {
             return Collections.nCopies(70_000, 1);
+        }
+
+        public List<Integer> massiveVirtualList() {
+            return Collections.nCopies(100_000_000, 1);
+        }
+
+        public Map<String, Integer> massiveVirtualMap() {
+            return new AbstractMap<>() {
+                @Override
+                public int size() {
+                    return 100_000;
+                }
+
+                @Override
+                public Set<Entry<String, Integer>> entrySet() {
+                    throw new AssertionError("massive map entries must never be iterated before size check");
+                }
+            };
         }
     }
 
@@ -612,7 +632,8 @@ public class LuavaSecurityAuditSuiteTest {
             state.setCapability("svc", new AttenuatingFactoryService(),
                     "safeSummary", "safeInt", "safeStringList",
                     "leakedObject", "leakedList", "leakedMap", "leakedOptional", "leakedArray",
-                    "attenuatedChild", "deeplyNestedList", "oversizedList");
+                    "attenuatedChild", "deeplyNestedList", "oversizedList",
+                    "massiveVirtualList", "massiveVirtualMap");
 
             assertEquals("summary", state.eval("return svc:safeSummary()").toLuaString());
             assertEquals(42L, state.eval("return svc:safeInt()").toLong());
@@ -626,7 +647,9 @@ public class LuavaSecurityAuditSuiteTest {
                     "return svc:leakedOptional()",
                     "return svc:leakedArray()",
                     "return svc:deeplyNestedList()",
-                    "return svc:oversizedList()")) {
+                    "return svc:oversizedList()",
+                    "return svc:massiveVirtualList()",
+                    "return svc:massiveVirtualMap()")) {
                 LuaException err = assertThrows(LuaException.class, () -> state.eval(call));
                 assertTrue(err.getMessage().contains("access denied"),
                         "Expected access denied for '" + call + "', got: " + err.getMessage());
@@ -783,6 +806,39 @@ public class LuavaSecurityAuditSuiteTest {
                 assertFalse(leaseA.state().isClosed(), "poolB rejection must not close poolA's active state");
                 assertEquals(9L, leaseA.eval("return 4 + 5").toLong());
             }
+        }
+    }
+
+    @Test
+    void warmIdleDoesNotExceedMaxTotalTest() {
+        try (LuaStatePool pool = LuaStatePool.builder()
+                .isolationMode(LuaStatePool.IsolationMode.STATEFUL)
+                .maxTotal(2)
+                .maxIdle(2)
+                .policy(ExecutionPolicy.builder().sandbox(true).build())
+                .build()) {
+            LuaStatePool.Lease first = pool.acquireLease();
+            LuaStatePool.Lease second = pool.acquireLease();
+            assertEquals(2, pool.activeCount());
+            assertEquals(2, pool.totalCount());
+
+            first.close();
+            assertEquals(1, pool.activeCount());
+            assertEquals(1, pool.idleCount());
+            assertEquals(2, pool.totalCount());
+
+            int created = pool.warmIdle(2);
+            assertEquals(0, created, "warmIdle must not exceed maxTotal across active + idle states");
+            assertEquals(1, pool.activeCount());
+            assertEquals(1, pool.idleCount());
+            assertEquals(2, pool.totalCount());
+            assertEquals(1, pool.availablePermits());
+
+            second.close();
+            assertEquals(0, pool.activeCount());
+            assertEquals(2, pool.idleCount());
+            assertEquals(2, pool.totalCount());
+            assertEquals(2, pool.availablePermits());
         }
     }
 }

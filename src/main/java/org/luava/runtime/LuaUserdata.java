@@ -728,6 +728,13 @@ public final class LuaUserdata extends LuaValue {
                         + MAX_CAPABILITY_RETURN_ELEMENTS + ")");
             }
         }
+
+        void reserveElements(long count) {
+            if (count < 0 || count > (long) (MAX_CAPABILITY_RETURN_ELEMENTS - elements)) {
+                throw new LuaException("access denied: capability return exceeded max element count ("
+                        + MAX_CAPABILITY_RETURN_ELEMENTS + ")");
+            }
+        }
     }
 
     private static LuaValue convertReturn(Class<?> returnType, Object result, boolean capabilityGrant) {
@@ -771,10 +778,12 @@ public final class LuaUserdata extends LuaValue {
             return opt.isPresent() ? sanitizeCapabilityReturn(opt.get(), ctx, depth + 1) : LuaNil.NIL;
         }
         if (result instanceof List<?> list) {
+            int size = list.size();
+            ctx.reserveElements(size);
             enterCapabilityContainer(result, ctx.visited);
             try {
-                LuaTable table = new LuaTable(list.size(), 0);
-                for (int i = 0; i < list.size(); i++) {
+                LuaTable table = new LuaTable(size, 0);
+                for (int i = 0; i < size; i++) {
                     table.rawset(
                             LuaInteger.valueOf(i + 1),
                             sanitizeCapabilityReturn(list.get(i), ctx, depth + 1));
@@ -785,9 +794,11 @@ public final class LuaUserdata extends LuaValue {
             }
         }
         if (result instanceof Map<?, ?> map) {
+            int size = map.size();
+            ctx.reserveElements((long) size * 2L);
             enterCapabilityContainer(result, ctx.visited);
             try {
-                LuaTable table = new LuaTable(0, map.size());
+                LuaTable table = new LuaTable(0, size);
                 for (Map.Entry<?, ?> entry : map.entrySet()) {
                     table.rawset(
                             sanitizeCapabilityReturn(entry.getKey(), ctx, depth + 1),
@@ -799,9 +810,11 @@ public final class LuaUserdata extends LuaValue {
             }
         }
         if (result instanceof Set<?> set) {
+            int size = set.size();
+            ctx.reserveElements(size);
             enterCapabilityContainer(result, ctx.visited);
             try {
-                LuaTable table = new LuaTable(set.size(), 0);
+                LuaTable table = new LuaTable(size, 0);
                 int i = 1;
                 for (Object elem : set) {
                     table.rawset(
@@ -814,9 +827,10 @@ public final class LuaUserdata extends LuaValue {
             }
         }
         if (result.getClass().isArray()) {
+            int len = Array.getLength(result);
+            ctx.reserveElements(len);
             enterCapabilityContainer(result, ctx.visited);
             try {
-                int len = Array.getLength(result);
                 LuaTable table = new LuaTable(len, 0);
                 for (int i = 0; i < len; i++) {
                     table.rawset(
@@ -853,6 +867,7 @@ public final class LuaUserdata extends LuaValue {
                     + type);
         }
         if (lv instanceof LuaTable tbl) {
+            ctx.reserveElements(tbl.rawlen());
             enterCapabilityContainer(tbl, ctx.visited);
             try {
                 LuaTable snapshot = new LuaTable();
@@ -869,6 +884,7 @@ public final class LuaUserdata extends LuaValue {
         }
         if (lv instanceof Varargs va) {
             int n = va.count();
+            ctx.reserveElements(n);
             LuaValue[] items = new LuaValue[n];
             for (int i = 0; i < n; i++) {
                 ctx.countElement();
