@@ -118,6 +118,7 @@ public final class LuaState implements AutoCloseable {
     private volatile boolean tainted = false;
     private volatile boolean poolIdle = false;
     private final java.util.concurrent.atomic.AtomicLong leaseGeneration = new java.util.concurrent.atomic.AtomicLong();
+    private final AtomicReference<LuaStatePool> owningPool = new AtomicReference<>();
     private final LuaTable globals = new LuaTable();
     private final LuaTable registry = new LuaTable();
     private final LuaCoroutine mainThread = LuaCoroutine.createMainThread();
@@ -678,6 +679,18 @@ public final class LuaState implements AutoCloseable {
 
     boolean isPoolIdle() {
         return poolIdle;
+    }
+
+    boolean tryClaimPool(LuaStatePool pool) {
+        LuaStatePool current = owningPool.get();
+        if (current == pool) {
+            return true;
+        }
+        return current == null && owningPool.compareAndSet(null, pool);
+    }
+
+    void releasePoolOwnership(LuaStatePool pool) {
+        owningPool.compareAndSet(pool, null);
     }
 
     /** Configures behavior when {@link #evalAsync} reaches {@link #getMaxPendingAsyncTasks()}. */
@@ -1874,16 +1887,18 @@ public final class LuaState implements AutoCloseable {
             CompletableFuture<Void> prev = asyncTail;
             CompletableFuture<Void>[] holder = new CompletableFuture[1];
             CompletableFuture<Void> next = prev.whenCompleteAsync((ignored, err) -> {
+                LuaValue value = null;
+                Throwable failure = null;
                 try {
                     if (closed || poolIdle) {
-                        result.completeExceptionally(new LuaException("LuaState is closed"));
+                        failure = new LuaException("LuaState is closed");
                     } else if (isCancelled()) {
-                        result.completeExceptionally(new LuaException("execution cancelled"));
+                        failure = new LuaException("execution cancelled");
                     } else {
-                        result.complete(eval(luaSource, chunkName));
+                        value = eval(luaSource, chunkName);
                     }
                 } catch (Throwable t) {
-                    result.completeExceptionally(t);
+                    failure = t;
                 } finally {
                     pendingAsyncTasks.decrementAndGet();
                     synchronized (asyncLock) {
@@ -1892,6 +1907,11 @@ public final class LuaState implements AutoCloseable {
                         }
                         asyncLock.notifyAll();
                     }
+                }
+                if (failure != null) {
+                    result.completeExceptionally(failure);
+                } else {
+                    result.complete(value);
                 }
             }, ASYNC_EXECUTOR);
             holder[0] = next;

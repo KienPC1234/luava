@@ -715,6 +715,21 @@ public final class LuaUserdata extends LuaValue {
                 + (target != null ? target.getClass().getName() : "static class"));
     }
 
+    private static final int MAX_CAPABILITY_RETURN_DEPTH = 32;
+    private static final int MAX_CAPABILITY_RETURN_ELEMENTS = 65_536;
+
+    private static final class CapabilitySanitizeContext {
+        final Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        int elements = 0;
+
+        void countElement() {
+            if (++elements > MAX_CAPABILITY_RETURN_ELEMENTS) {
+                throw new LuaException("access denied: capability return exceeded max element count ("
+                        + MAX_CAPABILITY_RETURN_ELEMENTS + ")");
+            }
+        }
+    }
+
     private static LuaValue convertReturn(Class<?> returnType, Object result, boolean capabilityGrant) {
         if (returnType == void.class || returnType == Void.class || result == null) {
             return LuaNil.NIL;
@@ -722,10 +737,15 @@ public final class LuaUserdata extends LuaValue {
         if (!capabilityGrant) {
             return LuaDataConverter.toLua(result);
         }
-        return sanitizeCapabilityReturn(result, Collections.newSetFromMap(new IdentityHashMap<>()));
+        return sanitizeCapabilityReturn(result, new CapabilitySanitizeContext(), 0);
     }
 
-    private static LuaValue sanitizeCapabilityReturn(Object result, Set<Object> visited) {
+    private static LuaValue sanitizeCapabilityReturn(Object result, CapabilitySanitizeContext ctx, int depth) {
+        if (depth > MAX_CAPABILITY_RETURN_DEPTH) {
+            throw new LuaException("access denied: capability return exceeded max nesting depth ("
+                    + MAX_CAPABILITY_RETURN_DEPTH + ")");
+        }
+        ctx.countElement();
         if (result == null) {
             return LuaNil.NIL;
         }
@@ -733,7 +753,7 @@ public final class LuaUserdata extends LuaValue {
             return new LuaUserdata(cap);
         }
         if (result instanceof LuaValue lv) {
-            return sanitizeCapabilityLuaValue(lv, visited);
+            return sanitizeCapabilityLuaValue(lv, ctx, depth);
         }
         if (result instanceof Boolean
                 || result instanceof Integer
@@ -748,65 +768,75 @@ public final class LuaUserdata extends LuaValue {
             return LuaDataConverter.toLua(result);
         }
         if (result instanceof Optional<?> opt) {
-            return opt.isPresent() ? sanitizeCapabilityReturn(opt.get(), visited) : LuaNil.NIL;
+            return opt.isPresent() ? sanitizeCapabilityReturn(opt.get(), ctx, depth + 1) : LuaNil.NIL;
         }
         if (result instanceof List<?> list) {
-            enterCapabilityContainer(result, visited);
+            enterCapabilityContainer(result, ctx.visited);
             try {
                 LuaTable table = new LuaTable(list.size(), 0);
                 for (int i = 0; i < list.size(); i++) {
-                    table.rawset(LuaInteger.valueOf(i + 1), sanitizeCapabilityReturn(list.get(i), visited));
+                    table.rawset(
+                            LuaInteger.valueOf(i + 1),
+                            sanitizeCapabilityReturn(list.get(i), ctx, depth + 1));
                 }
                 return table;
             } finally {
-                visited.remove(result);
+                ctx.visited.remove(result);
             }
         }
         if (result instanceof Map<?, ?> map) {
-            enterCapabilityContainer(result, visited);
+            enterCapabilityContainer(result, ctx.visited);
             try {
                 LuaTable table = new LuaTable(0, map.size());
                 for (Map.Entry<?, ?> entry : map.entrySet()) {
                     table.rawset(
-                            sanitizeCapabilityReturn(entry.getKey(), visited),
-                            sanitizeCapabilityReturn(entry.getValue(), visited));
+                            sanitizeCapabilityReturn(entry.getKey(), ctx, depth + 1),
+                            sanitizeCapabilityReturn(entry.getValue(), ctx, depth + 1));
                 }
                 return table;
             } finally {
-                visited.remove(result);
+                ctx.visited.remove(result);
             }
         }
         if (result instanceof Set<?> set) {
-            enterCapabilityContainer(result, visited);
+            enterCapabilityContainer(result, ctx.visited);
             try {
                 LuaTable table = new LuaTable(set.size(), 0);
                 int i = 1;
                 for (Object elem : set) {
-                    table.rawset(LuaInteger.valueOf(i++), sanitizeCapabilityReturn(elem, visited));
+                    table.rawset(
+                            LuaInteger.valueOf(i++),
+                            sanitizeCapabilityReturn(elem, ctx, depth + 1));
                 }
                 return table;
             } finally {
-                visited.remove(result);
+                ctx.visited.remove(result);
             }
         }
         if (result.getClass().isArray()) {
-            enterCapabilityContainer(result, visited);
+            enterCapabilityContainer(result, ctx.visited);
             try {
                 int len = Array.getLength(result);
                 LuaTable table = new LuaTable(len, 0);
                 for (int i = 0; i < len; i++) {
-                    table.rawset(LuaInteger.valueOf(i + 1), sanitizeCapabilityReturn(Array.get(result, i), visited));
+                    table.rawset(
+                            LuaInteger.valueOf(i + 1),
+                            sanitizeCapabilityReturn(Array.get(result, i), ctx, depth + 1));
                 }
                 return table;
             } finally {
-                visited.remove(result);
+                ctx.visited.remove(result);
             }
         }
         throw new LuaException("access denied: capability method cannot expose unwrapped Java object of type "
                 + result.getClass().getName());
     }
 
-    private static LuaValue sanitizeCapabilityLuaValue(LuaValue lv, Set<Object> visited) {
+    private static LuaValue sanitizeCapabilityLuaValue(LuaValue lv, CapabilitySanitizeContext ctx, int depth) {
+        if (depth > MAX_CAPABILITY_RETURN_DEPTH) {
+            throw new LuaException("access denied: capability return exceeded max nesting depth ("
+                    + MAX_CAPABILITY_RETURN_DEPTH + ")");
+        }
         if (lv == null || lv.isNil()
                 || lv instanceof LuaBoolean
                 || lv instanceof LuaInteger
@@ -823,22 +853,26 @@ public final class LuaUserdata extends LuaValue {
                     + type);
         }
         if (lv instanceof LuaTable tbl) {
-            enterCapabilityContainer(tbl, visited);
+            enterCapabilityContainer(tbl, ctx.visited);
             try {
                 LuaTable snapshot = new LuaTable();
-                tbl.forEach((k, v) -> snapshot.rawset(
-                        sanitizeCapabilityLuaValue(k, visited),
-                        sanitizeCapabilityLuaValue(v, visited)));
+                tbl.forEach((k, v) -> {
+                    ctx.countElement();
+                    snapshot.rawset(
+                            sanitizeCapabilityLuaValue(k, ctx, depth + 1),
+                            sanitizeCapabilityLuaValue(v, ctx, depth + 1));
+                });
                 return snapshot;
             } finally {
-                visited.remove(tbl);
+                ctx.visited.remove(tbl);
             }
         }
         if (lv instanceof Varargs va) {
             int n = va.count();
             LuaValue[] items = new LuaValue[n];
             for (int i = 0; i < n; i++) {
-                items[i] = sanitizeCapabilityLuaValue(va.arg(i + 1), visited);
+                ctx.countElement();
+                items[i] = sanitizeCapabilityLuaValue(va.arg(i + 1), ctx, depth + 1);
             }
             return Varargs.of(items);
         }

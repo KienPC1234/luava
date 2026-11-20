@@ -108,6 +108,18 @@ public class LuavaSecurityAuditSuiteTest {
         public JavaCapability attenuatedChild() {
             return new JavaCapability(delegate, "safeOp");
         }
+
+        public List<Object> deeplyNestedList() {
+            List<Object> cur = List.of("leaf");
+            for (int i = 0; i < 40; i++) {
+                cur = List.of(cur);
+            }
+            return cur;
+        }
+
+        public List<Integer> oversizedList() {
+            return Collections.nCopies(70_000, 1);
+        }
     }
 
     public static final class DeniedSamImpl implements LongUnaryOperator {
@@ -600,7 +612,7 @@ public class LuavaSecurityAuditSuiteTest {
             state.setCapability("svc", new AttenuatingFactoryService(),
                     "safeSummary", "safeInt", "safeStringList",
                     "leakedObject", "leakedList", "leakedMap", "leakedOptional", "leakedArray",
-                    "attenuatedChild");
+                    "attenuatedChild", "deeplyNestedList", "oversizedList");
 
             assertEquals("summary", state.eval("return svc:safeSummary()").toLuaString());
             assertEquals(42L, state.eval("return svc:safeInt()").toLong());
@@ -612,7 +624,9 @@ public class LuavaSecurityAuditSuiteTest {
                     "return svc:leakedList()",
                     "return svc:leakedMap()",
                     "return svc:leakedOptional()",
-                    "return svc:leakedArray()")) {
+                    "return svc:leakedArray()",
+                    "return svc:deeplyNestedList()",
+                    "return svc:oversizedList()")) {
                 LuaException err = assertThrows(LuaException.class, () -> state.eval(call));
                 assertTrue(err.getMessage().contains("access denied"),
                         "Expected access denied for '" + call + "', got: " + err.getMessage());
@@ -726,6 +740,49 @@ public class LuavaSecurityAuditSuiteTest {
             }
             assertEquals(0, pool.idleCount(), "state tripping maxMemoryBytes must be tainted and discarded");
             assertEquals(1, pool.availablePermits());
+        }
+    }
+
+    @Test
+    void asyncCallerBlocksContinuationResubmissionTest() throws Exception {
+        try (LuaState s = new LuaState()
+                .maxPendingAsyncTasks(1)
+                .asyncRejectionPolicy(LuaState.AsyncRejectionPolicy.CALLER_BLOCKS)) {
+            CompletableFuture<LuaValue> chain = s.evalAsync("return 1");
+            for (int step = 2; step <= 6; step++) {
+                final int expectedNext = step;
+                chain = chain.thenCompose(prev -> s.evalAsync("return " + (prev.toLong() + 1) + " -- " + expectedNext));
+            }
+            assertEquals(6L, chain.get(5, TimeUnit.SECONDS).toLong());
+            assertEquals(0, s.getPendingAsyncTaskCount(),
+                    "pending count must reach 0 before future completion notifies waiters/continuations");
+        }
+    }
+
+    @Test
+    void crossPoolDuplicateFactoryStateRejectedWithoutClosingOtherPoolTest() {
+        LuaState shared = new LuaState();
+        try (LuaStatePool poolA = LuaStatePool.builder()
+                .isolationMode(LuaStatePool.IsolationMode.STATEFUL)
+                .maxTotal(1)
+                .maxIdle(1)
+                .factory(() -> shared)
+                .build();
+             LuaStatePool poolB = LuaStatePool.builder()
+                     .isolationMode(LuaStatePool.IsolationMode.STATEFUL)
+                     .maxTotal(1)
+                     .maxIdle(1)
+                     .factory(() -> shared)
+                     .build()) {
+            try (LuaStatePool.Lease leaseA = poolA.acquireLease()) {
+                LuaException crossErr = assertThrows(LuaException.class, poolB::acquireLease);
+                assertTrue(crossErr.getMessage().contains("already managed")
+                        || crossErr.getMessage().contains("already owned"));
+                assertEquals(0, poolB.activeCount());
+                assertEquals(1, poolB.availablePermits());
+                assertFalse(leaseA.state().isClosed(), "poolB rejection must not close poolA's active state");
+                assertEquals(9L, leaseA.eval("return 4 + 5").toLong());
+            }
         }
     }
 }

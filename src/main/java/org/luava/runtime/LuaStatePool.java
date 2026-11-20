@@ -184,9 +184,9 @@ public final class LuaStatePool implements AutoCloseable {
             }
             long gen;
             synchronized (leaseLock) {
-                if (!fromIdle && managedStates.containsKey(state)) {
+                if (!fromIdle && (managedStates.containsKey(state) || !state.tryClaimPool(this))) {
                     closeOnRollback = false;
-                    throw new LuaException("pool factory returned a LuaState already managed by this pool");
+                    throw new LuaException("pool factory returned a LuaState already managed by another pool or lease");
                 }
                 if (activeLeases.containsKey(state)) {
                     closeOnRollback = false;
@@ -334,9 +334,9 @@ public final class LuaStatePool implements AutoCloseable {
                 state = createFreshState();
                 long gen;
                 synchronized (leaseLock) {
-                    if (managedStates.containsKey(state)) {
+                    if (managedStates.containsKey(state) || !state.tryClaimPool(this)) {
                         closeOnRollback = false;
-                        throw new LuaException("pool factory returned a LuaState already managed by this pool");
+                        throw new LuaException("pool factory returned a LuaState already managed by another pool or lease");
                     }
                     managedStates.put(state, Boolean.TRUE);
                     gen = state.nextPoolLeaseGeneration();
@@ -444,6 +444,7 @@ public final class LuaStatePool implements AutoCloseable {
             managedStates.remove(state);
         }
         state.markPoolRetired();
+        state.releasePoolOwnership(this);
         closeQuietly(state);
     }
 
