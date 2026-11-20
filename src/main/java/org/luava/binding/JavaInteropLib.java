@@ -189,9 +189,10 @@ public final class JavaInteropLib {
 
     /** Loads a class after checking it against the active access policy. */
     static Class<?> loadClass(String className) {
-        JavaAccessPolicy.active().check(className);
+        JavaAccessPolicy policy = JavaAccessPolicy.active();
+        policy.check(className);
         try {
-            return Class.forName(className);
+            return Class.forName(className, !policy.isDeferClassInit(), JavaInteropLib.class.getClassLoader());
         } catch (ClassNotFoundException e) {
             throw new LuaException("Class not found: " + className);
         }
@@ -204,12 +205,13 @@ public final class JavaInteropLib {
 
     /**
      * Loads a class for a boolean {@code instanceof} probe: denied or
-     * missing classes both yield {@code null} instead of throwing.
+     * missing classes both yield {@code null} instead of throwing, without
+     * running static initializers.
      */
     static Class<?> loadClassOrNull(String className) {
         if (!JavaAccessPolicy.active().isAllowed(className)) return null;
         try {
-            return Class.forName(className);
+            return Class.forName(className, false, JavaInteropLib.class.getClassLoader());
         } catch (ClassNotFoundException e) {
             return null;
         }

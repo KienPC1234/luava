@@ -223,6 +223,11 @@ public abstract class LuaValue {
 
     public static final int MAXTAGLOOP = 2000;
 
+    /** Adjusts a multi-return metamethod result to a single Lua value. */
+    public static LuaValue firstValue(LuaValue v) {
+        return (v instanceof Varargs va) ? va.first() : v;
+    }
+
     public LuaValue get(LuaValue key) {
         LuaValue t = this;
         for (int loop = 0; loop < MAXTAGLOOP; loop++) {
@@ -241,7 +246,7 @@ public abstract class LuaValue {
                 if (!handler.isNil()) {
                     if (handler.isFunction()) {
                         org.luava.runtime.eval.CallStack.setNextCall("index", true);
-                        return handler.call(t, key);
+                        return firstValue(handler.call(t, key));
                     }
                     t = handler;
                     continue;
@@ -324,7 +329,7 @@ public abstract class LuaValue {
             LuaValue handler = mt.rawget(Meta.LEN);
             if (!handler.isNil()) {
                 org.luava.runtime.eval.CallStack.setNextCall("len", true);
-                return handler.call(this, this);
+                return firstValue(handler.call(this, this));
             }
         }
         if (this.isTable()) {
@@ -624,7 +629,7 @@ public abstract class LuaValue {
                     throw new LuaException("attempt to call a " + handler.typeName() + " value (metamethod 'bnot')");
                 }
                 org.luava.runtime.eval.CallStack.setNextCall("bnot", true);
-                return handler.call(this, this);
+                return firstValue(handler.call(this, this));
             }
         }
         if (this.isNumber()) {
@@ -907,7 +912,7 @@ public abstract class LuaValue {
                 throw new LuaException("attempt to call a " + handler.typeName() + " value (metamethod '" + eventName + "')");
             }
             org.luava.runtime.eval.CallStack.setNextCall(eventName, true);
-            return handler.call(a, b);
+            return firstValue(handler.call(a, b));
         }
         if ("perform bitwise operation on".equals(opDesc)) {
             if (a.isNumber() && b.isNumber()) {

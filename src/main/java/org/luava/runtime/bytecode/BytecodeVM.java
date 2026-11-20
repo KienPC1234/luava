@@ -22,6 +22,11 @@ public final class BytecodeVM {
     public static final byte TYPE_FLOAT = 3;
     public static final byte TYPE_OBJECT = 4;
 
+    // Pre-initialize PromoteSignal at class-load time so StackOverflowError
+    // teardown in finishFrame() never runs PromoteSignal.<clinit> on an
+    // exhausted JVM stack.
+    private static final LuaCoroutine.PromoteSignal PROMOTE_SIGNAL = LuaCoroutine.PromoteSignal.INSTANCE;
+
     public static boolean isNumber(byte t) {
         return t == TYPE_INT || t == TYPE_FLOAT;
     }
@@ -140,6 +145,17 @@ public final class BytecodeVM {
         }
     }
 
+    public static void setRawSlot(
+            long[] pStack, byte[] tStack, LuaValue[] oStack, int idx, byte tag, long prim, LuaValue obj) {
+        if (tag != TYPE_OBJECT) {
+            tStack[idx] = tag;
+            pStack[idx] = prim;
+            oStack[idx] = null;
+        } else {
+            setLuaValue(pStack, tStack, oStack, idx, obj);
+        }
+    }
+
     public static void copyReg(long[] pStack, byte[] tStack, LuaValue[] oStack, int dst, int src) {
         pStack[dst] = pStack[src];
         tStack[dst] = tStack[src];
@@ -177,8 +193,37 @@ public final class BytecodeVM {
 
     private static VmContext initVmContext(LuaState state, LuaCoroutine coInit, LuaClosure initialClosure,
             int nArgs, LuaValue singleArg, LuaValue[] initialArgs, boolean stackless) {
+        byte arg0Tag = 0;
+        long arg0Prim = 0L;
+        LuaValue arg0Obj = null;
+        if (nArgs == 1 && initialArgs == null && singleArg != null) {
+            if (singleArg instanceof LuaInteger li) {
+                arg0Tag = TYPE_INT;
+                arg0Prim = li.toLong();
+            } else if (singleArg instanceof LuaFloat lf) {
+                arg0Tag = TYPE_FLOAT;
+                arg0Prim = Double.doubleToRawLongBits(lf.toDouble());
+            } else if (singleArg instanceof LuaBoolean lb) {
+                arg0Tag = TYPE_BOOLEAN;
+                arg0Prim = lb.toBoolean() ? 1L : 0L;
+            } else if (singleArg.isNil()) {
+                arg0Tag = TYPE_NIL;
+            } else {
+                arg0Tag = TYPE_OBJECT;
+                arg0Obj = singleArg;
+            }
+        } else if (nArgs == 1 && initialArgs != null && initialArgs.length > 0) {
+            arg0Tag = TYPE_OBJECT;
+            arg0Obj = initialArgs[0];
+        }
+        return initVmContextRaw(state, coInit, initialClosure, nArgs, arg0Tag, arg0Prim, arg0Obj, initialArgs, stackless);
+    }
+
+    private static VmContext initVmContextRaw(LuaState state, LuaCoroutine coInit, LuaClosure initialClosure,
+            int nArgs, byte arg0Tag, long arg0Prim, LuaValue arg0Obj, LuaValue[] initialArgs, boolean stackless) {
         VmContext ctx = new VmContext();
         ctx.co = coInit;
+        ctx.threadCoroSlot = LuaCoroutine.currentSlot();
         ctx.thread = coInit != null ? coInit : state.getMainThread();
         ctx.callState = coInit != null ? coInit.getCallStackState() : CallStack.currentState();
         ctx.stackless = stackless;
@@ -209,13 +254,17 @@ public final class BytecodeVM {
         ctx.oStack = ctx.thread.getObjectStack();
 
         for (int i = 0; i < ctx.proto.numParams; i++) {
-            LuaValue argVal;
             if (i < nArgs) {
-                argVal = (nArgs == 1 && initialArgs == null) ? singleArg : initialArgs[i];
+                if (nArgs == 1 && initialArgs == null) {
+                    setRawSlot(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, arg0Tag, arg0Prim, arg0Obj);
+                } else {
+                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, initialArgs[i]);
+                }
             } else {
-                argVal = LuaNil.NIL;
+                ctx.tStack[ctx.base + i] = TYPE_NIL;
+                ctx.pStack[ctx.base + i] = 0L;
+                ctx.oStack[ctx.base + i] = null;
             }
-            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, argVal);
         }
         ctx.top = ctx.base + ctx.proto.numParams;
 
@@ -225,13 +274,21 @@ public final class BytecodeVM {
             ctx.varargs = new LuaValue[nv];
             for (int i = 0; i < nv; i++) {
                 int idx = ctx.proto.numParams + i;
-                ctx.varargs[i] = (nArgs == 1 && initialArgs == null) ? singleArg : initialArgs[idx];
+                ctx.varargs[i] = (nArgs == 1 && initialArgs == null)
+                        ? getLuaValueFromRaw(arg0Prim, arg0Tag, arg0Obj) : initialArgs[idx];
             }
         }
 
-        ctx.initialDepth = CallStack.depth();
-        CallStack.setNextVmFrame(ctx.callState, state, ctx.base, ctx.base - 1, ctx.varargs, ctx.pc);
-        CallStack.push(initialClosure, initialClosure.getName(), initialClosure.getLineDefined());
+        ctx.initialDepth = ctx.callState.depth();
+        if (ctx.callState.nextName != null || ctx.callState.nextNamewhat != null
+                || ctx.callState.nextMetamethod || ctx.callState.nextMethod) {
+            CallStack.setNextVmFrame(ctx.callState, state, ctx.base, ctx.base - 1, ctx.varargs, ctx.pc);
+            CallStack.push(initialClosure, initialClosure.getName(), initialClosure.getLineDefined());
+        } else {
+            CallStack.pushVmFrame(initialClosure, initialClosure.getName(), "", initialClosure.getLineDefined(),
+                    false, false, 1, initialClosure.proto.numParams,
+                    state, ctx.base, ctx.base - 1, ctx.varargs, ctx.callState, coInit);
+        }
         ctx.oldpc = -1;
         ctx.varargPrepRan = false;
         ctx.thrown = null;
@@ -290,6 +347,7 @@ public final class BytecodeVM {
                 ctx.stacklessPromoted = false;
                 ctx.thrown = null;
             }
+            ctx.threadCoroSlot = LuaCoroutine.currentSlot();
             co.activeStacklessCtx = ctx;
             LuaValue[] result = runLoop(state, ctx);
             if (ctx.stacklessYielded) {
@@ -335,6 +393,7 @@ public final class BytecodeVM {
             finishFrame(state, ctx);
             throw sig;
         }
+        ctx.threadCoroSlot = LuaCoroutine.currentSlot();
         ctx.stackless = false;
         ctx.stacklessYielded = false;
         ctx.stacklessPromoted = false;
@@ -435,7 +494,7 @@ public final class BytecodeVM {
         // Impure kernels are allowed: their every call deopts before entering
         // a callee, and a deopt resumes the top-level interpreter at the
         // faulting pc with committed state intact.
-        if (!jc.returnsInt && jc.objHandle == null) {
+        if (!jc.returnsInt && jc.entry == null && jc.objHandle == null) {
             return null;
         }
         if (!jc.recentlyUsed) {
@@ -443,23 +502,29 @@ public final class BytecodeVM {
         }
         try {
             if (jc.returnsVoid) {
-                // The handle returns a long sentinel; the cast pins the exact
-                // MethodType so invokeExact matches (a bare statement call
-                // would infer a void type). The value is discarded.
-                long ignored = (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals,
-                        ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
+                long ignored = jc.entry != null
+                        ? jc.entry.callInt(closure, (Object[]) closure.upvals, ctx.pStack, ctx.tStack, ctx.oStack,
+                                ctx.base)
+                        : (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals,
+                                ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
                 finishFrame(state, ctx);
                 return new LuaValue[0];
             }
             if (jc.returnsInt) {
-                long r = (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals,
-                        ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
+                long r = jc.entry != null
+                        ? jc.entry.callInt(closure, (Object[]) closure.upvals, ctx.pStack, ctx.tStack, ctx.oStack,
+                                ctx.base)
+                        : (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals,
+                                ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
                 ctx.pStack[ctx.base] = r;
                 ctx.tStack[ctx.base] = TYPE_INT;
                 ctx.oStack[ctx.base] = null;
             } else {
-                LuaValue r = (LuaValue) jc.objHandle.invokeExact(closure, (Object[]) closure.upvals,
-                        ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
+                LuaValue r = jc.entry != null
+                        ? jc.entry.callObj(closure, (Object[]) closure.upvals, ctx.pStack, ctx.tStack, ctx.oStack,
+                                ctx.base)
+                        : (LuaValue) jc.objHandle.invokeExact(closure, (Object[]) closure.upvals,
+                                ctx.pStack, ctx.tStack, ctx.oStack, ctx.base);
                 setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, r);
             }
             ctx.top = ctx.base + 1;
@@ -537,8 +602,12 @@ public final class BytecodeVM {
         LuaCoroutine co0 = ctx.co;
         // Cooperative runaway-script guard, constant for this execute() call.
         LuaState.LoopGuard guard = state.loopGuard;
-        try {
-            while (true) {
+        LuaValue[] exitResult = null;
+        Throwable rethrow = null;
+        outer:
+        while (true) {
+            try {
+                while (true) {
                 int instPc = ctx.pc;
                 // Lazy frame sync: mirror pc for on-demand debug readers
                 // (getinfo/traceback/getlocal sync the top frame from this).
@@ -637,13 +706,13 @@ public final class BytecodeVM {
                     ctx.upvals[b].setValue(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a));
                 }
                 case OpCode.OP_GETTABUP -> executeGetTabUpCached(ctx, ctx.pc, a, inst);
-                case OpCode.OP_GETTABLE -> executeGetTable(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_GETI -> executeGetI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_GETFIELD -> executeGetField(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_SETTABUP -> executeSetTabUp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.upvals, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_SETTABLE -> executeSetTable(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_SETI -> executeSetI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_SETFIELD -> executeSetField(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_GETTABLE -> executeGetTable(ctx, a, inst);
+                case OpCode.OP_GETI -> executeGetI(ctx, a, inst);
+                case OpCode.OP_GETFIELD -> executeGetFieldCached(ctx, instPc, a, inst);
+                case OpCode.OP_SETTABUP -> executeSetTabUp(ctx, a, inst);
+                case OpCode.OP_SETTABLE -> executeSetTable(ctx, a, inst);
+                case OpCode.OP_SETI -> executeSetI(ctx, a, inst);
+                case OpCode.OP_SETFIELD -> executeSetField(ctx, a, inst);
                 case OpCode.OP_NEWTABLE -> ctx.pc = executeNewTable(ctx.code, ctx.pc, ctx.tStack, ctx.oStack, ctx.base, a, inst);
                 case OpCode.OP_SELF -> executeSelfCached(ctx, state, ctx.pc, a, inst);
                 case OpCode.OP_ADD -> {
@@ -665,7 +734,7 @@ public final class BytecodeVM {
                         ctx.oStack[regA] = null;
                         if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) ctx.pc++;
                     } else {
-                        executeSlowAdd(ctx.pStack, ctx.tStack, ctx.oStack, regA, regB, regC);
+                        executeSlowAdd(ctx, regA, regB, regC);
                     }
                 }
                 case OpCode.OP_ADDI -> {
@@ -685,10 +754,10 @@ public final class BytecodeVM {
                         ctx.oStack[regA] = null;
                         if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBINI) ctx.pc++;
                     } else {
-                        executeSlowAddI(ctx.pStack, ctx.tStack, ctx.oStack, regA, regB, sc);
+                        executeSlowAddI(ctx, regA, regB, sc);
                     }
                 }
-                case OpCode.OP_ADDK -> executeSlowAddK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_ADDK -> executeSlowAddK(ctx, a, inst);
                 case OpCode.OP_SUB -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
@@ -708,10 +777,10 @@ public final class BytecodeVM {
                         ctx.oStack[regA] = null;
                         if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) ctx.pc++;
                     } else {
-                        executeSlowSub(ctx.pStack, ctx.tStack, ctx.oStack, regA, regB, regC);
+                        executeSlowSub(ctx, regA, regB, regC);
                     }
                 }
-                case OpCode.OP_SUBK -> executeSlowSubK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+                case OpCode.OP_SUBK -> executeSlowSubK(ctx, a, inst);
                 case OpCode.OP_MUL -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
@@ -731,28 +800,28 @@ public final class BytecodeVM {
                         ctx.oStack[regA] = null;
                         if (ctx.pc < ctx.code.length && ((ctx.code[ctx.pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_MMBIN) ctx.pc++;
                     } else {
-                        executeSlowMul(ctx.pStack, ctx.tStack, ctx.oStack, regA, regB, regC);
+                        executeSlowMul(ctx, regA, regB, regC);
                     }
                 }
-                case OpCode.OP_MULK -> executeSlowMulK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_DIV -> executeSlowDiv(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_DIVK -> executeSlowDivK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_IDIV -> executeSlowIDiv(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_IDIVK -> executeSlowIDivK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_MOD -> executeSlowMod(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_MODK -> executeSlowModK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_POW -> executeSlowPow(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_POWK -> executeSlowPowK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_BAND -> executeSlowBand(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_BANDK -> executeSlowBandK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_BOR -> executeSlowBor(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_BORK -> executeSlowBorK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_BXOR -> executeSlowBxor(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_BXORK -> executeSlowBxorK(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
-                case OpCode.OP_SHL -> executeSlowShl(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_SHLI -> executeSlowShlI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_SHR -> executeSlowShr(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
-                case OpCode.OP_SHRI -> executeSlowShrI(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_MULK -> executeSlowMulK(ctx, a, inst);
+                case OpCode.OP_DIV -> executeSlowDiv(ctx, a, inst);
+                case OpCode.OP_DIVK -> executeSlowDivK(ctx, a, inst);
+                case OpCode.OP_IDIV -> executeSlowIDiv(ctx, a, inst);
+                case OpCode.OP_IDIVK -> executeSlowIDivK(ctx, a, inst);
+                case OpCode.OP_MOD -> executeSlowMod(ctx, a, inst);
+                case OpCode.OP_MODK -> executeSlowModK(ctx, a, inst);
+                case OpCode.OP_POW -> executeSlowPow(ctx, a, inst);
+                case OpCode.OP_POWK -> executeSlowPowK(ctx, a, inst);
+                case OpCode.OP_BAND -> executeSlowBand(ctx, a, inst);
+                case OpCode.OP_BANDK -> executeSlowBandK(ctx, a, inst);
+                case OpCode.OP_BOR -> executeSlowBor(ctx, a, inst);
+                case OpCode.OP_BORK -> executeSlowBorK(ctx, a, inst);
+                case OpCode.OP_BXOR -> executeSlowBxor(ctx, a, inst);
+                case OpCode.OP_BXORK -> executeSlowBxorK(ctx, a, inst);
+                case OpCode.OP_SHL -> executeSlowShl(ctx, a, inst);
+                case OpCode.OP_SHLI -> executeSlowShlI(ctx, a, inst);
+                case OpCode.OP_SHR -> executeSlowShr(ctx, a, inst);
+                case OpCode.OP_SHRI -> executeSlowShrI(ctx, a, inst);
                 case OpCode.OP_UNM -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int regB = ctx.base + b;
@@ -766,7 +835,7 @@ public final class BytecodeVM {
                         ctx.tStack[regA] = TYPE_FLOAT;
                         ctx.oStack[regA] = null;
                     } else {
-                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).unm());
+                        executeSlowUnm(ctx, regA, regB);
                     }
                 }
                 case OpCode.OP_BNOT -> {
@@ -778,7 +847,7 @@ public final class BytecodeVM {
                         ctx.tStack[regA] = TYPE_INT;
                         ctx.oStack[regA] = null;
                     } else {
-                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).bnot());
+                        executeSlowBnot(ctx, regA, regB);
                     }
                 }
                 case OpCode.OP_NOT -> {
@@ -790,9 +859,9 @@ public final class BytecodeVM {
                 }
                 case OpCode.OP_LEN -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).len());
+                    executeSlowLen(ctx, ctx.base + a, ctx.base + b);
                 }
-                case OpCode.OP_CONCAT -> executeConcat(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base, a, inst);
+                case OpCode.OP_CONCAT -> executeConcat(ctx, a, inst);
                 case OpCode.OP_CLOSE -> doClose(state, ctx, a, false);
                 case OpCode.OP_TBC -> doClose(state, ctx, a, true);
                 case OpCode.OP_JMP -> {
@@ -810,21 +879,19 @@ public final class BytecodeVM {
                     byte ta = ctx.tStack[regA];
                     byte tb = ctx.tStack[regB];
                     boolean cond;
-                    if (ta == tb && ta == TYPE_INT) {
-                        cond = (ctx.pStack[regA] == ctx.pStack[regB]);
-                    } else if (ta == tb && ta == TYPE_BOOLEAN) {
-                        cond = (ctx.pStack[regA] == ctx.pStack[regB]);
-                    } else if (ta == TYPE_NIL && tb == TYPE_NIL) {
-                        cond = true;
+                    if (ta == tb && ta != TYPE_OBJECT && ta != TYPE_FLOAT) {
+                        cond = (ta == TYPE_NIL) || (ctx.pStack[regA] == ctx.pStack[regB]);
+                    } else if (ta != tb && ta != TYPE_FLOAT && tb != TYPE_FLOAT) {
+                        cond = false;
                     } else {
-                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaEquals(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB));
+                        cond = eqSlow(ctx, regA, regB);
                     }
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
                 case OpCode.OP_EQK -> {
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-                    boolean cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a).luaEquals(ctx.k[b]);
+                    boolean cond = eqConst(ctx, ctx.base + a, ctx.k[b]);
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
                 case OpCode.OP_EQI -> {
@@ -833,7 +900,7 @@ public final class BytecodeVM {
                     int regA = ctx.base + a;
                     boolean cond = (ctx.tStack[regA] == TYPE_INT && ctx.pStack[regA] == sb);
                     if (!cond && ctx.tStack[regA] != TYPE_INT) {
-                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaEquals(LuaInteger.valueOf(sb));
+                        cond = eqImmSlow(ctx, regA, sb);
                     }
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
@@ -854,7 +921,7 @@ public final class BytecodeVM {
                     } else if (ta == TYPE_FLOAT && tb == TYPE_FLOAT) {
                         cond = Double.longBitsToDouble(ctx.pStack[regA]) < Double.longBitsToDouble(ctx.pStack[regB]);
                     } else {
-                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessThan(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB));
+                        cond = ltSlow(ctx, regA, regB);
                     }
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
@@ -875,16 +942,11 @@ public final class BytecodeVM {
                     } else if (ta == TYPE_FLOAT && tb == TYPE_FLOAT) {
                         cond = Double.longBitsToDouble(ctx.pStack[regA]) <= Double.longBitsToDouble(ctx.pStack[regB]);
                     } else {
-                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessOrEqual(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB));
+                        cond = leSlow(ctx, regA, regB);
                     }
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
                 case OpCode.OP_LTI -> {
-                    // PUC lvm.c op_orderI: compare R[A] with the signed
-                    // immediate sB against 0 (or, for GTI/GEI, 1) using the
-                    // numeric ordering macros. Integer and float lanes are
-                    // unboxed; other types fall back to the metamethod via
-                    // the slow path.
                     int sb = Instruction.getsB(inst);
                     int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
                     int regA = ctx.base + a;
@@ -895,7 +957,7 @@ public final class BytecodeVM {
                     } else if (ta == TYPE_FLOAT) {
                         cond = Double.longBitsToDouble(ctx.pStack[regA]) < sb;
                     } else {
-                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessThan(LuaInteger.valueOf(sb));
+                        cond = ltImmSlow(ctx, regA, sb);
                     }
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
@@ -910,7 +972,7 @@ public final class BytecodeVM {
                     } else if (ta == TYPE_FLOAT) {
                         cond = Double.longBitsToDouble(ctx.pStack[regA]) <= sb;
                     } else {
-                        cond = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessOrEqual(LuaInteger.valueOf(sb));
+                        cond = leImmSlow(ctx, regA, sb);
                     }
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
@@ -925,9 +987,7 @@ public final class BytecodeVM {
                     } else if (ta == TYPE_FLOAT) {
                         cond = Double.longBitsToDouble(ctx.pStack[regA]) > sb;
                     } else {
-                        // PUC op_orderI(GTI, inv=1, TM_LT): metamethod sees the
-                        // immediate on the left, i.e. `im < R[A]`.
-                        cond = LuaInteger.valueOf(sb).luaLessThan(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA));
+                        cond = gtImmSlow(ctx, regA, sb);
                     }
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
@@ -942,8 +1002,7 @@ public final class BytecodeVM {
                     } else if (ta == TYPE_FLOAT) {
                         cond = Double.longBitsToDouble(ctx.pStack[regA]) >= sb;
                     } else {
-                        // PUC op_orderI(GEI, inv=1, TM_LE): `im <= R[A]`.
-                        cond = LuaInteger.valueOf(sb).luaLessOrEqual(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA));
+                        cond = geImmSlow(ctx, regA, sb);
                     }
                     if (cond != (flagK == 1)) ctx.pc++;
                 }
@@ -965,19 +1024,41 @@ public final class BytecodeVM {
                     clearDeadTemp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.proto, ctx.base, b, ctx.pc - 1);
                 }
                 case OpCode.OP_CALL -> {
-                    if (executeCallOp(state, ctx, a, inst)) {
-                        return LuaCoroutine.EMPTY_VALUES;
+                    VmContext nextCtx = executeCallOp(state, ctx, a, inst);
+                    if (nextCtx != null) {
+                        if (nextCtx == ctx) {
+                            exitResult = LuaCoroutine.EMPTY_VALUES;
+                            break outer;
+                        }
+                        ctx = nextCtx;
+                        co0 = ctx.co;
                     }
                 }
                 case OpCode.OP_TAILCALL -> {
                     LuaValue[] tailResult = doTailCall(state, ctx, a, inst);
                     if (tailResult != null) {
-                        return tailResult;
+                        if (ctx.callerVmCtx != null) {
+                            ctx = handleTrampolineTailReturn(state, ctx, tailResult);
+                            co0 = ctx.co;
+                            if (ctx.thrown != null) {
+                                rethrow = ctx.thrown;
+                                ctx.thrown = null;
+                                break outer;
+                            }
+                        } else {
+                            exitResult = tailResult;
+                            break outer;
+                        }
                     }
                 }
                 case OpCode.OP_RETURN0 -> {
                     if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.thread, ctx.base, null);
+                    if (ctx.callDepth == 0 && ctx.callerVmCtx != null) {
+                        ctx = finishTrampolineReturn(state, ctx, ctx.base + a, 0);
+                        co0 = ctx.co;
+                        continue;
+                    }
                     LuaValue[] r0;
                     if (ctx.thread.hooksActive) {
                         LuaValue[] retVals0 = new LuaValue[0];
@@ -987,12 +1068,18 @@ public final class BytecodeVM {
                         r0 = returnToCallerRaw(state, ctx, ctx.base + a, 0);
                     }
                     if (r0 != null) {
-                        return r0;
+                        exitResult = r0;
+                        break outer;
                     }
                 }
                 case OpCode.OP_RETURN1 -> {
                     if (ctx.thread.getOpenUpvaluesHead() != null) state.closeUpvalues(ctx.thread, ctx.base);
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.thread, ctx.base, null);
+                    if (ctx.callDepth == 0 && ctx.callerVmCtx != null) {
+                        ctx = finishTrampolineReturn(state, ctx, ctx.base + a, 1);
+                        co0 = ctx.co;
+                        continue;
+                    }
                     LuaValue[] r1;
                     if (ctx.thread.hooksActive) {
                         LuaValue ret = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
@@ -1004,7 +1091,8 @@ public final class BytecodeVM {
                         r1 = returnToCallerRaw(state, ctx, ctx.base + a, 1);
                     }
                     if (r1 != null) {
-                        return r1;
+                        exitResult = r1;
+                        break outer;
                     }
                 }
                 case OpCode.OP_RETURN -> {
@@ -1012,6 +1100,11 @@ public final class BytecodeVM {
                     if (ctx.thread.getTbcHead() != null) state.closeTbc(ctx.thread, ctx.base, null);
                     int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
                     int nReturns = b > 0 ? b - 1 : (ctx.top - (ctx.base + a));
+                    if (ctx.callDepth == 0 && ctx.callerVmCtx != null) {
+                        ctx = finishTrampolineReturn(state, ctx, ctx.base + a, nReturns);
+                        co0 = ctx.co;
+                        continue;
+                    }
                     LuaValue[] rN;
                     if (ctx.thread.hooksActive) {
                         LuaValue[] retVals = new LuaValue[nReturns];
@@ -1025,7 +1118,8 @@ public final class BytecodeVM {
                         rN = returnToCallerRaw(state, ctx, ctx.base + a, nReturns);
                     }
                     if (rN != null) {
-                        return rN;
+                        exitResult = rN;
+                        break outer;
                     }
                 }
                 case OpCode.OP_FORPREP -> doForPrep(state, ctx, a, inst);
@@ -1087,9 +1181,37 @@ public final class BytecodeVM {
                 default -> throw new LuaException("unimplemented opcode: " + OpCode.getOpName(op));
             }
         }
+        } catch (LuaCoroutine.PromoteSignal ps) {
+            VmContext child = ctx;
+            VmContext caller = child.callerVmCtx;
+            if (caller != null) {
+                ctx = caller;
+                co0 = caller.co;
+                handleTrampolinePromote(state, child);
+                if (caller.thrown != null) {
+                    rethrow = caller.thrown;
+                    caller.thrown = null;
+                    break outer;
+                }
+                continue outer;
+            }
+            ctx.thrown = ps;
+            rethrow = ps;
+            break outer;
         } catch (org.luava.runtime.eval.LuaUnwindException ue) {
+            if (ctx.callerVmCtx != null) {
+                ctx = handleTrampolineError(state, ctx, ue);
+                if (ctx.thrown != null) {
+                    rethrow = ctx.thrown;
+                    ctx.thrown = null;
+                    break outer;
+                }
+                co0 = ctx.co;
+                continue outer;
+            }
             ctx.thrown = ue;
-            throw ue;
+            rethrow = ue;
+            break outer;
         } catch (LuaException le) {
             int faultPc = (ctx.pc > 0) ? ctx.pc - 1 : 0;
             // Lazy-sync top frame so tracebacks/getinfo see the fault site.
@@ -1106,16 +1228,59 @@ public final class BytecodeVM {
             if (CallStack.canHandleError()) {
                 LuaValue res = CallStack.runErrorHandler(le.getErrorObject());
                 ctx.thrown = le;
-                throw new org.luava.runtime.eval.LuaUnwindException(res, le.getErrorObject());
+                Throwable uw = new org.luava.runtime.eval.LuaUnwindException(res, le.getErrorObject());
+                if (ctx.callerVmCtx != null) {
+                    ctx = handleTrampolineError(state, ctx, uw);
+                    if (ctx.thrown != null) {
+                        rethrow = ctx.thrown;
+                        ctx.thrown = null;
+                        break outer;
+                    }
+                    co0 = ctx.co;
+                    continue outer;
+                }
+                rethrow = uw;
+                break outer;
+            }
+            if (ctx.callerVmCtx != null) {
+                ctx = handleTrampolineError(state, ctx, le);
+                if (ctx.thrown != null) {
+                    rethrow = ctx.thrown;
+                    ctx.thrown = null;
+                    break outer;
+                }
+                co0 = ctx.co;
+                continue outer;
             }
             ctx.thrown = le;
-            throw le;
+            rethrow = le;
+            break outer;
         } catch (Throwable t) {
+            if (ctx.callerVmCtx != null && !(t instanceof org.luava.runtime.LuaExit)
+                    && !(t instanceof VirtualMachineError && !(t instanceof StackOverflowError))) {
+                ctx = handleTrampolineError(state, ctx, t);
+                if (ctx.thrown != null) {
+                    rethrow = ctx.thrown;
+                    ctx.thrown = null;
+                    break outer;
+                }
+                co0 = ctx.co;
+                continue outer;
+            }
             ctx.thrown = t;
-            throw t;
-        } finally {
+            rethrow = t;
+            break outer;
+        }
+        }
+        if (!ctx.stacklessYielded && !ctx.stacklessPromoted) {
             finishFrame(state, ctx);
         }
+        if (rethrow != null) {
+            if (rethrow instanceof RuntimeException re) throw re;
+            if (rethrow instanceof Error err) throw err;
+            throw new RuntimeException(rethrow);
+        }
+        return exitResult;
     }
 
     /**
@@ -1128,7 +1293,7 @@ public final class BytecodeVM {
                 || ctx.thrown == LuaCoroutine.PromoteSignal.INSTANCE) {
             return;
         }
-        while (CallStack.depth() > ctx.initialDepth) {
+        while (ctx.callState.top > ctx.initialDepth) {
             CallStack.pop(ctx.callState, ctx.co);
         }
         state.closeUpvalues(ctx.thread, ctx.savedStackTop);
@@ -1155,6 +1320,13 @@ public final class BytecodeVM {
         }
         state.closeTbc(ctx.savedStackTop, errVal);
         ctx.thread.setStackTop(ctx.savedStackTop);
+    }
+
+    /** Refreshes cached stack array refs after a callback may have grown the stack. */
+    private static void syncStackArrays(VmContext ctx) {
+        ctx.pStack = ctx.thread.getPrimitiveStack();
+        ctx.tStack = ctx.thread.getTypeStack();
+        ctx.oStack = ctx.thread.getObjectStack();
     }
 
     /**
@@ -1357,8 +1529,10 @@ public final class BytecodeVM {
             if (!jc.returnsInt) {
                 // Object-returning kernel (factories): box-free registers in,
                 // one boxed value out.
-                LuaValue r = (LuaValue) jc.objHandle.invokeExact(child, (Object[]) child.upvals, pStack,
-                        tStack, oStack, base);
+                LuaValue r = jc.entry != null
+                        ? jc.entry.callObj(child, (Object[]) child.upvals, pStack, tStack, oStack, base)
+                        : (LuaValue) jc.objHandle.invokeExact(child, (Object[]) child.upvals, pStack,
+                                tStack, oStack, base);
                 ctx.pStack = pStack;
                 ctx.tStack = tStack;
                 ctx.oStack = oStack;
@@ -1384,8 +1558,10 @@ public final class BytecodeVM {
             if (jc.returnsVoid) {
                 // Void kernel: no result. Materialize zero values, or nil-fill
                 // however many the caller expected.
-                long ignored = (long) jc.handle.invokeExact(child, (Object[]) child.upvals,
-                        pStack, tStack, oStack, base);
+                long ignored = jc.entry != null
+                        ? jc.entry.callInt(child, (Object[]) child.upvals, pStack, tStack, oStack, base)
+                        : (long) jc.handle.invokeExact(child, (Object[]) child.upvals,
+                                pStack, tStack, oStack, base);
                 ctx.pStack = pStack;
                 ctx.tStack = tStack;
                 ctx.oStack = oStack;
@@ -1407,7 +1583,9 @@ public final class BytecodeVM {
             }
             // The compiled integer kernel yields exactly one integer result;
             // mirror the returnToCallerRaw layout framelessly.
-            long r = (long) jc.handle.invokeExact(child, (Object[]) child.upvals, pStack, tStack, oStack, base);
+            long r = jc.entry != null
+                    ? jc.entry.callInt(child, (Object[]) child.upvals, pStack, tStack, oStack, base)
+                    : (long) jc.handle.invokeExact(child, (Object[]) child.upvals, pStack, tStack, oStack, base);
             ctx.pStack = pStack;
             ctx.tStack = tStack;
             ctx.oStack = oStack;
@@ -1585,7 +1763,7 @@ public final class BytecodeVM {
         return Boolean.getBoolean("luava.jit.debug");
     }
 
-    private static boolean executeCallOp(LuaState state, VmContext ctx, int a, int inst) {
+    private static VmContext executeCallOp(LuaState state, VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
 
@@ -1617,14 +1795,29 @@ public final class BytecodeVM {
             if (func == org.luava.runtime.standard.BaseLib.TOSTRING && nActualArgs == 1) {
                 inlined = inlineTostring1(state, ctx, funcIdx, nResults);
             } else if (func == org.luava.runtime.standard.CoroutineLib.YIELD) {
-                if (ctx.stackless && LuaCoroutine.isYieldable()) {
-                    stacklessYield(state, ctx, funcIdx, nActualArgs, nResults);
-                    return true;
+                if (ctx.stackless && ctx.co != null && ctx.co.isYieldableInstance()) {
+                    return stacklessYield(state, ctx, funcIdx, nActualArgs, nResults);
                 }
                 inlined = inlineYield(state, ctx, funcIdx, nActualArgs, nResults);
             } else if (func == org.luava.runtime.standard.CoroutineLib.RESUME) {
+                if (ctx.co != null && nActualArgs >= 1
+                        && ctx.tStack[funcIdx + 1] == TYPE_OBJECT
+                        && ctx.oStack[funcIdx + 1] instanceof LuaCoroutine targetCo) {
+                    VmContext childCtx = tryEnterCoroutineTrampoline(
+                            state, ctx, targetCo, funcIdx, funcIdx + 2, nActualArgs - 1, nResults, false);
+                    if (childCtx != null) {
+                        return childCtx;
+                    }
+                }
                 inlined = inlineResume(ctx, funcIdx, nActualArgs, nResults);
             } else if (func instanceof org.luava.runtime.standard.CoroutineLib.WrapFunction wf) {
+                if (ctx.co != null) {
+                    VmContext childCtx = tryEnterCoroutineTrampoline(
+                            state, ctx, wf.co, funcIdx, funcIdx + 1, nActualArgs, nResults, true);
+                    if (childCtx != null) {
+                        return childCtx;
+                    }
+                }
                 inlined = inlineWrapResume(ctx, wf.co, funcIdx, nActualArgs, nResults);
             } else if (func == org.luava.runtime.standard.StringLib.GMATCH
                     && (nActualArgs == 2 || nActualArgs == 3)) {
@@ -1653,7 +1846,7 @@ public final class BytecodeVM {
                 ctx.pStack = ctx.thread.getPrimitiveStack();
                 ctx.tStack = ctx.thread.getTypeStack();
                 ctx.oStack = ctx.thread.getObjectStack();
-                return false;
+                return null;
             }
         }
 
@@ -1665,7 +1858,7 @@ public final class BytecodeVM {
                 ctx.pStack = ctx.thread.getPrimitiveStack();
                 ctx.tStack = ctx.thread.getTypeStack();
                 ctx.oStack = ctx.thread.getObjectStack();
-                return false;
+                return null;
             }
             // Hybrid JIT fast lane (plan.md): a compiled kernel
             // runs framelessly on the register window. 1 = handled; 2 = run
@@ -1673,7 +1866,7 @@ public final class BytecodeVM {
             // 0 = cold/unsuitable, run from scratch.
             int jit = tryJitCall(state, ctx, childClosure, funcIdx, nActualArgs, nResults);
             if (jit == 1) {
-                return false;
+                return null;
             }
             CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
             if (callerFrame != null) {
@@ -1759,9 +1952,12 @@ public final class BytecodeVM {
             }
         } else if (func instanceof LuaFunction fn) {
             if (ctx.stackless && !isStacklessSafeLeaf(fn)) {
+                if (ctx.callerVmCtx != null) {
+                    throw LuaCoroutine.PromoteSignal.INSTANCE;
+                }
                 ctx.pc = ctx.co.vmPcMirror;
                 ctx.stacklessPromoted = true;
-                return true;
+                return ctx;
             }
             int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
             int newTop = executeExternalCall(state, ctx, ctx.proto, ctx.pc, ctx.base, fn, funcIdx, nActualArgs, nResults, callLine);
@@ -1772,7 +1968,7 @@ public final class BytecodeVM {
             ctx.tStack = ctx.thread.getTypeStack();
             ctx.oStack = ctx.thread.getObjectStack();
         }
-        return false;
+        return null;
     }
 
     private static boolean isStacklessSafeLeaf(LuaFunction fn) {
@@ -1781,20 +1977,245 @@ public final class BytecodeVM {
                 || fn == org.luava.runtime.standard.CoroutineLib.WRAP;
     }
 
-    private static void stacklessYield(LuaState state, VmContext ctx, int funcIdx, int nActualArgs, int nResults) {
+    private static VmContext stacklessYield(
+            LuaState state, VmContext ctx, int funcIdx, int nActualArgs, int nResults) {
         stampYieldFrame(state, ctx, funcIdx);
-        LuaValue single = null;
+        VmContext caller = ctx.callerVmCtx;
+        if (caller != null && nActualArgs <= 1) {
+            byte singleTag = 0;
+            long singlePrim = 0L;
+            LuaValue singleObj = null;
+            if (nActualArgs == 1) {
+                int argSlot = funcIdx + 1;
+                singleTag = ctx.tStack[argSlot];
+                if (singleTag != TYPE_OBJECT) {
+                    singlePrim = ctx.pStack[argSlot];
+                } else {
+                    singleObj = ctx.oStack[argSlot];
+                }
+            }
+            ctx.co.suspendTrampoline(ctx, state, funcIdx, nResults);
+            int callerFuncIdx = ctx.callerFuncIdx;
+            int callerNResults = ctx.callerNResults;
+            boolean callerIsWrap = ctx.callerIsWrap;
+            ctx.callerVmCtx = null;
+            caller.co.markRunningFromTrampoline();
+            if (caller.threadCoroSlot != null) {
+                caller.threadCoroSlot[0] = caller.co;
+            } else {
+                LuaCoroutine.setCurrent(caller.co);
+            }
+            writeDirectYieldToCaller(
+                    caller, callerFuncIdx, callerNResults, callerIsWrap, nActualArgs, singleTag, singlePrim, singleObj);
+            return caller;
+        }
+        byte singleTag = 0;
+        long singlePrim = 0L;
+        LuaValue singleObj = null;
         LuaValue[] multi = null;
         if (nActualArgs == 1) {
-            single = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1);
+            int argSlot = funcIdx + 1;
+            byte tag = ctx.tStack[argSlot];
+            if (tag != TYPE_OBJECT) {
+                singleTag = tag;
+                singlePrim = ctx.pStack[argSlot];
+            } else {
+                singleObj = ctx.oStack[argSlot];
+            }
         } else if (nActualArgs > 1) {
             multi = new LuaValue[nActualArgs];
             for (int i = 0; i < nActualArgs; i++) {
                 multi[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1 + i);
             }
         }
-        ctx.co.suspendStackless(ctx, state, funcIdx, nResults, nActualArgs, single, multi);
+        ctx.co.suspendStacklessRaw(
+                ctx, state, funcIdx, nResults, nActualArgs, singleTag, singlePrim, singleObj, multi);
+        if (caller != null) {
+            int callerFuncIdx = ctx.callerFuncIdx;
+            int callerNResults = ctx.callerNResults;
+            boolean callerIsWrap = ctx.callerIsWrap;
+            ctx.callerVmCtx = null;
+            caller.co.markRunningFromTrampoline();
+            if (caller.threadCoroSlot != null) {
+                caller.threadCoroSlot[0] = caller.co;
+            } else {
+                LuaCoroutine.setCurrent(caller.co);
+            }
+            writeChildHandoffToCaller(caller, ctx.co, callerFuncIdx, callerNResults, callerIsWrap);
+            return caller;
+        }
         ctx.stacklessYielded = true;
+        return ctx;
+    }
+
+    private static void writeDirectYieldToCaller(VmContext caller, int funcIdx, int nResults, boolean isWrap,
+            int count, byte singleTag, long singlePrim, LuaValue singleObj) {
+        long[] p = caller.pStack;
+        byte[] t = caller.tStack;
+        LuaValue[] o = caller.oStack;
+        if (!isWrap) {
+            if (count == 0) {
+                if (nResults != 0) {
+                    t[funcIdx] = TYPE_BOOLEAN;
+                    p[funcIdx] = 1L;
+                    o[funcIdx] = null;
+                    for (int i = 1; i < nResults; i++) {
+                        t[funcIdx + i] = TYPE_NIL;
+                        p[funcIdx + i] = 0L;
+                        o[funcIdx + i] = null;
+                    }
+                }
+                if (nResults < 0) {
+                    caller.top = funcIdx + 1;
+                }
+                return;
+            }
+            if (nResults != 0) {
+                t[funcIdx] = TYPE_BOOLEAN;
+                p[funcIdx] = 1L;
+                o[funcIdx] = null;
+                if (nResults != 1) {
+                    setRawSlot(p, t, o, funcIdx + 1, singleTag, singlePrim, singleObj);
+                    for (int i = 2; i < nResults; i++) {
+                        t[funcIdx + i] = TYPE_NIL;
+                        p[funcIdx + i] = 0L;
+                        o[funcIdx + i] = null;
+                    }
+                }
+            }
+            if (nResults < 0) {
+                caller.top = funcIdx + 2;
+            }
+            return;
+        }
+        if (count == 0) {
+            if (nResults > 0) {
+                for (int i = 0; i < nResults; i++) {
+                    t[funcIdx + i] = TYPE_NIL;
+                    p[funcIdx + i] = 0L;
+                    o[funcIdx + i] = null;
+                }
+            } else if (nResults < 0) {
+                caller.top = funcIdx;
+            }
+            return;
+        }
+        if (nResults != 0) {
+            setRawSlot(p, t, o, funcIdx, singleTag, singlePrim, singleObj);
+            for (int i = 1; i < nResults; i++) {
+                t[funcIdx + i] = TYPE_NIL;
+                p[funcIdx + i] = 0L;
+                o[funcIdx + i] = null;
+            }
+        }
+        if (nResults < 0) {
+            caller.top = funcIdx + 1;
+        }
+    }
+
+    private static boolean eqSlow(VmContext ctx, int regA, int regB) {
+        long[] p = ctx.pStack;
+        byte[] t = ctx.tStack;
+        LuaValue[] o = ctx.oStack;
+        byte ta = t[regA];
+        byte tb = t[regB];
+        if (ta == TYPE_FLOAT && tb == TYPE_FLOAT) {
+            return Double.longBitsToDouble(p[regA]) == Double.longBitsToDouble(p[regB]);
+        }
+        if (ta == TYPE_INT && tb == TYPE_FLOAT) {
+            double d = Double.longBitsToDouble(p[regB]);
+            return LuaFloat.valueOf(d).luaEquals(LuaInteger.valueOf(p[regA]));
+        }
+        if (ta == TYPE_FLOAT && tb == TYPE_INT) {
+            double d = Double.longBitsToDouble(p[regA]);
+            return LuaFloat.valueOf(d).luaEquals(LuaInteger.valueOf(p[regB]));
+        }
+        boolean res = getLuaValue(p, t, o, regA).luaEquals(getLuaValue(p, t, o, regB));
+        syncStackArrays(ctx);
+        return res;
+    }
+
+    private static boolean eqConst(VmContext ctx, int regA, LuaValue kv) {
+        long[] p = ctx.pStack;
+        byte[] t = ctx.tStack;
+        LuaValue[] o = ctx.oStack;
+        byte ta = t[regA];
+        if (kv == LuaNil.NIL) {
+            return ta == TYPE_NIL;
+        }
+        if (kv instanceof LuaInteger li) {
+            if (ta == TYPE_INT) {
+                return p[regA] == li.toLong();
+            }
+            if (ta == TYPE_FLOAT) {
+                return LuaFloat.valueOf(Double.longBitsToDouble(p[regA])).luaEquals(li);
+            }
+            return false;
+        }
+        if (kv instanceof LuaFloat lf) {
+            if (ta == TYPE_FLOAT) {
+                return Double.longBitsToDouble(p[regA]) == lf.toDouble();
+            }
+            if (ta == TYPE_INT) {
+                return lf.luaEquals(LuaInteger.valueOf(p[regA]));
+            }
+            return false;
+        }
+        if (kv instanceof LuaBoolean lb) {
+            return ta == TYPE_BOOLEAN && ((p[regA] != 0L) == lb.toBoolean());
+        }
+        if (ta != TYPE_OBJECT) {
+            return false;
+        }
+        boolean res = o[regA] != null && o[regA].luaEquals(kv);
+        syncStackArrays(ctx);
+        return res;
+    }
+
+    private static boolean eqImmSlow(VmContext ctx, int regA, int sb) {
+        boolean res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaEquals(LuaInteger.valueOf(sb));
+        syncStackArrays(ctx);
+        return res;
+    }
+
+    private static boolean ltSlow(VmContext ctx, int regA, int regB) {
+        boolean res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA)
+                .luaLessThan(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB));
+        syncStackArrays(ctx);
+        return res;
+    }
+
+    private static boolean leSlow(VmContext ctx, int regA, int regB) {
+        boolean res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA)
+                .luaLessOrEqual(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB));
+        syncStackArrays(ctx);
+        return res;
+    }
+
+    private static boolean ltImmSlow(VmContext ctx, int regA, int sb) {
+        boolean res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessThan(LuaInteger.valueOf(sb));
+        syncStackArrays(ctx);
+        return res;
+    }
+
+    private static boolean leImmSlow(VmContext ctx, int regA, int sb) {
+        boolean res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA).luaLessOrEqual(LuaInteger.valueOf(sb));
+        syncStackArrays(ctx);
+        return res;
+    }
+
+    private static boolean gtImmSlow(VmContext ctx, int regA, int sb) {
+        // PUC op_orderI(GTI, inv=1, TM_LT): metamethod sees the immediate on the left, i.e. `im < R[A]`.
+        boolean res = LuaInteger.valueOf(sb).luaLessThan(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA));
+        syncStackArrays(ctx);
+        return res;
+    }
+
+    private static boolean geImmSlow(VmContext ctx, int regA, int sb) {
+        // PUC op_orderI(GEI, inv=1, TM_LE): `im <= R[A]`.
+        boolean res = LuaInteger.valueOf(sb).luaLessOrEqual(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA));
+        syncStackArrays(ctx);
+        return res;
     }
 
     private static void stampYieldFrame(LuaState state, VmContext ctx, int funcIdx) {
@@ -1808,9 +2229,377 @@ public final class BytecodeVM {
                 callerFrame.line = curLine;
             }
         }
-        CallStack.setNextVmFrame(ctx.callState, state, funcIdx + 1, funcIdx, null, -1);
-        CallStack.push(org.luava.runtime.standard.CoroutineLib.YIELD, "yield", "field",
-                curLine, false, false, ctx.callState, ctx.co);
+        CallStack.pushYieldFrame(ctx.callState, org.luava.runtime.standard.CoroutineLib.YIELD,
+                curLine, state, funcIdx + 1, funcIdx);
+    }
+
+    private static VmContext tryEnterCoroutineTrampoline(LuaState state, VmContext callerCtx, LuaCoroutine targetCo,
+            int funcIdx, int argStart, int argCount, int nResults, boolean isWrap) {
+        int mode = targetCo.tryBeginTrampoline(callerCtx.co, state);
+        if (mode == LuaCoroutine.TRAMPOLINE_DENIED) {
+            return null;
+        }
+        byte arg0Tag = 0;
+        long arg0Prim = 0L;
+        LuaValue arg0Obj = null;
+        LuaValue[] multiArgs = null;
+        if (argCount == 1) {
+            byte tag = callerCtx.tStack[argStart];
+            arg0Tag = tag;
+            if (tag != TYPE_OBJECT) {
+                arg0Prim = callerCtx.pStack[argStart];
+            } else {
+                arg0Obj = callerCtx.oStack[argStart];
+            }
+        } else if (argCount > 1) {
+            multiArgs = new LuaValue[argCount];
+            for (int i = 0; i < argCount; i++) {
+                multiArgs[i] = getLuaValue(callerCtx.pStack, callerCtx.tStack, callerCtx.oStack, argStart + i);
+            }
+        }
+        VmContext childCtx;
+        LuaCoroutine[] slot = callerCtx.threadCoroSlot;
+        if (mode == LuaCoroutine.TRAMPOLINE_START) {
+            LuaCoroutine prevCoro = callerCtx.co;
+            if (slot != null) {
+                slot[0] = targetCo;
+            } else {
+                LuaCoroutine.setCurrent(targetCo);
+            }
+            childCtx = initVmContextRaw(state, targetCo, (LuaClosure) targetCo.getEntryFunction(),
+                    argCount, arg0Tag, arg0Prim, arg0Obj, multiArgs, true);
+            if (childCtx == null) {
+                if (slot != null) {
+                    slot[0] = prevCoro;
+                } else {
+                    LuaCoroutine.setCurrent(prevCoro);
+                }
+                return null;
+            }
+        } else {
+            childCtx = targetCo.getStacklessCtx();
+            CallStack.popYieldFrame(childCtx.callState);
+            int yFuncIdx = targetCo.yieldFuncIdx;
+            int yNResults = targetCo.yieldNResults;
+            int top;
+            if (argCount == 0) {
+                if (yNResults > 0) {
+                    for (int i = 0; i < yNResults; i++) {
+                        childCtx.tStack[yFuncIdx + i] = TYPE_NIL;
+                        childCtx.pStack[yFuncIdx + i] = 0L;
+                        childCtx.oStack[yFuncIdx + i] = null;
+                    }
+                    top = yFuncIdx + yNResults;
+                } else {
+                    top = yFuncIdx;
+                }
+            } else if (argCount == 1) {
+                if (yNResults != 0) {
+                    setRawSlot(childCtx.pStack, childCtx.tStack, childCtx.oStack,
+                            yFuncIdx, arg0Tag, arg0Prim, arg0Obj);
+                    for (int i = 1; i < yNResults; i++) {
+                        childCtx.tStack[yFuncIdx + i] = TYPE_NIL;
+                        childCtx.pStack[yFuncIdx + i] = 0L;
+                        childCtx.oStack[yFuncIdx + i] = null;
+                    }
+                }
+                top = yNResults >= 0 ? yFuncIdx + yNResults : yFuncIdx + 1;
+            } else {
+                if (yNResults >= 0) {
+                    for (int i = 0; i < yNResults; i++) {
+                        if (i < argCount) {
+                            setLuaValue(childCtx.pStack, childCtx.tStack, childCtx.oStack,
+                                    yFuncIdx + i, multiArgs[i]);
+                        } else {
+                            childCtx.tStack[yFuncIdx + i] = TYPE_NIL;
+                            childCtx.pStack[yFuncIdx + i] = 0L;
+                            childCtx.oStack[yFuncIdx + i] = null;
+                        }
+                    }
+                    top = yFuncIdx + yNResults;
+                } else {
+                    for (int i = 0; i < argCount; i++) {
+                        setLuaValue(childCtx.pStack, childCtx.tStack, childCtx.oStack, yFuncIdx + i, multiArgs[i]);
+                    }
+                    top = yFuncIdx + argCount;
+                }
+            }
+            if (yNResults < 0) {
+                childCtx.top = top;
+            }
+            childCtx.stacklessYielded = false;
+            childCtx.stacklessPromoted = false;
+            childCtx.thrown = null;
+            if (slot != null) {
+                childCtx.threadCoroSlot = slot;
+                slot[0] = targetCo;
+            } else {
+                LuaCoroutine.setCurrent(targetCo);
+            }
+        }
+        childCtx.callerVmCtx = callerCtx;
+        childCtx.callerFuncIdx = funcIdx;
+        childCtx.callerNResults = nResults;
+        childCtx.callerIsWrap = isWrap;
+        targetCo.activeStacklessCtx = childCtx;
+        return childCtx;
+    }
+
+    private static VmContext finishTrampolineReturn(LuaState state, VmContext ctx, int srcIdx, int nReturns) {
+        byte sTag = 0;
+        long sPrim = 0L;
+        LuaValue sObj = null;
+        LuaValue[] multi = null;
+        if (nReturns == 1) {
+            byte tag = ctx.tStack[srcIdx];
+            if (tag != TYPE_OBJECT) {
+                sTag = tag;
+                sPrim = ctx.pStack[srcIdx];
+            } else {
+                sObj = ctx.oStack[srcIdx];
+            }
+        } else if (nReturns > 1) {
+            multi = new LuaValue[nReturns];
+            for (int i = 0; i < nReturns; i++) {
+                multi[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, srcIdx + i);
+            }
+        }
+        VmContext caller = ctx.callerVmCtx;
+        int cFunc = ctx.callerFuncIdx;
+        int cNRes = ctx.callerNResults;
+        boolean cWrap = ctx.callerIsWrap;
+        ctx.callerVmCtx = null;
+        finishFrame(state, ctx);
+        ctx.co.completeNormallyRaw(nReturns, sTag, sPrim, sObj, multi);
+        ctx.co.clearStacklessOnExit();
+        caller.co.markRunningFromTrampoline();
+        if (caller.threadCoroSlot != null) {
+            caller.threadCoroSlot[0] = caller.co;
+        } else {
+            LuaCoroutine.setCurrent(caller.co);
+        }
+        writeChildHandoffToCaller(caller, ctx.co, cFunc, cNRes, cWrap);
+        return caller;
+    }
+
+    private static VmContext handleTrampolineTailReturn(
+            LuaState state, VmContext ctx, LuaValue[] tailResult) {
+        if (ctx.stacklessPromoted) {
+            return handleTrampolinePromote(state, ctx);
+        }
+        VmContext caller = ctx.callerVmCtx;
+        int cFunc = ctx.callerFuncIdx;
+        int cNRes = ctx.callerNResults;
+        boolean cWrap = ctx.callerIsWrap;
+        ctx.callerVmCtx = null;
+        finishFrame(state, ctx);
+        ctx.co.completeNormallyArray(tailResult);
+        ctx.co.clearStacklessOnExit();
+        caller.co.markRunningFromTrampoline();
+        if (caller.threadCoroSlot != null) {
+            caller.threadCoroSlot[0] = caller.co;
+        } else {
+            LuaCoroutine.setCurrent(caller.co);
+        }
+        writeChildHandoffToCaller(caller, ctx.co, cFunc, cNRes, cWrap);
+        return caller;
+    }
+
+    private static VmContext handleTrampolinePromote(LuaState state, VmContext ctx) {
+        VmContext caller = ctx.callerVmCtx;
+        int cFunc = ctx.callerFuncIdx;
+        int cNRes = ctx.callerNResults;
+        boolean cWrap = ctx.callerIsWrap;
+        ctx.callerVmCtx = null;
+        ctx.pc = ctx.co.vmPcMirror;
+        ctx.thrown = null;
+        ctx.stacklessPromoted = false;
+        ctx.stackless = false;
+        ctx.co.activeStacklessCtx = null;
+        if (caller.threadCoroSlot != null) {
+            caller.threadCoroSlot[0] = caller.co;
+        } else {
+            LuaCoroutine.setCurrent(caller.co);
+        }
+        try {
+            ctx.co.graduateToVirtualThread(state, ctx);
+        } finally {
+            caller.co.markRunningFromTrampoline();
+        }
+        if (ctx.co.getError() != null) {
+            LuaValue errVal = ctx.co.materializeSingleResult();
+            if (errVal == null) {
+                errVal = LuaString.valueOf("error in coroutine");
+            }
+            if (cWrap) {
+                if (ctx.co.getStatus() == LuaCoroutine.Status.SUSPENDED) {
+                    try { ctx.co.close(); } catch (Exception ignored) {}
+                }
+                caller.thrown = new LuaException(errVal);
+                return caller;
+            }
+            writeTwoValuesToCaller(caller, cFunc, cNRes, LuaBoolean.FALSE, errVal);
+            return caller;
+        }
+        writeChildHandoffToCaller(caller, ctx.co, cFunc, cNRes, cWrap);
+        return caller;
+    }
+
+    private static VmContext handleTrampolineError(LuaState state, VmContext ctx, Throwable err) {
+        VmContext caller = ctx.callerVmCtx;
+        int cFunc = ctx.callerFuncIdx;
+        int cNRes = ctx.callerNResults;
+        boolean cWrap = ctx.callerIsWrap;
+        ctx.callerVmCtx = null;
+        ctx.thrown = err;
+        finishFrame(state, ctx);
+        ctx.co.recordFailure(err);
+        caller.co.markRunningFromTrampoline();
+        if (caller.threadCoroSlot != null) {
+            caller.threadCoroSlot[0] = caller.co;
+        } else {
+            LuaCoroutine.setCurrent(caller.co);
+        }
+        LuaValue errVal = ctx.co.materializeSingleResult();
+        if (errVal == null) {
+            errVal = LuaString.valueOf("error in coroutine");
+        }
+        if (cWrap) {
+            caller.thrown = (err instanceof LuaException le) ? le : new LuaException(errVal);
+            return caller;
+        }
+        writeTwoValuesToCaller(caller, cFunc, cNRes, LuaBoolean.FALSE, errVal);
+        return caller;
+    }
+
+    private static void writeChildHandoffToCaller(
+            VmContext caller, LuaCoroutine childCo, int funcIdx, int nResults, boolean isWrap) {
+        int len = childCo.handoffResultCount;
+        long[] p = caller.pStack;
+        byte[] t = caller.tStack;
+        LuaValue[] o = caller.oStack;
+        if (!isWrap) {
+            if (len <= 0) {
+                if (nResults != 0) {
+                    t[funcIdx] = TYPE_BOOLEAN;
+                    p[funcIdx] = 1L;
+                    o[funcIdx] = null;
+                    for (int i = 1; i < nResults; i++) {
+                        t[funcIdx + i] = TYPE_NIL;
+                        p[funcIdx + i] = 0L;
+                        o[funcIdx + i] = null;
+                    }
+                }
+                if (nResults < 0) {
+                    caller.top = funcIdx + 1;
+                }
+                return;
+            }
+            if (len == 1) {
+                if (nResults != 0) {
+                    t[funcIdx] = TYPE_BOOLEAN;
+                    p[funcIdx] = 1L;
+                    o[funcIdx] = null;
+                    if (nResults != 1) {
+                        if (childCo.handoffSingleTag != 0) {
+                            setRawSlot(p, t, o, funcIdx + 1, childCo.handoffSingleTag,
+                                    childCo.handoffSinglePrim, null);
+                        } else {
+                            setLuaValue(p, t, o, funcIdx + 1, childCo.handoffSingleResult);
+                        }
+                        for (int i = 2; i < nResults; i++) {
+                            t[funcIdx + i] = TYPE_NIL;
+                            p[funcIdx + i] = 0L;
+                            o[funcIdx + i] = null;
+                        }
+                    }
+                }
+                if (nResults < 0) {
+                    caller.top = funcIdx + 2;
+                }
+                return;
+            }
+            LuaValue[] multi = childCo.handoffResult;
+            if (nResults >= 0) {
+                if (nResults > 0) {
+                    t[funcIdx] = TYPE_BOOLEAN;
+                    p[funcIdx] = 1L;
+                    o[funcIdx] = null;
+                    for (int i = 1; i < nResults; i++) {
+                        setLuaValue(p, t, o, funcIdx + i, (i - 1) < len ? multi[i - 1] : LuaNil.NIL);
+                    }
+                }
+            } else {
+                t[funcIdx] = TYPE_BOOLEAN;
+                p[funcIdx] = 1L;
+                o[funcIdx] = null;
+                for (int i = 0; i < len; i++) {
+                    setLuaValue(p, t, o, funcIdx + 1 + i, multi[i]);
+                }
+                caller.top = funcIdx + 1 + len;
+            }
+            return;
+        }
+        if (len <= 0) {
+            if (nResults > 0) {
+                for (int i = 0; i < nResults; i++) {
+                    t[funcIdx + i] = TYPE_NIL;
+                    p[funcIdx + i] = 0L;
+                    o[funcIdx + i] = null;
+                }
+            } else if (nResults < 0) {
+                caller.top = funcIdx;
+            }
+            return;
+        }
+        if (len == 1) {
+            if (nResults != 0) {
+                if (childCo.handoffSingleTag != 0) {
+                    setRawSlot(p, t, o, funcIdx, childCo.handoffSingleTag,
+                            childCo.handoffSinglePrim, null);
+                } else {
+                    setLuaValue(p, t, o, funcIdx, childCo.handoffSingleResult);
+                }
+                for (int i = 1; i < nResults; i++) {
+                    t[funcIdx + i] = TYPE_NIL;
+                    p[funcIdx + i] = 0L;
+                    o[funcIdx + i] = null;
+                }
+            }
+            if (nResults < 0) {
+                caller.top = funcIdx + 1;
+            }
+            return;
+        }
+        LuaValue[] multi = childCo.handoffResult;
+        if (nResults >= 0) {
+            for (int i = 0; i < nResults; i++) {
+                setLuaValue(p, t, o, funcIdx + i, i < len ? multi[i] : LuaNil.NIL);
+            }
+        } else {
+            for (int i = 0; i < len; i++) {
+                setLuaValue(p, t, o, funcIdx + i, multi[i]);
+            }
+            caller.top = funcIdx + len;
+        }
+    }
+
+    private static void writeTwoValuesToCaller(
+            VmContext caller, int funcIdx, int nResults, LuaValue v0, LuaValue v1) {
+        if (nResults != 0) {
+            setLuaValue(caller.pStack, caller.tStack, caller.oStack, funcIdx, v0);
+            if (nResults != 1) {
+                setLuaValue(caller.pStack, caller.tStack, caller.oStack, funcIdx + 1, v1);
+                for (int i = 2; i < nResults; i++) {
+                    caller.tStack[funcIdx + i] = TYPE_NIL;
+                    caller.pStack[funcIdx + i] = 0L;
+                    caller.oStack[funcIdx + i] = null;
+                }
+            }
+        }
+        if (nResults < 0) {
+            caller.top = funcIdx + 2;
+        }
     }
 
     /**
@@ -2455,6 +3244,7 @@ public final class BytecodeVM {
         } else {
             state.closeUpvalues(ctx.thread, ctx.base + a);
             state.closeTbc(ctx.thread, ctx.base + a, null);
+            syncStackArrays(ctx);
         }
     }
 
@@ -2563,11 +3353,13 @@ public final class BytecodeVM {
         oStack[regA] = child;
     }
 
-    private static void executeGetTabUp(long[] pStack, byte[] tStack, LuaValue[] oStack, Upvalue[] upvals, LuaValue[] k, int base, int a, int inst) {
+    private static void executeGetTabUp(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        LuaValue tbl = upvals[b].getValue();
-        setLuaValue(pStack, tStack, oStack, base + a, tbl.get(k[c]));
+        LuaValue tbl = ctx.upvals[b].getValue();
+        LuaValue val = tbl.get(ctx.k[c]);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, val);
     }
 
     /**
@@ -2689,6 +3481,48 @@ public final class BytecodeVM {
                     }
                     kind[a] = 2;
                     konst[a] = proto.constants[bx];
+                    if (sawClosure && writesCaptured(a, capturedRegs, capturedCount)) {
+                        return null;
+                    }
+                }
+                case OpCode.OP_LOADI -> {
+                    if (a < 0 || a >= regs || returned) {
+                        return null;
+                    }
+                    int sbx = ((inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx) - Instruction.OFFSET_sBx;
+                    kind[a] = 2;
+                    konst[a] = LuaInteger.valueOf(sbx);
+                    if (sawClosure && writesCaptured(a, capturedRegs, capturedCount)) {
+                        return null;
+                    }
+                }
+                case OpCode.OP_LOADF -> {
+                    if (a < 0 || a >= regs || returned) {
+                        return null;
+                    }
+                    int sbx = ((inst >>> Instruction.POS_Bx) & Instruction.MASK_Bx) - Instruction.OFFSET_sBx;
+                    kind[a] = 2;
+                    konst[a] = LuaFloat.valueOf((double) sbx);
+                    if (sawClosure && writesCaptured(a, capturedRegs, capturedCount)) {
+                        return null;
+                    }
+                }
+                case OpCode.OP_LOADFALSE -> {
+                    if (a < 0 || a >= regs || returned) {
+                        return null;
+                    }
+                    kind[a] = 2;
+                    konst[a] = LuaBoolean.FALSE;
+                    if (sawClosure && writesCaptured(a, capturedRegs, capturedCount)) {
+                        return null;
+                    }
+                }
+                case OpCode.OP_LOADTRUE -> {
+                    if (a < 0 || a >= regs || returned) {
+                        return null;
+                    }
+                    kind[a] = 2;
+                    konst[a] = LuaBoolean.TRUE;
                     if (sawClosure && writesCaptured(a, capturedRegs, capturedCount)) {
                         return null;
                     }
@@ -2837,6 +3671,17 @@ public final class BytecodeVM {
         return true;
     }
 
+    /** Returns the cached trivial-factory descriptor for {@code proto}, analyzing once on demand. */
+    public static LuaProto.FactoryInfo ensureFactoryAnalyzed(LuaProto proto) {
+        LuaProto.FactoryInfo fi = proto.factoryInfo;
+        if (!proto.factoryAnalyzed) {
+            fi = analyzeFactory(proto);
+            proto.factoryInfo = fi;
+            proto.factoryAnalyzed = true;
+        }
+        return fi;
+    }
+
     /**
      * Builds the child closure for a trivial factory, or null when the
      * generic path must run. Shared by {@code OP_CALL} and {@code OP_TAILCALL}
@@ -2845,52 +3690,69 @@ public final class BytecodeVM {
     private static LuaClosure factoryBuild(LuaState state, VmContext ctx, LuaClosure closure,
             int funcIdx, int nActualArgs) {
         LuaProto proto = closure.proto;
-        LuaProto.FactoryInfo fi = proto.factoryInfo;
-        if (!proto.factoryAnalyzed) {
-            fi = analyzeFactory(proto);
-            proto.factoryInfo = fi;
-            proto.factoryAnalyzed = true;
-        }
+        LuaProto.FactoryInfo fi = ensureFactoryAnalyzed(proto);
         if (fi == null || ctx.thread.hooksActive || state.loopGuard != null) {
             return null;
         }
+        return factoryBuildFast(state, fi, proto, closure, ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, nActualArgs);
+    }
+
+    /** Builds a trivial-factory closure directly from caller register arrays without VM frame setup. */
+    public static LuaClosure factoryBuildFast(LuaState state, LuaProto.FactoryInfo fi, LuaProto proto,
+            LuaClosure closure, long[] pStack, byte[] tStack, LuaValue[] oStack, int funcIdx, int nActualArgs) {
         LuaProto child = proto.protos[fi.childIdx];
-        Upvalue[] ups = new Upvalue[fi.capKind.length];
-        Upvalue[] parentUps = closure.upvals;
-        for (int i = 0; i < ups.length; i++) {
-            // Parent-upvalue sharing indexes the FACTORY's own upvalue array
-            // (closure.upvals), never the caller's (ctx.upvals): at f(10) the
-            // caller is the chunk (whose upvalue 0 is _ENV), while f's
-            // upvalue 0 is w. Mixing them aliases the wrong variable.
-            if (fi.capKind[i] == 3 && (fi.capUp[i] < 0 || fi.capUp[i] >= parentUps.length)) {
-                return null;
+        int capLen = fi.capKind.length;
+        Upvalue[] ups;
+        if (capLen == 1 && fi.capKind[0] == 0) {
+            int ai = fi.capArg[0];
+            String name = child.upvalues[0].name;
+            Upvalue uv;
+            if (ai < nActualArgs) {
+                int slot = funcIdx + 1 + ai;
+                if (tStack[slot] == TYPE_INT) {
+                    uv = new org.luava.runtime.eval.Upvalue(name, pStack[slot]);
+                } else {
+                    uv = new org.luava.runtime.eval.Upvalue(
+                            name, getLuaValue(pStack, tStack, oStack, slot));
+                }
+            } else {
+                uv = new org.luava.runtime.eval.Upvalue(name, LuaNil.NIL);
             }
-            String name = child.upvalues[i].name;
-            switch (fi.capKind[i]) {
-                case 0 -> {
-                    int ai = fi.capArg[i];
-                    org.luava.runtime.eval.Upvalue uv =
-                            new org.luava.runtime.eval.Upvalue(name, LuaNil.NIL);
-                    if (ai < nActualArgs) {
-                        int slot = funcIdx + 1 + ai;
-                        // Unboxed int fast lane: no LuaInteger allocation,
-                        // identical representation to a normal close.
-                        if (ctx.tStack[slot] == TYPE_INT) {
-                            uv.setClosedInt(ctx.pStack[slot]);
+            ups = new Upvalue[] {uv};
+        } else {
+            ups = new Upvalue[capLen];
+            Upvalue[] parentUps = closure.upvals;
+            for (int i = 0; i < capLen; i++) {
+                if (fi.capKind[i] == 3 && (fi.capUp[i] < 0 || fi.capUp[i] >= parentUps.length)) {
+                    return null;
+                }
+                String name = child.upvalues[i].name;
+                switch (fi.capKind[i]) {
+                    case 0 -> {
+                        int ai = fi.capArg[i];
+                        if (ai < nActualArgs) {
+                            int slot = funcIdx + 1 + ai;
+                            if (tStack[slot] == TYPE_INT) {
+                                ups[i] = new org.luava.runtime.eval.Upvalue(name, pStack[slot]);
+                            } else {
+                                ups[i] = new org.luava.runtime.eval.Upvalue(
+                                        name, getLuaValue(pStack, tStack, oStack, slot));
+                            }
                         } else {
-                            uv.setValue(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, slot));
+                            ups[i] = new org.luava.runtime.eval.Upvalue(name, LuaNil.NIL);
                         }
                     }
-                    ups[i] = uv;
+                    case 1 -> ups[i] = new org.luava.runtime.eval.Upvalue(name, LuaNil.NIL);
+                    case 2 -> {
+                        LuaValue cv = fi.capConst[i];
+                        if (cv instanceof LuaInteger li) {
+                            ups[i] = new org.luava.runtime.eval.Upvalue(name, li.toLong());
+                        } else {
+                            ups[i] = new org.luava.runtime.eval.Upvalue(name, cv);
+                        }
+                    }
+                    default -> ups[i] = parentUps[fi.capUp[i]];
                 }
-                case 1 -> ups[i] = new org.luava.runtime.eval.Upvalue(name, LuaNil.NIL);
-                case 2 -> {
-                    org.luava.runtime.eval.Upvalue uv =
-                            new org.luava.runtime.eval.Upvalue(name, LuaNil.NIL);
-                    uv.setValue(fi.capConst[i]);
-                    ups[i] = uv;
-                }
-                default -> ups[i] = parentUps[fi.capUp[i]];
             }
         }
         LuaClosure childClosure = new LuaClosure(child, ups, closure.env, state);
@@ -3148,18 +4010,27 @@ public final class BytecodeVM {
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         LuaValue key = ctx.k[c];
         LuaValue uv = ctx.upvals[b].getValue();
-        if (key instanceof LuaString && uv instanceof LuaTable tbl) {
+        if (key instanceof LuaString ks && uv instanceof LuaTable tbl) {
             ctx.ensureGlobalCache();
-            int idx = (System.identityHashCode(tbl) ^ (pc * 33) ^ System.identityHashCode(key))
+            int idx = (ctx.proto.cacheSalt ^ (pc * 33) ^ ks.fastHash())
                     & (VmContext.GLOBAL_CACHE_SIZE - 1);
             if (ctx.gcHit(idx, ctx.proto, pc, tbl, key)) {
                 long ver = tbl.readVersion();
                 if (ver != -1L && ver == ctx.gcVersionAt(idx)) {
-                    setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, ctx.gcValueAt(idx));
+                    LuaValue cached = ctx.gcValueAt(idx);
+                    int dst = ctx.base + a;
+                    if (cached instanceof LuaFunction || cached instanceof LuaTable) {
+                        ctx.tStack[dst] = TYPE_OBJECT;
+                        ctx.pStack[dst] = 0L;
+                        ctx.oStack[dst] = cached;
+                    } else {
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, dst, cached);
+                    }
                     return;
                 }
             }
             LuaValue val = tbl.get(key);
+            syncStackArrays(ctx);
             long ver = tbl.readVersion();
             if (ver != -1L) {
                 ctx.gcStore(idx, ctx.proto, pc, tbl, key, ver, val);
@@ -3167,36 +4038,82 @@ public final class BytecodeVM {
             setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, val);
             return;
         }
-        executeGetTabUp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.upvals, ctx.k, ctx.base, a, inst);
+        executeGetTabUp(ctx, a, inst);
     }
 
-    private static void executeGetTable(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeGetFieldCached(VmContext ctx, int pc, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        int tb = base + b;
-        int kb = base + c;
+        int tb = ctx.base + b;
+        LuaValue key = ctx.k[c];
+        if (ctx.tStack[tb] == TYPE_OBJECT && ctx.oStack[tb] instanceof LuaTable lt) {
+            if (key instanceof LuaString ks) {
+                ctx.ensureGlobalCache();
+                int idx = (ctx.proto.cacheSalt ^ (pc * 33) ^ ks.fastHash())
+                        & (VmContext.GLOBAL_CACHE_SIZE - 1);
+                if (ctx.gcHit(idx, ctx.proto, pc, lt, key)) {
+                    long ver = lt.readVersion();
+                    if (ver != -1L && ver == ctx.gcVersionAt(idx)) {
+                        LuaValue cached = ctx.gcValueAt(idx);
+                        int dst = ctx.base + a;
+                        if (cached instanceof LuaFunction || cached instanceof LuaTable) {
+                            ctx.tStack[dst] = TYPE_OBJECT;
+                            ctx.pStack[dst] = 0L;
+                            ctx.oStack[dst] = cached;
+                        } else {
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, dst, cached);
+                        }
+                        return;
+                    }
+                }
+                if (lt.tryRawgetToStack(key, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a)) {
+                    long ver = lt.readVersion();
+                    if (ver != -1L && ctx.tStack[ctx.base + a] == TYPE_OBJECT && ctx.oStack[ctx.base + a] != null) {
+                        ctx.gcStore(idx, ctx.proto, pc, lt, key, ver, ctx.oStack[ctx.base + a]);
+                    }
+                    return;
+                }
+            } else if (lt.tryRawgetToStack(key, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a)) {
+                return;
+            }
+        }
+        LuaValue tbl = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, tb);
+        LuaValue val = tbl.get(key);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, val);
+    }
+
+    private static void executeGetTable(VmContext ctx, int a, int inst) {
+        int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
+        int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
+        int tb = ctx.base + b;
+        int kb = ctx.base + c;
         // Fast lane: plain table + integer key. Skips key boxing, virtual get(),
         // and value boxing/unboxing by reading directly into the stack triple.
-        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
-                && tStack[kb] == TYPE_INT) {
-            lt.rawgetIntToStack(pStack[kb], pStack, tStack, oStack, base + a);
+        if (ctx.tStack[tb] == TYPE_OBJECT && ctx.oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
+                && ctx.tStack[kb] == TYPE_INT) {
+            lt.rawgetIntToStack(ctx.pStack[kb], ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
             return;
         }
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + b);
-        LuaValue key = getLuaValue(pStack, tStack, oStack, base + c);
-        setLuaValue(pStack, tStack, oStack, base + a, tbl.get(key));
+        LuaValue tbl = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, tb);
+        LuaValue key = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, kb);
+        LuaValue val = tbl.get(key);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, val);
     }
 
-    private static void executeGetI(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeGetI(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        int tb = base + b;
-        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null) {
-            lt.rawgetIntToStack(c, pStack, tStack, oStack, base + a);
+        int tb = ctx.base + b;
+        if (ctx.tStack[tb] == TYPE_OBJECT && ctx.oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null) {
+            lt.rawgetIntToStack(c, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a);
             return;
         }
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, tb);
-        setLuaValue(pStack, tStack, oStack, base + a, tbl.get(LuaInteger.valueOf(c)));
+        LuaValue tbl = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, tb);
+        LuaValue val = tbl.get(LuaInteger.valueOf(c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, val);
     }
 
     private static void executeGetField(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
@@ -3215,80 +4132,87 @@ public final class BytecodeVM {
         setLuaValue(pStack, tStack, oStack, base + a, tbl.get(k[c]));
     }
 
-    private static void executeSetTabUp(long[] pStack, byte[] tStack, LuaValue[] oStack, Upvalue[] upvals, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSetTabUp(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-        LuaValue tbl = upvals[a].getValue();
-        LuaValue key = k[b];
-        LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
+        LuaValue tbl = ctx.upvals[a].getValue();
+        LuaValue key = ctx.k[b];
+        LuaValue val = flagK == 1 ? ctx.k[c] : getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c);
         tbl.set(key, val);
+        syncStackArrays(ctx);
     }
 
-    private static void executeSetTable(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSetTable(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-        int tb = base + a;
-        int kb = base + b;
+        int tb = ctx.base + a;
+        int kb = ctx.base + b;
         // Fast lane: plain table + integer key. Skips key boxing, virtual set(),
         // metatable probe, and value boxing on primitive/stack stores.
-        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
-                && tStack[kb] == TYPE_INT) {
+        if (ctx.tStack[tb] == TYPE_OBJECT && ctx.oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
+                && ctx.tStack[kb] == TYPE_INT) {
             if (flagK == 1) {
-                lt.rawsetInt(pStack[kb], k[c]);
+                lt.rawsetInt(ctx.pStack[kb], ctx.k[c]);
             } else {
-                lt.rawsetIntFromStack(pStack[kb], pStack, tStack, oStack, base + c);
+                lt.rawsetIntFromStack(ctx.pStack[kb], ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c);
             }
             return;
         }
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + a);
-        LuaValue key = getLuaValue(pStack, tStack, oStack, base + b);
-        LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
+        LuaValue tbl = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, tb);
+        LuaValue key = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, kb);
+        LuaValue val = flagK == 1 ? ctx.k[c] : getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c);
         tbl.set(key, val);
+        syncStackArrays(ctx);
     }
 
-    private static void executeSetI(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSetI(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-        int tb = base + a;
-        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null) {
+        int tb = ctx.base + a;
+        if (ctx.tStack[tb] == TYPE_OBJECT && ctx.oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null) {
             if (flagK == 1) {
-                lt.rawsetInt(b, k[c]);
+                lt.rawsetInt(b, ctx.k[c]);
             } else {
-                lt.rawsetIntFromStack(b, pStack, tStack, oStack, base + c);
+                lt.rawsetIntFromStack(b, ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c);
             }
             return;
         }
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, tb);
-        LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
+        LuaValue tbl = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, tb);
+        LuaValue val = flagK == 1 ? ctx.k[c] : getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c);
         tbl.set(LuaInteger.valueOf(b), val);
+        syncStackArrays(ctx);
     }
 
-    private static void executeSetField(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSetField(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-        int tb = base + a;
-        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt) {
-            if (flagK == 1 ? lt.trySetField(k[b], k[c]) : lt.trySetFieldFromStack(k[b], pStack, tStack, oStack, base + c)) {
+        int tb = ctx.base + a;
+        if (ctx.tStack[tb] == TYPE_OBJECT && ctx.oStack[tb] instanceof LuaTable lt) {
+            if (flagK == 1 ? lt.trySetField(ctx.k[b], ctx.k[c])
+                    : lt.trySetFieldFromStack(ctx.k[b], ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c)) {
                 return;
             }
         }
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, tb);
-        LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
-        tbl.set(k[b], val);
+        LuaValue tbl = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, tb);
+        LuaValue val = flagK == 1 ? ctx.k[c] : getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c);
+        tbl.set(ctx.k[b], val);
+        syncStackArrays(ctx);
     }
 
-    private static void executeSelf(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSelf(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + b);
-        LuaValue key = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
-        setLuaValue(pStack, tStack, oStack, base + a + 1, tbl);
-        setLuaValue(pStack, tStack, oStack, base + a, tbl.get(key));
+        LuaValue tbl = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b);
+        LuaValue key = flagK == 1 ? ctx.k[c] : getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, tbl);
+        LuaValue val = tbl.get(key);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, val);
     }
 
     /**
@@ -3368,224 +4292,293 @@ public final class BytecodeVM {
                 }
             }
         }
-        executeSelf(ctx.pStack, ctx.tStack, ctx.oStack, ctx.k, ctx.base, a, inst);
+        executeSelf(ctx, a, inst);
     }
 
-    private static void executeSlowAdd(long[] pStack, byte[] tStack, LuaValue[] oStack, int regA, int regB, int regC) {
-        LuaValue vb = getLuaValue(pStack, tStack, oStack, regB);
-        LuaValue vc = getLuaValue(pStack, tStack, oStack, regC);
-        setLuaValue(pStack, tStack, oStack, regA, vb.add(vc));
+    private static void executeSlowAdd(VmContext ctx, int regA, int regB, int regC) {
+        LuaValue vb = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB);
+        LuaValue vc = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regC);
+        LuaValue res = vb.add(vc);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
     }
 
-    private static void executeSlowAddI(long[] pStack, byte[] tStack, LuaValue[] oStack, int regA, int regB, int sc) {
-        LuaValue vb = getLuaValue(pStack, tStack, oStack, regB);
-        setLuaValue(pStack, tStack, oStack, regA, vb.add(LuaInteger.valueOf(sc)));
+    private static void executeSlowAddI(VmContext ctx, int regA, int regB, int sc) {
+        LuaValue vb = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB);
+        LuaValue res = vb.add(LuaInteger.valueOf(sc));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
     }
 
-    private static void executeSlowAddK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowAddK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        int regB = base + b;
-        int regA = base + a;
-        LuaValue kc = k[c];
-        if (tStack[regB] == TYPE_INT && kc instanceof LuaInteger ki) {
-            pStack[regA] = pStack[regB] + ki.toLong();
-            tStack[regA] = TYPE_INT;
-            oStack[regA] = null;
+        int regB = ctx.base + b;
+        int regA = ctx.base + a;
+        LuaValue kc = ctx.k[c];
+        if (ctx.tStack[regB] == TYPE_INT && kc instanceof LuaInteger ki) {
+            ctx.pStack[regA] = ctx.pStack[regB] + ki.toLong();
+            ctx.tStack[regA] = TYPE_INT;
+            ctx.oStack[regA] = null;
             return;
         }
-        if (isNumber(tStack[regB]) && kc.isNumber()) {
-            double db = tStack[regB] == TYPE_INT ? pStack[regB] : Double.longBitsToDouble(pStack[regB]);
-            pStack[regA] = Double.doubleToRawLongBits(db + kc.toDouble());
-            tStack[regA] = TYPE_FLOAT;
-            oStack[regA] = null;
+        if (isNumber(ctx.tStack[regB]) && kc.isNumber()) {
+            double db = ctx.tStack[regB] == TYPE_INT ? ctx.pStack[regB] : Double.longBitsToDouble(ctx.pStack[regB]);
+            ctx.pStack[regA] = Double.doubleToRawLongBits(db + kc.toDouble());
+            ctx.tStack[regA] = TYPE_FLOAT;
+            ctx.oStack[regA] = null;
             return;
         }
-        setLuaValue(pStack, tStack, oStack, regA, getLuaValue(pStack, tStack, oStack, regB).add(kc));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).add(kc);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
     }
 
-    private static void executeSlowSubK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowSubK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        int regB = base + b;
-        int regA = base + a;
-        LuaValue kc = k[c];
-        if (tStack[regB] == TYPE_INT && kc instanceof LuaInteger ki) {
-            pStack[regA] = pStack[regB] - ki.toLong();
-            tStack[regA] = TYPE_INT;
-            oStack[regA] = null;
+        int regB = ctx.base + b;
+        int regA = ctx.base + a;
+        LuaValue kc = ctx.k[c];
+        if (ctx.tStack[regB] == TYPE_INT && kc instanceof LuaInteger ki) {
+            ctx.pStack[regA] = ctx.pStack[regB] - ki.toLong();
+            ctx.tStack[regA] = TYPE_INT;
+            ctx.oStack[regA] = null;
             return;
         }
-        if (isNumber(tStack[regB]) && kc.isNumber()) {
-            double db = tStack[regB] == TYPE_INT ? pStack[regB] : Double.longBitsToDouble(pStack[regB]);
-            pStack[regA] = Double.doubleToRawLongBits(db - kc.toDouble());
-            tStack[regA] = TYPE_FLOAT;
-            oStack[regA] = null;
+        if (isNumber(ctx.tStack[regB]) && kc.isNumber()) {
+            double db = ctx.tStack[regB] == TYPE_INT ? ctx.pStack[regB] : Double.longBitsToDouble(ctx.pStack[regB]);
+            ctx.pStack[regA] = Double.doubleToRawLongBits(db - kc.toDouble());
+            ctx.tStack[regA] = TYPE_FLOAT;
+            ctx.oStack[regA] = null;
             return;
         }
-        setLuaValue(pStack, tStack, oStack, regA, getLuaValue(pStack, tStack, oStack, regB).sub(kc));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).sub(kc);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
     }
 
-    private static void executeSlowSub(long[] pStack, byte[] tStack, LuaValue[] oStack, int regA, int regB, int regC) {
-        LuaValue vb = getLuaValue(pStack, tStack, oStack, regB);
-        LuaValue vc = getLuaValue(pStack, tStack, oStack, regC);
-        setLuaValue(pStack, tStack, oStack, regA, vb.sub(vc));
+    private static void executeSlowSub(VmContext ctx, int regA, int regB, int regC) {
+        LuaValue vb = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB);
+        LuaValue vc = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regC);
+        LuaValue res = vb.sub(vc);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
     }
 
-    private static void executeSlowMul(long[] pStack, byte[] tStack, LuaValue[] oStack, int regA, int regB, int regC) {
-        LuaValue vb = getLuaValue(pStack, tStack, oStack, regB);
-        LuaValue vc = getLuaValue(pStack, tStack, oStack, regC);
-        setLuaValue(pStack, tStack, oStack, regA, vb.mul(vc));
+    private static void executeSlowMul(VmContext ctx, int regA, int regB, int regC) {
+        LuaValue vb = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB);
+        LuaValue vc = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regC);
+        LuaValue res = vb.mul(vc);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
     }
 
-    private static void executeSlowMulK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowMulK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        int regB = base + b;
-        int regA = base + a;
+        int regB = ctx.base + b;
+        int regA = ctx.base + a;
         // Unboxed fast lanes mirroring OP_MUL: the constant is a compile-time
         // literal (normally LuaInteger), so int*int must stay in the raw
         // register world instead of boxing through getLuaValue().mul().
-        LuaValue kc = k[c];
-        if (tStack[regB] == TYPE_INT && kc instanceof LuaInteger ki) {
-            pStack[regA] = pStack[regB] * ki.toLong();
-            tStack[regA] = TYPE_INT;
-            oStack[regA] = null;
+        LuaValue kc = ctx.k[c];
+        if (ctx.tStack[regB] == TYPE_INT && kc instanceof LuaInteger ki) {
+            ctx.pStack[regA] = ctx.pStack[regB] * ki.toLong();
+            ctx.tStack[regA] = TYPE_INT;
+            ctx.oStack[regA] = null;
             return;
         }
-        if (isNumber(tStack[regB]) && kc.isNumber()) {
-            double db = tStack[regB] == TYPE_INT ? pStack[regB] : Double.longBitsToDouble(pStack[regB]);
-            pStack[regA] = Double.doubleToRawLongBits(db * kc.toDouble());
-            tStack[regA] = TYPE_FLOAT;
-            oStack[regA] = null;
+        if (isNumber(ctx.tStack[regB]) && kc.isNumber()) {
+            double db = ctx.tStack[regB] == TYPE_INT ? ctx.pStack[regB] : Double.longBitsToDouble(ctx.pStack[regB]);
+            ctx.pStack[regA] = Double.doubleToRawLongBits(db * kc.toDouble());
+            ctx.tStack[regA] = TYPE_FLOAT;
+            ctx.oStack[regA] = null;
             return;
         }
-        setLuaValue(pStack, tStack, oStack, regA, getLuaValue(pStack, tStack, oStack, regB).mul(kc));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).mul(kc);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
     }
 
-    private static void executeSlowDiv(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowDiv(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).div(getLuaValue(pStack, tStack, oStack, base + c)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).div(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowDivK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowDivK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).div(k[c]));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).div(ctx.k[c]);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowIDiv(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowIDiv(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).idiv(getLuaValue(pStack, tStack, oStack, base + c)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).idiv(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowIDivK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowIDivK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).idiv(k[c]));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).idiv(ctx.k[c]);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowMod(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowMod(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).mod(getLuaValue(pStack, tStack, oStack, base + c)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).mod(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowModK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowModK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).mod(k[c]));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).mod(ctx.k[c]);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowPow(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowPow(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).pow(getLuaValue(pStack, tStack, oStack, base + c)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).pow(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowPowK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowPowK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).pow(k[c]));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).pow(ctx.k[c]);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowBand(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowBand(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).band(getLuaValue(pStack, tStack, oStack, base + c)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).band(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowBandK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowBandK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).band(k[c]));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).band(ctx.k[c]);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowBor(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowBor(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).bor(getLuaValue(pStack, tStack, oStack, base + c)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).bor(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowBorK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowBorK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).bor(k[c]));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).bor(ctx.k[c]);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowBxor(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowBxor(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).bxor(getLuaValue(pStack, tStack, oStack, base + c)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).bxor(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowBxorK(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
+    private static void executeSlowBxorK(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).bxor(k[c]));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).bxor(ctx.k[c]);
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowShl(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowShl(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).shl(getLuaValue(pStack, tStack, oStack, base + c)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).shl(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowShlI(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowShlI(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int sc = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, LuaInteger.valueOf(sc).shl(getLuaValue(pStack, tStack, oStack, base + b)));
+        LuaValue res = LuaInteger.valueOf(sc).shl(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowShr(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowShr(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).shr(getLuaValue(pStack, tStack, oStack, base + c)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).shr(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + c));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeSlowShrI(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowShrI(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int sc = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        setLuaValue(pStack, tStack, oStack, base + a, getLuaValue(pStack, tStack, oStack, base + b).shr(LuaInteger.valueOf(sc)));
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + b).shr(LuaInteger.valueOf(sc));
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, res);
     }
 
-    private static void executeConcat(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
+    private static void executeSlowUnm(VmContext ctx, int regA, int regB) {
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).unm();
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
+    }
+
+    private static void executeSlowBnot(VmContext ctx, int regA, int regB) {
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).bnot();
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
+    }
+
+    private static void executeSlowLen(VmContext ctx, int regA, int regB) {
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regB).len();
+        syncStackArrays(ctx);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, regA, res);
+    }
+
+    private static void executeConcat(VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-        int from = base + a;
+        int from = ctx.base + a;
         if (b >= 2) {
-            LuaValue fast = org.luava.runtime.jit.JitRuntime.concatRange(pStack, tStack, oStack, from, from + b);
+            LuaValue fast = org.luava.runtime.jit.JitRuntime.concatRange(ctx.pStack, ctx.tStack, ctx.oStack, from, from + b);
             if (fast != null) {
-                setLuaValue(pStack, tStack, oStack, from, fast);
+                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, from, fast);
                 return;
             }
         }
-        LuaValue res = getLuaValue(pStack, tStack, oStack, from);
+        LuaValue res = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, from);
         for (int j = 1; j < b; j++) {
-            res = res.concat(getLuaValue(pStack, tStack, oStack, from + j));
+            res = res.concat(getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, from + j));
+            syncStackArrays(ctx);
         }
-        setLuaValue(pStack, tStack, oStack, from, res);
+        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, from, res);
     }
 
     private static LuaValue[] getArgsForCall(long[] pStack, byte[] tStack, LuaValue[] oStack, int startIdx, int count) {
@@ -4059,10 +5052,11 @@ public final class BytecodeVM {
             if (tv instanceof org.luava.runtime.LuaTable tbl && ctrl.isNumber()) {
                 long i = ctrl.toLong() + 1;
                 LuaValue val = tbl.get(org.luava.runtime.LuaInteger.valueOf(i));
+                syncStackArrays(ctx);
                 if (val.isNil()) {
-                    writeTForResults(pStack, tStack, oStack, base + a + 4, c, null);
+                    writeTForResults(ctx.pStack, ctx.tStack, ctx.oStack, base + a + 4, c, null);
                 } else {
-                    writeTForResults(pStack, tStack, oStack, base + a + 4, c,
+                    writeTForResults(ctx.pStack, ctx.tStack, ctx.oStack, base + a + 4, c,
                             Varargs.of(org.luava.runtime.LuaInteger.valueOf(i), val));
                 }
                 return;
@@ -4082,8 +5076,9 @@ public final class BytecodeVM {
             res = f.call(s, var);
         } finally {
             org.luava.runtime.eval.CallStack.clearNextCallIf(ctx.callState, "for iterator");
+            syncStackArrays(ctx);
         }
-        writeTForResults(pStack, tStack, oStack, base + a + 4, c, res);
+        writeTForResults(ctx.pStack, ctx.tStack, ctx.oStack, base + a + 4, c, res);
     }
 
     /**

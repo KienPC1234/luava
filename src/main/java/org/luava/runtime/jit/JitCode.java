@@ -20,6 +20,7 @@ import org.luava.runtime.bytecode.LuaProto;
  */
 public final class JitCode {
     public final LuaProto proto;
+    public final JitEntry entry;
     public final MethodHandle handle;
     /** Object-returning variant (null when the proto returns an integer). */
     public final MethodHandle objHandle;
@@ -83,7 +84,15 @@ public final class JitCode {
     public JitCode(LuaProto proto, MethodHandle handle, MethodHandle objHandle, MethodHandle osrHandle,
             boolean[] osrTargets, boolean pure, boolean callSafe, boolean leafNoWindow,
             boolean returnsInt, boolean returnsVoid) {
+        this(proto, null, handle, objHandle, osrHandle, osrTargets, pure, callSafe, leafNoWindow,
+                returnsInt, returnsVoid);
+    }
+
+    public JitCode(LuaProto proto, JitEntry entry, MethodHandle handle, MethodHandle objHandle,
+            MethodHandle osrHandle, boolean[] osrTargets, boolean pure, boolean callSafe,
+            boolean leafNoWindow, boolean returnsInt, boolean returnsVoid) {
         this.proto = proto;
+        this.entry = entry;
         this.handle = handle;
         this.objHandle = objHandle;
         this.osrHandle = osrHandle;

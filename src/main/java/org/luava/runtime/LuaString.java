@@ -9,7 +9,7 @@ package org.luava.runtime;
 
 
 public final class LuaString extends LuaValue {
-    public static final LuaString EMPTY = new LuaString("");
+    public static final LuaString EMPTY = new LuaString("", true);
     /**
      * Pre-allocated PUC memory-error message ({@code MEMERRMSG}). When the JVM
      * heap is exhausted, building the error message must not allocate again or
@@ -20,7 +20,7 @@ public final class LuaString extends LuaValue {
     private static final LuaString[] ASCII_CACHE = new LuaString[256];
     static {
         for (int i = 0; i < 256; i++) {
-            ASCII_CACHE[i] = new LuaString(String.valueOf((char) i));
+            ASCII_CACHE[i] = new LuaString(String.valueOf((char) i), true);
         }
     }
     private static final int MAX_SHORT_STRING = 40;
@@ -92,6 +92,7 @@ public final class LuaString extends LuaValue {
     private final int rawOffset;
     private final int rawLength;
     private int strHash;
+    private final boolean canonical;
 
     public static void setStringMetatable(LuaTable mt) {
         LuaValue.setBasicMetatable(LuaType.STRING, mt);
@@ -103,12 +104,17 @@ public final class LuaString extends LuaValue {
     }
 
     public LuaString(String value) {
+        this(value, false);
+    }
+
+    private LuaString(String value, boolean canonical) {
         String s = value != null ? value : "";
         this.value = s;
         this.rawBytes = null;
         this.rawOffset = 0;
         this.rawLength = s.length();
         this.strHash = s.hashCode();
+        this.canonical = canonical;
         accountAlloc(this.rawLength);
     }
 
@@ -118,7 +124,12 @@ public final class LuaString extends LuaValue {
         this.rawOffset = off;
         this.rawLength = len;
         this.strHash = 0;
+        this.canonical = false;
         accountAlloc(len);
+    }
+
+    public boolean isCanonical() {
+        return canonical;
     }
 
     private void accountAlloc(int len) {
@@ -288,7 +299,7 @@ public final class LuaString extends LuaValue {
         if (INTERN_POOL.size() >= MAX_INTERN_ENTRIES) {
             return new LuaString(s);
         }
-        LuaString fresh = new LuaString(s);
+        LuaString fresh = new LuaString(s, true);
         LuaString raced = INTERN_POOL.putIfAbsent(s, fresh);
         return raced != null ? raced : fresh;
     }
@@ -433,7 +444,10 @@ public final class LuaString extends LuaValue {
     @Override
     public boolean equals(Object obj) {
         if (this == obj) return true;
-        if (!(obj instanceof LuaString other) || this.rawLength != other.rawLength) {
+        if (!(obj instanceof LuaString other)) {
+            return false;
+        }
+        if ((this.canonical & other.canonical) || this.rawLength != other.rawLength) {
             return false;
         }
         int h1 = this.strHash;

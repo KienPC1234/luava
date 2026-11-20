@@ -159,6 +159,15 @@ public final class CallStack {
             errorTop = 0;
         }
 
+        public void restoreProtectedSize(int targetSize) {
+            while (protectedFrames.size() > targetSize) {
+                protectedFrames.remove(protectedFrames.size() - 1);
+            }
+            if (protectedFrames.isEmpty()) {
+                clearSavedErrorStack();
+            }
+        }
+
         public int depth() {
             if (errorStack != null) {
                 return errorTop;
@@ -559,6 +568,43 @@ public final class CallStack {
         state.top = top + 1;
         if (cur != null && cur.hooksActive) {
             firePushHook(cur);
+        }
+    }
+
+    /** Fast push for coroutine stackless yield (caller checked {@code !hooksActive}). */
+    public static void pushYieldFrame(CallStackState state, LuaFunction fn, int line,
+            org.luava.runtime.LuaState vmState, int baseIndex, int funcIndex) {
+        int top = state.top;
+        if (top < state.frameLimit && state.protectedFrames.isEmpty() && top < state.stack.length) {
+            Frame frame = state.stack[top];
+            if (frame != null) {
+                frame.function = fn;
+                frame.name = "yield";
+                frame.namewhat = "field";
+                frame.line = line;
+                frame.baseIndex = baseIndex;
+                frame.funcIndex = funcIndex;
+                frame.state = vmState;
+                frame.pc = 0;
+                frame.isTailCall = false;
+                state.top = top + 1;
+                return;
+            }
+        }
+        pushVmFrame(fn, "yield", "field", line, false, false, 1, 0,
+                vmState, baseIndex, funcIndex, null, state, null);
+    }
+
+    /** Fast pop pairing with {@link #pushYieldFrame} on trampoline resume. */
+    public static void popYieldFrame(CallStackState state) {
+        int top = state.top;
+        if (top > 0) {
+            state.top = --top;
+            Frame f = state.stack[top];
+            if (f != null) {
+                f.function = null;
+                f.state = null;
+            }
         }
     }
 

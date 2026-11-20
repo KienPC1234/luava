@@ -51,6 +51,11 @@ public final class VmContext {
     public boolean stackless;
     public boolean stacklessYielded;
     public boolean stacklessPromoted;
+    /** Direct in-loop caller link when executing via the stackless coroutine trampoline. */
+    public VmContext callerVmCtx;
+    public int callerFuncIdx;
+    public int callerNResults;
+    public boolean callerIsWrap;
     /** Scratch in/out slot for tiny helpers (e.g. callable resolution). */
     public int scratch0;
 
@@ -82,6 +87,8 @@ public final class VmContext {
      */
     public LuaCoroutine co;
     public CallStack.CallStackState callState;
+    /** Cached per-OS-thread current coroutine cell (eliminates ThreadLocalMap.set on coroutine switch). */
+    public LuaCoroutine[] threadCoroSlot;
 
     /**
      * Effective thread for stack operations: {@code co} when running inside a

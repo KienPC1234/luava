@@ -11,6 +11,10 @@ import org.luava.runtime.LuaValue;
 import org.luava.runtime.jit.JitCode;
 
 public final class LuaProto {
+    private static final java.util.concurrent.atomic.AtomicInteger NEXT_CACHE_SALT =
+            new java.util.concurrent.atomic.AtomicInteger(1);
+
+    public final int cacheSalt = NEXT_CACHE_SALT.getAndIncrement() * 0x9E3779B9;
     public final String name;
     public final String source;
     public final int lineDefined;

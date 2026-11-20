@@ -71,18 +71,51 @@ public final class LuaState implements AutoCloseable {
      */
     private final AtomicLong statsCalls = new AtomicLong();
     private final AtomicLong statsInstructions = new AtomicLong();
+    public volatile boolean hasActiveHooks = false;
+    private final java.util.concurrent.atomic.AtomicInteger activeHookCount =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    public void updateHookPresence(boolean wasActive, boolean nowActive) {
+        if (wasActive == nowActive) {
+            return;
+        }
+        if (nowActive) {
+            activeHookCount.incrementAndGet();
+            hasActiveHooks = true;
+        } else if (activeHookCount.decrementAndGet() <= 0) {
+            activeHookCount.set(0);
+            hasActiveHooks = false;
+        }
+    }
     /** Set by {@link #close()}; further entries fail fast via {@link #ensureOpen()}. */
     private final AtomicBoolean closing = new AtomicBoolean(false);
     private volatile boolean closed;
     /** Per-state garbage collector bookkeeping (zero cross-state lock/counter contention). */
     public final org.luava.runtime.eval.GCManager.StateGC gcState =
             new org.luava.runtime.eval.GCManager.StateGC(this);
+    /** Per-state JIT snapshot buffer avoiding {@code ThreadLocal} lookups on windowed calls. */
+    public final org.luava.runtime.jit.JitRuntime.SnapshotStack jitSnapshotStack =
+            new org.luava.runtime.jit.JitRuntime.SnapshotStack();
     /** Tracks the root host thread currently executing on this state to detect unsupported concurrent use. */
     private final AtomicReference<Thread> executingRootThread = new AtomicReference<>();
     private int executingDepth = 0;
+    public enum AsyncRejectionPolicy {
+        /** Fail immediately with {@link LuaException} when pending tasks reach {@code maxPendingAsyncTasks}. */
+        REJECT,
+        /** Block caller threads until a pending async task completes (or state closes). */
+        CALLER_BLOCKS
+    }
+
     private final Object asyncLock = new Object();
     private CompletableFuture<Void> asyncTail = CompletableFuture.completedFuture(null);
+    private final java.util.concurrent.atomic.AtomicInteger pendingAsyncTasks =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private volatile int maxPendingAsyncTasks = ExecutionPolicy.DEFAULT_MAX_PENDING_ASYNC_TASKS;
+    private volatile AsyncRejectionPolicy asyncRejectionPolicy = AsyncRejectionPolicy.REJECT;
     private static final ExecutorService ASYNC_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+    private volatile boolean executedOrLoaded = false;
+    private volatile boolean sandboxed = false;
+    private volatile boolean tainted = false;
     private final LuaTable globals = new LuaTable();
     private final LuaTable registry = new LuaTable();
     private final LuaCoroutine mainThread = LuaCoroutine.createMainThread();
@@ -567,12 +600,19 @@ public final class LuaState implements AutoCloseable {
     }
 
     public LuaState javaPolicy(JavaAccessPolicy policy) {
-        this.javaAccessPolicy = (policy != null) ? policy : JavaAccessPolicy.DEFAULT;
+        JavaAccessPolicy next = (policy != null) ? policy : JavaAccessPolicy.DEFAULT;
+        if (sandboxed && executedOrLoaded && next == JavaAccessPolicy.UNRESTRICTED) {
+            throw new LuaException("cannot widen sandbox policy after code has been loaded or executed");
+        }
+        this.javaAccessPolicy = next;
         return this;
     }
 
     /** Allows additional Java class/package patterns through the policy. */
     public LuaState javaAllow(String... patterns) {
+        if (sandboxed && executedOrLoaded) {
+            throw new LuaException("cannot widen sandbox Java allowlist after code has been loaded or executed");
+        }
         this.javaAccessPolicy = javaAccessPolicy.withAllow(patterns);
         return this;
     }
@@ -585,6 +625,85 @@ public final class LuaState implements AutoCloseable {
 
     public JavaAccessPolicy getJavaAccessPolicy() {
         return javaAccessPolicy;
+    }
+
+    /** Configures maximum queued/in-flight {@link #evalAsync} tasks (0 = unlimited). */
+    public LuaState maxPendingAsyncTasks(int limit) {
+        if (limit < 0) {
+            throw new IllegalArgumentException("maxPendingAsyncTasks must not be negative");
+        }
+        this.maxPendingAsyncTasks = limit;
+        return this;
+    }
+
+    public int getMaxPendingAsyncTasks() {
+        return maxPendingAsyncTasks;
+    }
+
+    public int getPendingAsyncTaskCount() {
+        return pendingAsyncTasks.get();
+    }
+
+    /** Configures behavior when {@link #evalAsync} reaches {@link #getMaxPendingAsyncTasks()}. */
+    public LuaState asyncRejectionPolicy(AsyncRejectionPolicy policy) {
+        this.asyncRejectionPolicy = (policy != null) ? policy : AsyncRejectionPolicy.REJECT;
+        return this;
+    }
+
+    public AsyncRejectionPolicy getAsyncRejectionPolicy() {
+        return asyncRejectionPolicy;
+    }
+
+    /** Whether this state has been marked untrusted/unhealthy by a limit trip or internal failure. */
+    public boolean isTainted() {
+        return closed || tainted || cancelled;
+    }
+
+    public boolean isSandboxed() {
+        return sandboxed;
+    }
+
+    /** Exposes a Java object wrapped by a strict method-name capability allowlist. */
+    public void setCapability(String name, Object target, String... allowedMethods) {
+        globals.rawset(LuaString.valueOf(name), LuaUserdata.capability(target, allowedMethods));
+    }
+
+    /** Atomically applies an immutable {@link ExecutionPolicy} to this state. */
+    public LuaState applyPolicy(ExecutionPolicy policy) {
+        ensureOpen();
+        if (policy == null) {
+            throw new IllegalArgumentException("policy must not be null");
+        }
+        if (policy.isSandbox() && !sandboxed) {
+            sandbox();
+        }
+        if (policy.javaAccessPolicy() != null) {
+            javaPolicy(policy.javaAccessPolicy());
+        }
+        for (String d : policy.denyLibraries()) {
+            deny(d);
+        }
+        for (String a : policy.allowLibraries()) {
+            allow(a);
+        }
+        long instr = policy.instructionLimit();
+        Duration t = policy.timeout();
+        long timeoutNanos = (t != null && !t.isZero() && !t.isNegative()) ? t.toNanos() : 0L;
+        if (instr > 0 || timeoutNanos > 0 || policy.isCancellable()) {
+            Guard guard = new Guard(Math.max(0L, instr), timeoutNanos);
+            guard.arm();
+            this.loopGuard = guard;
+        } else {
+            this.loopGuard = null;
+        }
+        maxAllocationBytes(policy.maxAllocationBytes());
+        maxMemoryBytes(policy.maxMemoryBytes());
+        maxCoroutines(policy.maxCoroutines());
+        maxCallDepth(policy.maxCallDepth());
+        maxPendingAsyncTasks(policy.maxPendingAsyncTasks());
+        asyncRejectionPolicy(policy.asyncRejectionPolicy());
+        jitEnabled(policy.jitEnabled());
+        return this;
     }
 
     /** Effective per-allocation cap for the currently running chunk. */
@@ -691,6 +810,11 @@ public final class LuaState implements AutoCloseable {
      * @return this state (fluent one-liner: {@code new LuaState().sandbox()})
      */
     public LuaState sandbox() {
+        if (executedOrLoaded && !sandboxed) {
+            throw new LuaException(
+                    "cannot convert a LuaState to sandbox after code has been loaded or executed; call sandbox() on a fresh state");
+        }
+        sandboxed = true;
         javaAccessPolicy = JavaAccessPolicy.STRICT;
         return deny("os", "io", "package", "require", "dofile", "loadfile", "java", "luajava", "debug");
     }
@@ -723,6 +847,10 @@ public final class LuaState implements AutoCloseable {
      * the package library.
      */
     public LuaState allow(String name) {
+        if (sandboxed && executedOrLoaded && isSensitiveLibrary(name)) {
+            throw new LuaException("cannot re-enable library '" + name
+                    + "' on an active sandbox after code has been loaded or executed");
+        }
         switch (name) {
             case "math" -> lazyLib("math", t -> MathLib.fillInto(t, globals));
             case "string" -> {
@@ -743,6 +871,11 @@ public final class LuaState implements AutoCloseable {
             default -> throw new LuaException("unknown library: " + name);
         }
         return this;
+    }
+
+    private static boolean isSensitiveLibrary(String name) {
+        return "os".equals(name) || "io".equals(name) || "package".equals(name)
+                || "java".equals(name) || "debug".equals(name);
     }
 
     private void installPackage() {        LuaTable pkgLib = lazyLib("package", t -> PackageLib.fillInto(t, this, globals));
@@ -967,6 +1100,7 @@ public final class LuaState implements AutoCloseable {
             ACTIVE_MAX_ALLOC.remove();
         }
         if (isTopLevel) {
+            executedOrLoaded = true;
             armGuard();
         }
 
@@ -1013,16 +1147,29 @@ public final class LuaState implements AutoCloseable {
      * pass through unchanged so {@code os.exit}, coroutine close and error
      * unwinding keep their semantics.
      */
-    private static <T> T guardHostBoundary(java.util.function.Supplier<T> body) {
+    private <T> T guardHostBoundary(java.util.function.Supplier<T> body) {
         try {
             return body.get();
-        } catch (LuaException | LuaExit
+        } catch (GuardTimeout gt) {
+            this.tainted = true;
+            throw gt;
+        } catch (LuaException e) {
+            String msg = e.getMessage();
+            if (msg != null && (msg.contains("instruction limit")
+                    || msg.contains("memory limit")
+                    || msg.contains("execution cancelled"))) {
+                this.tainted = true;
+            }
+            throw e;
+        } catch (LuaExit
                 | org.luava.runtime.eval.LuaUnwindException
                 | org.luava.runtime.concurrency.LuaCoroutine.CoroutineCloseSignal e) {
             throw e;
         } catch (StackOverflowError e) {
+            this.tainted = true;
             throw new LuaException("stack overflow");
         } catch (OutOfMemoryError oom) {
+            this.tainted = true;
             // PUC reports a failed allocation as the Lua-level error "not
             // enough memory" (LUA_ERRMEM), catchable by pcall. Build it from
             // the pre-allocated message so this boundary need not allocate
@@ -1030,6 +1177,7 @@ public final class LuaState implements AutoCloseable {
             // OutOfMemoryError to the host).
             throw new LuaException(LuaString.MEMORY_ERROR);
         } catch (Throwable t) {
+            this.tainted = true;
             String msg = t.getMessage() != null ? t.getMessage() : t.toString();
             throw new LuaException("internal error: " + t.getClass().getSimpleName() + ": " + msg);
         }
@@ -1079,6 +1227,7 @@ public final class LuaState implements AutoCloseable {
 
     public LuaFunction load(CompiledChunk chunk, LuaValue env) {
         ensureOpen();
+        executedOrLoaded = true;
         if (chunk == null) {
             throw new LuaException("compiled chunk must not be null");
         }
@@ -1164,6 +1313,7 @@ public final class LuaState implements AutoCloseable {
             if (cause instanceof RuntimeException re) throw re;
             throw new LuaException("Error during execution: " + cause.getMessage());
         } catch (TimeoutException e) {
+            this.tainted = true;
             guard.cancel();
             future.cancel(false);
             try {
@@ -1183,11 +1333,17 @@ public final class LuaState implements AutoCloseable {
      * cheap (one field check per instruction). Pass {@code 0} to disable.
      */
     public LuaState instructionLimit(long maxInstructions) {
+        long timeoutNanos = (loopGuard instanceof Guard g) ? g.timeoutNanos : 0;
         if (maxInstructions <= 0) {
-            loopGuard = null;
+            if (timeoutNanos > 0) {
+                Guard guard = new Guard(0, timeoutNanos);
+                guard.arm();
+                loopGuard = guard;
+            } else {
+                loopGuard = null;
+            }
             return this;
         }
-        long timeoutNanos = (loopGuard instanceof Guard g) ? g.timeoutNanos : 0;
         Guard guard = new Guard(maxInstructions, timeoutNanos);
         guard.arm();
         loopGuard = guard;
@@ -1200,11 +1356,17 @@ public final class LuaState implements AutoCloseable {
      * instruction) to keep the hot path cheap. Pass {@code null} to disable.
      */
     public LuaState timeout(Duration timeout) {
+        long maxInstr = (loopGuard instanceof Guard g) ? g.maxInstr : 0;
         if (timeout == null || timeout.isZero() || timeout.isNegative()) {
-            loopGuard = null;
+            if (maxInstr > 0) {
+                Guard guard = new Guard(maxInstr, 0);
+                guard.arm();
+                loopGuard = guard;
+            } else {
+                loopGuard = null;
+            }
             return this;
         }
-        long maxInstr = (loopGuard instanceof Guard g) ? g.maxInstr : 0;
         Guard guard = new Guard(maxInstr, timeout.toNanos());
         guard.arm();
         loopGuard = guard;
@@ -1242,6 +1404,7 @@ public final class LuaState implements AutoCloseable {
 
     public LuaFunction compile(String luaSource, String chunkName, LuaValue env) {
         ensureOpen();
+        executedOrLoaded = true;
         LuaValue chunkEnvVal = (env != null) ? env : globals;
         LuaTable chunkGlobals = (chunkEnvVal instanceof LuaTable t) ? t : globals;
 
@@ -1644,16 +1807,55 @@ public final class LuaState implements AutoCloseable {
      */
     public CompletableFuture<LuaValue> evalAsync(String luaSource, String chunkName) {
         ensureOpen();
+        int cap = maxPendingAsyncTasks;
+        AsyncRejectionPolicy policy = asyncRejectionPolicy;
         CompletableFuture<LuaValue> result = new CompletableFuture<>();
         synchronized (asyncLock) {
+            if (cap > 0) {
+                if (policy == AsyncRejectionPolicy.CALLER_BLOCKS) {
+                    boolean interrupted = false;
+                    while (pendingAsyncTasks.get() >= cap && !closed) {
+                        try {
+                            asyncLock.wait();
+                        } catch (InterruptedException ie) {
+                            interrupted = true;
+                            break;
+                        }
+                    }
+                    if (interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new LuaException("async task submission interrupted");
+                    }
+                    ensureOpen();
+                } else if (pendingAsyncTasks.get() >= cap) {
+                    throw new LuaException("async task queue is full (limit: " + cap + ")");
+                }
+            }
+            pendingAsyncTasks.incrementAndGet();
             CompletableFuture<Void> prev = asyncTail;
+            CompletableFuture<Void>[] holder = new CompletableFuture[1];
             CompletableFuture<Void> next = prev.whenCompleteAsync((ignored, err) -> {
                 try {
-                    result.complete(eval(luaSource, chunkName));
+                    if (closed) {
+                        result.completeExceptionally(new LuaException("LuaState is closed"));
+                    } else if (isCancelled()) {
+                        result.completeExceptionally(new LuaException("execution cancelled"));
+                    } else {
+                        result.complete(eval(luaSource, chunkName));
+                    }
                 } catch (Throwable t) {
                     result.completeExceptionally(t);
+                } finally {
+                    pendingAsyncTasks.decrementAndGet();
+                    synchronized (asyncLock) {
+                        if (asyncTail == holder[0]) {
+                            asyncTail = CompletableFuture.completedFuture(null);
+                        }
+                        asyncLock.notifyAll();
+                    }
                 }
             }, ASYNC_EXECUTOR);
+            holder[0] = next;
             asyncTail = next;
         }
         return result;
@@ -1672,10 +1874,17 @@ public final class LuaState implements AutoCloseable {
             return;
         }
         closed = true;
-        if (loopGuard instanceof Guard g) {
-            g.cancel();
+        synchronized (asyncLock) {
+            asyncLock.notifyAll();
         }
-        clearGuard();
+        Thread execThread = executingRootThread.get();
+        if (execThread != null) {
+            cancelled = true;
+            if (loopGuard instanceof Guard g) {
+                g.cancel();
+            }
+            java.util.concurrent.locks.LockSupport.unpark(execThread);
+        }
         List<org.luava.runtime.bytecode.LuaProto> protos;
         synchronized (protoCache) {
             protos = new ArrayList<>(protoCache.values());
@@ -1684,7 +1893,7 @@ public final class LuaState implements AutoCloseable {
         for (org.luava.runtime.bytecode.LuaProto proto : protos) {
             org.luava.runtime.jit.JitCompiler.invalidateTree(proto);
         }
-        if (executingRootThread.get() == null) {
+        if (execThread == null) {
             LuaState prevBasic = LuaValue.pushBasicState(this);
             try {
                 mainThread.closeAllTbc();
@@ -1693,5 +1902,9 @@ public final class LuaState implements AutoCloseable {
             }
         }
         org.luava.runtime.eval.GCManager.unregisterState(this);
+        cancelled = true;
+        if (loopGuard instanceof Guard g) {
+            g.cancel();
+        }
     }
 }

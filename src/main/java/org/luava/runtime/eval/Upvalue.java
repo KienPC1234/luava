@@ -102,6 +102,12 @@ public final class Upvalue {
         this.isOpenOnStack = false;
     }
 
+    public Upvalue(String name, long initialInt) {
+        this.name = name != null ? name : "?";
+        this.rawValue = initialInt;
+        this.typeTag = BytecodeVM.TYPE_INT;
+    }
+
     public String getName() {
         return name;
     }

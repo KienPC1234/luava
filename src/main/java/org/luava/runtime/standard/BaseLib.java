@@ -162,7 +162,7 @@ public final class BaseLib {
     public static LuaValue setmetatableCore(LuaTable t, LuaValue mt) {
         LuaTable oldMt = t.getMetatable();
         if (oldMt != null) {
-            LuaValue protectedVal = oldMt.rawget(LuaString.interned("__metatable"));
+            LuaValue protectedVal = oldMt.rawget(LuaValue.Meta.METATABLE);
             if (!protectedVal.isNil()) {
                 throw new LuaException("cannot change a protected metatable");
             }
@@ -172,7 +172,7 @@ public final class BaseLib {
         } else if (mt.isTable()) {
             LuaTable tableMt = (LuaTable) mt;
             t.setMetatable(tableMt);
-            LuaValue gcHandler = tableMt.rawget(LuaString.interned("__gc"));
+            LuaValue gcHandler = tableMt.rawget(LuaValue.Meta.GC);
             if (!gcHandler.isNil()) {
                 org.luava.runtime.eval.GCManager.register(t, gcHandler);
             }
@@ -381,10 +381,12 @@ public final class BaseLib {
             // frame at the depth limit throws StackOverflowError, and a frame
             // pushed outside the try would never be popped, leaving a stale
             // handler that later lets an unwind escape past top level.
+            org.luava.runtime.eval.CallStack.CallStackState cs = org.luava.runtime.eval.CallStack.currentState();
+            int savedProtectedSize = cs.protectedFrames.size();
             boolean pushedProtectedFrame = false;
             boolean pushedCFrame = false;
             try {
-                org.luava.runtime.eval.CallStack.pushProtectedFrame(null);
+                cs.protectedFrames.add(new org.luava.runtime.eval.CallStack.ProtectedFrame(null, cs.depth()));
                 pushedProtectedFrame = true;
                 if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
                     org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
@@ -421,11 +423,11 @@ public final class BaseLib {
                 String msg = t.getMessage() != null ? t.getMessage() : t.toString();
                 return Varargs.of(LuaBoolean.FALSE, LuaString.valueOf(msg));
             } finally {
+                if (pushedProtectedFrame) {
+                    cs.restoreProtectedSize(savedProtectedSize);
+                }
                 if (pushedCFrame) {
                     org.luava.runtime.eval.CallStack.pop();
-                }
-                if (pushedProtectedFrame) {
-                    org.luava.runtime.eval.CallStack.popProtectedFrame();
                 }
             }
         }));
@@ -448,10 +450,12 @@ public final class BaseLib {
 
             // See pcall: push the protected frame inside the try so a
             // StackOverflowError at the depth limit cannot leak it.
+            org.luava.runtime.eval.CallStack.CallStackState cs = org.luava.runtime.eval.CallStack.currentState();
+            int savedProtectedSize = cs.protectedFrames.size();
             boolean pushedProtectedFrame = false;
             boolean pushedCFrame = false;
             try {
-                org.luava.runtime.eval.CallStack.pushProtectedFrame(msgh);
+                cs.protectedFrames.add(new org.luava.runtime.eval.CallStack.ProtectedFrame(msgh, cs.depth()));
                 pushedProtectedFrame = true;
                 if (target instanceof LuaFunction fn && !(fn instanceof org.luava.runtime.bytecode.LuaClosure)) {
                     org.luava.runtime.eval.CallStack.setNextTransfer(1, fnArgs.length, fnArgs);
@@ -500,11 +504,11 @@ public final class BaseLib {
                     return Varargs.of(LuaBoolean.FALSE, LuaString.interned("error in error handling"));
                 }
             } finally {
+                if (pushedProtectedFrame) {
+                    cs.restoreProtectedSize(savedProtectedSize);
+                }
                 if (pushedCFrame) {
                     org.luava.runtime.eval.CallStack.pop();
-                }
-                if (pushedProtectedFrame) {
-                    org.luava.runtime.eval.CallStack.popProtectedFrame();
                 }
             }
         }));

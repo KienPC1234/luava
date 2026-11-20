@@ -46,9 +46,14 @@ public final class LuaClosure extends LuaFunction {
         // materializing first (lazily-created list replaces null).
         this.params = null;
         if (proto.name != null) {
-            this.setName(proto.name);
+            this.name = proto.name;
         }
-        org.luava.runtime.eval.GCManager.onAlloc(64 + this.upvals.length * 16);
+        long allocBytes = 64 + this.upvals.length * 16L;
+        if (state != null) {
+            state.gcState.onAlloc(allocBytes);
+        } else {
+            org.luava.runtime.eval.GCManager.onAlloc(allocBytes);
+        }
     }
 
     /**

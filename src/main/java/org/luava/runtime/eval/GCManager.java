@@ -80,6 +80,9 @@ public final class GCManager {
     private static volatile boolean hasRootProviders = false;
     private static final List<java.lang.ref.WeakReference<LuaState>> STATES = new ArrayList<>();
     private static final StateGC GLOBAL_GC = new StateGC(null);
+    private static final LuaString MEMORY_LIMIT_ERROR = LuaString.interned("memory limit exceeded");
+    /** True once any state installed {@code maxMemoryBytes > 0}; keeps uncapped hot paths free of ThreadLocal reads. */
+    public static volatile boolean ANY_MEMORY_CAP = false;
 
     private GCManager() {}
 
@@ -115,6 +118,7 @@ public final class GCManager {
         public void setMaxMemoryBytes(long bytes) {
             this.maxMemoryBytes = bytes;
             if (bytes > 0) {
+                ANY_MEMORY_CAP = true;
                 long capThresh = Math.max(1024L, bytes / 4);
                 if (gcThreshold > capThresh) {
                     gcThreshold = capThresh;
@@ -131,16 +135,37 @@ public final class GCManager {
         }
 
         /** Thread-confined hot-path allocation accounting for an active state. */
-        void onAlloc(long bytes) {
+        public void onAlloc(long bytes) {
+            long memCap = maxMemoryBytes;
+            if (memCap > 0 && bytes > memCap) {
+                throw new org.luava.runtime.LuaException(MEMORY_LIMIT_ERROR);
+            }
             long total = uncollectedBytes + bytes;
             uncollectedBytes = total;
-            if (total < gcThreshold) {
+            if (total < gcThreshold && !(memCap > 0 && liveRetainedBytes + total > memCap)) {
                 return;
             }
-            if (!gcRunning && maxMemoryBytes <= 0) {
+            if (!gcRunning && memCap <= 0) {
                 return;
             }
             collectOnThreshold(bytes);
+        }
+
+        void preAllocCheck(long pendingBytes) {
+            long memCap = maxMemoryBytes;
+            if (memCap <= 0 || pendingBytes <= 0) {
+                return;
+            }
+            if (pendingBytes > memCap) {
+                throw new org.luava.runtime.LuaException(MEMORY_LIMIT_ERROR);
+            }
+            long total = uncollectedBytes + pendingBytes;
+            if (total >= gcThreshold || liveRetainedBytes + total > memCap) {
+                uncollectedBytes = total;
+                collectOnThreshold(pendingBytes);
+            } else {
+                uncollectedBytes = total;
+            }
         }
 
         synchronized void onAllocSynchronized(long bytes) {
@@ -150,9 +175,10 @@ public final class GCManager {
         private synchronized void collectOnThreshold(long pendingAllocBytes) {
             long memCap = maxMemoryBytes;
             if (memCap > 0 && pendingAllocBytes > memCap) {
-                throw new org.luava.runtime.LuaException("memory limit exceeded");
+                throw new org.luava.runtime.LuaException(MEMORY_LIMIT_ERROR);
             }
-            if ((!gcRunning && memCap <= 0) || uncollectedBytes < gcThreshold) {
+            if ((!gcRunning && memCap <= 0)
+                    || (uncollectedBytes < gcThreshold && !(memCap > 0 && liveRetainedBytes + uncollectedBytes > memCap))) {
                 return;
             }
             if (collecting) {
@@ -160,8 +186,8 @@ public final class GCManager {
             }
             uncollectedBytes = 0;
             collectInternal();
-            if (memCap > 0 && liveRetainedBytes > memCap) {
-                throw new org.luava.runtime.LuaException("memory limit exceeded");
+            if (memCap > 0 && (liveRetainedBytes > memCap || pendingAllocBytes > (memCap - liveRetainedBytes))) {
+                throw new org.luava.runtime.LuaException(MEMORY_LIMIT_ERROR);
             }
         }
 
@@ -497,6 +523,20 @@ public final class GCManager {
             active.gcState.onAlloc(bytes);
         } else {
             GLOBAL_GC.onAllocSynchronized(bytes);
+        }
+    }
+
+    /**
+     * Checks and accounts for a large backing allocation before allocating its
+     * storage when any state enforces {@code maxMemoryBytes}.
+     */
+    public static void preAllocCheck(long pendingBytes) {
+        if (!ANY_MEMORY_CAP || pendingBytes <= 0) {
+            return;
+        }
+        LuaState active = LuaValue.activeBasicState();
+        if (active != null) {
+            active.gcState.preAllocCheck(pendingBytes);
         }
     }
 

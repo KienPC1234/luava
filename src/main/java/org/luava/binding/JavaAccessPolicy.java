@@ -94,20 +94,38 @@ public final class JavaAccessPolicy {
      * {@code java} is re-enabled.
      */
     public static final JavaAccessPolicy STRICT =
-            new JavaAccessPolicy(buildOrderedRules(DEFAULT_ALLOW, DEFAULT_DENY), false, "strict");
+            new JavaAccessPolicy(buildOrderedRules(DEFAULT_ALLOW, DEFAULT_DENY), false, "strict", false, true);
+
+    /**
+     * Closed member-allowlist variant of {@link #STRICT}: both class loading
+     * and member/SAM invocation on host-injected objects require an explicit
+     * allow match (unless wrapped via {@link JavaCapability}).
+     */
+    public static final JavaAccessPolicy STRICT_ALLOWLIST =
+            new JavaAccessPolicy(buildOrderedRules(DEFAULT_ALLOW, DEFAULT_DENY),
+                    false, "strict-allowlist", true, true);
 
     private final Rule[] rules;
     private final boolean defaultAllow;
     private final String label;
+    private final boolean memberAllowlistOnly;
+    private final boolean deferClassInit;
 
     public JavaAccessPolicy(String[] allow, String[] deny, boolean defaultAllow) {
-        this(buildCustomRules(allow, deny), defaultAllow, "custom");
+        this(buildCustomRules(allow, deny), defaultAllow, "custom", false, false);
     }
 
     private JavaAccessPolicy(Rule[] rules, boolean defaultAllow, String label) {
+        this(rules, defaultAllow, label, false, false);
+    }
+
+    private JavaAccessPolicy(Rule[] rules, boolean defaultAllow, String label,
+            boolean memberAllowlistOnly, boolean deferClassInit) {
         this.rules = rules.clone();
         this.defaultAllow = defaultAllow;
         this.label = label;
+        this.memberAllowlistOnly = memberAllowlistOnly;
+        this.deferClassInit = deferClassInit;
     }
 
     private static Rule[] buildOrderedRules(String[] firstAllow, String[] thenDeny) {
@@ -142,12 +160,38 @@ public final class JavaAccessPolicy {
 
     /** Returns a copy of this policy with additional allow patterns. */
     public JavaAccessPolicy withAllow(String... patterns) {
-        return new JavaAccessPolicy(appendRules(this.rules, patterns, true), this.defaultAllow, label);
+        return new JavaAccessPolicy(appendRules(this.rules, patterns, true),
+                this.defaultAllow, label, memberAllowlistOnly, deferClassInit);
     }
 
     /** Returns a copy of this policy with additional deny patterns. */
     public JavaAccessPolicy withDeny(String... patterns) {
-        return new JavaAccessPolicy(appendRules(this.rules, patterns, false), this.defaultAllow, label);
+        return new JavaAccessPolicy(appendRules(this.rules, patterns, false),
+                this.defaultAllow, label, memberAllowlistOnly, deferClassInit);
+    }
+
+    /** Returns a copy controlling whether member access uses allowlist-only mode. */
+    public JavaAccessPolicy withMemberAllowlistOnly(boolean memberAllowlistOnly) {
+        if (this.memberAllowlistOnly == memberAllowlistOnly) {
+            return this;
+        }
+        return new JavaAccessPolicy(this.rules, this.defaultAllow, label, memberAllowlistOnly, deferClassInit);
+    }
+
+    /** Returns a copy controlling whether {@code java.import} defers static initializers. */
+    public JavaAccessPolicy withDeferClassInit(boolean deferClassInit) {
+        if (this.deferClassInit == deferClassInit) {
+            return this;
+        }
+        return new JavaAccessPolicy(this.rules, this.defaultAllow, label, memberAllowlistOnly, deferClassInit);
+    }
+
+    public boolean isMemberAllowlistOnly() {
+        return memberAllowlistOnly;
+    }
+
+    public boolean isDeferClassInit() {
+        return deferClassInit;
     }
 
     public boolean isAllowed(String className) {
@@ -178,6 +222,75 @@ public final class JavaAccessPolicy {
             }
         }
         return false;
+    }
+
+    /**
+     * Checks {@code clazz} and all of its supertypes/interfaces against deny rules.
+     */
+    public boolean isDeniedHierarchy(Class<?> clazz) {
+        for (Class<?> cur = clazz; cur != null; cur = cur.getSuperclass()) {
+            if (cur == java.io.Serializable.class) {
+                continue;
+            }
+            if (isDenied(cur.getName())) {
+                return true;
+            }
+            for (Class<?> iface : cur.getInterfaces()) {
+                if (iface != java.io.Serializable.class && isDeniedHierarchy(iface)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Whether member or SAM access is allowed on {@code targetClass} and {@code declaringClass}.
+     */
+    public boolean allowsMember(Class<?> targetClass, Class<?> declaringClass, String memberName) {
+        if (this != UNRESTRICTED && memberName != null && isDangerousObjectMethod(declaringClass, memberName)) {
+            return false;
+        }
+        if (targetClass != null) {
+            if (isDeniedHierarchy(targetClass)) {
+                return false;
+            }
+            if (memberAllowlistOnly) {
+                boolean allowedTarget = isAllowed(targetClass.getName())
+                        || (targetClass.isSynthetic() && declaringClass != null
+                                && declaringClass != Object.class && isAllowed(declaringClass.getName()));
+                if (!allowedTarget) {
+                    return false;
+                }
+            }
+        }
+        if (declaringClass != null) {
+            if (isDeniedHierarchy(declaringClass)) {
+                return false;
+            }
+            if (memberAllowlistOnly && !isAllowed(declaringClass.getName())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Throws a {@link LuaException} if member/SAM access is blocked by this policy. */
+    public void checkMember(Class<?> targetClass, Class<?> declaringClass, String memberName) {
+        if (!allowsMember(targetClass, declaringClass, memberName)) {
+            String culprit = (targetClass != null ? targetClass.getName()
+                    : (declaringClass != null ? declaringClass.getName() : "<unknown>"));
+            throw new LuaException("access denied: " + culprit
+                    + (memberName != null ? "." + memberName : "")
+                    + " is blocked by the Java access policy (" + label + ")");
+        }
+    }
+
+    private static boolean isDangerousObjectMethod(Class<?> declaringClass, String memberName) {
+        if (declaringClass != Object.class && declaringClass != null) {
+            return false;
+        }
+        return "wait".equals(memberName) || "notify".equals(memberName) || "notifyAll".equals(memberName);
     }
 
     /**

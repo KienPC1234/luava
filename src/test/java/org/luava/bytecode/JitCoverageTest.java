@@ -1360,8 +1360,12 @@ public class JitCoverageTest {
         }
         for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
             // Resolving a method handle forces the verifier over the body.
-            MethodHandles.lookup().findStatic(cls, m.getName(),
-                    MethodType.methodType(m.getReturnType(), m.getParameterTypes()));
+            MethodType mt = MethodType.methodType(m.getReturnType(), m.getParameterTypes());
+            if (java.lang.reflect.Modifier.isStatic(m.getModifiers())) {
+                MethodHandles.lookup().findStatic(cls, m.getName(), mt);
+            } else {
+                MethodHandles.lookup().findVirtual(cls, m.getName(), mt);
+            }
         }
     }
 

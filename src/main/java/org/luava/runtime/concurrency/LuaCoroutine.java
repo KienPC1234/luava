@@ -47,7 +47,12 @@ public final class LuaCoroutine extends LuaValue {
     private static final LuaValue[] RESUME_OVERFLOW_ERROR = new LuaValue[]{LuaBoolean.FALSE, LuaString.valueOf("C stack overflow")};
     private static final LuaValue[] RESUME_SUCCESS_EMPTY = new LuaValue[]{LuaBoolean.TRUE};
 
-    private static final ThreadLocal<LuaCoroutine> CURRENT_COROUTINE = new ThreadLocal<>();
+    private static final ThreadLocal<LuaCoroutine[]> CURRENT_SLOT =
+            ThreadLocal.withInitial(() -> new LuaCoroutine[1]);
+
+    public static LuaCoroutine[] currentSlot() {
+        return CURRENT_SLOT.get();
+    }
 
     /**
      * Handoff rendezvous sequence numbers. A plain status-flag handshake
@@ -90,7 +95,11 @@ public final class LuaCoroutine extends LuaValue {
 
     /** Disarm this coroutine's hook (idempotent; safe to call on death/close). */
     private void disarmHook() {
+        boolean wasActive = hooksActive;
         hooksActive = false;
+        if (wasActive && ownerState != null) {
+            ownerState.updateHookPresence(true, false);
+        }
     }
 
     /**
@@ -123,9 +132,9 @@ public final class LuaCoroutine extends LuaValue {
     private volatile LuaValue[] handoffArgs;
     private volatile LuaValue handoffSingleArg;
     private volatile int handoffArgCount;
-    private volatile LuaValue[] handoffResult;
-    private volatile LuaValue handoffSingleResult;
-    private volatile int handoffResultCount;
+    public volatile LuaValue[] handoffResult;
+    public volatile LuaValue handoffSingleResult;
+    public volatile int handoffResultCount;
     // Caller ThreadLocal scope transferred across resume/close under the coroutine lock.
     private LuaState handoffActiveState;
     private Long handoffMaxAlloc;
@@ -139,7 +148,14 @@ public final class LuaCoroutine extends LuaValue {
     private LuaState installedBasicState;
     private Thread installedRootThread;
     private volatile Status status = Status.SUSPENDED;
+    private static final java.util.concurrent.atomic.AtomicReferenceFieldUpdater<LuaCoroutine, Status>
+            STATUS_UPDATER = java.util.concurrent.atomic.AtomicReferenceFieldUpdater.newUpdater(
+                    LuaCoroutine.class, Status.class, "status");
     private volatile Throwable error;
+
+    public Throwable getError() {
+        return error;
+    }
     private static final int MAX_NESTED_COROUTINES = 200;
     private int nestedDepth = 0;
     private volatile int nonYieldableCount = 0;
@@ -288,7 +304,11 @@ public final class LuaCoroutine extends LuaValue {
             hookConfig.mask = "";
             hookConfig.count = 0;
         }
+        boolean wasActive = hooksActive;
         hooksActive = active;
+        if (ownerState != null) {
+            ownerState.updateHookPresence(wasActive, active);
+        }
 
         CallStack.CallStackState state = getCallStackState();
         if (state != null && state.top > 1) {
@@ -461,14 +481,14 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public static LuaCoroutine running() {
-        return CURRENT_COROUTINE.get();
+        return CURRENT_SLOT.get()[0];
     }
 
     public static void setCurrent(LuaCoroutine coro) {
         if (coro != null) {
-            CURRENT_COROUTINE.set(coro);
+            CURRENT_SLOT.get()[0] = coro;
         } else {
-            CURRENT_COROUTINE.remove();
+            CURRENT_SLOT.remove();
         }
     }
 
@@ -478,7 +498,7 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public static boolean isYieldable() {
-        LuaCoroutine cur = CURRENT_COROUTINE.get();
+        LuaCoroutine cur = CURRENT_SLOT.get()[0];
         return cur != null && !cur.isMainThread && cur.nonYieldableCount == 0;
     }
 
@@ -506,9 +526,28 @@ public final class LuaCoroutine extends LuaValue {
     private LuaState stacklessState;
     public int yieldFuncIdx;
     public int yieldNResults;
+    public byte handoffSingleTag;
+    public long handoffSinglePrim;
+
+    public static final int TRAMPOLINE_DENIED = -1;
+    public static final int TRAMPOLINE_START = 0;
+    public static final int TRAMPOLINE_RESUME = 1;
+
+    public org.luava.runtime.bytecode.VmContext getStacklessCtx() {
+        return stacklessCtx;
+    }
+
+    public LuaValue materializeSingleResult() {
+        if (handoffSingleTag != 0) {
+            handoffSingleResult = org.luava.runtime.bytecode.BytecodeVM.getLuaValueFromRaw(
+                    handoffSinglePrim, handoffSingleTag, null);
+            handoffSingleTag = 0;
+        }
+        return handoffSingleResult;
+    }
 
     public static void promoteIfStackless() {
-        LuaCoroutine cur = CURRENT_COROUTINE.get();
+        LuaCoroutine cur = CURRENT_SLOT.get()[0];
         if (cur != null && cur.activeStacklessCtx != null) {
             throw PromoteSignal.INSTANCE;
         }
@@ -596,7 +635,7 @@ public final class LuaCoroutine extends LuaValue {
 
     private Thread startCoroutineThread(java.util.function.Supplier<LuaValue> body) {
         return Thread.ofVirtual().name("lua-coroutine-" + System.identityHashCode(this)).start(() -> {
-            CURRENT_COROUTINE.set(this);
+            CURRENT_SLOT.get()[0] = this;
             try {
                 syncWorkerContext();
                 LuaValue result = body.get();
@@ -621,7 +660,7 @@ public final class LuaCoroutine extends LuaValue {
             } finally {
                 disarmHook();
                 clearWorkerContext();
-                CURRENT_COROUTINE.remove();
+                CURRENT_SLOT.remove();
                 yieldSeq++;
                 if (resumerParked) {
                     LockSupport.unpark(resumerThread);
@@ -631,6 +670,7 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public void completeNormally(LuaValue result) {
+        handoffSingleTag = 0;
         if (result instanceof Varargs va) {
             LuaValue[] vals = va.getValuesUnsafe();
             handoffResult = vals;
@@ -645,7 +685,28 @@ public final class LuaCoroutine extends LuaValue {
         callStackState.clearSavedErrorStack();
     }
 
+    public void completeNormallyRaw(int count, byte singleTag, long singlePrim, LuaValue singleObj, LuaValue[] multi) {
+        handoffResultCount = count;
+        if (count <= 0) {
+            handoffResult = null;
+            handoffSingleResult = null;
+            handoffSingleTag = 0;
+        } else if (count == 1) {
+            handoffResult = null;
+            handoffSingleTag = singleTag;
+            handoffSinglePrim = singlePrim;
+            handoffSingleResult = singleObj;
+        } else {
+            handoffSingleTag = 0;
+            handoffSingleResult = null;
+            handoffResult = multi;
+        }
+        markDead();
+        callStackState.clearSavedErrorStack();
+    }
+
     public void completeNormallyArray(LuaValue[] vals) {
+        handoffSingleTag = 0;
         if (vals == null || vals.length == 0) {
             handoffResult = null;
             handoffSingleResult = null;
@@ -671,9 +732,88 @@ public final class LuaCoroutine extends LuaValue {
         this.yieldFuncIdx = funcIdx;
         this.yieldNResults = nResults;
         this.handoffResultCount = yieldCount;
+        this.handoffSingleTag = 0;
         this.handoffSingleResult = singleYield;
         this.handoffResult = multiYield;
         this.status = Status.SUSPENDED;
+    }
+
+    public void suspendStacklessRaw(org.luava.runtime.bytecode.VmContext ctx, LuaState state,
+            int funcIdx, int nResults, int yieldCount, byte singleTag, long singlePrim,
+            LuaValue singleObj, LuaValue[] multiYield) {
+        this.stacklessCtx = ctx;
+        this.stacklessState = state;
+        this.activeStacklessCtx = null;
+        this.yieldFuncIdx = funcIdx;
+        this.yieldNResults = nResults;
+        this.handoffResultCount = yieldCount;
+        this.handoffSingleTag = singleTag;
+        this.handoffSinglePrim = singlePrim;
+        this.handoffSingleResult = singleObj;
+        this.handoffResult = multiYield;
+        this.status = Status.SUSPENDED;
+    }
+
+    public void suspendTrampoline(
+            org.luava.runtime.bytecode.VmContext ctx, LuaState state, int funcIdx, int nResults) {
+        this.stacklessCtx = ctx;
+        this.stacklessState = state;
+        this.activeStacklessCtx = null;
+        this.yieldFuncIdx = funcIdx;
+        this.yieldNResults = nResults;
+        this.status = Status.SUSPENDED;
+    }
+
+    /** Attempts to enter stackless trampoline mode without launching/parking a VirtualThread. */
+    public int tryBeginTrampoline(LuaCoroutine callerCoro, LuaState callerState) {
+        if (stacklessCtx != null && virtualThread == null && !hooksActive && callerCoro != null
+                && stacklessState == callerState && callerCoro.nestedDepth + 1 < MAX_NESTED_COROUTINES
+                && callStackState.errorTop == 0 && callStackState.deathTop == 0 && !callStackState.preserveForDeath) {
+            if (STATUS_UPDATER.compareAndSet(this, Status.SUSPENDED, Status.RUNNING)) {
+                if (virtualThread == null && !hooksActive && stacklessCtx != null && stacklessState == callerState) {
+                    this.nestedDepth = callerCoro.nestedDepth + 1;
+                    callerCoro.status = Status.NORMAL;
+                    return TRAMPOLINE_RESUME;
+                }
+                STATUS_UPDATER.set(this, Status.SUSPENDED);
+            }
+        }
+        return tryBeginTrampolineSlow(callerCoro, callerState);
+    }
+
+    private synchronized int tryBeginTrampolineSlow(LuaCoroutine callerCoro, LuaState callerState) {
+        if (status != Status.SUSPENDED || virtualThread != null || hooksActive || callerCoro == null) {
+            return TRAMPOLINE_DENIED;
+        }
+        int depth = callerCoro.nestedDepth + 1;
+        if (depth >= MAX_NESTED_COROUTINES) {
+            return TRAMPOLINE_DENIED;
+        }
+        if (stacklessCtx != null) {
+            if (stacklessState != callerState) {
+                return TRAMPOLINE_DENIED;
+            }
+        } else if (!(entryFunction instanceof org.luava.runtime.bytecode.LuaClosure lc)
+                || (lc.getState() != null && lc.getState() != callerState)) {
+            return TRAMPOLINE_DENIED;
+        }
+        this.nestedDepth = depth;
+        callerCoro.status = Status.NORMAL;
+        this.status = Status.RUNNING;
+        if (this.error != null) {
+            this.error = null;
+        }
+        if (callStackState.errorTop != 0 || callStackState.deathTop != 0 || callStackState.preserveForDeath) {
+            callStackState.clearSavedErrorStack();
+            callStackState.preserveForDeath = false;
+            callStackState.deathStack = null;
+            callStackState.deathTop = 0;
+        }
+        return stacklessCtx != null ? TRAMPOLINE_RESUME : TRAMPOLINE_START;
+    }
+
+    public void markRunningFromTrampoline() {
+        this.status = Status.RUNNING;
     }
 
     public void clearStacklessOnExit() {
@@ -744,7 +884,7 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     private LuaValue[] resumeCore(int argCount, LuaValue singleArg, LuaValue[] multiArgs) {
-        LuaCoroutine callerCoro = CURRENT_COROUTINE.get();
+        LuaCoroutine callerCoro = CURRENT_SLOT.get()[0];
         Thread callerThread = Thread.currentThread();
         boolean runStackless = false;
         LuaState slState = null;
@@ -866,7 +1006,7 @@ public final class LuaCoroutine extends LuaValue {
             return RESUME_SUCCESS_EMPTY;
         }
         if (len == 1) {
-            return new LuaValue[]{LuaBoolean.TRUE, handoffSingleResult};
+            return new LuaValue[]{LuaBoolean.TRUE, materializeSingleResult()};
         }
         LuaValue[] res = handoffResult;
         LuaValue[] returnVals = new LuaValue[len + 1];
@@ -896,6 +1036,10 @@ public final class LuaCoroutine extends LuaValue {
             return writeOneResumeResult(p, t, o, funcIdx, nResults, LuaBoolean.TRUE);
         }
         if (len == 1) {
+            if (handoffSingleTag != 0) {
+                return writeTwoResumeResultsRaw(
+                        p, t, o, funcIdx, nResults, LuaBoolean.TRUE, handoffSingleTag, handoffSinglePrim);
+            }
             return writeTwoResumeResults(p, t, o, funcIdx, nResults, LuaBoolean.TRUE, handoffSingleResult);
         }
         LuaValue[] res = handoffResult;
@@ -956,10 +1100,42 @@ public final class LuaCoroutine extends LuaValue {
             return funcIdx;
         }
         if (len == 1) {
+            if (handoffSingleTag != 0) {
+                return writeOneResumeResultRaw(p, t, o, funcIdx, nResults, handoffSingleTag, handoffSinglePrim);
+            }
             return writeOneResumeResult(p, t, o, funcIdx, nResults, handoffSingleResult);
         }
         LuaValue[] res = handoffResult;
         return writeResumeResults(p, t, o, funcIdx, nResults, res, len);
+    }
+
+    private static int writeOneResumeResultRaw(long[] p, byte[] t, LuaValue[] o,
+            int funcIdx, int nResults, byte tag, long prim) {
+        if (nResults != 0) {
+            org.luava.runtime.bytecode.BytecodeVM.setRawSlot(p, t, o, funcIdx, tag, prim, null);
+            for (int i = 1; i < nResults; i++) {
+                t[funcIdx + i] = org.luava.runtime.bytecode.BytecodeVM.TYPE_NIL;
+                p[funcIdx + i] = 0L;
+                o[funcIdx + i] = null;
+            }
+        }
+        return nResults >= 0 ? funcIdx + nResults : funcIdx + 1;
+    }
+
+    private static int writeTwoResumeResultsRaw(long[] p, byte[] t, LuaValue[] o,
+            int funcIdx, int nResults, LuaValue v0, byte tag1, long prim1) {
+        if (nResults != 0) {
+            org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx, v0);
+            if (nResults != 1) {
+                org.luava.runtime.bytecode.BytecodeVM.setRawSlot(p, t, o, funcIdx + 1, tag1, prim1, null);
+                for (int i = 2; i < nResults; i++) {
+                    t[funcIdx + i] = org.luava.runtime.bytecode.BytecodeVM.TYPE_NIL;
+                    p[funcIdx + i] = 0L;
+                    o[funcIdx + i] = null;
+                }
+            }
+        }
+        return nResults >= 0 ? funcIdx + nResults : funcIdx + 2;
     }
 
     private static int writeOneResumeResult(long[] p, byte[] t, LuaValue[] o,
@@ -1004,6 +1180,7 @@ public final class LuaCoroutine extends LuaValue {
 
     public static LuaValue[] yield(LuaValue... args) {
         LuaCoroutine current = yieldCheck();
+        current.handoffSingleTag = 0;
         if (args == null || args.length == 0) {
             current.handoffResultCount = 0;
             current.handoffSingleResult = null;
@@ -1025,6 +1202,7 @@ public final class LuaCoroutine extends LuaValue {
     public static int yieldInline(long[] p, byte[] t, LuaValue[] o,
             int funcIdx, int nActualArgs, int nResults) {
         LuaCoroutine current = yieldCheck();
+        current.handoffSingleTag = 0;
         if (nActualArgs == 0) {
             current.handoffResultCount = 0;
             current.handoffSingleResult = null;
@@ -1061,7 +1239,7 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     private static LuaCoroutine yieldCheck() {
-        LuaCoroutine current = CURRENT_COROUTINE.get();
+        LuaCoroutine current = CURRENT_SLOT.get()[0];
         if (current == null || current.isMainThread) {
             throw LuaException.undecorated("attempt to yield from outside a coroutine");
         }
@@ -1148,7 +1326,7 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public LuaValue[] close() {
-        LuaCoroutine callerCoro = CURRENT_COROUTINE.get();
+        LuaCoroutine callerCoro = CURRENT_SLOT.get()[0];
         long seenYield;
         synchronized (this) {
             if (status == Status.RUNNING || status == Status.NORMAL) {

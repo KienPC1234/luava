@@ -25,6 +25,19 @@ public final class LuaTable extends LuaValue {
     private int arrLen;
 
     // Lazy hash storage: stays null for pure arrays and empty tables.
+    // Tables with up to 4 non-weak string hash entries (e.g. OOP objects like
+    // {x = x, y = y}) store them unboxed in SmallFields, spilling to hashPart on
+    // a 5th key, a non-string hash key, or weak mode.
+    private static final class SmallFields {
+        LuaString k0, k1, k2, k3;
+        long p0, p1, p2, p3;
+        byte t0, t1, t2, t3;
+        LuaValue o0, o1, o2, o3;
+        int size;
+        boolean allCanonical = true;
+    }
+
+    private SmallFields smallFields;
     private HashMap<LuaValue, LuaValue> hashPart;
     private long hashKeyBloom;
     private LuaTable metatable;
@@ -79,13 +92,20 @@ public final class LuaTable extends LuaValue {
      * therefore where {@code table.insert} puts a new element.
      */
     public LuaTable(int arrayCapacity, int hashCapacity) {
+        if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
+            long preBytes = (arrayCapacity > 0 ? (long) arrayCapacity * 9L : 0L)
+                    + (hashCapacity > 0 ? (long) hashCapacity * 64L : 0L);
+            if (preBytes > 0) {
+                org.luava.runtime.eval.GCManager.preAllocCheck(preBytes);
+            }
+        }
         if (arrayCapacity > 0) {
             this.arrP = new long[arrayCapacity];
             this.arrT = new byte[arrayCapacity];
             this.arrLen = arrayCapacity;
         }
-        if (hashCapacity > 0) {
-            this.hashPart = new HashMap<>(hashCapacity <= 4 ? 8 : Math.max(16, (hashCapacity * 4) / 3 + 1));
+        if (hashCapacity > 4) {
+            this.hashPart = new HashMap<>(Math.max(16, (hashCapacity * 4) / 3 + 1));
         }
         org.luava.runtime.eval.GCManager.onAlloc();
     }
@@ -166,6 +186,9 @@ public final class LuaTable extends LuaValue {
     private void ensureArrayCapacity(int minCap) {
         if (arrT == null) {
             int cap = Math.max(4, minCap);
+            if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
+                org.luava.runtime.eval.GCManager.preAllocCheck((long) cap * 9L);
+            }
             arrP = new long[cap];
             arrT = new byte[cap];
             return;
@@ -176,6 +199,10 @@ public final class LuaTable extends LuaValue {
         }
         int doubled = (cur <= (Integer.MAX_VALUE >> 1)) ? Math.max(8, cur << 1) : (Integer.MAX_VALUE - 8);
         int newCap = Math.max(minCap, doubled);
+        if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
+            long elemBytes = (arrO != null) ? 16L : 9L;
+            org.luava.runtime.eval.GCManager.preAllocCheck((long) (newCap - cur) * elemBytes);
+        }
         arrP = Arrays.copyOf(arrP, newCap);
         arrT = Arrays.copyOf(arrT, newCap);
         if (arrO != null) {
@@ -185,6 +212,9 @@ public final class LuaTable extends LuaValue {
 
     private void ensureArrO() {
         if (arrO == null) {
+            if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
+                org.luava.runtime.eval.GCManager.preAllocCheck((long) arrT.length * 8L);
+            }
             arrO = new LuaValue[arrT.length];
         }
     }
@@ -260,6 +290,9 @@ public final class LuaTable extends LuaValue {
     }
 
     private int hashEntryCount() {
+        if (smallFields != null) {
+            return smallFields.size;
+        }
         return hashPart != null ? hashPart.size() : 0;
     }
 
@@ -268,14 +301,242 @@ public final class LuaTable extends LuaValue {
     }
 
     public boolean hasMaybeStringKey(LuaString ks) {
-        return hashPart != null && (hashKeyBloom & (1L << (ks.fastHash() & 63))) != 0L;
+        return (smallFields != null || hashPart != null)
+                && (hashKeyBloom & (1L << (ks.fastHash() & 63))) != 0L;
     }
 
     private HashMap<LuaValue, LuaValue> ensureHashPart() {
+        if (smallFields != null) {
+            spillSmallToHash();
+        }
         if (hashPart == null) {
             hashPart = new HashMap<>();
         }
         return hashPart;
+    }
+
+    private static int findSmallSlot(SmallFields sf, LuaString ks) {
+        int n = sf.size;
+        if (n >= 1 && sf.k0 == ks) return 0;
+        if (n >= 2 && sf.k1 == ks) return 1;
+        if (n >= 3 && sf.k2 == ks) return 2;
+        if (n >= 4 && sf.k3 == ks) return 3;
+        if (ks.isCanonical() && sf.allCanonical) return -1;
+        if (n >= 1 && sf.k0.equals(ks)) return 0;
+        if (n >= 2 && sf.k1.equals(ks)) return 1;
+        if (n >= 3 && sf.k2.equals(ks)) return 2;
+        if (n >= 4 && sf.k3.equals(ks)) return 3;
+        return -1;
+    }
+
+    private static void writeSmallRaw(SmallFields sf, int slot, byte tag, long prim, LuaValue obj) {
+        LuaValue cleanObj = (tag == BytecodeVM.TYPE_OBJECT) ? obj : null;
+        if (tag == BytecodeVM.TYPE_OBJECT && (obj == null || obj == LuaNil.NIL || obj.isNil())) {
+            tag = BytecodeVM.TYPE_NIL;
+            prim = 0L;
+            cleanObj = null;
+        }
+        switch (slot) {
+            case 0 -> { sf.t0 = tag; sf.p0 = prim; sf.o0 = cleanObj; }
+            case 1 -> { sf.t1 = tag; sf.p1 = prim; sf.o1 = cleanObj; }
+            case 2 -> { sf.t2 = tag; sf.p2 = prim; sf.o2 = cleanObj; }
+            default -> { sf.t3 = tag; sf.p3 = prim; sf.o3 = cleanObj; }
+        }
+    }
+
+    private static void writeSmallLuaValue(SmallFields sf, int slot, LuaValue val) {
+        if (val == null || val == LuaNil.NIL || val.isNil()) {
+            writeSmallRaw(sf, slot, BytecodeVM.TYPE_NIL, 0L, null);
+        } else if (val instanceof LuaInteger li) {
+            writeSmallRaw(sf, slot, BytecodeVM.TYPE_INT, li.toLong(), null);
+        } else if (val instanceof LuaFloat lf) {
+            writeSmallRaw(sf, slot, BytecodeVM.TYPE_FLOAT, Double.doubleToRawLongBits(lf.toDouble()), null);
+        } else if (val instanceof LuaBoolean lb) {
+            writeSmallRaw(sf, slot, BytecodeVM.TYPE_BOOLEAN, lb.toBoolean() ? 1L : 0L, null);
+        } else {
+            writeSmallRaw(sf, slot, BytecodeVM.TYPE_OBJECT, 0L, val);
+        }
+    }
+
+    private static LuaString smallKeyAt(SmallFields sf, int slot) {
+        return switch (slot) {
+            case 0 -> sf.k0;
+            case 1 -> sf.k1;
+            case 2 -> sf.k2;
+            default -> sf.k3;
+        };
+    }
+
+    private static LuaValue smallValAt(SmallFields sf, int slot) {
+        byte tag;
+        long prim;
+        LuaValue obj;
+        switch (slot) {
+            case 0 -> { tag = sf.t0; prim = sf.p0; obj = sf.o0; }
+            case 1 -> { tag = sf.t1; prim = sf.p1; obj = sf.o1; }
+            case 2 -> { tag = sf.t2; prim = sf.p2; obj = sf.o2; }
+            default -> { tag = sf.t3; prim = sf.p3; obj = sf.o3; }
+        }
+        return BytecodeVM.getLuaValueFromRaw(prim, tag, obj);
+    }
+
+    private static boolean smallGetToStack(
+            SmallFields sf, LuaString ks, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
+        int n = sf.size;
+        if (n >= 1 && sf.k0 == ks) {
+            byte tag = sf.t0;
+            if (tag == BytecodeVM.TYPE_NIL) return false;
+            tStack[dst] = tag;
+            pStack[dst] = sf.p0;
+            oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? sf.o0 : null;
+            return true;
+        }
+        if (n >= 2 && sf.k1 == ks) {
+            byte tag = sf.t1;
+            if (tag == BytecodeVM.TYPE_NIL) return false;
+            tStack[dst] = tag;
+            pStack[dst] = sf.p1;
+            oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? sf.o1 : null;
+            return true;
+        }
+        if (n >= 3 && sf.k2 == ks) {
+            byte tag = sf.t2;
+            if (tag == BytecodeVM.TYPE_NIL) return false;
+            tStack[dst] = tag;
+            pStack[dst] = sf.p2;
+            oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? sf.o2 : null;
+            return true;
+        }
+        if (n >= 4 && sf.k3 == ks) {
+            byte tag = sf.t3;
+            if (tag == BytecodeVM.TYPE_NIL) return false;
+            tStack[dst] = tag;
+            pStack[dst] = sf.p3;
+            oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? sf.o3 : null;
+            return true;
+        }
+        if (ks.isCanonical() && sf.allCanonical) {
+            return false;
+        }
+        int slot = findSmallSlotEquals(sf, ks);
+        if (slot < 0) {
+            return false;
+        }
+        byte tag;
+        long prim;
+        LuaValue obj;
+        switch (slot) {
+            case 0 -> { tag = sf.t0; prim = sf.p0; obj = sf.o0; }
+            case 1 -> { tag = sf.t1; prim = sf.p1; obj = sf.o1; }
+            case 2 -> { tag = sf.t2; prim = sf.p2; obj = sf.o2; }
+            default -> { tag = sf.t3; prim = sf.p3; obj = sf.o3; }
+        }
+        if (tag == BytecodeVM.TYPE_NIL) {
+            return false;
+        }
+        tStack[dst] = tag;
+        pStack[dst] = prim;
+        oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? obj : null;
+        return true;
+    }
+
+    private static int findSmallSlotEquals(SmallFields sf, LuaString ks) {
+        int n = sf.size;
+        if (n >= 1 && sf.k0.equals(ks)) return 0;
+        if (n >= 2 && sf.k1.equals(ks)) return 1;
+        if (n >= 3 && sf.k2.equals(ks)) return 2;
+        if (n >= 4 && sf.k3.equals(ks)) return 3;
+        return -1;
+    }
+
+    private void spillSmallToHash() {
+        SmallFields sf = this.smallFields;
+        if (sf == null) {
+            return;
+        }
+        this.smallFields = null;
+        HashMap<LuaValue, LuaValue> map = this.hashPart;
+        if (map == null) {
+            map = new HashMap<>(8);
+            this.hashPart = map;
+        }
+        int n = sf.size;
+        if (n >= 1) map.put(sf.k0, BytecodeVM.getLuaValueFromRaw(sf.p0, sf.t0, sf.o0));
+        if (n >= 2) map.put(sf.k1, BytecodeVM.getLuaValueFromRaw(sf.p1, sf.t1, sf.o1));
+        if (n >= 3) map.put(sf.k2, BytecodeVM.getLuaValueFromRaw(sf.p2, sf.t2, sf.o2));
+        if (n >= 4) map.put(sf.k3, BytecodeVM.getLuaValueFromRaw(sf.p3, sf.t3, sf.o3));
+    }
+
+    private void putSmallRaw(LuaString ks, byte tag, long prim, LuaValue obj) {
+        boolean isNil = (tag == BytecodeVM.TYPE_NIL)
+                || (tag == BytecodeVM.TYPE_OBJECT && (obj == null || obj == LuaNil.NIL || obj.isNil()));
+        SmallFields sf = this.smallFields;
+        if (sf == null) {
+            if (isNil) {
+                return;
+            }
+            if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
+                org.luava.runtime.eval.GCManager.preAllocCheck(64L);
+            }
+            sf = new SmallFields();
+            sf.k0 = ks;
+            sf.size = 1;
+            sf.allCanonical = ks.isCanonical();
+            writeSmallRaw(sf, 0, tag, prim, obj);
+            this.smallFields = sf;
+            hashKeyBloom |= (1L << (ks.fastHash() & 63));
+            return;
+        }
+        int slot = findSmallSlot(sf, ks);
+        if (slot >= 0) {
+            writeSmallRaw(sf, slot, tag, prim, obj);
+            return;
+        }
+        if (isNil) {
+            return;
+        }
+        int n = sf.size;
+        if (n < 4) {
+            if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
+                org.luava.runtime.eval.GCManager.preAllocCheck(64L);
+            }
+            switch (n) {
+                case 0 -> sf.k0 = ks;
+                case 1 -> sf.k1 = ks;
+                case 2 -> sf.k2 = ks;
+                default -> sf.k3 = ks;
+            }
+            sf.size = n + 1;
+            sf.allCanonical &= ks.isCanonical();
+            writeSmallRaw(sf, n, tag, prim, obj);
+            hashKeyBloom |= (1L << (ks.fastHash() & 63));
+            return;
+        }
+        spillSmallToHash();
+        hashKeyBloom |= (1L << (ks.fastHash() & 63));
+        putHashEntry(this.hashPart, ks, BytecodeVM.getLuaValueFromRaw(prim, tag, obj));
+    }
+
+    private void putSmallValue(LuaString ks, LuaValue value) {
+        if (value == null || value == LuaNil.NIL || value.isNil()) {
+            SmallFields sf = this.smallFields;
+            if (sf != null) {
+                int slot = findSmallSlot(sf, ks);
+                if (slot >= 0) {
+                    writeSmallRaw(sf, slot, BytecodeVM.TYPE_NIL, 0L, null);
+                }
+            }
+            return;
+        }
+        if (value instanceof LuaInteger li) {
+            putSmallRaw(ks, BytecodeVM.TYPE_INT, li.toLong(), null);
+        } else if (value instanceof LuaFloat lf) {
+            putSmallRaw(ks, BytecodeVM.TYPE_FLOAT, Double.doubleToRawLongBits(lf.toDouble()), null);
+        } else if (value instanceof LuaBoolean lb) {
+            putSmallRaw(ks, BytecodeVM.TYPE_BOOLEAN, lb.toBoolean() ? 1L : 0L, null);
+        } else {
+            putSmallRaw(ks, BytecodeVM.TYPE_OBJECT, 0L, value);
+        }
     }
 
     private void removeIntShadowFromHash(long idx) {
@@ -390,6 +651,7 @@ public final class LuaTable extends LuaValue {
     }
 
     private void convertToWeak() {
+        spillSmallToHash();
         if (weakValues) {
             for (int i = 0; i < arrLen; i++) {
                 if (arrT[i] == BytecodeVM.TYPE_OBJECT && arrO != null) {
@@ -479,6 +741,12 @@ public final class LuaTable extends LuaValue {
     public void forEachKey(java.util.function.Consumer<LuaValue> consumer) {
         for (int i = 0; i < arrLen; i++) {
             consumer.accept(LuaInteger.valueOf(i + 1));
+        }
+        if (smallFields != null) {
+            SmallFields sf = smallFields;
+            for (int i = 0; i < sf.size; i++) {
+                consumer.accept(smallKeyAt(sf, i));
+            }
         }
         if (hashPart != null) {
             for (LuaValue k : hashPart.keySet()) {
@@ -638,10 +906,59 @@ public final class LuaTable extends LuaValue {
         rawset(LuaInteger.valueOf(idx), BytecodeVM.getLuaValueFromRaw(pVal, tag, oVal));
     }
 
+    public void rawsetIntLong(long idx, long val) {
+        if (lazyFiller == null && hashPart == null && arrO == null) {
+            if (idx >= 1 && idx <= arrLen) {
+                int i = (int) (idx - 1);
+                arrT[i] = BytecodeVM.TYPE_INT;
+                arrP[i] = val;
+                return;
+            }
+            if (idx == arrLen + 1 && arrT != null && arrLen < arrT.length) {
+                int i = arrLen++;
+                arrT[i] = BytecodeVM.TYPE_INT;
+                arrP[i] = val;
+                return;
+            }
+        }
+        rawsetIntLongSlow(idx, val);
+    }
+
+    private void rawsetIntLongSlow(long idx, long val) {
+        if (lazyFiller != null) {
+            ensureFilledSlow();
+        }
+        if (idx == arrLen + 1) {
+            ensureArrayCapacity(arrLen + 1);
+            int i = arrLen++;
+            arrT[i] = BytecodeVM.TYPE_INT;
+            arrP[i] = val;
+            if (arrO != null) arrO[i] = null;
+            if (hashPart != null && !hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
+            return;
+        }
+        if (idx >= 1 && idx <= arrLen) {
+            if (hashPart != null && !hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
+            int i = (int) (idx - 1);
+            arrT[i] = BytecodeVM.TYPE_INT;
+            arrP[i] = val;
+            if (arrO != null) arrO[i] = null;
+            return;
+        }
+        rawset(LuaInteger.valueOf(idx), LuaInteger.valueOf(val));
+    }
+
     public boolean tryRawgetToStack(LuaValue key, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
         if (lazyFiller == null && !weakValues && key instanceof LuaString ks) {
+            if ((hashKeyBloom & (1L << (ks.fastHash() & 63))) == 0L) {
+                return false;
+            }
+            SmallFields sf = this.smallFields;
+            if (sf != null) {
+                return smallGetToStack(sf, ks, pStack, tStack, oStack, dst);
+            }
             HashMap<LuaValue, LuaValue> map = this.hashPart;
-            if (map == null || (hashKeyBloom & (1L << (ks.fastHash() & 63))) == 0L) {
+            if (map == null) {
                 return false;
             }
             LuaValue val = map.get(ks);
@@ -656,7 +973,10 @@ public final class LuaTable extends LuaValue {
 
     private boolean tryRawgetToStackSlow(LuaValue key, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
         ensureFilled();
-        if (key instanceof LuaString) {
+        if (key instanceof LuaString ks) {
+            if (smallFields != null) {
+                return smallGetToStack(smallFields, ks, pStack, tStack, oStack, dst);
+            }
             if (hashPart == null) {
                 return false;
             }
@@ -685,8 +1005,16 @@ public final class LuaTable extends LuaValue {
 
     public LuaValue rawget(LuaValue key) {
         if (lazyFiller == null && !weakValues && key instanceof LuaString ks) {
+            if ((hashKeyBloom & (1L << (ks.fastHash() & 63))) == 0L) {
+                return LuaNil.NIL;
+            }
+            SmallFields sf = this.smallFields;
+            if (sf != null) {
+                int slot = findSmallSlot(sf, ks);
+                return slot >= 0 ? smallValAt(sf, slot) : LuaNil.NIL;
+            }
             HashMap<LuaValue, LuaValue> map = this.hashPart;
-            if (map == null || (hashKeyBloom & (1L << (ks.fastHash() & 63))) == 0L) {
+            if (map == null) {
                 return LuaNil.NIL;
             }
             LuaValue val = map.get(ks);
@@ -697,7 +1025,11 @@ public final class LuaTable extends LuaValue {
 
     private LuaValue rawgetSlow(LuaValue key) {
         ensureFilled();
-        if (key instanceof LuaString) {
+        if (key instanceof LuaString ks) {
+            if (smallFields != null) {
+                int slot = findSmallSlot(smallFields, ks);
+                return slot >= 0 ? smallValAt(smallFields, slot) : LuaNil.NIL;
+            }
             if (hashPart == null) {
                 return LuaNil.NIL;
             }
@@ -740,19 +1072,30 @@ public final class LuaTable extends LuaValue {
         return val != null ? val : LuaNil.NIL;
     }
 
+    private static void putHashEntry(HashMap<LuaValue, LuaValue> map, LuaValue key, LuaValue val) {
+        if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP && !map.containsKey(key)) {
+            org.luava.runtime.eval.GCManager.preAllocCheck(64L);
+        }
+        map.put(key, val);
+    }
+
     public void rawset(LuaValue key, LuaValue value) {
         ensureFilled();
         modCount++;
         lastReturnedKey = null;
         nextIterator = null;
         if (key instanceof LuaString ks && !weakKeys && !weakValues) {
+            if (hashPart == null) {
+                putSmallValue(ks, value);
+                return;
+            }
             if (value == null || value == LuaNil.NIL || value.isNil()) {
-                if (hashPart != null && hashPart.containsKey(ks)) {
+                if (hashPart.containsKey(ks)) {
                     hashPart.put(ks, LuaNil.NIL);
                 }
             } else {
                 hashKeyBloom |= (1L << (ks.fastHash() & 63));
-                ensureHashPart().put(ks, value);
+                putHashEntry(hashPart, ks, value);
             }
             return;
         }
@@ -791,7 +1134,7 @@ public final class LuaTable extends LuaValue {
             }
         } else if (!weakKeys && !weakValues) {
             markBloom(key);
-            ensureHashPart().put(key, toStore);
+            putHashEntry(ensureHashPart(), key, toStore);
         } else {
             HashMap<LuaValue, LuaValue> map = ensureHashPart();
             if (!map.containsKey(key)) {
@@ -799,7 +1142,7 @@ public final class LuaTable extends LuaValue {
             }
             LuaValue keyToStore = (weakKeys && isCollectable(key)) ? new WeakKey(key) : key;
             markBloom(keyToStore);
-            map.put(keyToStore, toStore);
+            putHashEntry(map, keyToStore, toStore);
         }
     }
 
@@ -809,14 +1152,18 @@ public final class LuaTable extends LuaValue {
             modCount++;
             lastReturnedKey = null;
             nextIterator = null;
+            if (hashPart == null) {
+                putSmallRaw(ks, tStack[src], pStack[src], oStack[src]);
+                return;
+            }
             LuaValue val = BytecodeVM.getLuaValue(pStack, tStack, oStack, src);
             if (val.isNil()) {
-                if (hashPart != null && hashPart.containsKey(ks)) {
+                if (hashPart.containsKey(ks)) {
                     hashPart.put(ks, LuaNil.NIL);
                 }
             } else {
                 hashKeyBloom |= (1L << (ks.fastHash() & 63));
-                ensureHashPart().put(ks, val);
+                putHashEntry(hashPart, ks, val);
             }
             return;
         }
@@ -825,20 +1172,20 @@ public final class LuaTable extends LuaValue {
 
     public boolean trySetFieldFromStack(LuaValue key, long[] pStack, byte[] tStack, LuaValue[] oStack, int src) {
         if (lazyFiller == null && metatable == null && !weakKeys && !weakValues && key instanceof LuaString ks) {
-            HashMap<LuaValue, LuaValue> map = this.hashPart;
-            if (map == null) {
-                map = new HashMap<>(4);
-                this.hashPart = map;
-            }
             modCount++;
             lastReturnedKey = null;
             nextIterator = null;
+            HashMap<LuaValue, LuaValue> map = this.hashPart;
+            if (map == null) {
+                putSmallRaw(ks, tStack[src], pStack[src], oStack[src]);
+                return true;
+            }
             LuaValue val = BytecodeVM.getLuaValue(pStack, tStack, oStack, src);
             if (val == LuaNil.NIL) {
                 if (map.containsKey(ks)) map.put(ks, LuaNil.NIL);
             } else {
                 hashKeyBloom |= (1L << (ks.fastHash() & 63));
-                map.put(ks, val);
+                putHashEntry(map, ks, val);
             }
             return true;
         }
@@ -859,19 +1206,19 @@ public final class LuaTable extends LuaValue {
 
     public boolean trySetField(LuaValue key, LuaValue val) {
         if (lazyFiller == null && metatable == null && !weakKeys && !weakValues && key instanceof LuaString ks) {
-            HashMap<LuaValue, LuaValue> map = this.hashPart;
-            if (map == null) {
-                map = new HashMap<>(4);
-                this.hashPart = map;
-            }
             modCount++;
             lastReturnedKey = null;
             nextIterator = null;
+            HashMap<LuaValue, LuaValue> map = this.hashPart;
+            if (map == null) {
+                putSmallValue(ks, val);
+                return true;
+            }
             if (val == null || val == LuaNil.NIL || val.isNil()) {
                 if (map.containsKey(ks)) map.put(ks, LuaNil.NIL);
             } else {
                 hashKeyBloom |= (1L << (ks.fastHash() & 63));
-                map.put(ks, val);
+                putHashEntry(map, ks, val);
             }
             return true;
         }
@@ -1028,7 +1375,7 @@ public final class LuaTable extends LuaValue {
                 if (handler.isNil()) return LuaNil.NIL;
                 if (handler.isFunction()) {
                     org.luava.runtime.eval.CallStack.setNextCall("index", true);
-                    return handler.call(tbl, key);
+                    return firstValue(handler.call(tbl, key));
                 }
                 t = handler;
             } else {
@@ -1084,7 +1431,7 @@ public final class LuaTable extends LuaValue {
             LuaValue handler = metatable.rawget(LuaValue.Meta.LEN);
             if (!handler.isNil()) {
                 org.luava.runtime.eval.CallStack.setNextCall("len", true);
-                return handler.call(this, this);
+                return firstValue(handler.call(this, this));
             }
         }
         return LuaInteger.valueOf(rawlen());
@@ -1175,6 +1522,17 @@ public final class LuaTable extends LuaValue {
                     }
                 }
             }
+            if (smallFields != null) {
+                SmallFields sf = smallFields;
+                for (int i = 0; i < sf.size; i++) {
+                    LuaValue val = smallValAt(sf, i);
+                    if (!val.isNil()) {
+                        lastReturnedKey = null;
+                        nextIterator = null;
+                        return Varargs.of(smallKeyAt(sf, i), val);
+                    }
+                }
+            }
             if (hashPart != null) {
                 Iterator<Map.Entry<LuaValue, LuaValue>> iter = hashPart.entrySet().iterator();
                 while (iter.hasNext()) {
@@ -1208,6 +1566,17 @@ public final class LuaTable extends LuaValue {
                         }
                     }
                 }
+                if (smallFields != null) {
+                    SmallFields sf = smallFields;
+                    for (int i = 0; i < sf.size; i++) {
+                        LuaValue val = smallValAt(sf, i);
+                        if (!val.isNil()) {
+                            lastReturnedKey = null;
+                            nextIterator = null;
+                            return Varargs.of(smallKeyAt(sf, i), val);
+                        }
+                    }
+                }
                 if (hashPart != null) {
                     Iterator<Map.Entry<LuaValue, LuaValue>> iter = hashPart.entrySet().iterator();
                     while (iter.hasNext()) {
@@ -1230,7 +1599,24 @@ public final class LuaTable extends LuaValue {
             }
         }
 
-        // 3. Traversal within hash part
+        // 3. Traversal within hash / smallFields part
+        if (smallFields != null) {
+            SmallFields sf = smallFields;
+            int foundIdx = -1;
+            if (currentKey instanceof LuaString ks) {
+                foundIdx = findSmallSlot(sf, ks);
+            }
+            if (foundIdx < 0) {
+                throw new LuaException("invalid key to 'next'");
+            }
+            for (int i = foundIdx + 1; i < sf.size; i++) {
+                LuaValue val = smallValAt(sf, i);
+                if (!val.isNil()) {
+                    return Varargs.of(smallKeyAt(sf, i), val);
+                }
+            }
+            return Varargs.of(LuaNil.NIL);
+        }
         if (hashPart == null) {
             lastReturnedKey = null;
             nextIterator = null;
@@ -1293,6 +1679,15 @@ public final class LuaTable extends LuaValue {
                 }
             }
         }
+        if (smallFields != null) {
+            SmallFields sf = smallFields;
+            for (int i = 0; i < sf.size; i++) {
+                LuaValue v = smallValAt(sf, i);
+                if (!v.isNil()) {
+                    list.add(smallKeyAt(sf, i));
+                }
+            }
+        }
         if (hashPart != null) {
             for (Map.Entry<LuaValue, LuaValue> entry : hashPart.entrySet()) {
                 LuaValue k = entry.getKey();
@@ -1313,7 +1708,7 @@ public final class LuaTable extends LuaValue {
             LuaValue handler = metatable.rawget(LuaValue.Meta.TOSTRING);
             if (!handler.isNil()) {
                 org.luava.runtime.concurrency.LuaCoroutine.promoteIfStackless();
-                LuaValue res = handler.call(this);
+                LuaValue res = firstValue(handler.call(this));
                 // luaL_tolstring accepts a numeric result too (lua_isstring).
                 if (!res.isString() && !res.isNumber()) {
                     throw new LuaException("'__tostring' must return a string");
@@ -1330,8 +1725,9 @@ public final class LuaTable extends LuaValue {
 
     /** Rough retained heap byte estimate used by {@code LuaState.maxMemoryBytes(long)}. */
     public long estimatedMemoryBytes() {
-        long h = (hashPart != null) ? (long) hashPart.size() * 48L : 0L;
-        return 64L + (long) arrLen * 16L + h;
+        long arrBytes = (arrT != null) ? (long) arrT.length * (arrO != null ? 16L : 9L) : 0L;
+        long h = (hashPart != null) ? (long) hashPart.size() * 64L : (smallFields != null ? 96L : 0L);
+        return 64L + arrBytes + h;
     }
 
     public void forEach(java.util.function.BiConsumer<LuaValue, LuaValue> consumer) {
@@ -1340,6 +1736,15 @@ public final class LuaTable extends LuaValue {
                 LuaValue v = readArraySlot(i);
                 if (v != null && !v.isNil()) {
                     consumer.accept(LuaInteger.valueOf(i + 1), v);
+                }
+            }
+        }
+        if (smallFields != null) {
+            SmallFields sf = smallFields;
+            for (int i = 0; i < sf.size; i++) {
+                LuaValue v = smallValAt(sf, i);
+                if (!v.isNil()) {
+                    consumer.accept(smallKeyAt(sf, i), v);
                 }
             }
         }

@@ -40,12 +40,18 @@ public final class JitRuntime {
      */
     public static long invoke(JitCode jc, LuaClosure callee, Object[] up, long[] p, byte[] t, LuaValue[] o,
             int base) throws Throwable {
+        if (jc.entry != null) {
+            return jc.entry.callInt(callee, up, p, t, o, base);
+        }
         return (long) jc.handle.invokeExact(callee, up, p, t, o, base);
     }
 
     /** Object-returning variant for factories and escaping values. */
     public static LuaValue invokeObj(JitCode jc, LuaClosure callee, Object[] up, long[] p, byte[] t, LuaValue[] o,
             int base) throws Throwable {
+        if (jc.entry != null) {
+            return jc.entry.callObj(callee, up, p, t, o, base);
+        }
         return (LuaValue) jc.objHandle.invokeExact(callee, up, p, t, o, base);
     }
 
@@ -65,7 +71,7 @@ public final class JitRuntime {
     // snapshot sits above every live outer snapshot.
     // ------------------------------------------------------------------
 
-    private static final class SnapshotStack {
+    public static final class SnapshotStack {
         long[] p = new long[128];
         byte[] t = new byte[128];
         LuaValue[] o = new LuaValue[128];
@@ -89,10 +95,9 @@ public final class JitRuntime {
         return c < 0 ? 0 : c;
     }
 
-    /** Pushes {@code n} raw triples at {@code from}; returns a cursor. */
-    private static int pushWindow(long[] p, byte[] t, LuaValue[] o, int from, int n) {
+    /** Pushes {@code n} raw triples at {@code from} onto {@code s}; returns a cursor. */
+    private static int pushWindow(SnapshotStack s, long[] p, byte[] t, LuaValue[] o, int from, int n) {
         int count = clampSpan(p, from, n);
-        SnapshotStack s = SNAPSHOTS.get();
         s.ensure(count);
         int at = s.top;
         for (int i = 0; i < count; i++) {
@@ -104,18 +109,13 @@ public final class JitRuntime {
         return at;
     }
 
-    private static void restoreWindow(int cursor, long[] p, byte[] t, LuaValue[] o, int from, int n) {
+    private static void restoreWindow(SnapshotStack s, int cursor, long[] p, byte[] t, LuaValue[] o, int from, int n) {
         int count = clampSpan(p, from, n);
-        SnapshotStack s = SNAPSHOTS.get();
         for (int i = 0; i < count; i++) {
             p[from + i] = s.p[cursor + i];
             t[from + i] = s.t[cursor + i];
             o[from + i] = s.o[cursor + i];
         }
-    }
-
-    private static void popWindow(int cursor) {
-        SNAPSHOTS.get().top = cursor;
     }
 
     /** Argument span a compiled call can clobber; see the section comment. */
@@ -193,6 +193,21 @@ public final class JitRuntime {
         }
         org.luava.runtime.bytecode.LuaProto proto = closure.proto;
         org.luava.runtime.LuaState st = closure.getState();
+        if (st == null || (st.loopGuard == null && !st.hasActiveHooks)) {
+            org.luava.runtime.bytecode.LuaProto.FactoryInfo fi =
+                    org.luava.runtime.bytecode.BytecodeVM.ensureFactoryAnalyzed(proto);
+            if (fi != null) {
+                LuaClosure built = org.luava.runtime.bytecode.BytecodeVM.factoryBuildFast(
+                        st, fi, proto, closure, p, t, o, argBase - 1, nArgs);
+                if (built != null) {
+                    int dst = argBase - 1;
+                    p[dst] = 0L;
+                    t[dst] = org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT;
+                    o[dst] = built;
+                    return;
+                }
+            }
+        }
         JitCode jc;
         if (st == null || st.loopGuard == null) {
             jc = proto.jitCode;
@@ -207,9 +222,13 @@ public final class JitRuntime {
         if (jc.leafNoWindow && nArgs == proto.numParams && argBase + proto.maxStackSize <= p.length) {
             int dst = argBase - 1;
             if (jc.returnsInt) {
-                p[dst] = (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals, p, t, o, argBase);
+                p[dst] = jc.entry != null
+                        ? jc.entry.callInt(closure, (Object[]) closure.upvals, p, t, o, argBase)
+                        : (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals, p, t, o, argBase);
                 t[dst] = org.luava.runtime.bytecode.BytecodeVM.TYPE_INT;
                 o[dst] = null;
+            } else if (jc.entry != null) {
+                jc.entry.callInto(closure, (Object[]) closure.upvals, p, t, o, argBase, dst);
             } else {
                 LuaValue r = (LuaValue) jc.objHandle.invokeExact(closure, (Object[]) closure.upvals,
                         p, t, o, argBase);
@@ -224,32 +243,82 @@ public final class JitRuntime {
             JitCode jc, long[] p, byte[] t, LuaValue[] o, int argBase, int nArgs, int resumePc)
             throws Throwable {
         int numParams = proto.numParams;
-        if (nArgs < numParams) {
-            nilFill(p, t, o, argBase + nArgs, argBase + numParams);
-        }
+        int win = callWindow(jc, nArgs);
         if (argBase + proto.maxStackSize > p.length) {
             throw new DeoptSignal(resumePc, false);
         }
-        int win = callWindow(jc, nArgs);
-        int cursor = pushWindow(p, t, o, argBase, win);
         int dst = argBase - 1;
+        if (win <= 2 && argBase + win <= p.length) {
+            long p0 = win >= 1 ? p[argBase] : 0L;
+            byte t0 = win >= 1 ? t[argBase] : 0;
+            LuaValue o0 = win >= 1 ? o[argBase] : null;
+            long p1 = win == 2 ? p[argBase + 1] : 0L;
+            byte t1 = win == 2 ? t[argBase + 1] : 0;
+            LuaValue o1 = win == 2 ? o[argBase + 1] : null;
+            if (nArgs < numParams) {
+                nilFill(p, t, o, argBase + nArgs, argBase + numParams);
+            }
+            try {
+                if (jc.returnsInt) {
+                    long r = jc.entry != null
+                            ? jc.entry.callInt(closure, (Object[]) closure.upvals, p, t, o, argBase)
+                            : (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals, p, t, o, argBase);
+                    p[dst] = r;
+                    t[dst] = org.luava.runtime.bytecode.BytecodeVM.TYPE_INT;
+                    o[dst] = null;
+                } else if (jc.entry != null) {
+                    jc.entry.callInto(closure, (Object[]) closure.upvals, p, t, o, argBase, dst);
+                } else {
+                    LuaValue r = (LuaValue) jc.objHandle.invokeExact(closure, (Object[]) closure.upvals,
+                            p, t, o, argBase);
+                    org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, dst, r);
+                }
+                return;
+            } catch (DeoptSignal d) {
+                if (win >= 1) {
+                    p[argBase] = p0;
+                    t[argBase] = t0;
+                    o[argBase] = o0;
+                    if (win == 2) {
+                        p[argBase + 1] = p1;
+                        t[argBase + 1] = t1;
+                        o[argBase + 1] = o1;
+                    }
+                }
+                throw d;
+            }
+        }
+        if (nArgs < numParams) {
+            nilFill(p, t, o, argBase + nArgs, argBase + numParams);
+        }
+        SnapshotStack s = snapshotsFor(closure);
+        int cursor = pushWindow(s, p, t, o, argBase, win);
         try {
             if (jc.returnsInt) {
-                long r = (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals, p, t, o, argBase);
+                long r = jc.entry != null
+                        ? jc.entry.callInt(closure, (Object[]) closure.upvals, p, t, o, argBase)
+                        : (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals, p, t, o, argBase);
                 p[dst] = r;
                 t[dst] = org.luava.runtime.bytecode.BytecodeVM.TYPE_INT;
                 o[dst] = null;
+            } else if (jc.entry != null) {
+                jc.entry.callInto(closure, (Object[]) closure.upvals, p, t, o, argBase, dst);
             } else {
                 LuaValue r = (LuaValue) jc.objHandle.invokeExact(closure, (Object[]) closure.upvals,
                         p, t, o, argBase);
                 org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, dst, r);
             }
         } catch (DeoptSignal d) {
-            restoreWindow(cursor, p, t, o, argBase, win);
+            restoreWindow(s, cursor, p, t, o, argBase, win);
             throw d;
         } finally {
-            popWindow(cursor);
+            s.top = cursor;
         }
+    }
+
+    private static SnapshotStack snapshotsFor(LuaClosure closure) {
+        org.luava.runtime.LuaState st = closure.getState();
+        return st != null ? st.jitSnapshotStack : SNAPSHOTS.get();
     }
 
     /**
@@ -262,15 +331,19 @@ public final class JitRuntime {
     public static long invokeTailSnap(JitCode jc, LuaClosure callee, long[] p, byte[] t, LuaValue[] o,
             int base, int a, int nArgs, int callerMaxStack) throws Throwable {
         int win = Math.max(callerMaxStack, a + 1 + nArgs);
-        int cursor = pushWindow(p, t, o, base, win);
+        SnapshotStack s = snapshotsFor(callee);
+        int cursor = pushWindow(s, p, t, o, base, win);
         try {
             shiftTailArgs(p, t, o, base, a, nArgs, jc.numParams);
+            if (jc.entry != null) {
+                return jc.entry.callInt(callee, (Object[]) callee.upvals, p, t, o, base);
+            }
             return (long) jc.handle.invokeExact(callee, (Object[]) callee.upvals, p, t, o, base);
         } catch (DeoptSignal d) {
-            restoreWindow(cursor, p, t, o, base, win);
+            restoreWindow(s, cursor, p, t, o, base, win);
             throw d;
         } finally {
-            popWindow(cursor);
+            s.top = cursor;
         }
     }
 
@@ -278,15 +351,48 @@ public final class JitRuntime {
     public static LuaValue invokeTailObjSnap(JitCode jc, LuaClosure callee, long[] p, byte[] t, LuaValue[] o,
             int base, int a, int nArgs, int callerMaxStack) throws Throwable {
         int win = Math.max(callerMaxStack, a + 1 + nArgs);
-        int cursor = pushWindow(p, t, o, base, win);
+        SnapshotStack s = snapshotsFor(callee);
+        int cursor = pushWindow(s, p, t, o, base, win);
         try {
             shiftTailArgs(p, t, o, base, a, nArgs, jc.numParams);
+            if (jc.entry != null) {
+                return jc.entry.callObj(callee, (Object[]) callee.upvals, p, t, o, base);
+            }
             return (LuaValue) jc.objHandle.invokeExact(callee, (Object[]) callee.upvals, p, t, o, base);
         } catch (DeoptSignal d) {
-            restoreWindow(cursor, p, t, o, base, win);
+            restoreWindow(s, cursor, p, t, o, base, win);
             throw d;
         } finally {
-            popWindow(cursor);
+            s.top = cursor;
+        }
+    }
+
+    /** Direct-slot variant of {@link #invokeTailSnap} for zero-box {@code callInto} callers. */
+    public static void invokeTailInto(JitCode jc, LuaClosure callee, long[] p, byte[] t, LuaValue[] o,
+            int base, int a, int nArgs, int callerMaxStack, int dst) throws Throwable {
+        int win = Math.max(callerMaxStack, a + 1 + nArgs);
+        SnapshotStack s = snapshotsFor(callee);
+        int cursor = pushWindow(s, p, t, o, base, win);
+        try {
+            shiftTailArgs(p, t, o, base, a, nArgs, jc.numParams);
+            if (jc.returnsInt) {
+                long r = jc.entry != null
+                        ? jc.entry.callInt(callee, (Object[]) callee.upvals, p, t, o, base)
+                        : (long) jc.handle.invokeExact(callee, (Object[]) callee.upvals, p, t, o, base);
+                p[dst] = r;
+                t[dst] = org.luava.runtime.bytecode.BytecodeVM.TYPE_INT;
+                o[dst] = null;
+            } else if (jc.entry != null) {
+                jc.entry.callInto(callee, (Object[]) callee.upvals, p, t, o, base, dst);
+            } else {
+                LuaValue r = (LuaValue) jc.objHandle.invokeExact(callee, (Object[]) callee.upvals, p, t, o, base);
+                org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, dst, r);
+            }
+        } catch (DeoptSignal d) {
+            restoreWindow(s, cursor, p, t, o, base, win);
+            throw d;
+        } finally {
+            s.top = cursor;
         }
     }
 

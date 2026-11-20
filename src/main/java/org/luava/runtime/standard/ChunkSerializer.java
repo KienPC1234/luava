@@ -40,6 +40,9 @@ public final class ChunkSerializer {
     private static final long LUAC_INT = 0x5678L;
     private static final double LUAC_NUM = 370.5;
     private static final byte[] MAGIC_FOOTER = "LUAVA_V1".getBytes(StandardCharsets.US_ASCII);
+    private static final int MAX_PARAM_COUNT = 256;
+    private static final int MAX_UPVALUE_COUNT = 256;
+    private static final int MAX_CHUNK_BYTES = 64 * 1024 * 1024;
 
     private ChunkSerializer() {}
 
@@ -120,7 +123,7 @@ public final class ChunkSerializer {
         int lastLineDefined = in.readInt();
 
         int paramCount = in.readInt();
-        if (paramCount < 0) {
+        if (paramCount < 0 || paramCount > MAX_PARAM_COUNT) {
             throw new LuaException("corrupt binary chunk");
         }
         if (paramCount * 2L > bais.available()) {
@@ -128,11 +131,12 @@ public final class ChunkSerializer {
         }
         List<String> params = new ArrayList<>(paramCount);
         for (int i = 0; i < paramCount; i++) {
+            LuaState.checkGuard();
             params.add(in.readUTF());
         }
 
         int upCount = in.readInt();
-        if (upCount < 0) {
+        if (upCount < 0 || upCount > MAX_UPVALUE_COUNT) {
             throw new LuaException("corrupt binary chunk");
         }
         if (upCount * 2L > bais.available()) {
@@ -140,6 +144,7 @@ public final class ChunkSerializer {
         }
         List<String> upvalueNames = new ArrayList<>(upCount);
         for (int i = 0; i < upCount; i++) {
+            LuaState.checkGuard();
             upvalueNames.add(in.readUTF());
         }
 
@@ -147,14 +152,24 @@ public final class ChunkSerializer {
         if (codeLen < 0 || codeLen > bais.available()) {
             throw new LuaException("truncated binary chunk");
         }
+        long maxAllowedBytes = Math.min(MAX_CHUNK_BYTES, LuaState.allocationLimit());
+        if (codeLen > maxAllowedBytes) {
+            throw new LuaException("corrupt binary chunk (allocation limit exceeded)");
+        }
         byte[] codeBytes = new byte[codeLen];
         in.readFully(codeBytes);
         String code = new String(codeBytes, StandardCharsets.UTF_8);
 
+        LuaState.checkGuard();
         Lexer lexer = new Lexer(code);
         List<Token> tokens = lexer.scanTokens();
         Parser parser = new Parser(tokens);
-        Statements.BlockStmt body = parser.parse();
+        Statements.BlockStmt body;
+        try {
+            body = parser.parse();
+        } catch (org.luava.frontend.parser.ParseException pe) {
+            throw new LuaException("corrupt binary chunk: " + pe.getMessage());
+        }
 
         LuaTable envTable = (envVal instanceof LuaTable t) ? t : globals;
 
@@ -268,7 +283,8 @@ public final class ChunkSerializer {
         if (hasMagicFooter(bytes)) {
             ByteBuffer footBb = ByteBuffer.wrap(bytes, bytes.length - 12, 4).order(ByteOrder.LITTLE_ENDIAN);
             int payloadLen = footBb.getInt();
-            if (payloadLen > 0 && payloadLen <= bytes.length - 12) {
+            int headerEnd = HEADER.length + 16;
+            if (payloadLen > 0 && payloadLen <= bytes.length - 12 - headerEnd) {
                 int offset = bytes.length - 12 - payloadLen;
                 try {
                     return decodePayload(bytes, offset, payloadLen, chunkName, envVal, globals, rootEnv);

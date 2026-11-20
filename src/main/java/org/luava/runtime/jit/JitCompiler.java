@@ -11,6 +11,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.luava.runtime.bytecode.LuaClosure;
 import org.luava.runtime.bytecode.LuaProto;
 
@@ -19,19 +20,31 @@ import org.luava.runtime.bytecode.LuaProto;
  * function) and caches them. Anything unexpected disables JIT for that
  * proto and the interpreter transparently takes over.
  *
- * <p>Compilation normally happens on a single background daemon thread so a
- * hot request never pays compile latency (server-friendly); set
+ * <p>Compilation normally happens on a background daemon pool so a hot
+ * request never pays compile latency (server-friendly); set
  * {@code -Dluava.jit.sync=true} for deterministic synchronous tier-up in
  * benchmarks and tests.
  */
 public final class JitCompiler {
+    public record Telemetry(
+            long compiledCount,
+            long failedCount,
+            long vmErrorCount,
+            boolean globallyDisabled,
+            int cacheSize,
+            int queueSize) {}
+
     private static final AtomicInteger CLASS_SEQ = new AtomicInteger();
+    private static final AtomicLong COMPILED_COUNT = new AtomicLong();
+    private static final AtomicLong FAILED_COUNT = new AtomicLong();
+    private static final AtomicLong VM_ERROR_COUNT = new AtomicLong();
     private static final JitCodeCache CACHE = new JitCodeCache();
     private static final int QUEUE_CAPACITY = Integer.getInteger("luava.jit.queueCapacity", 512);
     private static final int WORKER_THREADS = Math.max(2, Math.min(4,
             Integer.getInteger("luava.jit.threads", Runtime.getRuntime().availableProcessors())));
     private static final LinkedBlockingQueue<LuaProto> QUEUE = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
     private static volatile boolean workerStarted;
+    private static volatile boolean globalEmergencyDisabled;
     /** One-shot "ASM is missing, you are running interpreted" notice. */
     private static volatile boolean asmMissingReported;
 
@@ -51,6 +64,9 @@ public final class JitCompiler {
      * for {@link org.luava.runtime.LuaState.LoopGuard}-protected execution.
      */
     public static void requestCompile(LuaProto proto, boolean guarded) {
+        if (globalEmergencyDisabled || proto == null) {
+            return;
+        }
         if (!guarded) {
             if (proto.jitCode != null || proto.jitDisabled || proto.jitQueued) {
                 return;
@@ -160,7 +176,7 @@ public final class JitCompiler {
     }
 
     private static void drain() {
-        while (true) {
+        while (!globalEmergencyDisabled) {
             try {
                 LuaProto proto = QUEUE.take();
                 if (proto.jitQueued) {
@@ -180,24 +196,45 @@ public final class JitCompiler {
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 return;
+            } catch (VirtualMachineError vme) {
+                if (vme instanceof StackOverflowError) {
+                    FAILED_COUNT.incrementAndGet();
+                    continue;
+                }
+                tripEmergencyDisable(vme);
+                return;
             } catch (Throwable t) {
-                // Never let the compiler thread die; the proto simply stays
-                // interpreted (jitDisabled is set inside tryCompile paths).
+                FAILED_COUNT.incrementAndGet();
+                if (Boolean.getBoolean("luava.jit.debug")) {
+                    System.err.println("[jit] worker exception: " + t);
+                }
             }
+        }
+    }
+
+    private static void tripEmergencyDisable(VirtualMachineError vme) {
+        VM_ERROR_COUNT.incrementAndGet();
+        globalEmergencyDisabled = true;
+        QUEUE.clear();
+        if (Boolean.getBoolean("luava.jit.debug")) {
+            System.err.println("[jit] emergency disabled after JVM error: " + vme);
         }
     }
 
     /**
      * Attempts to compile {@code proto}. Returns the code on success, null
-     * when the proto is outside the JIT subset. Never throws: failures are
-     * reported as null and the proto is marked {@code jitDisabled} so the
-     * caller stops retrying and continues interpreted. Idempotent.
+     * when the proto is outside the JIT subset. Never throws for normal compile
+     * or bytecode fallback errors: failures are reported as null and the proto
+     * is marked {@code jitDisabled} so execution continues interpreted.
      */
     public static JitCode tryCompile(LuaProto proto) {
         return tryCompile(proto, false);
     }
 
     public static JitCode tryCompile(LuaProto proto, boolean guarded) {
+        if (globalEmergencyDisabled || proto == null) {
+            return null;
+        }
         JitCode existing = guarded ? proto.guardedJitCode : proto.jitCode;
         if (existing != null || (guarded ? proto.guardedJitDisabled : proto.jitDisabled)) {
             return existing;
@@ -238,6 +275,7 @@ public final class JitCompiler {
                 MethodHandles.Lookup lookup = MethodHandles.lookup();
                 Class<?> cls = lookup.defineHiddenClass(tr.bytes(), true,
                         MethodHandles.Lookup.ClassOption.NESTMATE).lookupClass();
+                JitEntry entry = (JitEntry) cls.getDeclaredConstructor().newInstance();
                 JitCode code;
                 if (info.returnsInt()) {
                     java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "exec",
@@ -250,7 +288,7 @@ public final class JitCompiler {
                                         long[].class, byte[].class, org.luava.runtime.LuaValue[].class,
                                         int.class, int.class));
                     }
-                    code = new JitCode(proto, mh, null, osr, tr.osrTargets(), info.pure(),
+                    code = new JitCode(proto, entry, mh, null, osr, tr.osrTargets(), info.pure(),
                             info.callSafe(), info.leafNoWindow(), true, info.returnsVoid());
                 } else {
                     java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "execObj",
@@ -264,7 +302,7 @@ public final class JitCompiler {
                                         Object[].class, long[].class, byte[].class,
                                         org.luava.runtime.LuaValue[].class, int.class, int.class));
                     }
-                    code = new JitCode(proto, null, mh, osr, tr.osrTargets(), info.pure(),
+                    code = new JitCode(proto, entry, null, mh, osr, tr.osrTargets(), info.pure(),
                             info.callSafe(), info.leafNoWindow(), false, false);
                 }
                 if (guarded ? proto.guardedJitDisabled : proto.jitDisabled) {
@@ -276,16 +314,33 @@ public final class JitCompiler {
                     proto.jitCode = code;
                 }
                 CACHE.put(proto, code);
+                COMPILED_COUNT.incrementAndGet();
                 if (debug) {
                     System.err.println("[jit] compiled" + (guarded ? " (guarded): " : ": ") + proto.name);
                 }
                 return code;
+            } catch (VirtualMachineError vme) {
+                if (guarded) {
+                    proto.guardedJitDisabled = true;
+                } else {
+                    proto.jitDisabled = true;
+                }
+                if (vme instanceof StackOverflowError) {
+                    FAILED_COUNT.incrementAndGet();
+                    return null;
+                }
+                tripEmergencyDisable(vme);
+                if (!Thread.currentThread().getName().startsWith("luava-jit-")) {
+                    throw vme;
+                }
+                return null;
             } catch (Throwable t) {
                 if (guarded) {
                     proto.guardedJitDisabled = true;
                 } else {
                     proto.jitDisabled = true;
                 }
+                FAILED_COUNT.incrementAndGet();
                 reportMissingAsm(t);
                 if (debug) {
                     System.err.println("[jit] compile failed for " + proto.name + ": " + t);
@@ -336,6 +391,25 @@ public final class JitCompiler {
 
     public static int cacheSize() {
         return CACHE.size();
+    }
+
+    public static Telemetry telemetry() {
+        return new Telemetry(
+                COMPILED_COUNT.get(),
+                FAILED_COUNT.get(),
+                VM_ERROR_COUNT.get(),
+                globalEmergencyDisabled,
+                CACHE.size(),
+                QUEUE.size());
+    }
+
+    public static boolean isGloballyDisabled() {
+        return globalEmergencyDisabled;
+    }
+
+    public static void disableGlobally() {
+        globalEmergencyDisabled = true;
+        QUEUE.clear();
     }
 
     /**
