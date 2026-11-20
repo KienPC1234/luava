@@ -49,20 +49,20 @@ resource caps (one state per thread or tenant).
 
 - **Conformance**: 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` suites pass (`OfficialSuiteEvaluationTest`), alongside 388 unit, adversarial security, and PUC 5.4 differential tests across JIT ON, JIT OFF (`-Dluava.jit=false`), and synchronous aggressive tier-up (`-Dluava.jit.sync=true -Dluava.jit.hotThreshold=1`).
 
-Current benchmarks (`Bench <file> 6 10`, 6 warmup, 10 measured runs, `-Dluava.jit.sync=true`):
+Paired benchmark across **Luava 0.2.6** (`-Dluava.jit.sync=true`), **LuaJ 3.0.1** (interleaved 5 pairs, pinned core 0 except coroutines, 6 warmup, 10 iters median best ms), and **PUC Lua 5.4.8 C** (6 warmup, 10 iters in-process best ms):
 
-| Task | Luava range (ms) |
-| :--- | ---: |
-| `01_arithmetic` | 36.43 - 36.79 |
-| `02_loops` | 235.90 - 238.11 |
-| `03_table_array` | 12.53 - 15.77 |
-| `04_string_concat` | 6.10 - 10.35 |
-| `05_closures` | 16.01 - 21.45 |
-| `06_coroutines` | 90.71 - 93.96 |
-| `07_hash_table` | 47.09 - 75.60 |
-| `08_oop_metatables` | 304.49 - 308.16 |
-| `09_string_patterns` | 49.92 - 70.61 |
-| `10_sieve` | 121.74 - 138.99 |
+| Task | Luava 0.2.6 (ms) | LuaJ 3.0.1 (ms) | Lua 5.4.8 C (ms) | vs LuaJ | vs Lua C |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| `01_arith_loop` | 36.50 | 258.72 | 60.21 | 7.09x | 1.65x |
+| `02_fibonacci` | 235.18 | 2423.43 | 745.67 | 10.31x | 3.17x |
+| `03_table_ops` | 17.45 | 47.83 | 13.50 | 2.74x | 0.77x |
+| `04_string_concat` | 9.90 | 16.05 | 13.07 | 1.62x | 1.32x |
+| `05_closures` | 27.78 | 63.38 | 22.79 | 2.28x | 0.82x |
+| `06_coroutines` | 89.69 | 2351.69 | 27.22 | 26.22x | 0.30x |
+| `07_hash_table` | 49.76 | 199.87 | 195.47 | 4.02x | 3.93x |
+| `08_oop_metatables` | 289.97 | 595.44 | 222.50 | 2.05x | 0.77x |
+| `09_string_pattern` | 70.73 | 78.94 | 88.33 | 1.12x | 1.25x |
+| `10_sieve` | 123.46 | 307.38 | 144.12 | 2.49x | 1.17x |
 
 ## License
 

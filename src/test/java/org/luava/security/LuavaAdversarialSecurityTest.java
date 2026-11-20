@@ -194,6 +194,7 @@ public class LuavaAdversarialSecurityTest {
             runner.interrupt();
             assertTrue(runnerDone.await(2, TimeUnit.SECONDS),
                     "interrupted coroutine resumer must exit promptly instead of spinning");
+            runner.join(2000);
             releaseWorker.countDown();
             assertNotNull(thrown.get());
             assertTrue(thrown.get().getMessage().contains("interrupted"),
