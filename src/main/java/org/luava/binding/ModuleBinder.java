@@ -175,9 +175,10 @@ public final class ModuleBinder {
                 }
 
                 try {
-                    Class<?>[] paramTypes = bestMatch.getParameterTypes();
+                    LuaDataConverter.MethodMeta meta = LuaDataConverter.methodMeta(bestMatch);
+                    Class<?>[] paramTypes = meta.paramTypes;
                     Object[] javaArgs;
-                    if (!bestMatch.isVarArgs()) {
+                    if (!meta.isVarArgs) {
                         javaArgs = new Object[paramTypes.length];
                         for (int i = 0; i < paramTypes.length; i++) {
                             javaArgs[i] = LuaDataConverter.toJava(effectiveArgs[i], paramTypes[i]);
@@ -197,15 +198,11 @@ public final class ModuleBinder {
                         javaArgs[fixed] = varArray;
                     }
 
-                    // Cache the unreflected handle per method so repeated calls
-                    // do not pay Method.invoke reflection (AGENTS.md §II.2).
-                    // An instance-method handle takes the receiver as its
-                    // leading argument; a static handle takes none.
-                    MethodHandle mh = LuaDataConverter.samHandle(bestMatch);
+                    MethodHandle mh = meta.handle;
                     Object res;
                     if (mh != null) {
                         Object[] effective;
-                        if (Modifier.isStatic(bestMatch.getModifiers())) {
+                        if (meta.isStatic) {
                             effective = javaArgs;
                         } else {
                             effective = new Object[javaArgs.length + 1];
@@ -214,9 +211,9 @@ public final class ModuleBinder {
                         }
                         res = mh.invokeWithArguments(effective);
                     } else {
-                        res = bestMatch.invoke(Modifier.isStatic(bestMatch.getModifiers()) ? null : instance, javaArgs);
+                        res = bestMatch.invoke(meta.isStatic ? null : instance, javaArgs);
                     }
-                    if (bestMatch.getReturnType() == void.class || bestMatch.getReturnType() == Void.class) {
+                    if (meta.returnType == void.class || meta.returnType == Void.class) {
                         return LuaNil.NIL;
                     }
                     return LuaDataConverter.toLua(res);

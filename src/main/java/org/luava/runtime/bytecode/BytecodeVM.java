@@ -154,15 +154,35 @@ public final class BytecodeVM {
     }
 
     public static LuaValue[] execute(LuaState state, LuaClosure initialClosure, LuaValue[] initialArgs) {
-        VmContext ctx = new VmContext();
         LuaCoroutine coInit = LuaCoroutine.running();
+        int nArgs = initialArgs != null ? initialArgs.length : 0;
+        VmContext ctx = initVmContext(state, coInit, initialClosure, nArgs, null, initialArgs, false);
+        // A previous run of this (cached) proto may have tiered it up. Run
+        // the compiled kernel directly instead of dispatching every
+        // instruction; a deopt resumes the interpreter at the faulting pc
+        // with all committed state intact.
+        LuaValue[] jitResult = runTopLevelJit(state, ctx, initialClosure);
+        if (jitResult != null) {
+            return jitResult;
+        }
+        // Hoisted: coroutine is constant for the whole execute() invocation
+        // (resume continues the same thread/CURRENT; nested coroutines get
+        // their own execute()). Saves a ThreadLocal lookup per instruction.
+        try {
+            return runLoop(state, ctx);
+        } catch (OsrUnwind ou) {
+            return ctx.osrTopResult;
+        }
+    }
+
+    private static VmContext initVmContext(LuaState state, LuaCoroutine coInit, LuaClosure initialClosure,
+            int nArgs, LuaValue singleArg, LuaValue[] initialArgs, boolean stackless) {
+        VmContext ctx = new VmContext();
         ctx.co = coInit;
         ctx.thread = coInit != null ? coInit : state.getMainThread();
         ctx.callState = coInit != null ? coInit.getCallStackState() : CallStack.currentState();
+        ctx.stackless = stackless;
         ctx.thread.ensureStackCapacity(256);
-        ctx.pStack = ctx.thread.getPrimitiveStack();
-        ctx.tStack = ctx.thread.getTypeStack();
-        ctx.oStack = ctx.thread.getObjectStack();
 
         // Grow-on-demand CallInfo stack. A host call that makes no Lua-to-Lua
         // nested call (a leaf handler) never needs an entry, so eagerly
@@ -188,9 +208,14 @@ public final class BytecodeVM {
         ctx.tStack = ctx.thread.getTypeStack();
         ctx.oStack = ctx.thread.getObjectStack();
 
-        int nArgs = initialArgs != null ? initialArgs.length : 0;
         for (int i = 0; i < ctx.proto.numParams; i++) {
-            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, (i < nArgs) ? initialArgs[i] : LuaNil.NIL);
+            LuaValue argVal;
+            if (i < nArgs) {
+                argVal = (nArgs == 1 && initialArgs == null) ? singleArg : initialArgs[i];
+            } else {
+                argVal = LuaNil.NIL;
+            }
+            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + i, argVal);
         }
         ctx.top = ctx.base + ctx.proto.numParams;
 
@@ -199,7 +224,8 @@ public final class BytecodeVM {
             int nv = nArgs - ctx.proto.numParams;
             ctx.varargs = new LuaValue[nv];
             for (int i = 0; i < nv; i++) {
-                ctx.varargs[i] = initialArgs[ctx.proto.numParams + i];
+                int idx = ctx.proto.numParams + i;
+                ctx.varargs[i] = (nArgs == 1 && initialArgs == null) ? singleArg : initialArgs[idx];
             }
         }
 
@@ -209,22 +235,127 @@ public final class BytecodeVM {
         ctx.oldpc = -1;
         ctx.varargPrepRan = false;
         ctx.thrown = null;
-        // A previous run of this (cached) proto may have tiered it up. Run
-        // the compiled kernel directly instead of dispatching every
-        // instruction; a deopt resumes the interpreter at the faulting pc
-        // with all committed state intact.
-        LuaValue[] jitResult = runTopLevelJit(state, ctx, initialClosure);
-        if (jitResult != null) {
-            return jitResult;
+        return ctx;
+    }
+
+    /** Executes one stackless resume-to-yield/return turn on the caller thread. */
+    public static void resumeStackless(LuaState state, LuaCoroutine co, VmContext existingCtx,
+            LuaClosure entryClosure, int argCount, LuaValue singleArg, LuaValue[] multiArgs) {
+        LuaCoroutine prevCoro = LuaCoroutine.running();
+        LuaCoroutine.setCurrent(co);
+        VmContext ctx = existingCtx;
+        try {
+            if (ctx == null) {
+                ctx = initVmContext(state, co, entryClosure, argCount, singleArg, multiArgs, true);
+            } else {
+                CallStack.pop(ctx.callState, co);
+                int funcIdx = co.yieldFuncIdx;
+                int nResults = co.yieldNResults;
+                int top;
+                if (argCount == 0) {
+                    if (nResults > 0) {
+                        for (int i = 0; i < nResults; i++) {
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i, LuaNil.NIL);
+                        }
+                        top = funcIdx + nResults;
+                    } else {
+                        top = funcIdx;
+                    }
+                } else if (argCount == 1) {
+                    if (nResults != 0) {
+                        setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, singleArg);
+                        for (int i = 1; i < nResults; i++) {
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i, LuaNil.NIL);
+                        }
+                    }
+                    top = nResults >= 0 ? funcIdx + nResults : funcIdx + 1;
+                } else {
+                    if (nResults >= 0) {
+                        for (int i = 0; i < nResults; i++) {
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i,
+                                    i < argCount ? multiArgs[i] : LuaNil.NIL);
+                        }
+                        top = funcIdx + nResults;
+                    } else {
+                        for (int i = 0; i < argCount; i++) {
+                            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i, multiArgs[i]);
+                        }
+                        top = funcIdx + argCount;
+                    }
+                }
+                if (nResults < 0) {
+                    ctx.top = top;
+                }
+                ctx.stacklessYielded = false;
+                ctx.stacklessPromoted = false;
+                ctx.thrown = null;
+            }
+            co.activeStacklessCtx = ctx;
+            LuaValue[] result = runLoop(state, ctx);
+            if (ctx.stacklessYielded) {
+                return;
+            }
+            if (ctx.stacklessPromoted) {
+                ctx.stacklessPromoted = false;
+                ctx.stackless = false;
+                co.activeStacklessCtx = null;
+                co.graduateToVirtualThread(state, ctx);
+                return;
+            }
+            co.clearStacklessOnExit();
+            co.completeNormallyArray(result);
+        } catch (LuaCoroutine.PromoteSignal ps) {
+            if (ctx != null) {
+                ctx.pc = co.vmPcMirror;
+                ctx.thrown = null;
+                ctx.stacklessPromoted = false;
+                ctx.stackless = false;
+            }
+            co.activeStacklessCtx = null;
+            co.graduateToVirtualThread(state, ctx);
+        } catch (org.luava.runtime.LuaExit ex) {
+            co.setExitSignal(ex);
+            throw ex;
+        } catch (Throwable t) {
+            co.recordFailure(t);
+        } finally {
+            co.activeStacklessCtx = null;
+            LuaCoroutine.setCurrent(prevCoro);
         }
-        // Hoisted: coroutine is constant for the whole execute() invocation
-        // (resume continues the same thread/CURRENT; nested coroutines get
-        // their own execute()). Saves a ThreadLocal lookup per instruction.
+    }
+
+    /** Continues a promoted stackless coroutine on its new VirtualThread. */
+    public static LuaValue[] continueStacklessInVirtualThread(LuaState state, VmContext ctx) {
+        if (ctx.co != null && ctx.co.isClosing()) {
+            LuaCoroutine.CoroutineCloseSignal sig = new LuaCoroutine.CoroutineCloseSignal();
+            ctx.thrown = sig;
+            ctx.stacklessYielded = false;
+            ctx.stacklessPromoted = false;
+            ctx.stackless = false;
+            finishFrame(state, ctx);
+            throw sig;
+        }
+        ctx.stackless = false;
+        ctx.stacklessYielded = false;
+        ctx.stacklessPromoted = false;
+        ctx.thrown = null;
         try {
             return runLoop(state, ctx);
         } catch (OsrUnwind ou) {
             return ctx.osrTopResult;
         }
+    }
+
+    /** Closes a suspended stackless coroutine that holds no to-be-closed variables. */
+    public static void closeStacklessClean(LuaState state, LuaCoroutine co, VmContext ctx) {
+        while (ctx.callState.depth() > ctx.initialDepth) {
+            CallStack.pop(ctx.callState, co);
+        }
+        if (state != null) {
+            state.closeUpvalues(co, ctx.savedStackTop);
+        }
+        co.setStackTop(ctx.savedStackTop);
+        co.clearStacklessOnExit();
     }
 
     /**
@@ -256,17 +387,24 @@ public final class BytecodeVM {
         return ++jc.structuralDeopts > LuaState.JIT_STRUCTURAL_DEOPT_BUDGET;
     }
 
+    public static boolean jitBlockedByGuard(LuaState state) {
+        LuaState.LoopGuard g = state.loopGuard;
+        return g instanceof LuaState.Guard hg && hg.hasSmallInstrBudget();
+    }
+
     private static LuaValue[] runTopLevelJit(LuaState state, VmContext ctx, LuaClosure closure) {
         // Hooks must be observable: the interpreter polls ctx.thread, so the
         // JIT gate must read the same thread. It used ctx.co, which is null on
         // a host entry (ctx.thread is the main thread then), so a compiled
         // function entered from the host silently ran past an armed count/line
         // hook (debug.sethook observed 0 firings instead of the interpreted
-        // counts).
-        if (!state.isJitEnabled() || ctx.thread.hooksActive || state.loopGuard != null) {
+        // counts). Small instruction budgets (< 8192) also stay interpreted for
+        // per-instruction granularity; timeout and server budgets use JIT safepoints.
+        if (!state.isJitEnabled() || ctx.thread.hooksActive || jitBlockedByGuard(state)) {
             return null;
         }
-        JitCode jc = closure.proto.jitCode;
+        boolean guarded = state.loopGuard != null;
+        JitCode jc = guarded ? closure.proto.guardedJitCode : closure.proto.jitCode;
         // Host-entry tier-up: `execute` is the entry point for every host call
         // (LuaState.call/eval, a direct LuaClosure.invoke), whereas Lua-to-Lua
         // calls are inlined and never reach here. Count host entries so a
@@ -276,14 +414,19 @@ public final class BytecodeVM {
         // interpreted forever.
         if (jc == null) {
             LuaProto proto = closure.proto;
-            if (!proto.jitDisabled && !proto.loopCompileRequested) {
+            boolean disabled = guarded ? proto.guardedJitDisabled : proto.jitDisabled;
+            if (!disabled && !proto.loopCompileRequested) {
                 int hot = proto.hotCount + 1;
                 proto.hotCount = hot;
                 if (hot >= LuaState.JIT_HOT_THRESHOLD) {
                     try {
-                        org.luava.runtime.jit.JitCompiler.requestCompile(proto);
+                        org.luava.runtime.jit.JitCompiler.requestCompile(proto, guarded);
                     } catch (Throwable t) {
-                        proto.jitDisabled = true;
+                        if (guarded) {
+                            proto.guardedJitDisabled = true;
+                        } else {
+                            proto.jitDisabled = true;
+                        }
                     }
                 }
             }
@@ -294,6 +437,9 @@ public final class BytecodeVM {
         // faulting pc with committed state intact.
         if (!jc.returnsInt && jc.objHandle == null) {
             return null;
+        }
+        if (!jc.recentlyUsed) {
+            jc.recentlyUsed = true;
         }
         try {
             if (jc.returnsVoid) {
@@ -332,6 +478,8 @@ public final class BytecodeVM {
             closure.proto.jitDisabled = true;
             ctx.pc = 0;
             return null;
+        } catch (LuaException le) {
+            throw le;
         } catch (RuntimeException | Error t) {
             closure.proto.jitCode = null;
             closure.proto.jitDisabled = true;
@@ -355,8 +503,10 @@ public final class BytecodeVM {
         if (!state.isJitEnabled()) {
             return;
         }
+        boolean guarded = state.loopGuard != null;
         LuaProto proto = ctx.proto;
-        if (proto.jitCode != null) {
+        JitCode jc = guarded ? proto.guardedJitCode : proto.jitCode;
+        if (jc != null) {
             // Kernel ready: enter at the body start (the FORLOOP back-edge
             // target) once this loop already requested a compile.
             if (proto.loopCompileRequested) {
@@ -364,17 +514,22 @@ public final class BytecodeVM {
             }
             return;
         }
-        if (proto.loopCompileRequested || proto.jitDisabled) {
+        boolean disabled = guarded ? proto.guardedJitDisabled : proto.jitDisabled;
+        if (proto.loopCompileRequested || disabled) {
             return;
         }
         proto.loopCompileRequested = true;
-        if (ctx.thread.hooksActive || state.loopGuard != null) {
+        if (ctx.thread.hooksActive || jitBlockedByGuard(state)) {
             return;
         }
         try {
-            JitCompiler.requestCompile(proto);
+            JitCompiler.requestCompile(proto, guarded);
         } catch (Throwable t) {
-            proto.jitDisabled = true;
+            if (guarded) {
+                proto.guardedJitDisabled = true;
+            } else {
+                proto.jitDisabled = true;
+            }
         }
     }
 
@@ -396,6 +551,8 @@ public final class BytecodeVM {
 
                 if (guard != null) {
                     guard.tick();
+                } else if (state != null && state.cancelled) {
+                    throw new LuaException("execution cancelled");
                 }
 
                 int inst = ctx.code[ctx.pc++];
@@ -807,7 +964,11 @@ public final class BytecodeVM {
                     }
                     clearDeadTemp(ctx.pStack, ctx.tStack, ctx.oStack, ctx.proto, ctx.base, b, ctx.pc - 1);
                 }
-                case OpCode.OP_CALL -> executeCallOp(state, ctx, a, inst);
+                case OpCode.OP_CALL -> {
+                    if (executeCallOp(state, ctx, a, inst)) {
+                        return LuaCoroutine.EMPTY_VALUES;
+                    }
+                }
                 case OpCode.OP_TAILCALL -> {
                     LuaValue[] tailResult = doTailCall(state, ctx, a, inst);
                     if (tailResult != null) {
@@ -963,6 +1124,10 @@ public final class BytecodeVM {
      * and restore the stack top.
      */
     private static void finishFrame(LuaState state, VmContext ctx) {
+        if (ctx.stacklessYielded || ctx.stacklessPromoted
+                || ctx.thrown == LuaCoroutine.PromoteSignal.INSTANCE) {
+            return;
+        }
         while (CallStack.depth() > ctx.initialDepth) {
             CallStack.pop(ctx.callState, ctx.co);
         }
@@ -999,6 +1164,9 @@ public final class BytecodeVM {
      * hook observers ({@code getlocal}, traceback) see the firing site.
      */
     private static void pollHooks(LuaCoroutine co, VmContext ctx, int instPc, int op) {
+        if (co.activeStacklessCtx != null) {
+            throw LuaCoroutine.PromoteSignal.INSTANCE;
+        }
         // Hooks armed: compute line/frame lazily (once per
         // instruction only while a hook is actually installed).
         int curLine = (ctx.proto.lineInfo != null && instPc < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[instPc] : -1;
@@ -1139,16 +1307,18 @@ public final class BytecodeVM {
         if (!state.isJitEnabled()) {
             return 0;
         }
-        if (ctx.thread.hooksActive || state.loopGuard != null) {
+        if (ctx.thread.hooksActive || jitBlockedByGuard(state)) {
             return 0;
         }
         LuaProto proto = child.proto;
         if (proto.mayYield) {
             return 0;
         }
-        JitCode jc = proto.jitCode;
+        boolean guarded = state.loopGuard != null;
+        JitCode jc = guarded ? proto.guardedJitCode : proto.jitCode;
         if (jc == null) {
-            if (proto.jitDisabled) {
+            boolean disabled = guarded ? proto.guardedJitDisabled : proto.jitDisabled;
+            if (disabled) {
                 return 0;
             }
             int hot = proto.hotCount + 1;
@@ -1159,15 +1329,25 @@ public final class BytecodeVM {
             // Tier-up is a request: background thread compiles (or
             // synchronously under luava.jit.sync); this call stays interpreted.
             try {
-                org.luava.runtime.jit.JitCompiler.requestCompile(proto);
+                org.luava.runtime.jit.JitCompiler.requestCompile(proto, guarded);
             } catch (Throwable t) {
-                proto.jitDisabled = true;
+                if (guarded) {
+                    proto.guardedJitDisabled = true;
+                } else {
+                    proto.jitDisabled = true;
+                }
             }
+            return 0;
+        }
+        if (ctx.stackless && !jc.pure) {
             return 0;
         }
         int base = funcIdx + 1;
         if (nActualArgs < proto.numParams) {
             return 0;
+        }
+        if (!jc.recentlyUsed) {
+            jc.recentlyUsed = true;
         }
         try {
             ctx.thread.ensureStackCapacity(base + proto.maxStackSize + 64);
@@ -1281,6 +1461,8 @@ public final class BytecodeVM {
             proto.jitDisabled = true;
             ctx.jitResumePc = 0;
             return 2;
+        } catch (LuaException le) {
+            throw le;
         } catch (Throwable t) {
             if (jitDebug()) {
                 System.err.println("[jit] FAILED proto=" + proto.name + " : " + t);
@@ -1330,16 +1512,18 @@ public final class BytecodeVM {
         if (!state.isJitEnabled()) {
             return 0;
         }
-        if (ctx.thread.hooksActive || state.loopGuard != null) {
+        if (ctx.thread.hooksActive || jitBlockedByGuard(state)) {
             return 0;
         }
         LuaProto proto = child.proto;
         if (proto.mayYield) {
             return 0;
         }
-        JitCode jc = proto.jitCode;
+        boolean guarded = state.loopGuard != null;
+        JitCode jc = guarded ? proto.guardedJitCode : proto.jitCode;
         if (jc == null) {
-            if (proto.jitDisabled) {
+            boolean disabled = guarded ? proto.guardedJitDisabled : proto.jitDisabled;
+            if (disabled) {
                 return 0;
             }
             int hot = proto.hotCount + 1;
@@ -1348,10 +1532,17 @@ public final class BytecodeVM {
                 return 0;
             }
             try {
-                org.luava.runtime.jit.JitCompiler.requestCompile(proto);
+                org.luava.runtime.jit.JitCompiler.requestCompile(proto, guarded);
             } catch (Throwable t) {
-                proto.jitDisabled = true;
+                if (guarded) {
+                    proto.guardedJitDisabled = true;
+                } else {
+                    proto.jitDisabled = true;
+                }
             }
+            return 0;
+        }
+        if (ctx.stackless && !jc.pure) {
             return 0;
         }
         if (nActualArgs < proto.numParams) {
@@ -1394,7 +1585,7 @@ public final class BytecodeVM {
         return Boolean.getBoolean("luava.jit.debug");
     }
 
-    private static void executeCallOp(LuaState state, VmContext ctx, int a, int inst) {
+    private static boolean executeCallOp(LuaState state, VmContext ctx, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
 
@@ -1425,8 +1616,16 @@ public final class BytecodeVM {
             int inlined = -1;
             if (func == org.luava.runtime.standard.BaseLib.TOSTRING && nActualArgs == 1) {
                 inlined = inlineTostring1(state, ctx, funcIdx, nResults);
+            } else if (func == org.luava.runtime.standard.CoroutineLib.YIELD) {
+                if (ctx.stackless && LuaCoroutine.isYieldable()) {
+                    stacklessYield(state, ctx, funcIdx, nActualArgs, nResults);
+                    return true;
+                }
+                inlined = inlineYield(state, ctx, funcIdx, nActualArgs, nResults);
             } else if (func == org.luava.runtime.standard.CoroutineLib.RESUME) {
                 inlined = inlineResume(ctx, funcIdx, nActualArgs, nResults);
+            } else if (func instanceof org.luava.runtime.standard.CoroutineLib.WrapFunction wf) {
+                inlined = inlineWrapResume(ctx, wf.co, funcIdx, nActualArgs, nResults);
             } else if (func == org.luava.runtime.standard.StringLib.GMATCH
                     && (nActualArgs == 2 || nActualArgs == 3)) {
                 inlined = inlineGmatch(ctx, funcIdx, nActualArgs, nResults);
@@ -1454,7 +1653,7 @@ public final class BytecodeVM {
                 ctx.pStack = ctx.thread.getPrimitiveStack();
                 ctx.tStack = ctx.thread.getTypeStack();
                 ctx.oStack = ctx.thread.getObjectStack();
-                return;
+                return false;
             }
         }
 
@@ -1466,7 +1665,7 @@ public final class BytecodeVM {
                 ctx.pStack = ctx.thread.getPrimitiveStack();
                 ctx.tStack = ctx.thread.getTypeStack();
                 ctx.oStack = ctx.thread.getObjectStack();
-                return;
+                return false;
             }
             // Hybrid JIT fast lane (plan.md): a compiled kernel
             // runs framelessly on the register window. 1 = handled; 2 = run
@@ -1474,7 +1673,7 @@ public final class BytecodeVM {
             // 0 = cold/unsuitable, run from scratch.
             int jit = tryJitCall(state, ctx, childClosure, funcIdx, nActualArgs, nResults);
             if (jit == 1) {
-                return;
+                return false;
             }
             CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
             if (callerFrame != null) {
@@ -1559,6 +1758,11 @@ public final class BytecodeVM {
                 ctx.pc = ctx.jitResumePc;
             }
         } else if (func instanceof LuaFunction fn) {
+            if (ctx.stackless && !isStacklessSafeLeaf(fn)) {
+                ctx.pc = ctx.co.vmPcMirror;
+                ctx.stacklessPromoted = true;
+                return true;
+            }
             int callLine = (ctx.proto.lineInfo != null && ctx.pc - 1 < ctx.proto.lineInfo.length) ? ctx.proto.lineInfo[ctx.pc - 1] : -1;
             int newTop = executeExternalCall(state, ctx, ctx.proto, ctx.pc, ctx.base, fn, funcIdx, nActualArgs, nResults, callLine);
             if (nResults < 0) {
@@ -1568,6 +1772,45 @@ public final class BytecodeVM {
             ctx.tStack = ctx.thread.getTypeStack();
             ctx.oStack = ctx.thread.getObjectStack();
         }
+        return false;
+    }
+
+    private static boolean isStacklessSafeLeaf(LuaFunction fn) {
+        return fn == org.luava.runtime.standard.CoroutineLib.CREATE
+                || fn == org.luava.runtime.standard.CoroutineLib.STATUS
+                || fn == org.luava.runtime.standard.CoroutineLib.WRAP;
+    }
+
+    private static void stacklessYield(LuaState state, VmContext ctx, int funcIdx, int nActualArgs, int nResults) {
+        stampYieldFrame(state, ctx, funcIdx);
+        LuaValue single = null;
+        LuaValue[] multi = null;
+        if (nActualArgs == 1) {
+            single = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1);
+        } else if (nActualArgs > 1) {
+            multi = new LuaValue[nActualArgs];
+            for (int i = 0; i < nActualArgs; i++) {
+                multi[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1 + i);
+            }
+        }
+        ctx.co.suspendStackless(ctx, state, funcIdx, nResults, nActualArgs, single, multi);
+        ctx.stacklessYielded = true;
+    }
+
+    private static void stampYieldFrame(LuaState state, VmContext ctx, int funcIdx) {
+        int callPc = ctx.pc - 1;
+        int curLine = (ctx.proto.lineInfo != null && callPc >= 0 && callPc < ctx.proto.lineInfo.length)
+                ? ctx.proto.lineInfo[callPc] : -1;
+        CallStack.Frame callerFrame = CallStack.topFrame(ctx.callState);
+        if (callerFrame != null) {
+            callerFrame.pc = callPc;
+            if (curLine > 0) {
+                callerFrame.line = curLine;
+            }
+        }
+        CallStack.setNextVmFrame(ctx.callState, state, funcIdx + 1, funcIdx, null, -1);
+        CallStack.push(org.luava.runtime.standard.CoroutineLib.YIELD, "yield", "field",
+                curLine, false, false, ctx.callState, ctx.co);
     }
 
     /**
@@ -1688,6 +1931,11 @@ public final class BytecodeVM {
             CallStack.setNextVmFrame(ctx.callState, state, ctx.base, ctx.base - 1, ctx.varargs, 0);
             CallStack.replaceTailCall(childClosure, callName, callNamewhat != null ? callNamewhat : "", childClosure.getLineDefined(), isMethod, isMeta, ctx.callState, ctx.co);
         } else if (func instanceof LuaFunction fn) {
+            if (ctx.stackless) {
+                ctx.pc = ctx.co.vmPcMirror;
+                ctx.stacklessPromoted = true;
+                return LuaCoroutine.EMPTY_VALUES;
+            }
             state.closeUpvalues(ctx.thread, ctx.base);
             state.closeTbc(ctx.thread, ctx.base, null);
 
@@ -2044,16 +2292,22 @@ public final class BytecodeVM {
             ctx.jitBackEdges = LuaState.JIT_LOOP_THRESHOLD;
         } else if (--ctx.jitBackEdges <= 0) {
             ctx.jitBackEdges = LuaState.JIT_LOOP_THRESHOLD;
-            if (state.isJitEnabled() && state.loopGuard == null && !ctx.thread.hooksActive) {
+            if (state.isJitEnabled() && !jitBlockedByGuard(state) && !ctx.thread.hooksActive) {
+                boolean guarded = state.loopGuard != null;
                 LuaProto proto = ctx.proto;
-                JitCode jc = proto.jitCode;
+                JitCode jc = guarded ? proto.guardedJitCode : proto.jitCode;
+                boolean disabled = guarded ? proto.guardedJitDisabled : proto.jitDisabled;
                 if (jc == null) {
-                    if (!proto.jitDisabled && !proto.loopCompileRequested) {
+                    if (!disabled && !proto.loopCompileRequested) {
                         proto.loopCompileRequested = true;
                         try {
-                            JitCompiler.requestCompile(proto);
+                            JitCompiler.requestCompile(proto, guarded);
                         } catch (Throwable t) {
-                            proto.jitDisabled = true;
+                            if (guarded) {
+                                proto.guardedJitDisabled = true;
+                            } else {
+                                proto.jitDisabled = true;
+                            }
                         }
                     }
                 } else if (proto.loopCompileRequested) {
@@ -2078,13 +2332,17 @@ public final class BytecodeVM {
             return;
         }
         LuaProto proto = ctx.proto;
-        JitCode jc = proto.jitCode;
-        if (jc == null || jc.osrHandle == null) {
+        boolean guarded = state.loopGuard != null;
+        JitCode jc = guarded ? proto.guardedJitCode : proto.jitCode;
+        if (jc == null || jc.osrHandle == null || (ctx.stackless && !jc.pure)) {
             return;
         }
         boolean[] targets = jc.osrTargets;
         if (targets == null || loopPc < 0 || loopPc >= targets.length || !targets[loopPc]) {
             return;
+        }
+        if (!jc.recentlyUsed) {
+            jc.recentlyUsed = true;
         }
         try {
             ctx.thread.ensureStackCapacity(ctx.base + proto.maxStackSize + 64);
@@ -2116,6 +2374,8 @@ public final class BytecodeVM {
             ctx.pc = d.pc;
         } catch (StackOverflowError soe) {
             proto.jitCode = null; proto.jitDisabled = true; ctx.pc = loopPc;
+        } catch (LuaException le) {
+            throw le;
         } catch (RuntimeException | Error t) {
             proto.jitCode = null; proto.jitDisabled = true; throw t;
         } catch (Throwable t) {
@@ -2241,12 +2501,13 @@ public final class BytecodeVM {
         // Honouring it reproduces luaH_resize's array pre-size, observable
         // through rawlen, the # border and table.insert placement.
         int arrayHint = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
+        int hashHint = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         if (pc < code.length && ((code[pc] >>> Instruction.POS_OP) & Instruction.MASK_OP) == OpCode.OP_EXTRAARG) {
             pc++;
         }
         int regA = base + a;
         tStack[regA] = TYPE_OBJECT;
-        oStack[regA] = new LuaTable(arrayHint, 0);
+        oStack[regA] = new LuaTable(arrayHint, hashHint);
         return pc;
     }
 
@@ -2265,10 +2526,9 @@ public final class BytecodeVM {
         int n = b > 0 ? b : (top - (base + a) - 1);
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + a);
         int regBase = base + a;
-        if (tbl instanceof LuaTable lt) {
+        if (tbl instanceof LuaTable lt && lt.getMetatable() == null) {
             for (int i = 1; i <= n; i++) {
-                LuaValue val = getLuaValue(pStack, tStack, oStack, regBase + i);
-                lt.rawset(LuaInteger.valueOf(last + i), val);
+                lt.rawsetIntFromStack(last + i, pStack, tStack, oStack, regBase + i);
             }
         } else {
             for (int i = 1; i <= n; i++) {
@@ -2333,7 +2593,7 @@ public final class BytecodeVM {
                 if (state.basicMetatable(LuaType.NUMBER) != null) {
                     return -1;
                 }
-                result = LuaString.valueOf(Long.toString(ctx.pStack[argIdx]));
+                result = LuaString.fromLong(ctx.pStack[argIdx]);
             }
             case TYPE_FLOAT -> {
                 if (state.basicMetatable(LuaType.NUMBER) != null) {
@@ -2791,37 +3051,61 @@ public final class BytecodeVM {
      * {@code (true, ...)} or {@code (false, err)}. Returns the new top, or -1
      * to fall back.
      */
+    private static int inlineYield(LuaState state, VmContext ctx, int funcIdx, int nActualArgs, int nResults) {
+        if (!LuaCoroutine.isYieldable()) {
+            return -1;
+        }
+        stampYieldFrame(state, ctx, funcIdx);
+        try {
+            return LuaCoroutine.yieldInline(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, nActualArgs, nResults);
+        } finally {
+            CallStack.pop(ctx.callState, ctx.co);
+        }
+    }
+
     private static int inlineResume(VmContext ctx, int funcIdx, int nActualArgs, int nResults) {
         if (nActualArgs < 1) {
             return -1;
         }
         LuaValue target = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1);
-        if (!(target instanceof org.luava.runtime.concurrency.LuaCoroutine co)) {
+        if (!(target instanceof LuaCoroutine co)) {
             return -1;
         }
         int argCount = nActualArgs - 1;
-        LuaValue[] resumeArgs;
         if (argCount <= 0) {
-            resumeArgs = org.luava.runtime.concurrency.LuaCoroutine.EMPTY_VALUES;
-        } else {
-            resumeArgs = new LuaValue[argCount];
-            for (int i = 0; i < argCount; i++) {
-                resumeArgs[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 2 + i);
-            }
+            return co.resumeInline(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, nResults,
+                    0, null, LuaCoroutine.EMPTY_VALUES);
         }
-        LuaValue[] results = co.resume(resumeArgs);
-        int n = results.length;
-        if (nResults >= 0) {
-            for (int i = 0; i < nResults; i++) {
-                setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i,
-                        i < n ? results[i] : LuaNil.NIL);
-            }
-            return funcIdx + nResults;
+        if (argCount == 1) {
+            LuaValue single = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 2);
+            return co.resumeInline(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, nResults,
+                    1, single, null);
         }
-        for (int i = 0; i < n; i++) {
-            setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + i, results[i]);
+        LuaValue[] resumeArgs = new LuaValue[argCount];
+        for (int i = 0; i < argCount; i++) {
+            resumeArgs[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 2 + i);
         }
-        return funcIdx + n;
+        return co.resumeInline(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, nResults,
+                argCount, null, resumeArgs);
+    }
+
+    private static int inlineWrapResume(VmContext ctx, LuaCoroutine co, int funcIdx,
+            int nActualArgs, int nResults) {
+        if (nActualArgs <= 0) {
+            return co.resumeWrapInline(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, nResults,
+                    0, null, LuaCoroutine.EMPTY_VALUES);
+        }
+        if (nActualArgs == 1) {
+            LuaValue single = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1);
+            return co.resumeWrapInline(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, nResults,
+                    1, single, null);
+        }
+        LuaValue[] resumeArgs = new LuaValue[nActualArgs];
+        for (int i = 0; i < nActualArgs; i++) {
+            resumeArgs[i] = getLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx + 1 + i);
+        }
+        return co.resumeWrapInline(ctx.pStack, ctx.tStack, ctx.oStack, funcIdx, nResults,
+                nActualArgs, null, resumeArgs);
     }
 
     private static int inlineGmatch(VmContext ctx, int funcIdx, int nArgs, int nResults) {
@@ -2891,11 +3175,11 @@ public final class BytecodeVM {
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int tb = base + b;
         int kb = base + c;
-        // Fast lane: plain table + integer key. Skips key boxing and the
-        // virtual get(); the result still unboxes into registers.
+        // Fast lane: plain table + integer key. Skips key boxing, virtual get(),
+        // and value boxing/unboxing by reading directly into the stack triple.
         if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
                 && tStack[kb] == TYPE_INT) {
-            setLuaValue(pStack, tStack, oStack, base + a, lt.rawgetInt(pStack[kb]));
+            lt.rawgetIntToStack(pStack[kb], pStack, tStack, oStack, base + a);
             return;
         }
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + b);
@@ -2906,12 +3190,13 @@ public final class BytecodeVM {
     private static void executeGetI(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + b);
-        if (tbl instanceof LuaTable lt && lt.getMetatable() == null) {
-            setLuaValue(pStack, tStack, oStack, base + a, lt.rawgetInt(c));
-        } else {
-            setLuaValue(pStack, tStack, oStack, base + a, tbl.get(LuaInteger.valueOf(c)));
+        int tb = base + b;
+        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null) {
+            lt.rawgetIntToStack(c, pStack, tStack, oStack, base + a);
+            return;
         }
+        LuaValue tbl = getLuaValue(pStack, tStack, oStack, tb);
+        setLuaValue(pStack, tStack, oStack, base + a, tbl.get(LuaInteger.valueOf(c)));
     }
 
     private static void executeGetField(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
@@ -2919,12 +3204,10 @@ public final class BytecodeVM {
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int tb = base + b;
         // Fast lane: the field exists directly on a table instance (the
-        // dominant `self.x` shape). Skips the virtual get() loop and the
-        // metatable walk; a miss falls through with identical semantics.
+        // dominant `self.x` shape). Skips the virtual get() loop and value boxing;
+        // a miss falls through with identical semantics.
         if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt) {
-            LuaValue val = lt.rawget(k[c]);
-            if (val != LuaNil.NIL) {
-                setLuaValue(pStack, tStack, oStack, base + a, val);
+            if (lt.tryRawgetToStack(k[c], pStack, tStack, oStack, base + a)) {
                 return;
             }
         }
@@ -2948,13 +3231,15 @@ public final class BytecodeVM {
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
         int tb = base + a;
         int kb = base + b;
-        // Fast lane: plain table + integer key. Skips key boxing, the
-        // virtual set() and the metatable probe; the value still boxes
-        // (tables hold objects). Mirrors the OP_SETI lane.
+        // Fast lane: plain table + integer key. Skips key boxing, virtual set(),
+        // metatable probe, and value boxing on primitive/stack stores.
         if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null
                 && tStack[kb] == TYPE_INT) {
-            LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
-            lt.rawsetInt(pStack[kb], val);
+            if (flagK == 1) {
+                lt.rawsetInt(pStack[kb], k[c]);
+            } else {
+                lt.rawsetIntFromStack(pStack[kb], pStack, tStack, oStack, base + c);
+            }
             return;
         }
         LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + a);
@@ -2967,20 +3252,31 @@ public final class BytecodeVM {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + a);
-        LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
-        if (tbl instanceof LuaTable lt && lt.getMetatable() == null) {
-            lt.rawsetInt(b, val);
-        } else {
-            tbl.set(LuaInteger.valueOf(b), val);
+        int tb = base + a;
+        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt && lt.getMetatable() == null) {
+            if (flagK == 1) {
+                lt.rawsetInt(b, k[c]);
+            } else {
+                lt.rawsetIntFromStack(b, pStack, tStack, oStack, base + c);
+            }
+            return;
         }
+        LuaValue tbl = getLuaValue(pStack, tStack, oStack, tb);
+        LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
+        tbl.set(LuaInteger.valueOf(b), val);
     }
 
     private static void executeSetField(long[] pStack, byte[] tStack, LuaValue[] oStack, LuaValue[] k, int base, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
         int c = (inst >>> Instruction.POS_C) & Instruction.MASK_C;
         int flagK = (inst >>> Instruction.POS_k) & Instruction.MASK_k;
-        LuaValue tbl = getLuaValue(pStack, tStack, oStack, base + a);
+        int tb = base + a;
+        if (tStack[tb] == TYPE_OBJECT && oStack[tb] instanceof LuaTable lt) {
+            if (flagK == 1 ? lt.trySetField(k[b], k[c]) : lt.trySetFieldFromStack(k[b], pStack, tStack, oStack, base + c)) {
+                return;
+            }
+        }
+        LuaValue tbl = getLuaValue(pStack, tStack, oStack, tb);
         LuaValue val = flagK == 1 ? k[c] : getLuaValue(pStack, tStack, oStack, base + c);
         tbl.set(k[b], val);
     }
@@ -3018,7 +3314,7 @@ public final class BytecodeVM {
                 // guarded by the index table's readVersion(). OOP loops reuse
                 // one metatable for millions of fresh instances, so this turns
                 // 2-3 hash probes per method call into a handful of compares.
-                LuaValue own = tbl.rawget(ks);
+                LuaValue own = tbl.hasMaybeStringKey(ks) ? tbl.rawget(ks) : LuaNil.NIL;
                 if (!own.isNil()) {
                     setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a + 1, ctx.oStack[regB]);
                     setLuaValue(ctx.pStack, ctx.tStack, ctx.oStack, ctx.base + a, own);
@@ -3277,11 +3573,19 @@ public final class BytecodeVM {
 
     private static void executeConcat(long[] pStack, byte[] tStack, LuaValue[] oStack, int base, int a, int inst) {
         int b = (inst >>> Instruction.POS_B) & Instruction.MASK_B;
-        LuaValue res = getLuaValue(pStack, tStack, oStack, base + a);
-        for (int j = 1; j < b; j++) {
-            res = res.concat(getLuaValue(pStack, tStack, oStack, base + a + j));
+        int from = base + a;
+        if (b >= 2) {
+            LuaValue fast = org.luava.runtime.jit.JitRuntime.concatRange(pStack, tStack, oStack, from, from + b);
+            if (fast != null) {
+                setLuaValue(pStack, tStack, oStack, from, fast);
+                return;
+            }
         }
-        setLuaValue(pStack, tStack, oStack, base + a, res);
+        LuaValue res = getLuaValue(pStack, tStack, oStack, from);
+        for (int j = 1; j < b; j++) {
+            res = res.concat(getLuaValue(pStack, tStack, oStack, from + j));
+        }
+        setLuaValue(pStack, tStack, oStack, from, res);
     }
 
     private static LuaValue[] getArgsForCall(long[] pStack, byte[] tStack, LuaValue[] oStack, int startIdx, int count) {
@@ -3771,6 +4075,7 @@ public final class BytecodeVM {
         // no frame, so clear afterwards (try-finally: also on throw) to avoid
         // leaking the name into unrelated later calls. Staged on the
         // ctx-local call state (no ThreadLocal) — this runs per iteration.
+        org.luava.runtime.concurrency.LuaCoroutine.promoteIfStackless();
         org.luava.runtime.eval.CallStack.setNextCall(ctx.callState, "for iterator", "for iterator", false, false);
         LuaValue res;
         try {

@@ -1,7 +1,7 @@
 # ROADMAP — Luava expansion plan
 
-Status: 2026-11-19, `master` @ `e09027b` (0.2.5 + embedding ops + JIT kernel size).
-Conformance 31/31 PUC, 366 unit tests, JIT on/off green.
+Status: 2026-11-20, 0.2.6 ("Meridian").
+Conformance 31/31 PUC Lua 5.4.9 suites, 388 unit/security/conformance tests, JIT on/off/sync green.
 
 This document covers **what to build next and in what order**. Measurement
 logs and per-item evidence stay in `plan.md` (maintainer notes, not shipped).
@@ -53,12 +53,12 @@ element creates a `String` and a `LuaString`; `gmatch` also copies source bytes
 per call. Track A removes one object per string operation and enables slice
 returns without copies.
 
-| Item | Work | Gate | Risk |
+| Item | Work | Gate | Status |
 |---|---|---|---|
-| A1 | `LuaString` stores `byte[]` + cached hash; `String` view built lazily only at the host/`io` boundary. Keep `%p` canonicalization and `string.dump` round-trip. | 04 ≥ 5 % | high |
-| A2 | Pattern engine returns slices over the source buffer (no `String` per capture/match). | 09 ≥ 10 % | high |
-| A3 | Cache the source byte view on `LuaString` (`volatile byte[]`, benign race) so `gmatch`/`gsub`/`string.byte` stop copying per call. | 09 ≥ 3 % standalone | medium |
-| A4 | `table.concat` byte-output lane (only after A1; revisit exact sizing with byte buffers). | 04 ≥ 3 % | low |
+| A1 | `LuaString` stores `byte[]` + cached hash; lazy `String` view at host/`io` boundary. Keep `%p` canonicalization and `string.dump` round-trip. | 04 >= 5 % | DONE |
+| A2 | Pattern engine returns slices over the source buffer (zero `String` per capture/match). | 09 >= 10 % | DONE |
+| A3 | Zero-copy byte slice views on `LuaString` (`bytes`, `offset`, `length`) for patterns/`string.byte`. | 09 >= 3 % | DONE |
+| A4 | `table.concat` byte-output lane (`LuaTable.concatPlainBytes`). | 04 >= 3 % | DONE |
 
 A1 is an internal representation change: every `instanceof LuaString` fast path
 must move to `byte[]`, and UTF-8 host bridging must stay byte-exact. Do A1 and
@@ -90,7 +90,7 @@ inlining and loop opts. Effort is better spent on Track A.
 | C1 | Debugger API: `breakpoint(line)`, `step`, `inspect(frame)`, plus `--inspect` CLI. DAP later, only if an IDE integration is actually requested. | script stops at line, locals readable | medium |
 | C2 | GraalVM `native-image`: `META-INF/native-image/*-config.json` for reflection/MethodHandle/proxy paths, CI job, documented limits. | `native-image` build runs the CLI and PUC smoke | medium |
 | C3 | AOT start-up cache: persist generated JIT class bytes keyed by proto fingerprint and load on startup. | first-request latency −50 % | medium |
-| C4 | `LuaStatePool` with bounded states on top of `close()`; per-tenant accounting. | 8 tenants, no leak | low |
+| C4 | `LuaStatePool` with bounded states on top of `close()` + `CompiledChunk` (`AutoCloseable`), plus `maxMemoryBytes`/`maxCoroutines`/`maxCallDepth`/`cancel`. | 8 tenants, no leak | DONE |
 | C5 | Async bridge beyond `evalAsync`: `registerAsyncFunction` + cancellation token, `CompletableFuture` interop. | server example passes | medium |
 | C6 | State snapshot/restore for globals (JSON/CBOR, cycles handled), opt-in. | round-trip equality | medium |
 
@@ -106,8 +106,9 @@ inlining and loop opts. Effort is better spent on Track A.
 
 Release train:
 
-* **0.2.6** — current master: kernel-size win + `stats()/close()/evalAsync` +
-  CLI ops flags, docs and README refresh. Low risk, ship first.
+* **0.2.6 ("Meridian")** — shipped: byte-slice strings, pattern slices, unboxed
+  `LuaTable` array lanes, guarded JIT kernels, stackless coroutines,
+  `CompiledChunk`/`LuaStatePool`, security/crash fixes, and resource controls.
 * **0.3.0** — C1 + C2 + C3 + C4 (debugger, native-image, AOT cache, pooling).
 * **0.4.0** — A1 + A2 + A3 (byte-backed strings, pattern fast path).
 * **0.5.0** — B1 + B2 if a workload proves them; B3/B4/B5 only by demand.

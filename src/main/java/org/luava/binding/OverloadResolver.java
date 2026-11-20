@@ -71,10 +71,27 @@ public final class OverloadResolver {
      * low but valid score, because the varargs penalty can push a valid total
      * below zero (e.g. {@code foo(Object...)} with one nil argument).
      */
-    private static final int INCOMPATIBLE = Integer.MIN_VALUE;
+    public static final int INCOMPATIBLE = Integer.MIN_VALUE;
 
     /** Cache of {@code target -> actual -> inheritance distance}. */
     private static final Map<Class<?>, Map<Class<?>, Integer>> DISTANCE_CACHE = new ConcurrentHashMap<>();
+
+    /** Cached parameter type arrays per Executable without pinning dynamically unloaded classes. */
+    private static final ClassValue<ConcurrentHashMap<Executable, Class<?>[]>> PARAM_TYPES_CACHE = new ClassValue<>() {
+        @Override
+        protected ConcurrentHashMap<Executable, Class<?>[]> computeValue(Class<?> declaringClass) {
+            return new ConcurrentHashMap<>();
+        }
+    };
+
+    /** Returns the cached parameter type array for {@code e} (never mutate the returned array). */
+    public static Class<?>[] paramTypes(Executable e) {
+        if (e instanceof java.lang.reflect.Method m) {
+            return LuaDataConverter.methodMeta(m).paramTypes;
+        }
+        return PARAM_TYPES_CACHE.get(e.getDeclaringClass())
+                .computeIfAbsent(e, Executable::getParameterTypes);
+    }
 
     /**
      * Picks the best candidate for {@code args}, or {@code null} when none is
@@ -85,26 +102,37 @@ public final class OverloadResolver {
         if (candidates == null || candidates.isEmpty()) {
             return null;
         }
+        int n = candidates.size();
+        if (n == 1) {
+            Executable single = candidates.get(0);
+            return score(single, args) != INCOMPATIBLE ? single : null;
+        }
         int bestScore = INCOMPATIBLE;
-        List<Executable> scores = new ArrayList<>(candidates.size());
-        int[] totals = new int[candidates.size()];
-        int i = 0;
-        for (Executable e : candidates) {
+        Executable best = null;
+        int bestCount = 0;
+        for (int i = 0; i < n; i++) {
+            Executable e = candidates.get(i);
             int s = score(e, args);
-            totals[i++] = s;
-            scores.add(e);
             if (s > bestScore) {
                 bestScore = s;
+                best = e;
+                bestCount = 1;
+            } else if (s == bestScore && s != INCOMPATIBLE) {
+                bestCount++;
             }
         }
         if (bestScore == INCOMPATIBLE) {
             return null;
         }
+        if (bestCount == 1) {
+            return best;
+        }
 
-        List<Executable> tied = new ArrayList<>(2);
-        for (int k = 0; k < scores.size(); k++) {
-            if (totals[k] == bestScore) {
-                tied.add(scores.get(k));
+        List<Executable> tied = new ArrayList<>(bestCount);
+        for (int i = 0; i < n; i++) {
+            Executable e = candidates.get(i);
+            if (score(e, args) == bestScore) {
+                tied.add(e);
             }
         }
         dedupe(tied);
@@ -120,7 +148,7 @@ public final class OverloadResolver {
 
     /** Total candidate score, or {@link #INCOMPATIBLE} when any argument fails. */
     private static int score(Executable e, LuaValue[] args) {
-        Class<?>[] paramTypes = e.getParameterTypes();
+        Class<?>[] paramTypes = paramTypes(e);
         boolean varArgs = e.isVarArgs();
         if (!varArgs) {
             if (paramTypes.length != args.length) {
@@ -165,7 +193,7 @@ public final class OverloadResolver {
      * {@link #INCOMPATIBLE} for a value the target cannot take at all, and a
      * positive closeness score otherwise (higher is closer).
      */
-    static int scoreArg(Class<?> target, LuaValue val) {
+    public static int scoreArg(Class<?> target, LuaValue val) {
         if (val == null || val.isNil()) {
             return target.isPrimitive() ? S_NULL_PRIM : S_NULL_REF;
         }
@@ -438,7 +466,7 @@ public final class OverloadResolver {
     private static boolean sameSignature(Executable a, Executable b) {
         return a.getName().equals(b.getName())
                 && a.isVarArgs() == b.isVarArgs()
-                && Arrays.equals(a.getParameterTypes(), b.getParameterTypes());
+                && Arrays.equals(paramTypes(a), paramTypes(b));
     }
 
     /** Returns the single candidate that dominates every other tied one, else null. */
@@ -462,8 +490,8 @@ public final class OverloadResolver {
     }
 
     private static boolean moreSpecific(Executable a, Executable b) {
-        Class<?>[] ap = a.getParameterTypes();
-        Class<?>[] bp = b.getParameterTypes();
+        Class<?>[] ap = paramTypes(a);
+        Class<?>[] bp = paramTypes(b);
         if (ap.length != bp.length) {
             return false;
         }
@@ -524,6 +552,6 @@ public final class OverloadResolver {
     }
 
     private static String describe(Executable e) {
-        return "(" + Arrays.toString(e.getParameterTypes()) + ")";
+        return "(" + Arrays.toString(paramTypes(e)) + ")";
     }
 }

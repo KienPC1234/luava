@@ -141,6 +141,7 @@ public final class CallStack {
         public org.luava.runtime.LuaState nextVmState = null;
         public org.luava.runtime.LuaValue[] nextVarargs = null;
         public int closingCount = 0;
+        public int frameLimit = MAX_CALL_DEPTH;
         public final java.util.List<ProtectedFrame> protectedFrames = new java.util.ArrayList<>();
 
         public void snapshotErrorStack() {
@@ -217,6 +218,9 @@ public final class CallStack {
     }
 
     public static void setNextCall(String name, boolean isMetamethod) {
+        if (isMetamethod) {
+            org.luava.runtime.concurrency.LuaCoroutine.promoteIfStackless();
+        }
         setNextCall(name, isMetamethod ? "metamethod" : null, false, isMetamethod);
     }
 
@@ -387,13 +391,13 @@ public final class CallStack {
                             CallStackState state, LuaCoroutine cur) {
         int top = state.top;
         if (isHandlingError(state)) {
-            if (top >= MAX_CALL_DEPTH + EXTRA_STACK_SLOTS) {
+            if (top >= state.frameLimit + EXTRA_STACK_SLOTS) {
                 org.luava.runtime.LuaException le = new org.luava.runtime.LuaException("error in error handling");
                 le.setDecorated(true);
                 throw le;
             }
         } else {
-            if (top >= MAX_CALL_DEPTH) {
+            if (top >= state.frameLimit) {
                 throw new org.luava.runtime.LuaException("stack overflow");
             }
         }
@@ -486,13 +490,13 @@ public final class CallStack {
      */
     private static void checkPushDepth(CallStackState state, int top) {
         if (!state.protectedFrames.isEmpty() && isHandlingError(state)) {
-            if (top >= MAX_CALL_DEPTH + EXTRA_STACK_SLOTS) {
+            if (top >= state.frameLimit + EXTRA_STACK_SLOTS) {
                 org.luava.runtime.LuaException le = new org.luava.runtime.LuaException("error in error handling");
                 le.setDecorated(true);
                 throw le;
             }
         } else {
-            if (top >= MAX_CALL_DEPTH) {
+            if (top >= state.frameLimit) {
                 throw new org.luava.runtime.LuaException("stack overflow");
             }
         }
@@ -518,7 +522,7 @@ public final class CallStack {
                                    org.luava.runtime.LuaValue[] varargs,
                                    CallStackState state, LuaCoroutine cur) {
         int top = state.top;
-        if (top >= MAX_CALL_DEPTH || !state.protectedFrames.isEmpty()) {
+        if (top >= state.frameLimit || !state.protectedFrames.isEmpty()) {
             checkPushDepth(state, top);
         }
 

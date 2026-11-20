@@ -9,6 +9,8 @@ package org.luava.runtime;
 
 import org.luava.binding.LuaDataConverter;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodType;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -17,28 +19,85 @@ import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class LuaUserdata extends LuaValue {
-    private static final Map<Class<?>, List<Method>> METHOD_CACHE = new ConcurrentHashMap<>();
-    private static final Map<Class<?>, List<Field>> FIELD_CACHE = new ConcurrentHashMap<>();
-    private static final Map<Class<?>, List<Constructor<?>>> CTOR_CACHE = new ConcurrentHashMap<>();
+    private static final class ClassMembers {
+        final Map<String, Field> instanceFields;
+        final Map<String, Field> staticFields;
+        final Map<String, List<Method>> instanceMethods;
+        final Map<String, List<Method>> staticMethods;
+        final boolean hasInstanceFields;
+        final boolean hasStaticFields;
+
+        ClassMembers(Class<?> c) {
+            Map<String, Field> instF = new HashMap<>();
+            Map<String, Field> statF = new HashMap<>();
+            for (Field f : c.getFields()) {
+                if (Modifier.isPublic(f.getModifiers())) {
+                    if (!Modifier.isPublic(f.getDeclaringClass().getModifiers())) {
+                        f.trySetAccessible();
+                    }
+                    if (Modifier.isStatic(f.getModifiers())) {
+                        statF.putIfAbsent(f.getName(), f);
+                    } else {
+                        instF.putIfAbsent(f.getName(), f);
+                    }
+                }
+            }
+            Set<Method> seen = new LinkedHashSet<>();
+            for (Method m : c.getMethods()) {
+                if (Modifier.isPublic(m.getModifiers())) {
+                    seen.add(resolveAccessibleMethod(m));
+                }
+            }
+            Map<String, List<Method>> instM = new HashMap<>();
+            Map<String, List<Method>> statM = new HashMap<>();
+            for (Method m : seen) {
+                Map<String, List<Method>> target = Modifier.isStatic(m.getModifiers()) ? statM : instM;
+                target.computeIfAbsent(m.getName(), k -> new ArrayList<>(2)).add(m);
+            }
+            instM.replaceAll((k, v) -> List.copyOf(v));
+            statM.replaceAll((k, v) -> List.copyOf(v));
+            this.instanceFields = instF.isEmpty() ? Map.of() : Map.copyOf(instF);
+            this.staticFields = statF.isEmpty() ? Map.of() : Map.copyOf(statF);
+            this.instanceMethods = instM.isEmpty() ? Map.of() : Map.copyOf(instM);
+            this.staticMethods = statM.isEmpty() ? Map.of() : Map.copyOf(statM);
+            this.hasInstanceFields = !this.instanceFields.isEmpty();
+            this.hasStaticFields = !this.staticFields.isEmpty();
+        }
+    }
+
+    private static final ClassValue<ClassMembers> MEMBERS_CACHE = new ClassValue<>() {
+        @Override
+        protected ClassMembers computeValue(Class<?> c) {
+            return new ClassMembers(c);
+        }
+    };
+    private static final ClassValue<List<Constructor<?>>> CTOR_CACHE = new ClassValue<>() {
+        @Override
+        protected List<Constructor<?>> computeValue(Class<?> c) {
+            return List.of(c.getConstructors());
+        }
+    };
+
+    private record CachedInvoker(org.luava.binding.JavaAccessPolicy policy, LuaFunction fn) {}
 
     private final Object instance;
     private final boolean isLight;
     private LuaTable metatable;
     private final LuaValue[] userValues;
     /**
-     * Per-userdata memo for resolved method invokers. A Lua loop such as
-     * {@code for ... do obj.method(x) end} reads {@code obj.method} every
-     * iteration; without this, each read allocated a fresh {@link LuaFunction}
-     * and re-resolved the candidate overload set. Keys are only inserted for
-     * names that actually matched a Java method, so the map stays bounded by
-     * the class's public API. Null for light userdata.
+     * Per-userdata memo for resolved method invokers, keyed by method name and
+     * tagged with the {@code JavaAccessPolicy} active at resolution time so a
+     * dynamic policy change invalidates the cached invoker safely.
      */
-    private ConcurrentHashMap<String, LuaFunction> methodCache;
+    private ConcurrentHashMap<String, CachedInvoker> methodCache;
     /** Cached single-abstract-method lookup for the SAM call lane. */
     private volatile boolean samResolved;
     private volatile Method samMethod;
@@ -181,42 +240,65 @@ public final class LuaUserdata extends LuaValue {
                     return createConstructorFunction(clazz);
                 }
 
-                // Static field
-                Field f = findField(clazz, name, true);
-                if (f != null) {
-                    try {
-                        return LuaDataConverter.toLuaLive(f.get(null));
-                    } catch (IllegalAccessException e) {
-                        throw new LuaException("Access error for static field " + name + ": " + e.getMessage());
+                org.luava.binding.JavaAccessPolicy policy = org.luava.binding.JavaAccessPolicy.active();
+                if (!policy.isDenied(clazz.getName())) {
+                    ClassMembers members = MEMBERS_CACHE.get(clazz);
+                    if (members.hasStaticFields) {
+                        Field f = members.staticFields.get(name);
+                        if (f != null && !policy.isDenied(f.getDeclaringClass().getName())) {
+                            try {
+                                return LuaDataConverter.toLuaLive(f.get(null));
+                            } catch (IllegalAccessException e) {
+                                throw new LuaException("Access error for static field " + name + ": " + e.getMessage());
+                            }
+                        }
                     }
-                }
 
-                // Static methods
-                List<Method> methods = findMethods(clazz, name, true);
-                if (!methods.isEmpty()) {
-                    LuaFunction fn = cachedInvoker(name, null, methods);
-                    if (fn != null) return fn;
-                    return createMethodInvoker(null, name, methods);
+                    ConcurrentHashMap<String, CachedInvoker> cache = !isLight ? methodCache : null;
+                    if (cache != null) {
+                        CachedInvoker existing = cache.get(name);
+                        if (existing != null && existing.policy == policy) {
+                            return existing.fn;
+                        }
+                    }
+
+                    List<Method> methods = filterByPolicy(members.staticMethods.get(name), policy);
+                    if (!methods.isEmpty()) {
+                        LuaFunction fn = cachedInvoker(name, null, methods, policy);
+                        if (fn != null) return fn;
+                        return createMethodInvoker(null, name, methods);
+                    }
                 }
             } else {
                 Class<?> clazz = instance.getClass();
-
-                // Instance field
-                Field f = findField(clazz, name, false);
-                if (f != null) {
-                    try {
-                        return LuaDataConverter.toLuaLive(f.get(instance));
-                    } catch (IllegalAccessException e) {
-                        throw new LuaException("Access error for field " + name + ": " + e.getMessage());
+                org.luava.binding.JavaAccessPolicy policy = org.luava.binding.JavaAccessPolicy.active();
+                if (!policy.isDenied(clazz.getName())) {
+                    ClassMembers members = MEMBERS_CACHE.get(clazz);
+                    if (members.hasInstanceFields) {
+                        Field f = members.instanceFields.get(name);
+                        if (f != null && !policy.isDenied(f.getDeclaringClass().getName())) {
+                            try {
+                                return LuaDataConverter.toLuaLive(f.get(instance));
+                            } catch (IllegalAccessException e) {
+                                throw new LuaException("Access error for field " + name + ": " + e.getMessage());
+                            }
+                        }
                     }
-                }
 
-                // Instance methods
-                List<Method> methods = findMethods(clazz, name, false);
-                if (!methods.isEmpty()) {
-                    LuaFunction fn = cachedInvoker(name, instance, methods);
-                    if (fn != null) return fn;
-                    return createMethodInvoker(instance, name, methods);
+                    ConcurrentHashMap<String, CachedInvoker> cache = !isLight ? methodCache : null;
+                    if (cache != null) {
+                        CachedInvoker existing = cache.get(name);
+                        if (existing != null && existing.policy == policy) {
+                            return existing.fn;
+                        }
+                    }
+
+                    List<Method> methods = filterByPolicy(members.instanceMethods.get(name), policy);
+                    if (!methods.isEmpty()) {
+                        LuaFunction fn = cachedInvoker(name, instance, methods, policy);
+                        if (fn != null) return fn;
+                        return createMethodInvoker(instance, name, methods);
+                    }
                 }
 
                 // Built-in collection lengths (fallback if no method/field)
@@ -369,18 +451,22 @@ public final class LuaUserdata extends LuaValue {
             for (Class<?> iface : clazz.getInterfaces()) {
                 Method ifaceSam = LuaDataConverter.findSingleAbstractMethod(iface);
                 if (ifaceSam != null) {
+                    if (Modifier.isPublic(iface.getModifiers())) {
+                        sam = ifaceSam;
+                        break;
+                    }
                     for (Method m : clazz.getMethods()) {
                         if (m.getName().equals(ifaceSam.getName()) && !m.isBridge()) {
-                            sam = m;
+                            sam = resolveAccessibleMethod(m);
                             break;
                         }
                     }
-                    if (sam == null) sam = ifaceSam;
+                    if (sam == null) sam = resolveAccessibleMethod(ifaceSam);
                     break;
                 }
             }
             if (sam == null) {
-                sam = LuaDataConverter.findSingleAbstractMethod(clazz);
+                sam = resolveAccessibleMethod(LuaDataConverter.findSingleAbstractMethod(clazz));
             }
             samMethod = sam;
             samResolved = true;
@@ -388,9 +474,69 @@ public final class LuaUserdata extends LuaValue {
         }
     }
 
+    /**
+     * Returns an accessible {@link Method} for {@code m}. When {@code m}'s
+     * declaring class is non-public (e.g. {@code List.of()}'s internal
+     * implementation class), finds the overridden public method on a public
+     * superclass or interface so JPMS does not fail with
+     * {@code InaccessibleObjectException}.
+     */
+    public static Method resolveAccessibleMethod(Method m) {
+        if (m == null) {
+            return null;
+        }
+        Class<?> declaring = m.getDeclaringClass();
+        if (Modifier.isPublic(declaring.getModifiers())) {
+            return m;
+        }
+        Method pub = findPublicOverriddenMethod(declaring, m.getName(), m.getParameterTypes());
+        if (pub != null) {
+            return pub;
+        }
+        m.trySetAccessible();
+        return m;
+    }
+
+    private static Method findPublicOverriddenMethod(Class<?> clazz, String name, Class<?>[] paramTypes) {
+        for (Class<?> cur = clazz; cur != null; cur = cur.getSuperclass()) {
+            if (cur != clazz && Modifier.isPublic(cur.getModifiers())) {
+                try {
+                    return cur.getMethod(name, paramTypes);
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+            Method fromIface = findPublicInterfaceMethod(cur.getInterfaces(), name, paramTypes);
+            if (fromIface != null) {
+                return fromIface;
+            }
+        }
+        return null;
+    }
+
+    private static Method findPublicInterfaceMethod(Class<?>[] ifaces, String name, Class<?>[] paramTypes) {
+        for (Class<?> iface : ifaces) {
+            if (Modifier.isPublic(iface.getModifiers())) {
+                try {
+                    return iface.getMethod(name, paramTypes);
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+            Method nested = findPublicInterfaceMethod(iface.getInterfaces(), name, paramTypes);
+            if (nested != null) {
+                return nested;
+            }
+        }
+        return null;
+    }
+
     private static LuaFunction createConstructorFunction(Class<?> clazz) {
         return LuaFunction.of(args -> {
-            List<Constructor<?>> ctors = CTOR_CACHE.computeIfAbsent(clazz, c -> Arrays.asList(c.getConstructors()));
+            org.luava.binding.JavaAccessPolicy policy = org.luava.binding.JavaAccessPolicy.active();
+            if (policy.isDenied(clazz.getName())) {
+                throw new LuaException("access denied: " + clazz.getName()
+                        + " is blocked by the Java access policy (" + policy.label() + ")");
+            }
+            List<Constructor<?>> ctors = CTOR_CACHE.get(clazz);
             Constructor<?> bestMatch = (Constructor<?>) org.luava.binding.OverloadResolver.resolve(ctors, args);
 
             if (bestMatch == null) {
@@ -409,14 +555,15 @@ public final class LuaUserdata extends LuaValue {
 
     /**
      * Returns the per-userdata memoized invoker for {@code name}, creating it
-     * on first use. The bound target is always this userdata's own instance
-     * (or null for static members), so no key beyond the name is needed.
+     * on first use when the active policy matches. The bound target is always
+     * this userdata's own instance (or null for static members).
      */
-    private LuaFunction cachedInvoker(String name, Object target, List<Method> candidates) {
+    private LuaFunction cachedInvoker(String name, Object target, List<Method> candidates,
+            org.luava.binding.JavaAccessPolicy policy) {
         if (isLight) {
             return null;
         }
-        ConcurrentHashMap<String, LuaFunction> cache = methodCache;
+        ConcurrentHashMap<String, CachedInvoker> cache = methodCache;
         if (cache == null) {
             synchronized (this) {
                 cache = methodCache;
@@ -426,28 +573,204 @@ public final class LuaUserdata extends LuaValue {
                 }
             }
         }
-        LuaFunction existing = cache.get(name);
-        if (existing != null) {
-            return existing;
+        CachedInvoker existing = cache.get(name);
+        if (existing != null && existing.policy == policy) {
+            return existing.fn;
         }
         LuaFunction created = createMethodInvoker(target, name, candidates);
-        LuaFunction prev = cache.putIfAbsent(name, created);
-        return prev != null ? prev : created;
+        CachedInvoker entry = new CachedInvoker(policy, created);
+        if (existing != null) {
+            cache.put(name, entry);
+            return created;
+        }
+        CachedInvoker prev = cache.putIfAbsent(name, entry);
+        return (prev != null && prev.policy == policy) ? prev.fn : created;
     }
 
     private static LuaFunction createMethodInvoker(Object target, String methodName, List<Method> candidates) {
+        if (candidates.size() == 1) {
+            LuaDataConverter.MethodMeta meta = LuaDataConverter.methodMeta(candidates.get(0));
+            if (!meta.isVarArgs && meta.handle != null) {
+                MethodHandle bound = (!meta.isStatic && target != null) ? meta.handle.bindTo(target) : meta.handle;
+                Class<?>[] p = meta.paramTypes;
+                if (p.length == 0) {
+                    MethodHandle mh = bound.asType(MethodType.genericMethodType(0));
+                    return createArity0Invoker(target, methodName, meta.returnType, mh);
+                }
+                if (p.length == 1) {
+                    if (p[0] == long.class && meta.returnType == long.class) {
+                        MethodHandle exact = bound.asType(MethodType.methodType(long.class, long.class));
+                        return createLongToLongInvoker(target, methodName, exact);
+                    }
+                    MethodHandle mh = bound.asType(MethodType.genericMethodType(1));
+                    return createArity1Invoker(target, methodName, p[0], meta.returnType, mh);
+                }
+                if (p.length == 2) {
+                    MethodHandle mh = bound.asType(MethodType.genericMethodType(2));
+                    return createArity2Invoker(target, methodName, p[0], p[1], meta.returnType, mh);
+                }
+                if (p.length == 3) {
+                    MethodHandle mh = bound.asType(MethodType.genericMethodType(3));
+                    return createArity3Invoker(target, methodName, p[0], p[1], p[2], meta.returnType, mh);
+                }
+                if (p.length == 4) {
+                    MethodHandle mh = bound.asType(MethodType.genericMethodType(4));
+                    return createArity4Invoker(target, methodName, p, meta.returnType, mh);
+                }
+            }
+        }
+        return createMultiInvoker(target, methodName, candidates);
+    }
+
+    private static boolean isSelf(LuaValue arg, Object target) {
+        return target != null && arg instanceof LuaUserdata self && self.instance == target;
+    }
+
+    private static int resolveOffset(LuaValue[] args, int arity, Object target, String methodName) {
+        if (args.length == arity) {
+            return 0;
+        }
+        if (args.length == arity + 1 && isSelf(args[0], target)) {
+            return 1;
+        }
+        throw noMatchingMethod(methodName, args.length, target);
+    }
+
+    private static LuaException noMatchingMethod(String methodName, int argc, Object target) {
+        return new LuaException("No matching method for '" + methodName + "' with " + argc + " arguments on "
+                + (target != null ? target.getClass().getName() : "static class"));
+    }
+
+    private static LuaValue convertReturn(Class<?> returnType, Object result) {
+        if (returnType == void.class || returnType == Void.class) {
+            return LuaNil.NIL;
+        }
+        return LuaDataConverter.toLua(result);
+    }
+
+    private static LuaFunction createLongToLongInvoker(Object target, String methodName, MethodHandle exact) {
+        return LuaFunction.of(args -> {
+            int off = resolveOffset(args, 1, target, methodName);
+            LuaValue a0 = args[off];
+            try {
+                if (a0 instanceof LuaInteger li) {
+                    return LuaInteger.valueOf((long) exact.invokeExact(li.toLong()));
+                }
+                if (org.luava.binding.OverloadResolver.scoreArg(long.class, a0)
+                        == org.luava.binding.OverloadResolver.INCOMPATIBLE) {
+                    throw noMatchingMethod(methodName, args.length, target);
+                }
+                long v = LuaDataConverter.toJava(a0, long.class);
+                return LuaInteger.valueOf((long) exact.invokeExact(v));
+            } catch (LuaException le) {
+                throw le;
+            } catch (Throwable t) {
+                throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
+            }
+        });
+    }
+
+    private static LuaFunction createArity0Invoker(Object target, String methodName,
+            Class<?> returnType, MethodHandle mh) {
+        return LuaFunction.of(args -> {
+            resolveOffset(args, 0, target, methodName);
+            try {
+                return convertReturn(returnType, mh.invokeExact());
+            } catch (Throwable t) {
+                throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
+            }
+        });
+    }
+
+    private static LuaFunction createArity1Invoker(Object target, String methodName,
+            Class<?> p0, Class<?> returnType, MethodHandle mh) {
+        return LuaFunction.of(args -> {
+            int off = resolveOffset(args, 1, target, methodName);
+            LuaValue a0 = args[off];
+            if (org.luava.binding.OverloadResolver.scoreArg(p0, a0)
+                    == org.luava.binding.OverloadResolver.INCOMPATIBLE) {
+                throw noMatchingMethod(methodName, args.length, target);
+            }
+            try {
+                Object j0 = LuaDataConverter.toJava(a0, p0);
+                return convertReturn(returnType, mh.invokeExact(j0));
+            } catch (Throwable t) {
+                throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
+            }
+        });
+    }
+
+    private static LuaFunction createArity2Invoker(Object target, String methodName,
+            Class<?> p0, Class<?> p1, Class<?> returnType, MethodHandle mh) {
+        return LuaFunction.of(args -> {
+            int off = resolveOffset(args, 2, target, methodName);
+            LuaValue a0 = args[off];
+            LuaValue a1 = args[off + 1];
+            if (org.luava.binding.OverloadResolver.scoreArg(p0, a0) == org.luava.binding.OverloadResolver.INCOMPATIBLE
+                    || org.luava.binding.OverloadResolver.scoreArg(p1, a1) == org.luava.binding.OverloadResolver.INCOMPATIBLE) {
+                throw noMatchingMethod(methodName, args.length, target);
+            }
+            try {
+                Object j0 = LuaDataConverter.toJava(a0, p0);
+                Object j1 = LuaDataConverter.toJava(a1, p1);
+                return convertReturn(returnType, mh.invokeExact(j0, j1));
+            } catch (Throwable t) {
+                throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
+            }
+        });
+    }
+
+    private static LuaFunction createArity3Invoker(Object target, String methodName,
+            Class<?> p0, Class<?> p1, Class<?> p2, Class<?> returnType, MethodHandle mh) {
+        return LuaFunction.of(args -> {
+            int off = resolveOffset(args, 3, target, methodName);
+            LuaValue a0 = args[off];
+            LuaValue a1 = args[off + 1];
+            LuaValue a2 = args[off + 2];
+            if (org.luava.binding.OverloadResolver.scoreArg(p0, a0) == org.luava.binding.OverloadResolver.INCOMPATIBLE
+                    || org.luava.binding.OverloadResolver.scoreArg(p1, a1) == org.luava.binding.OverloadResolver.INCOMPATIBLE
+                    || org.luava.binding.OverloadResolver.scoreArg(p2, a2) == org.luava.binding.OverloadResolver.INCOMPATIBLE) {
+                throw noMatchingMethod(methodName, args.length, target);
+            }
+            try {
+                Object j0 = LuaDataConverter.toJava(a0, p0);
+                Object j1 = LuaDataConverter.toJava(a1, p1);
+                Object j2 = LuaDataConverter.toJava(a2, p2);
+                return convertReturn(returnType, mh.invokeExact(j0, j1, j2));
+            } catch (Throwable t) {
+                throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
+            }
+        });
+    }
+
+    private static LuaFunction createArity4Invoker(Object target, String methodName,
+            Class<?>[] p, Class<?> returnType, MethodHandle mh) {
+        return LuaFunction.of(args -> {
+            int off = resolveOffset(args, 4, target, methodName);
+            for (int i = 0; i < 4; i++) {
+                if (org.luava.binding.OverloadResolver.scoreArg(p[i], args[off + i])
+                        == org.luava.binding.OverloadResolver.INCOMPATIBLE) {
+                    throw noMatchingMethod(methodName, args.length, target);
+                }
+            }
+            try {
+                Object j0 = LuaDataConverter.toJava(args[off], p[0]);
+                Object j1 = LuaDataConverter.toJava(args[off + 1], p[1]);
+                Object j2 = LuaDataConverter.toJava(args[off + 2], p[2]);
+                Object j3 = LuaDataConverter.toJava(args[off + 3], p[3]);
+                return convertReturn(returnType, mh.invokeExact(j0, j1, j2, j3));
+            } catch (Throwable t) {
+                throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
+            }
+        });
+    }
+
+    private static LuaFunction createMultiInvoker(Object target, String methodName, List<Method> candidates) {
         return LuaFunction.of(args -> {
             Method bestMatch = (Method) org.luava.binding.OverloadResolver.resolve(candidates, args);
             LuaValue[] callArgs = args;
 
             if (bestMatch == null) {
-                // Lua's `obj:m(...)` is defined as `obj.m(obj, ...)`: OP_SELF
-                // pushes the receiver as the first argument, and the function
-                // value it fetched is the same bound invoker `obj.m` returns.
-                // Retry with that leading self dropped, so the colon form
-                // reaches the method exactly like the dot form. Resolving the
-                // full argument list first keeps a genuine `obj.m(obj, ...)`
-                // overload (a self-taking method) working.
                 LuaValue[] withoutSelf = dropLeadingSelf(args, target);
                 if (withoutSelf != null) {
                     bestMatch = (Method) org.luava.binding.OverloadResolver.resolve(candidates, withoutSelf);
@@ -456,17 +779,14 @@ public final class LuaUserdata extends LuaValue {
             }
 
             if (bestMatch == null) {
-                throw new LuaException("No matching method for '" + methodName + "' with " + args.length + " arguments on " +
-                    (target != null ? target.getClass().getName() : "static class"));
+                throw noMatchingMethod(methodName, args.length, target);
             }
 
             try {
-                Object[] javaArgs = convertArgs(bestMatch.getParameterTypes(), bestMatch.isVarArgs(), callArgs);
-                Object result = invokeResolved(bestMatch, target, javaArgs);
-                if (bestMatch.getReturnType() == void.class || bestMatch.getReturnType() == Void.class) {
-                    return LuaNil.NIL;
-                }
-                return LuaDataConverter.toLua(result);
+                LuaDataConverter.MethodMeta meta = LuaDataConverter.methodMeta(bestMatch);
+                Object[] javaArgs = convertArgs(meta.paramTypes, meta.isVarArgs, callArgs);
+                Object result = invokeResolved(meta, target, javaArgs);
+                return convertReturn(meta.returnType, result);
             } catch (Throwable t) {
                 throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }
@@ -505,12 +825,12 @@ public final class LuaUserdata extends LuaValue {
      * so catching them here to "retry" would re-invoke a method that threw and
      * double-apply its side effects.
      */
-    private static Object invokeResolved(Method method, Object target, Object[] javaArgs) throws Throwable {
-        java.lang.invoke.MethodHandle mh = LuaDataConverter.samHandle(method);
+    private static Object invokeResolved(LuaDataConverter.MethodMeta meta, Object target, Object[] javaArgs) throws Throwable {
+        MethodHandle mh = meta.handle;
         if (mh == null) {
-            return method.invoke(target, javaArgs);
+            return meta.accessibleMethod.invoke(target, javaArgs);
         }
-        return mh.invokeWithArguments(withReceiver(method, target, javaArgs));
+        return mh.invokeWithArguments(withReceiver(meta.isStatic, target, javaArgs));
     }
 
     /**
@@ -527,7 +847,10 @@ public final class LuaUserdata extends LuaValue {
      * cannot be used for this retry.
      */
     private static Object invokeSam(Method method, Object target, Object[] javaArgs) throws Throwable {
-        method.setAccessible(true);
+        method = resolveAccessibleMethod(method);
+        if (!Modifier.isPublic(method.getDeclaringClass().getModifiers())) {
+            method.trySetAccessible();
+        }
         try {
             return method.invoke(target, javaArgs);
         } catch (IllegalArgumentException iae) {
@@ -549,8 +872,8 @@ public final class LuaUserdata extends LuaValue {
      * An unreflected instance-method handle takes the receiver as its leading
      * argument, so prepend it. Static methods take the arguments unchanged.
      */
-    private static Object[] withReceiver(Method method, Object target, Object[] javaArgs) {
-        if (Modifier.isStatic(method.getModifiers())) {
+    private static Object[] withReceiver(boolean isStatic, Object target, Object[] javaArgs) {
+        if (isStatic) {
             return javaArgs;
         }
         Object[] effective = new Object[javaArgs.length + 1];
@@ -584,46 +907,36 @@ public final class LuaUserdata extends LuaValue {
     }
 
     private static Field findField(Class<?> clazz, String name, boolean isStatic) {
-        List<Field> fields = FIELD_CACHE.computeIfAbsent(clazz, c -> {
-            List<Field> list = new ArrayList<>();
-            for (Field f : c.getFields()) {
-                if (Modifier.isPublic(f.getModifiers())) {
-                    f.setAccessible(true);
-                    list.add(f);
-                }
-            }
-            return list;
-        });
-        for (Field f : fields) {
-            if (f.getName().equals(name)
-                    && Modifier.isStatic(f.getModifiers()) == isStatic
-                    && !org.luava.binding.JavaAccessPolicy.active().isDenied(f.getDeclaringClass().getName())) {
-                return f;
-            }
+        org.luava.binding.JavaAccessPolicy policy = org.luava.binding.JavaAccessPolicy.active();
+        if (policy.isDenied(clazz.getName())) {
+            return null;
+        }
+        ClassMembers members = MEMBERS_CACHE.get(clazz);
+        Field f = isStatic ? members.staticFields.get(name) : members.instanceFields.get(name);
+        if (f != null && !policy.isDenied(f.getDeclaringClass().getName())) {
+            return f;
         }
         return null;
     }
 
-    private static List<Method> findMethods(Class<?> clazz, String name, boolean isStatic) {
-        List<Method> methods = METHOD_CACHE.computeIfAbsent(clazz, c -> {
-            List<Method> list = new ArrayList<>();
-            for (Method m : c.getMethods()) {
-                if (Modifier.isPublic(m.getModifiers())) {
-                    m.setAccessible(true);
-                    list.add(m);
+    private static List<Method> filterByPolicy(List<Method> methods, org.luava.binding.JavaAccessPolicy policy) {
+        if (methods == null || methods.isEmpty()) {
+            return List.of();
+        }
+        int n = methods.size();
+        for (int i = 0; i < n; i++) {
+            if (policy.isDenied(methods.get(i).getDeclaringClass().getName())) {
+                List<Method> filtered = new ArrayList<>(n);
+                for (int j = 0; j < n; j++) {
+                    Method m = methods.get(j);
+                    if (!policy.isDenied(m.getDeclaringClass().getName())) {
+                        filtered.add(m);
+                    }
                 }
-            }
-            return list;
-        });
-        List<Method> result = new ArrayList<>();
-        for (Method m : methods) {
-            if (m.getName().equals(name)
-                    && Modifier.isStatic(m.getModifiers()) == isStatic
-                    && !org.luava.binding.JavaAccessPolicy.active().isDenied(m.getDeclaringClass().getName())) {
-                result.add(m);
+                return filtered;
             }
         }
-        return result;
+        return methods;
     }
 
     @Override

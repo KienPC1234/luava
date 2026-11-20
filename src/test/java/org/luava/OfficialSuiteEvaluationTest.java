@@ -45,6 +45,7 @@ public class OfficialSuiteEvaluationTest {
                         org.luava.runtime.eval.GCManager.reset();
                         String content = Files.readString(f.toPath(), java.nio.charset.StandardCharsets.ISO_8859_1);
                         state = new LuaState();
+                        state.eval("package.path = package.path .. ';tests/lua-5.4.9-tests/?.lua'");
                         // files.lua runs its full i/o, loadfile and os.date
                         // coverage on Luava, but its last block drives the CLI
                         // via arg[0]. The suite's own embedded mode (_port)

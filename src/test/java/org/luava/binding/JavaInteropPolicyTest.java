@@ -11,6 +11,12 @@ import org.junit.jupiter.api.Test;
 import org.luava.runtime.LuaException;
 import org.luava.runtime.LuaState;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -139,5 +145,72 @@ public class JavaInteropPolicyTest {
         LuaException ex = assertThrows(LuaException.class, () -> state.eval(code, "@policy"));
         assertTrue(ex.getMessage().contains("access denied"),
                 "expected an access-denied error, got: " + ex.getMessage());
+    }
+
+    @Test
+    void defaultPolicyBlocksEngineInternalsAndDangerousUtilSubpackages() {
+        LuaState s = new LuaState();
+        String[] blocked = {
+            "org.luava.binding.JavaAccessPolicy",
+            "org.luava.runtime.LuaState",
+            "java.util.logging.FileHandler",
+            "java.util.zip.ZipFile",
+            "java.util.jar.JarFile",
+            "java.util.Formatter",
+            "java.util.Timer",
+            "java.util.concurrent.Executors",
+            "javax.naming.InitialContext",
+            "java.lang.ProcessBuilder$Redirect",
+            "[Ljava.lang.Runtime;"
+        };
+        for (String cls : blocked) {
+            assertDenied(s, "return java.import('" + cls + "')");
+        }
+    }
+
+    @Test
+    void strictPolicyBlocksDangerousUtilSubpackagesWhileKeepingCollections() {
+        LuaState s = new LuaState().sandbox().allow("java");
+        assertDenied(s, "return java.import('java.util.logging.FileHandler')");
+        assertDenied(s, "return java.import('java.util.Formatter')");
+        assertDenied(s, "return java.import('java.util.concurrent.Executors')");
+        assertEquals(1L, s.eval("local L = java.new('java.util.ArrayList'); L.add('ok'); return L.size()").toLong());
+    }
+
+    @Test
+    void javaDenyOverridesEarlierAllowRules() {
+        LuaState strict = new LuaState()
+                .sandbox()
+                .allow("java")
+                .javaAllow("java.util.*")
+                .javaDeny("java.util.ArrayList");
+        assertDenied(strict, "return java.import('java.util.ArrayList')");
+        assertEquals(0L, strict.eval("return java.new('java.util.HashMap').size()").toLong());
+
+        LuaState def = new LuaState().javaDeny("java.util.ArrayList");
+        assertDenied(def, "return java.import('java.util.ArrayList')");
+    }
+
+    @Test
+    void constructorInvocationChecksPolicy() {
+        LuaState s = new LuaState().sandbox();
+        s.registerClass("FH", java.util.logging.FileHandler.class);
+        assertDenied(s, "return FH.new('pwned.log')");
+    }
+
+    @Test
+    void jpmsUnmodifiableAndFactoryCollectionsWorkCleanly() {
+        LuaState s = new LuaState();
+        s.setLive("list", List.of("a", "b"));
+        s.setLive("map", Map.of("k", "v"));
+        s.setLive("unmod", Collections.unmodifiableList(new ArrayList<>(List.of(10, 20, 30))));
+        s.setLive("fn", (Function<Long, Long>) x -> x + 1);
+
+        assertEquals(2L, s.eval("return list.size()").toLong());
+        assertEquals("b", s.eval("return list.get(1)").toLuaString());
+        assertEquals("v", s.eval("return map.get('k')").toLuaString());
+        assertEquals(3L, s.eval("return unmod.size()").toLong());
+        assertEquals(20L, s.eval("return unmod.get(1)").toLong());
+        assertEquals(42L, s.eval("return fn(41)").toLong());
     }
 }

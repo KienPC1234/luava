@@ -40,11 +40,62 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class LuaDataConverter {
     private LuaDataConverter() {}
 
-    /** Cached SAM lookup: interface -> the unique abstract method (or NONE). */
-    private static final Map<Class<?>, Method> SAM_METHOD_CACHE = new ConcurrentHashMap<>();
-    private static final Set<Class<?>> NO_SAM = ConcurrentHashMap.newKeySet();
-    /** Cached unreflected SAM handles, keyed by the abstract method. */
-    private static final Map<Method, MethodHandle> SAM_HANDLE_CACHE = new ConcurrentHashMap<>();
+    /** Cached SAM lookup per Class without strongly pinning dynamically unloaded classes. */
+    private static final ClassValue<Method> SAM_METHOD_CACHE = new ClassValue<>() {
+        @Override
+        protected Method computeValue(Class<?> iface) {
+            if (!iface.isInterface()) {
+                return null;
+            }
+            Method candidate = null;
+            for (Method m : iface.getMethods()) {
+                if (Modifier.isAbstract(m.getModifiers())) {
+                    if (isObjectMethod(m)) {
+                        continue;
+                    }
+                    if (candidate != null) {
+                        return null;
+                    }
+                    candidate = m;
+                }
+            }
+            return candidate;
+        }
+    };
+    /** Cached unreflected method metadata per declaring class without pinning unloaded classes. */
+    private static final ClassValue<Map<Method, MethodMeta>> METHOD_META_CACHE = new ClassValue<>() {
+        @Override
+        protected Map<Method, MethodMeta> computeValue(Class<?> declaringClass) {
+            return new ConcurrentHashMap<>();
+        }
+    };
+
+    /** Pre-resolved immutable reflection metadata and unreflected handle for a Java method. */
+    public static final class MethodMeta {
+        public final Method accessibleMethod;
+        public final Class<?>[] paramTypes;
+        public final Class<?> returnType;
+        public final boolean isVarArgs;
+        public final boolean isStatic;
+        public final MethodHandle handle;
+        public final MethodHandle unboundGeneric;
+
+        MethodMeta(Method accessibleMethod, MethodHandle handle) {
+            this.accessibleMethod = accessibleMethod;
+            this.paramTypes = accessibleMethod.getParameterTypes();
+            this.returnType = accessibleMethod.getReturnType();
+            this.isVarArgs = accessibleMethod.isVarArgs();
+            this.isStatic = Modifier.isStatic(accessibleMethod.getModifiers());
+            this.handle = handle;
+            int totalArity = this.paramTypes.length + (this.isStatic ? 0 : 1);
+            if (handle != null && !this.isVarArgs && totalArity <= 5) {
+                this.unboundGeneric = handle.asType(
+                        java.lang.invoke.MethodType.genericMethodType(totalArity));
+            } else {
+                this.unboundGeneric = null;
+            }
+        }
+    }
 
     /**
      * Converts a host Java {@code String} (Unicode text) into a Lua string.
@@ -560,30 +611,8 @@ public final class LuaDataConverter {
     }
 
     public static Method findSingleAbstractMethod(Class<?> iface) {
-        if (!iface.isInterface()) return null;
-        if (NO_SAM.contains(iface)) return null;
-        Method cached = SAM_METHOD_CACHE.get(iface);
-        if (cached != null) return cached;
-        Method candidate = null;
-        for (Method m : iface.getMethods()) {
-            if (Modifier.isAbstract(m.getModifiers())) {
-                if (isObjectMethod(m)) continue;
-                if (candidate != null) {
-                    // More than one abstract method: remember the negative
-                    // result so repeated scoreArg/conversion probes do not
-                    // rescan the interface on every call.
-                    NO_SAM.add(iface);
-                    return null;
-                }
-                candidate = m;
-            }
-        }
-        if (candidate == null) {
-            NO_SAM.add(iface);
-            return null;
-        }
-        SAM_METHOD_CACHE.put(iface, candidate);
-        return candidate;
+        if (iface == null || !iface.isInterface()) return null;
+        return SAM_METHOD_CACHE.get(iface);
     }
 
     private static boolean isObjectMethod(Method m) {
@@ -653,19 +682,22 @@ public final class LuaDataConverter {
     }
 
     /**
-     * Returns a cached, unreflected {@link MethodHandle} for a SAM method.
-     * Prefer this over {@code Method.invoke} on any hot Java-interop path so
-     * the reflection cost is paid once per method and C2 can optimize the
-     * call site. Returns {@code null} when the method cannot be unreflected.
+     * Returns cached {@link MethodMeta} (parameter types, static/varargs flags,
+     * accessible {@link Method}, and unreflected {@link MethodHandle}) for {@code method}.
      */
-    public static MethodHandle samHandle(Method method) {
-        MethodHandle h = SAM_HANDLE_CACHE.get(method);
-        if (h != null) {
-            return h;
+    public static MethodMeta methodMeta(Method method) {
+        Map<Method, MethodMeta> classCache = METHOD_META_CACHE.get(method.getDeclaringClass());
+        MethodMeta meta = classCache.get(method);
+        if (meta != null) {
+            return meta;
         }
+        Method target = LuaUserdata.resolveAccessibleMethod(method);
+        MethodHandle mh = null;
         try {
-            method.setAccessible(true);
-            MethodHandle mh = MethodHandles.lookup().unreflect(method);
+            if (!Modifier.isPublic(target.getDeclaringClass().getModifiers())) {
+                target.trySetAccessible();
+            }
+            mh = MethodHandles.lookup().unreflect(target);
             // Callers already pack varargs into the trailing array via
             // convertArgs, so the handle must be fixed-arity. A varargs
             // collector would re-spread that array as extra arguments and
@@ -674,10 +706,19 @@ public final class LuaDataConverter {
             if (mh.isVarargsCollector()) {
                 mh = mh.asFixedArity();
             }
-            MethodHandle prev = SAM_HANDLE_CACHE.putIfAbsent(method, mh);
-            return prev != null ? prev : mh;
-        } catch (IllegalAccessException e) {
-            return null;
+        } catch (IllegalAccessException | RuntimeException ignored) {
+            mh = null;
         }
+        MethodMeta created = new MethodMeta(target, mh);
+        MethodMeta prev = classCache.putIfAbsent(method, created);
+        return prev != null ? prev : created;
+    }
+
+    /**
+     * Returns a cached, unreflected {@link MethodHandle} for a SAM method.
+     * Returns {@code null} when the method cannot be unreflected.
+     */
+    public static MethodHandle samHandle(Method method) {
+        return methodMeta(method).handle;
     }
 }

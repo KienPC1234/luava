@@ -118,43 +118,45 @@ public final class TableLib {
                 throw LuaValue.argError(1, "concat", "table expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
             LuaTable t = (LuaTable) args[0];
-            String sep = (args.length > 1 && !args[1].isNil()) ? args[1].toLuaString() : "";
+            LuaValue sepArg = (args.length > 1 && !args[1].isNil()) ? args[1] : null;
             long i = (args.length > 2 && !args[2].isNil()) ? checkInteger(args, 2, "concat") : 1;
             long last = (args.length > 3 && !args[3].isNil()) ? checkInteger(args, 3, "concat") : luaLen(t);
+            long allocCap = org.luava.runtime.LuaState.allocationLimit();
 
             // Plain-table fast lane: no metatable means get() == rawget, so
-            // read the array part directly (no per-element key boxing, no
-            // hash probe) with a presized buffer. Falls through to the
-            // generic path for metatables or exotic ranges.
+            // read the unboxed array part directly into a single byte buffer.
             if (t.getMetatable() == null && i >= 1 && last >= i - 1 && last <= Integer.MAX_VALUE) {
-                long count = last - i + 1;
-                int cap = count > (1 << 20) / 8 ? (1 << 20) : (int) (count * 8);
-                StringBuilder sb = new StringBuilder(Math.max(16, cap));
-                for (long idx = i; idx <= last; idx++) {
-                    LuaValue val = t.rawgetInt(idx);
-                    if (!val.isString() && !val.isNumber()) {
-                        throw new LuaException("invalid value (" + val.typeName() + ") at index " + idx + " in table for 'concat'");
-                    }
-                    if (idx > i) sb.append(sep);
-                    sb.append(val.toLuaString());
-                }
-                return LuaString.valueOf(sb.toString());
+                LuaString sepLs = (sepArg == null) ? LuaString.EMPTY
+                        : (sepArg instanceof LuaString ls ? ls : LuaString.valueOf(sepArg.toLuaString()));
+                return t.concatPlainBytes(sepLs.rawBytesUnsafe(), sepLs.rawOffset(), sepLs.rawLength(), i, last, allocCap);
             }
+            String sep = sepArg != null ? sepArg.toLuaString() : "";
 
             StringBuilder sb = new StringBuilder();
             for (; i < last; i++) {
+                if ((i & 0xFF) == 0) org.luava.runtime.LuaState.checkGuard();
                 LuaValue val = t.get(LuaInteger.valueOf(i));
                 if (!val.isString() && !val.isNumber()) {
                     throw new LuaException("invalid value (" + val.typeName() + ") at index " + i + " in table for 'concat'");
                 }
-                sb.append(val.toLuaString()).append(sep);
+                String piece = val.toLuaString();
+                long needed = (long) sb.length() + piece.length() + sep.length();
+                if (needed > allocCap) {
+                    throw new LuaException("resulting string too large");
+                }
+                sb.append(piece).append(sep);
             }
             if (i == last) {
+                org.luava.runtime.LuaState.checkGuard();
                 LuaValue val = t.get(LuaInteger.valueOf(i));
                 if (!val.isString() && !val.isNumber()) {
                     throw new LuaException("invalid value (" + val.typeName() + ") at index " + i + " in table for 'concat'");
                 }
-                sb.append(val.toLuaString());
+                String piece = val.toLuaString();
+                if ((long) sb.length() + piece.length() > allocCap) {
+                    throw new LuaException("resulting string too large");
+                }
+                sb.append(piece);
             }
             return LuaString.valueOf(sb.toString());
         }));

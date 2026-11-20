@@ -120,19 +120,31 @@ public final class ChunkSerializer {
         int lastLineDefined = in.readInt();
 
         int paramCount = in.readInt();
+        if (paramCount < 0) {
+            throw new LuaException("corrupt binary chunk");
+        }
+        if (paramCount * 2L > bais.available()) {
+            throw new LuaException("truncated binary chunk");
+        }
         List<String> params = new ArrayList<>(paramCount);
         for (int i = 0; i < paramCount; i++) {
             params.add(in.readUTF());
         }
 
         int upCount = in.readInt();
+        if (upCount < 0) {
+            throw new LuaException("corrupt binary chunk");
+        }
+        if (upCount * 2L > bais.available()) {
+            throw new LuaException("truncated binary chunk");
+        }
         List<String> upvalueNames = new ArrayList<>(upCount);
         for (int i = 0; i < upCount; i++) {
             upvalueNames.add(in.readUTF());
         }
 
         int codeLen = in.readInt();
-        if (bais.available() < codeLen) {
+        if (codeLen < 0 || codeLen > bais.available()) {
             throw new LuaException("truncated binary chunk");
         }
         byte[] codeBytes = new byte[codeLen];
@@ -256,7 +268,7 @@ public final class ChunkSerializer {
         if (hasMagicFooter(bytes)) {
             ByteBuffer footBb = ByteBuffer.wrap(bytes, bytes.length - 12, 4).order(ByteOrder.LITTLE_ENDIAN);
             int payloadLen = footBb.getInt();
-            if (payloadLen > 0 && bytes.length >= 12 + payloadLen) {
+            if (payloadLen > 0 && payloadLen <= bytes.length - 12) {
                 int offset = bytes.length - 12 - payloadLen;
                 try {
                     return decodePayload(bytes, offset, payloadLen, chunkName, envVal, globals, rootEnv);

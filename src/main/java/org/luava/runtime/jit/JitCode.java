@@ -43,6 +43,10 @@ public final class JitCode {
      * kernel): restart-from-entry deopt is safe and other JIT code may
      * call it directly. */
     public final boolean pure;
+    /** True when the proto may safely run from compiled callers (either pure or restart-safe impure leaf). */
+    public final boolean callSafe;
+    /** True when exact-arity calls never write params and never mutate before any possible deopt. */
+    public final boolean leafNoWindow;
     /** True when every reachable single-value return yields an integer. */
     public final boolean returnsInt;
     /**
@@ -59,6 +63,8 @@ public final class JitCode {
      * prefix never pays for the per-call exception is disarmed eventually.
      */
     public int structuralDeopts;
+    /** Second-chance clock bit set on JIT/OSR hits without locking. */
+    public boolean recentlyUsed = true;
 
     public JitCode(LuaProto proto, MethodHandle handle, boolean pure) {
         this(proto, handle, null, null, null, pure, true, false);
@@ -71,6 +77,12 @@ public final class JitCode {
 
     public JitCode(LuaProto proto, MethodHandle handle, MethodHandle objHandle, MethodHandle osrHandle,
             boolean[] osrTargets, boolean pure, boolean returnsInt, boolean returnsVoid) {
+        this(proto, handle, objHandle, osrHandle, osrTargets, pure, pure, false, returnsInt, returnsVoid);
+    }
+
+    public JitCode(LuaProto proto, MethodHandle handle, MethodHandle objHandle, MethodHandle osrHandle,
+            boolean[] osrTargets, boolean pure, boolean callSafe, boolean leafNoWindow,
+            boolean returnsInt, boolean returnsVoid) {
         this.proto = proto;
         this.handle = handle;
         this.objHandle = objHandle;
@@ -79,6 +91,8 @@ public final class JitCode {
         this.maxStack = proto.maxStackSize;
         this.numParams = proto.numParams;
         this.pure = pure;
+        this.callSafe = callSafe;
+        this.leafNoWindow = leafNoWindow;
         this.returnsInt = returnsInt;
         this.returnsVoid = returnsVoid;
         this.deopts = 0;

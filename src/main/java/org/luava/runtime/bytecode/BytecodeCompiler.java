@@ -1699,7 +1699,8 @@ public final class BytecodeCompiler {
 
         void compileTableConstructor(Expressions.TableConstructorExpr tce, int targetReg) {
             int nFields = tce.fields().size();
-            emit(Instruction.encodeABC(OpCode.OP_NEWTABLE, targetReg, constructorArrayHint(tce), 0, 0), tce.line());
+            emit(Instruction.encodeABC(OpCode.OP_NEWTABLE, targetReg,
+                    constructorArrayHint(tce), constructorHashHint(tce), 0), tce.line());
             emit(Instruction.encodeAx(OpCode.OP_EXTRAARG, nFields), tce.line());
 
             int arrayIdx = 0;
@@ -1800,6 +1801,18 @@ public final class BytecodeCompiler {
                 }
             }
             return Math.min(listItems, Instruction.MASK_B);
+        }
+
+        int constructorHashHint(Expressions.TableConstructorExpr tce) {
+            List<Expressions.TableField> fields = tce.fields();
+            int n = fields.size();
+            int hashItems = 0;
+            for (int i = 0; i < n; i++) {
+                if (fields.get(i).key() != null) {
+                    hashItems++;
+                }
+            }
+            return Math.min(hashItems, Instruction.MASK_C);
         }
 
         void flushListFields(int targetReg, List<Expressions.TableField> list, int arrayIdx, int line) {

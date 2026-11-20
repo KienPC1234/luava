@@ -87,13 +87,16 @@ public final class CoroutineLib {
         return Varargs.of(co.close());
     }
 
-    static LuaValue wrapImpl(LuaValue[] args) {
-        if (args.length == 0 || !args[0].isFunction()) {
-            throw LuaValue.argError(1, "coroutine.wrap", "function expected, got "
-                    + (args.length == 0 ? "no value" : args[0].typeName()));
+    /** Wrapper callable produced by {@code coroutine.wrap} so the VM can inline resumes. */
+    public static final class WrapFunction extends LuaFunction {
+        public final LuaCoroutine co;
+
+        WrapFunction(LuaCoroutine co) {
+            this.co = co;
         }
-        LuaCoroutine co = new LuaCoroutine((LuaFunction) args[0]);
-        return LuaFunction.of(wrapArgs -> {
+
+        @Override
+        public LuaValue invoke(LuaValue... wrapArgs) {
             LuaValue[] results = co.resume(wrapArgs);
             if (!results[0].toBoolean()) {
                 if (co.getStatus() == LuaCoroutine.Status.SUSPENDED) {
@@ -109,7 +112,15 @@ public final class CoroutineLib {
             LuaValue[] out = new LuaValue[outLen];
             System.arraycopy(results, 1, out, 0, outLen);
             return Varargs.of(out);
-        });
+        }
+    }
+
+    static LuaValue wrapImpl(LuaValue[] args) {
+        if (args.length == 0 || !args[0].isFunction()) {
+            throw LuaValue.argError(1, "coroutine.wrap", "function expected, got "
+                    + (args.length == 0 ? "no value" : args[0].typeName()));
+        }
+        return new WrapFunction(new LuaCoroutine((LuaFunction) args[0]));
     }
 
     public static void open(LuaTable globals) {

@@ -7,17 +7,20 @@
  */
 package org.luava.runtime.concurrency;
 
+import org.luava.binding.JavaAccessPolicy;
 import org.luava.runtime.LuaBoolean;
 import org.luava.runtime.LuaException;
 import org.luava.runtime.LuaFunction;
 import org.luava.runtime.LuaInteger;
 import org.luava.runtime.LuaNil;
+import org.luava.runtime.LuaState;
 import org.luava.runtime.LuaString;
 import org.luava.runtime.LuaType;
 import org.luava.runtime.LuaValue;
 import org.luava.runtime.Varargs;
 import org.luava.runtime.eval.CallStack;
 
+import java.util.Objects;
 import java.util.concurrent.locks.LockSupport;
 
 public final class LuaCoroutine extends LuaValue {
@@ -61,17 +64,17 @@ public final class LuaCoroutine extends LuaValue {
      */
     private volatile long yieldSeq = 0;
     private volatile long resumeSeq = 0;
+    private volatile boolean resumerParked = false;
+    private volatile boolean workerParked = false;
 
     /**
-     * Bounded spin budget before falling back to {@link LockSupport#park()}.
-     * A resume/yield handoff normally completes in a few hundred nanoseconds,
-     * but an unconditional park costs a full Loom context switch (~20us on
-     * this hardware). Spinning briefly on the (volatile) sequence lets the
-     * counterpart be observed without descheduling; after the budget we park
-     * as before, so a contended environment only wastes the bounded budget
-     * and still makes progress.
+     * Adaptive spin budget (pure pause iterations before falling back to bounded
+     * nanoTime spin + LockSupport.park). Avoids nanoTime overhead during fast
+     * cooperative yields while bounding spin on genuinely blocked waits.
      */
-    private static final long HANDOFF_SPIN_NANOS = 50_000L;
+    private int resumerSpinBudget = 1024;
+    private int workerSpinBudget = 1024;
+    private static final long HANDOFF_SPIN_NANOS = 10_000L;
 
     /**
      * Per-coroutine "a hook is active" flag for the VM hot path. Hooks in
@@ -112,10 +115,29 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     private final LuaFunction entryFunction;
+    private final LuaState ownerState;
+    private final java.util.concurrent.atomic.AtomicBoolean deadAccounted =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
     private volatile Thread resumerThread;
     private volatile Thread virtualThread;
     private volatile LuaValue[] handoffArgs;
+    private volatile LuaValue handoffSingleArg;
+    private volatile int handoffArgCount;
     private volatile LuaValue[] handoffResult;
+    private volatile LuaValue handoffSingleResult;
+    private volatile int handoffResultCount;
+    // Caller ThreadLocal scope transferred across resume/close under the coroutine lock.
+    private LuaState handoffActiveState;
+    private Long handoffMaxAlloc;
+    private JavaAccessPolicy handoffPolicy;
+    private LuaState handoffBasicState;
+    private Thread handoffRootThread;
+    // Worker-confined mirror of installed ThreadLocals on virtualThread.
+    private LuaState installedActiveState;
+    private Long installedMaxAlloc;
+    private JavaAccessPolicy installedPolicy;
+    private LuaState installedBasicState;
+    private Thread installedRootThread;
     private volatile Status status = Status.SUSPENDED;
     private volatile Throwable error;
     private static final int MAX_NESTED_COROUTINES = 200;
@@ -410,6 +432,22 @@ public final class LuaCoroutine extends LuaValue {
     public LuaCoroutine(LuaFunction function, boolean isMainThread) {
         this.entryFunction = function;
         this.isMainThread = isMainThread;
+        LuaState active = isMainThread ? null : LuaState.activeState();
+        this.ownerState = active;
+        if (active != null) {
+            active.onCoroutineCreated();
+            int cap = active.getMaxCallDepth();
+            if (cap > 0) {
+                this.callStackState.frameLimit = Math.min(cap, org.luava.runtime.eval.CallStack.MAX_CALL_DEPTH);
+            }
+        }
+    }
+
+    private void markDead() {
+        status = Status.DEAD;
+        if (ownerState != null && deadAccounted.compareAndSet(false, true)) {
+            ownerState.onCoroutineDead();
+        }
     }
 
     public static LuaCoroutine createMainThread() {
@@ -454,18 +492,266 @@ public final class LuaCoroutine extends LuaValue {
         }
     }
 
+    /** Internal unwind signal when a stackless coroutine needs a VirtualThread. */
+    public static final class PromoteSignal extends Error {
+        public static final PromoteSignal INSTANCE = new PromoteSignal();
+
+        private PromoteSignal() {
+            super(null, null, false, false);
+        }
+    }
+
+    public org.luava.runtime.bytecode.VmContext activeStacklessCtx;
+    private org.luava.runtime.bytecode.VmContext stacklessCtx;
+    private LuaState stacklessState;
+    public int yieldFuncIdx;
+    public int yieldNResults;
+
+    public static void promoteIfStackless() {
+        LuaCoroutine cur = CURRENT_COROUTINE.get();
+        if (cur != null && cur.activeStacklessCtx != null) {
+            throw PromoteSignal.INSTANCE;
+        }
+    }
+
+    public boolean isStacklessSuspended() {
+        return virtualThread == null && stacklessCtx != null;
+    }
+
+    public boolean isClosing() {
+        return isClosing;
+    }
+
     private volatile boolean isClosing = false;
     private volatile org.luava.runtime.LuaExit exitSignal = null;
 
-    public LuaValue[] resume(LuaValue... args) {
+    private void captureCallerContext() {
+        handoffActiveState = LuaState.activeState();
+        handoffMaxAlloc = LuaState.activeMaxAlloc();
+        handoffPolicy = JavaAccessPolicy.activeOrNull();
+        handoffBasicState = LuaValue.activeBasicState();
+        handoffRootThread = LuaState.activeRootThread();
+    }
+
+    private void syncWorkerContext() {
+        if (handoffActiveState != installedActiveState) {
+            LuaState.swapActiveState(handoffActiveState);
+            installedActiveState = handoffActiveState;
+        }
+        if (!Objects.equals(handoffMaxAlloc, installedMaxAlloc)) {
+            LuaState.swapActiveMaxAlloc(handoffMaxAlloc);
+            installedMaxAlloc = handoffMaxAlloc;
+        }
+        if (handoffPolicy != installedPolicy) {
+            JavaAccessPolicy.setActive(handoffPolicy);
+            installedPolicy = handoffPolicy;
+        }
+        if (handoffBasicState != installedBasicState) {
+            if (handoffBasicState == null) {
+                LuaValue.popBasicState(null);
+            } else {
+                LuaValue.pushBasicState(handoffBasicState);
+            }
+            installedBasicState = handoffBasicState;
+        }
+        if (handoffRootThread != installedRootThread) {
+            LuaState.swapActiveRootThread(handoffRootThread);
+            installedRootThread = handoffRootThread;
+        }
+    }
+
+    private void clearWorkerContext() {
+        if (installedActiveState != null) {
+            LuaState.swapActiveState(null);
+            installedActiveState = null;
+        }
+        if (installedMaxAlloc != null) {
+            LuaState.swapActiveMaxAlloc(null);
+            installedMaxAlloc = null;
+        }
+        if (installedPolicy != null) {
+            JavaAccessPolicy.restoreActive(null);
+            installedPolicy = null;
+        }
+        if (installedBasicState != null) {
+            LuaValue.popBasicState(null);
+            installedBasicState = null;
+        }
+        if (installedRootThread != null) {
+            LuaState.swapActiveRootThread(null);
+            installedRootThread = null;
+        }
+    }
+
+    private LuaValue[] materializeHandoffArgs() {
+        int c = handoffArgCount;
+        if (c == 0) {
+            return EMPTY_VALUES;
+        }
+        if (c == 1) {
+            return new LuaValue[]{handoffSingleArg};
+        }
+        return handoffArgs != null ? handoffArgs : EMPTY_VALUES;
+    }
+
+    private Thread startCoroutineThread(java.util.function.Supplier<LuaValue> body) {
+        return Thread.ofVirtual().name("lua-coroutine-" + System.identityHashCode(this)).start(() -> {
+            CURRENT_COROUTINE.set(this);
+            try {
+                syncWorkerContext();
+                LuaValue result = body.get();
+                completeNormally(result);
+            } catch (CoroutineCloseSignal ccs) {
+                handoffResult = null;
+                handoffSingleResult = null;
+                handoffResultCount = 0;
+                markDead();
+                callStackState.clearSavedErrorStack();
+            } catch (org.luava.runtime.LuaExit ex) {
+                markDead();
+                callStackState.clearSavedErrorStack();
+                exitSignal = ex;
+                yieldSeq++;
+                if (resumerParked) {
+                    LockSupport.unpark(resumerThread);
+                }
+                throw ex;
+            } catch (Throwable t) {
+                recordFailure(t);
+            } finally {
+                disarmHook();
+                clearWorkerContext();
+                CURRENT_COROUTINE.remove();
+                yieldSeq++;
+                if (resumerParked) {
+                    LockSupport.unpark(resumerThread);
+                }
+            }
+        });
+    }
+
+    public void completeNormally(LuaValue result) {
+        if (result instanceof Varargs va) {
+            LuaValue[] vals = va.getValuesUnsafe();
+            handoffResult = vals;
+            handoffResultCount = vals.length;
+            handoffSingleResult = vals.length == 1 ? vals[0] : null;
+        } else {
+            handoffSingleResult = result;
+            handoffResult = null;
+            handoffResultCount = 1;
+        }
+        markDead();
+        callStackState.clearSavedErrorStack();
+    }
+
+    public void completeNormallyArray(LuaValue[] vals) {
+        if (vals == null || vals.length == 0) {
+            handoffResult = null;
+            handoffSingleResult = null;
+            handoffResultCount = 0;
+        } else if (vals.length == 1) {
+            handoffResult = null;
+            handoffSingleResult = vals[0];
+            handoffResultCount = 1;
+        } else {
+            handoffResult = vals;
+            handoffSingleResult = null;
+            handoffResultCount = vals.length;
+        }
+        markDead();
+        callStackState.clearSavedErrorStack();
+    }
+
+    public void suspendStackless(org.luava.runtime.bytecode.VmContext ctx, LuaState state,
+            int funcIdx, int nResults, int yieldCount, LuaValue singleYield, LuaValue[] multiYield) {
+        this.stacklessCtx = ctx;
+        this.stacklessState = state;
+        this.activeStacklessCtx = null;
+        this.yieldFuncIdx = funcIdx;
+        this.yieldNResults = nResults;
+        this.handoffResultCount = yieldCount;
+        this.handoffSingleResult = singleYield;
+        this.handoffResult = multiYield;
+        this.status = Status.SUSPENDED;
+    }
+
+    public void clearStacklessOnExit() {
+        this.activeStacklessCtx = null;
+        this.stacklessCtx = null;
+        this.stacklessState = null;
+        disarmHook();
+    }
+
+    public void setExitSignal(org.luava.runtime.LuaExit ex) {
+        markDead();
+        callStackState.clearSavedErrorStack();
+        clearStacklessOnExit();
+        exitSignal = ex;
+    }
+
+    public void recordFailure(Throwable t) {
+        error = t;
+        if (callStackState.deathTop > 0 && callStackState.deathStack != null) {
+            org.luava.runtime.eval.CallStack.Frame[] ds = callStackState.deathStack;
+            int dn = callStackState.deathTop;
+            for (int i = 0, j = dn - 1; i < j; i++, j--) {
+                org.luava.runtime.eval.CallStack.Frame tmp = ds[i];
+                ds[i] = ds[j];
+                ds[j] = tmp;
+            }
+            callStackState.errorStack = ds;
+            callStackState.errorTop = dn;
+            callStackState.deathStack = null;
+            callStackState.deathTop = 0;
+        } else {
+            callStackState.snapshotErrorStack();
+        }
+        callStackState.preserveForDeath = false;
+        LuaValue errVal;
+        if (t instanceof LuaException le && le.getErrorObject() != null) {
+            errVal = le.getErrorObject();
+        } else {
+            String msg = t.getMessage() != null ? t.getMessage() : t.toString();
+            errVal = LuaString.valueOf(msg);
+        }
+        handoffResult = new LuaValue[]{errVal};
+        handoffSingleResult = errVal;
+        handoffResultCount = 1;
+        markDead();
+        clearStacklessOnExit();
+    }
+
+    public void graduateToVirtualThread(LuaState state, org.luava.runtime.bytecode.VmContext ctx) {
+        long seenYield;
+        synchronized (this) {
+            this.resumerThread = Thread.currentThread();
+            captureCallerContext();
+            this.stacklessCtx = null;
+            this.stacklessState = null;
+            this.activeStacklessCtx = null;
+            seenYield = yieldSeq;
+            resumeSeq++;
+            this.virtualThread = startCoroutineThread(() -> {
+                LuaValue[] res = org.luava.runtime.bytecode.BytecodeVM.continueStacklessInVirtualThread(state, ctx);
+                return (res.length == 0) ? Varargs.EMPTY : ((res.length == 1) ? res[0] : Varargs.of(res));
+            });
+        }
+        awaitYield(seenYield);
+        if (exitSignal != null) {
+            throw exitSignal;
+        }
+    }
+
+    private LuaValue[] resumeCore(int argCount, LuaValue singleArg, LuaValue[] multiArgs) {
         LuaCoroutine callerCoro = CURRENT_COROUTINE.get();
         Thread callerThread = Thread.currentThread();
-        LuaValue[] resumeArgs = (args != null && args.length > 0 ? args : EMPTY_VALUES);
-        if (resumeArgs.length == 1 && resumeArgs[0] instanceof Varargs va) {
-            resumeArgs = va.getValuesUnsafe();
-        }
+        boolean runStackless = false;
+        LuaState slState = null;
+        org.luava.runtime.bytecode.VmContext slCtx = null;
+        org.luava.runtime.bytecode.LuaClosure entryClosure = null;
 
-        long seenYield;
+        long seenYield = 0;
         synchronized (this) {
             if (status == Status.DEAD) {
                 return RESUME_DEAD_ERROR;
@@ -484,84 +770,65 @@ public final class LuaCoroutine extends LuaValue {
                 callerCoro.status = Status.NORMAL;
             }
 
-            resumerThread = callerThread;
-            handoffArgs = resumeArgs;
-            status = Status.RUNNING;
+            error = null;
             callStackState.clearSavedErrorStack();
             callStackState.preserveForDeath = false;
             callStackState.deathStack = null;
             callStackState.deathTop = 0;
-            error = null;
-            // Snapshot the yield counter before publishing this resume, so
-            // the wait below observes only a yield/death from *this* cycle.
-            seenYield = yieldSeq;
-            resumeSeq++;
 
-            if (virtualThread == null) {
-                virtualThread = Thread.ofVirtual().name("lua-coroutine-" + System.identityHashCode(this)).start(() -> {
-                    CURRENT_COROUTINE.set(this);
-                    try {
-                        LuaValue result = entryFunction != null ? entryFunction.invoke(handoffArgs) : LuaNil.NIL;
-                        if (result instanceof Varargs va) {
-                            handoffResult = va.getValuesUnsafe();
-                        } else {
-                            handoffResult = new LuaValue[]{result};
-                        }
-                        status = Status.DEAD;
-                        callStackState.clearSavedErrorStack();
-                    } catch (CoroutineCloseSignal ccs) {
-                        status = Status.DEAD;
-                        callStackState.clearSavedErrorStack();
-                    } catch (org.luava.runtime.LuaExit ex) {
-                        // os.exit must unwind the host, not be turned into a
-                        // normal resume failure.
-                        status = Status.DEAD;
-                        callStackState.clearSavedErrorStack();
-                        exitSignal = ex;
-                        yieldSeq++;
-                        LockSupport.unpark(resumerThread);
-                        throw ex;
-                    } catch (Throwable t) {
-                        error = t;
-                        // Transfer death frames saved by reference during fatal
-                        // unwind (no copy). Pops save innermost-first, but stack
-                        // layout is outermost-first, so reverse (pointer swaps).
-                        // Falls back to snapshot if none.
-                        if (callStackState.deathTop > 0 && callStackState.deathStack != null) {
-                            org.luava.runtime.eval.CallStack.Frame[] ds = callStackState.deathStack;
-                            int dn = callStackState.deathTop;
-                            for (int i = 0, j = dn - 1; i < j; i++, j--) {
-                                org.luava.runtime.eval.CallStack.Frame tmp = ds[i];
-                                ds[i] = ds[j];
-                                ds[j] = tmp;
-                            }
-                            callStackState.errorStack = ds;
-                            callStackState.errorTop = dn;
-                            callStackState.deathStack = null;
-                            callStackState.deathTop = 0;
-                        } else {
-                            callStackState.snapshotErrorStack();
-                        }
-                        callStackState.preserveForDeath = false;
-                        LuaValue errVal;
-                        if (t instanceof LuaException le && le.getErrorObject() != null) {
-                            errVal = le.getErrorObject();
-                        } else {
-                            String msg = t.getMessage() != null ? t.getMessage() : t.toString();
-                            errVal = LuaString.valueOf(msg);
-                        }
-                        handoffResult = new LuaValue[]{errVal};
-                        status = Status.DEAD;
-                    } finally {
-                        disarmHook();
-                        CURRENT_COROUTINE.remove();
-                        yieldSeq++;
-                        LockSupport.unpark(resumerThread);
+            if (virtualThread == null && !hooksActive) {
+                if (stacklessCtx != null) {
+                    runStackless = true;
+                    slCtx = stacklessCtx;
+                    slState = stacklessState;
+                    status = Status.RUNNING;
+                } else if (entryFunction instanceof org.luava.runtime.bytecode.LuaClosure lc) {
+                    LuaState st = lc.getState();
+                    if (st == null) {
+                        st = LuaState.activeState();
                     }
-                });
-            } else {
-                LockSupport.unpark(virtualThread);
+                    if (st != null) {
+                        runStackless = true;
+                        slState = st;
+                        entryClosure = lc;
+                        status = Status.RUNNING;
+                    }
+                }
             }
+
+            if (!runStackless) {
+                resumerThread = callerThread;
+                handoffArgCount = argCount;
+                handoffSingleArg = singleArg;
+                handoffArgs = multiArgs;
+                captureCallerContext();
+                status = Status.RUNNING;
+                seenYield = yieldSeq;
+                resumeSeq++;
+
+                if (virtualThread == null) {
+                    virtualThread = startCoroutineThread(() -> entryFunction != null
+                            ? entryFunction.invoke(materializeHandoffArgs())
+                            : LuaNil.NIL);
+                } else if (workerParked) {
+                    LockSupport.unpark(virtualThread);
+                }
+            }
+        }
+
+        if (runStackless) {
+            try {
+                org.luava.runtime.bytecode.BytecodeVM.resumeStackless(
+                        slState, this, slCtx, entryClosure, argCount, singleArg, multiArgs);
+            } finally {
+                if (callerCoro != null) {
+                    callerCoro.status = Status.RUNNING;
+                }
+            }
+            if (exitSignal != null) {
+                throw exitSignal;
+            }
+            return null;
         }
 
         awaitYield(seenYield);
@@ -574,80 +841,308 @@ public final class LuaCoroutine extends LuaValue {
             throw exitSignal;
         }
 
+        return null;
+    }
+
+    public LuaValue[] resume(LuaValue... args) {
+        LuaValue[] resumeArgs = (args != null && args.length > 0 ? args : EMPTY_VALUES);
+        if (resumeArgs.length == 1 && resumeArgs[0] instanceof Varargs va) {
+            resumeArgs = va.getValuesUnsafe();
+        }
+        int argCount = resumeArgs.length;
+        LuaValue singleArg = (argCount == 1) ? resumeArgs[0] : null;
+        LuaValue[] fail = resumeCore(argCount, singleArg, resumeArgs);
+        if (fail != null) {
+            return fail;
+        }
+
         if (error != null) {
             LuaValue errVal = (handoffResult != null && handoffResult.length > 0) ? handoffResult[0] : LuaString.valueOf("error in coroutine");
             return new LuaValue[]{LuaBoolean.FALSE, errVal};
         }
 
-        if (handoffResult == null || handoffResult.length == 0) {
+        int len = handoffResultCount;
+        if (len <= 0) {
             return RESUME_SUCCESS_EMPTY;
         }
-        int len = handoffResult.length;
         if (len == 1) {
-            return new LuaValue[]{LuaBoolean.TRUE, handoffResult[0]};
+            return new LuaValue[]{LuaBoolean.TRUE, handoffSingleResult};
         }
+        LuaValue[] res = handoffResult;
         LuaValue[] returnVals = new LuaValue[len + 1];
         returnVals[0] = LuaBoolean.TRUE;
-        System.arraycopy(handoffResult, 0, returnVals, 1, len);
+        System.arraycopy(res, 0, returnVals, 1, len);
         return returnVals;
     }
 
+    /**
+     * Frameless VM fast lane for {@code coroutine.resume(co, ...)}: writes
+     * results straight into the caller's register window without allocating a
+     * wrapper array on 0- or 1-value switches. Returns the new VM top.
+     */
+    public int resumeInline(long[] p, byte[] t, LuaValue[] o, int funcIdx, int nResults,
+            int argCount, LuaValue singleArg, LuaValue[] multiArgs) {
+        LuaValue[] fail = resumeCore(argCount, singleArg, multiArgs);
+        if (fail != null) {
+            return writeResumeResults(p, t, o, funcIdx, nResults, fail, fail.length);
+        }
+        if (error != null) {
+            LuaValue errVal = (handoffResult != null && handoffResult.length > 0)
+                    ? handoffResult[0] : LuaString.valueOf("error in coroutine");
+            return writeTwoResumeResults(p, t, o, funcIdx, nResults, LuaBoolean.FALSE, errVal);
+        }
+        int len = handoffResultCount;
+        if (len <= 0) {
+            return writeOneResumeResult(p, t, o, funcIdx, nResults, LuaBoolean.TRUE);
+        }
+        if (len == 1) {
+            return writeTwoResumeResults(p, t, o, funcIdx, nResults, LuaBoolean.TRUE, handoffSingleResult);
+        }
+        LuaValue[] res = handoffResult;
+        int total = len + 1;
+        if (nResults >= 0) {
+            org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx, LuaBoolean.TRUE);
+            for (int i = 1; i < nResults; i++) {
+                org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx + i,
+                        (i - 1) < len ? res[i - 1] : LuaNil.NIL);
+            }
+            return funcIdx + nResults;
+        }
+        org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx, LuaBoolean.TRUE);
+        for (int i = 0; i < len; i++) {
+            org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx + 1 + i, res[i]);
+        }
+        return funcIdx + total;
+    }
+
+    /**
+     * Frameless VM fast lane for {@code coroutine.wrap(fn)} wrapper calls.
+     * Writes yielded/returned values starting at {@code funcIdx} (without the
+     * leading boolean) and returns {@code -1} when non-suspended so the generic
+     * wrapper handles status/error diagnostics identically.
+     */
+    public int resumeWrapInline(long[] p, byte[] t, LuaValue[] o, int funcIdx, int nResults,
+            int argCount, LuaValue singleArg, LuaValue[] multiArgs) {
+        if (status != Status.SUSPENDED) {
+            return -1;
+        }
+        LuaValue[] fail = resumeCore(argCount, singleArg, multiArgs);
+        if (fail != null) {
+            if (status == Status.SUSPENDED) {
+                try {
+                    close();
+                } catch (Exception ignored) {}
+            }
+            throw new LuaException(fail.length > 1 ? fail[1] : LuaString.interned("error in coroutine"));
+        }
+        if (error != null) {
+            if (status == Status.SUSPENDED) {
+                try {
+                    close();
+                } catch (Exception ignored) {}
+            }
+            LuaValue errVal = (handoffResult != null && handoffResult.length > 0)
+                    ? handoffResult[0] : LuaString.interned("error in coroutine");
+            throw new LuaException(errVal);
+        }
+        int len = handoffResultCount;
+        if (len <= 0) {
+            if (nResults > 0) {
+                for (int i = 0; i < nResults; i++) {
+                    org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx + i, LuaNil.NIL);
+                }
+                return funcIdx + nResults;
+            }
+            return funcIdx;
+        }
+        if (len == 1) {
+            return writeOneResumeResult(p, t, o, funcIdx, nResults, handoffSingleResult);
+        }
+        LuaValue[] res = handoffResult;
+        return writeResumeResults(p, t, o, funcIdx, nResults, res, len);
+    }
+
+    private static int writeOneResumeResult(long[] p, byte[] t, LuaValue[] o,
+            int funcIdx, int nResults, LuaValue v0) {
+        if (nResults != 0) {
+            org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx, v0);
+            for (int i = 1; i < nResults; i++) {
+                org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx + i, LuaNil.NIL);
+            }
+        }
+        return nResults >= 0 ? funcIdx + nResults : funcIdx + 1;
+    }
+
+    private static int writeTwoResumeResults(long[] p, byte[] t, LuaValue[] o,
+            int funcIdx, int nResults, LuaValue v0, LuaValue v1) {
+        if (nResults != 0) {
+            org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx, v0);
+            if (nResults != 1) {
+                org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx + 1, v1);
+                for (int i = 2; i < nResults; i++) {
+                    org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx + i, LuaNil.NIL);
+                }
+            }
+        }
+        return nResults >= 0 ? funcIdx + nResults : funcIdx + 2;
+    }
+
+    private static int writeResumeResults(long[] p, byte[] t, LuaValue[] o,
+            int funcIdx, int nResults, LuaValue[] vals, int len) {
+        if (nResults >= 0) {
+            for (int i = 0; i < nResults; i++) {
+                org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx + i,
+                        i < len ? vals[i] : LuaNil.NIL);
+            }
+            return funcIdx + nResults;
+        }
+        for (int i = 0; i < len; i++) {
+            org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx + i, vals[i]);
+        }
+        return funcIdx + len;
+    }
+
     public static LuaValue[] yield(LuaValue... args) {
+        LuaCoroutine current = yieldCheck();
+        if (args == null || args.length == 0) {
+            current.handoffResultCount = 0;
+            current.handoffSingleResult = null;
+            current.handoffResult = null;
+        } else if (args.length == 1) {
+            current.handoffResultCount = 1;
+            current.handoffSingleResult = args[0];
+            current.handoffResult = null;
+        } else {
+            current.handoffResultCount = args.length;
+            current.handoffSingleResult = null;
+            current.handoffResult = args;
+        }
+        current.performYieldHandoff();
+        return current.materializeHandoffArgs();
+    }
+
+    /** Frameless VM fast lane for {@code coroutine.yield(...)}. */
+    public static int yieldInline(long[] p, byte[] t, LuaValue[] o,
+            int funcIdx, int nActualArgs, int nResults) {
+        LuaCoroutine current = yieldCheck();
+        if (nActualArgs == 0) {
+            current.handoffResultCount = 0;
+            current.handoffSingleResult = null;
+            current.handoffResult = null;
+        } else if (nActualArgs == 1) {
+            current.handoffResultCount = 1;
+            current.handoffSingleResult = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + 1);
+            current.handoffResult = null;
+        } else {
+            LuaValue[] out = new LuaValue[nActualArgs];
+            for (int i = 0; i < nActualArgs; i++) {
+                out[i] = org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + 1 + i);
+            }
+            current.handoffResultCount = nActualArgs;
+            current.handoffSingleResult = null;
+            current.handoffResult = out;
+        }
+        current.performYieldHandoff();
+        int c = current.handoffArgCount;
+        if (c == 0) {
+            if (nResults > 0) {
+                for (int i = 0; i < nResults; i++) {
+                    org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, funcIdx + i, LuaNil.NIL);
+                }
+                return funcIdx + nResults;
+            }
+            return funcIdx;
+        }
+        if (c == 1) {
+            return writeOneResumeResult(p, t, o, funcIdx, nResults, current.handoffSingleArg);
+        }
+        LuaValue[] in = current.handoffArgs != null ? current.handoffArgs : EMPTY_VALUES;
+        return writeResumeResults(p, t, o, funcIdx, nResults, in, c);
+    }
+
+    private static LuaCoroutine yieldCheck() {
         LuaCoroutine current = CURRENT_COROUTINE.get();
         if (current == null || current.isMainThread) {
-            // PUC's lua_yield failure: raised from the C function, so
-            // luaG_runerror adds no source:line information.
             throw LuaException.undecorated("attempt to yield from outside a coroutine");
         }
         if (current.nonYieldableCount > 0 || current.isClosing) {
             throw LuaException.undecorated("attempt to yield across a C-call boundary");
         }
-        current.handoffResult = (args != null && args.length > 0 ? args : EMPTY_VALUES);
-        current.status = Status.SUSPENDED;
-        // Snapshot the resume counter before publishing this yield, so the
-        // wait below observes only a resume/close from *this* cycle.
-        long seenResume = current.resumeSeq;
-        current.yieldSeq++;
-
-        LockSupport.unpark(current.resumerThread);
-
-        current.awaitResume(seenResume);
-
-        if (current.isClosing) {
-            throw new CoroutineCloseSignal();
-        }
-
-        return current.handoffArgs != null ? current.handoffArgs : EMPTY_VALUES;
+        return current;
     }
 
-    /**
-     * Wait until the coroutine publishes a yield/death event newer than
-     * {@code seen}. Spins briefly before parking so a fast handoff avoids a
-     * Loom context switch; the sequence counter makes the wait exact even
-     * when the event lands before this method is reached.
-     */
+    private void performYieldHandoff() {
+        status = Status.SUSPENDED;
+        long seenResume = resumeSeq;
+        yieldSeq++;
+        if (resumerParked) {
+            LockSupport.unpark(resumerThread);
+        }
+
+        awaitResume(seenResume);
+        syncWorkerContext();
+
+        if (isClosing) {
+            throw new CoroutineCloseSignal();
+        }
+    }
+
     private void awaitYield(long seen) {
+        int budget = resumerSpinBudget;
+        for (int i = 0; i < budget; i++) {
+            if (yieldSeq != seen) {
+                if (budget < 4096) resumerSpinBudget = budget + 64;
+                return;
+            }
+            Thread.onSpinWait();
+        }
         long deadline = System.nanoTime() + HANDOFF_SPIN_NANOS;
         while (yieldSeq == seen) {
             if (System.nanoTime() < deadline) {
                 Thread.onSpinWait();
             } else {
-                LockSupport.park();
+                resumerSpinBudget = 64;
+                resumerParked = true;
+                if (yieldSeq == seen) {
+                    LockSupport.park();
+                }
+                resumerParked = false;
+                if (yieldSeq == seen) {
+                    org.luava.runtime.LuaState.checkGuard();
+                    if (Thread.currentThread().isInterrupted()) {
+                        throw new LuaException("execution interrupted");
+                    }
+                }
             }
         }
     }
 
-    /**
-     * Wait until the coroutine publishes a resume/close event newer than
-     * {@code seen} (see {@link #awaitYield}).
-     */
     private void awaitResume(long seen) {
+        int budget = workerSpinBudget;
+        for (int i = 0; i < budget; i++) {
+            if (resumeSeq != seen) {
+                if (budget < 4096) workerSpinBudget = budget + 64;
+                return;
+            }
+            Thread.onSpinWait();
+        }
         long deadline = System.nanoTime() + HANDOFF_SPIN_NANOS;
         while (resumeSeq == seen) {
             if (System.nanoTime() < deadline) {
                 Thread.onSpinWait();
             } else {
-                LockSupport.park();
+                workerSpinBudget = 64;
+                workerParked = true;
+                if (resumeSeq == seen) {
+                    LockSupport.park();
+                }
+                workerParked = false;
+                if (resumeSeq == seen) {
+                    org.luava.runtime.LuaState.checkGuard();
+                    if (Thread.currentThread().isInterrupted()) {
+                        throw new LuaException("execution interrupted");
+                    }
+                }
             }
         }
     }
@@ -676,21 +1171,50 @@ public final class LuaCoroutine extends LuaValue {
             this.nestedDepth = depth;
 
             if (virtualThread == null) {
-                status = Status.DEAD;
-                disarmHook();
-                return new LuaValue[]{LuaValue.valueOf(true)};
-            }
+                if (stacklessCtx != null && tbcHead != null) {
+                    if (callerCoro != null) {
+                        callerCoro.status = Status.NORMAL;
+                    }
+                    org.luava.runtime.bytecode.VmContext closeCtx = stacklessCtx;
+                    LuaState closeState = stacklessState;
+                    stacklessCtx = null;
+                    stacklessState = null;
+                    activeStacklessCtx = null;
+                    this.isClosing = true;
+                    this.resumerThread = Thread.currentThread();
+                    captureCallerContext();
+                    this.status = Status.RUNNING;
+                    seenYield = yieldSeq;
+                    resumeSeq++;
+                    this.virtualThread = startCoroutineThread(() -> {
+                        LuaValue[] res = org.luava.runtime.bytecode.BytecodeVM
+                                .continueStacklessInVirtualThread(closeState, closeCtx);
+                        return (res.length == 0) ? Varargs.EMPTY
+                                : ((res.length == 1) ? res[0] : Varargs.of(res));
+                    });
+                } else {
+                    if (stacklessCtx != null) {
+                        org.luava.runtime.bytecode.BytecodeVM.closeStacklessClean(stacklessState, this, stacklessCtx);
+                    }
+                    markDead();
+                    disarmHook();
+                    return new LuaValue[]{LuaValue.valueOf(true)};
+                }
+            } else {
+                if (callerCoro != null) {
+                    callerCoro.status = Status.NORMAL;
+                }
 
-            if (callerCoro != null) {
-                callerCoro.status = Status.NORMAL;
+                this.isClosing = true;
+                this.resumerThread = Thread.currentThread();
+                captureCallerContext();
+                this.status = Status.RUNNING;
+                seenYield = yieldSeq;
+                resumeSeq++;
+                if (workerParked) {
+                    LockSupport.unpark(virtualThread);
+                }
             }
-
-            this.isClosing = true;
-            this.resumerThread = Thread.currentThread();
-            this.status = Status.RUNNING;
-            seenYield = yieldSeq;
-            resumeSeq++;
-            LockSupport.unpark(virtualThread);
         }
 
         awaitYield(seenYield);

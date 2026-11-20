@@ -8,6 +8,7 @@
 package org.luava.security;
 
 import org.junit.jupiter.api.Test;
+import org.luava.runtime.LuaException;
 import org.luava.runtime.LuaExit;
 import org.luava.runtime.LuaState;
 import org.luava.runtime.LuaValue;
@@ -191,5 +192,129 @@ public class LuaSandboxSecurityTest {
         s.clearGuard();
         LuaValue r = s.eval("local x = 0 for i = 1, 100000 do x = x + i end return x", "@sec");
         assertNotEquals(0L, r.toLong());
+    }
+
+    @Test
+    void denyRemovesLibrariesFromRequireAndLoaded() {
+        LuaState s = new LuaState().deny("os", "io", "debug");
+        assertEquals("false", s.eval("local ok = pcall(require, 'os'); return tostring(ok)").toLuaString());
+        assertEquals("false", s.eval("local ok = pcall(require, 'io'); return tostring(ok)").toLuaString());
+        assertEquals("false", s.eval("local ok = pcall(require, 'debug'); return tostring(ok)").toLuaString());
+    }
+
+    @Test
+    void sandboxWithPackageAllowedCannotRequireDeniedLibs() {
+        LuaState s = new LuaState().sandbox().allow("package");
+        assertEquals("false", s.eval("local ok = pcall(require, 'os'); return tostring(ok)").toLuaString());
+        assertEquals("false", s.eval("local ok = pcall(require, 'io'); return tostring(ok)").toLuaString());
+        assertEquals("false", s.eval("local ok = pcall(require, 'debug'); return tostring(ok)").toLuaString());
+        assertEquals("table", s.eval("return type(require('math'))").toLuaString());
+    }
+
+    @Test
+    void allocationLimitAppliesToTableConcatStringFormatAndJavaArray() {
+        LuaState s = new LuaState().sandbox().allow("java").maxAllocationBytes(512);
+        assertEquals("false", s.eval("""
+                local t = {}
+                for i = 1, 200 do t[i] = 'abcd' end
+                local ok = pcall(table.concat, t)
+                return tostring(ok)
+                """).toLuaString());
+        assertEquals("false", s.eval(
+                "local big = ('x'):rep(400); local ok = pcall(string.format, '%s%s', big, big); return tostring(ok)")
+                .toLuaString());
+        assertEquals("false", s.eval(
+                "local ok = pcall(java.array, 'byte', 2048); return tostring(ok)")
+                .toLuaString());
+        assertEquals("ab", s.eval("return table.concat({'a', 'b'})").toLuaString());
+    }
+
+    @Test
+    void coroutineInheritsPolicyAllocationLimitAndGuard() {
+        LuaState s = new LuaState()
+                .sandbox()
+                .allow("java")
+                .maxAllocationBytes(512)
+                .instructionLimit(100_000);
+
+        assertEquals("false", s.eval("""
+                local f = coroutine.wrap(function()
+                    return java.import('java.util.logging.FileHandler')
+                end)
+                local ok = pcall(f)
+                return tostring(ok)
+                """).toLuaString());
+
+        assertEquals("false", s.eval("""
+                local f = coroutine.wrap(function()
+                    return string.rep('a', 4096)
+                end)
+                local ok = pcall(f)
+                return tostring(ok)
+                """).toLuaString());
+
+        assertThrows(LuaException.class, () -> s.eval("""
+                local f = coroutine.wrap(function()
+                    return ('a'):rep(300):find('a*a*a*a*a*b')
+                end)
+                return f()
+                """));
+    }
+
+    @Test
+    void stateCallEnforcesPolicyAllocationLimitAndRearmsGuard() {
+        LuaState s = new LuaState()
+                .sandbox()
+                .allow("java")
+                .maxAllocationBytes(512)
+                .instructionLimit(50_000);
+        s.eval("""
+                function tryImport() return java.import('java.lang.Runtime') end
+                function tryAlloc() return string.rep('x', 4096) end
+                function spin() while true do end end
+                function okWork() local sum = 0 for i = 1, 20 do sum = sum + i end return sum end
+                """);
+
+        LuaException denied = assertThrows(LuaException.class, () -> s.call("tryImport"));
+        assertTrue(denied.getMessage().contains("access denied"));
+
+        assertThrows(LuaException.class, () -> s.call("tryAlloc"));
+        assertThrows(LuaException.class, () -> s.call("spin"));
+        // Next state.call re-arms the instruction budget cleanly.
+        assertEquals(210L, s.call("okWork").toLong());
+    }
+
+    @Test
+    void guardedStateTiersUpJitAndStopsRunawayJitLoops() throws Exception {
+        LuaState s = new LuaState().sandbox().instructionLimit(500_000);
+        s.eval("""
+                function sumTo(n)
+                    local acc = 0
+                    for i = 1, n do acc = acc + i end
+                    return acc
+                end
+                """);
+        org.luava.runtime.LuaFunction fn = (org.luava.runtime.LuaFunction) s.get("sumTo");
+        if (fn instanceof org.luava.runtime.bytecode.LuaClosure lc && s.isJitEnabled()) {
+            org.luava.runtime.jit.JitCompiler.prewarm(lc, s);
+            assertTrue(s.stats().jitHits > 0, "guarded state should compile eligible functions to JIT");
+        }
+        assertEquals(500500L, s.call("sumTo", 1000).toLong());
+
+        // Compiled loop and compiled tail recursion must still trip instructionLimit
+        s.eval("function bigFor() local x = 0 for i = 1, 100000000 do x = x + 1 end return x end");
+        s.eval("function tailSpin() return tailSpin() end");
+        for (String inf : new String[]{"bigFor", "tailSpin"}) {
+            org.luava.runtime.LuaFunction f = (org.luava.runtime.LuaFunction) s.get(inf);
+            if (f instanceof org.luava.runtime.bytecode.LuaClosure lc && s.isJitEnabled()) {
+                org.luava.runtime.jit.JitCompiler.prewarm(lc, s);
+            }
+            assertThrows(LuaException.class, () -> s.call(inf), "guarded JIT must abort " + inf);
+        }
+
+        // Timeout-guarded compiled loop must abort promptly
+        LuaState timed = new LuaState().sandbox().timeout(Duration.ofMillis(120));
+        assertTerminatesWithin(timed,
+                "local s = 0 while true do s = s + 1 end return s", 3000);
     }
 }

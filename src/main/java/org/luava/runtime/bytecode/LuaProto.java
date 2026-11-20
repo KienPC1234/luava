@@ -35,10 +35,16 @@ public final class LuaProto {
     // the default engine; these fields only accelerate hot integer kernels.
     /** Compiled code for this proto, or null when interpreted. */
     public volatile JitCode jitCode;
+    /** Safepoint-instrumented compiled code for guarded states (timeout/instructionLimit). */
+    public volatile JitCode guardedJitCode;
     /** Set when compilation or guards prove the proto unsuitable for JIT. */
     public volatile boolean jitDisabled;
+    /** Set when guarded compilation proves unsuitable for this proto. */
+    public volatile boolean guardedJitDisabled;
     /** True while a background compile is queued/running (avoids duplicates). */
     public volatile boolean jitQueued;
+    /** True while a guarded background compile is queued/running. */
+    public volatile boolean guardedJitQueued;
     /** Conservative yield marker; JIT-able protos are proven non-yielding. */
     public boolean mayYield;
     /** Interpreter-side call counter driving tier-up. */

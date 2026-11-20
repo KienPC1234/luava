@@ -117,6 +117,9 @@ public final class StringLib {
     public static void fillInto(LuaTable stringTable, LuaTable globals) {
 
         stringTable.rawset(LuaString.interned("len"), LuaFunction.of(args -> {
+            if (args.length > 0 && args[0] instanceof LuaString ls) {
+                return LuaInteger.valueOf(ls.rawLength());
+            }
             String s = checkString(args, 0, "len");
             return LuaInteger.valueOf(s.length());
         }));
@@ -174,10 +177,19 @@ public final class StringLib {
             if (args.length == 0 || (!args[0].isString() && !args[0].isNumber())) {
                 throw LuaValue.argError(1, "sub", "string expected, got " + (args.length == 0 ? "no value" : args[0].typeName()));
             }
-            String s = args[0].toLuaString();
-            int len = s.length();
             long start = checkInteger(args, 1, "sub");
             long end = (args.length > 2 && !args[2].isNil()) ? checkInteger(args, 2, "sub") : -1;
+            if (args[0] instanceof LuaString ls) {
+                int len = ls.rawLength();
+                if (start < 0) start = len + start + 1;
+                if (end < 0) end = len + end + 1;
+                if (start < 1) start = 1;
+                if (end > len) end = len;
+                if (start > end) return LuaString.EMPTY;
+                return LuaString.fromSlice(ls.rawBytesUnsafe(), ls.rawOffset() + (int) start - 1, (int) (end - start + 1));
+            }
+            String s = args[0].toLuaString();
+            int len = s.length();
 
             if (start < 0) start = len + start + 1;
             if (end < 0) end = len + end + 1;
@@ -185,7 +197,7 @@ public final class StringLib {
             if (start < 1) start = 1;
             if (end > len) end = len;
 
-            if (start > end) return LuaString.interned("");
+            if (start > end) return LuaString.EMPTY;
             return LuaString.valueOf(s.substring((int) start - 1, (int) end));
         }));
 
@@ -244,21 +256,32 @@ public final class StringLib {
 
         stringTable.rawset(LuaString.interned("format"), LuaFunction.of(args -> {
             String fmt = checkString(args, 0, "format");
+            long allocCap = org.luava.runtime.LuaState.allocationLimit();
             StringBuilder b = new StringBuilder();
             int top = args.length - 1;
             int argIdx = 1;
             int sfl = fmt.length();
             int p = 0;
+            int specCount = 0;
 
             while (p < sfl) {
                 char c = fmt.charAt(p);
                 if (c != '%') {
+                    if (b.length() >= allocCap) {
+                        throw new LuaException("resulting string too large");
+                    }
                     b.append(c);
                     p++;
                 } else if (p + 1 < sfl && fmt.charAt(p + 1) == '%') {
+                    if (b.length() >= allocCap) {
+                        throw new LuaException("resulting string too large");
+                    }
                     b.append('%');
                     p += 2;
                 } else {
+                    if ((++specCount & 0xFF) == 0) {
+                        org.luava.runtime.LuaState.checkGuard();
+                    }
                     p++; // skip '%'
                     int start = p;
                     while (p < sfl && "-+ #0123456789.".indexOf(fmt.charAt(p)) >= 0) {
@@ -306,12 +329,7 @@ public final class StringLib {
                             checkFormat(form, "-", false);
                             long code = checkFormatInteger(v, argIdx);
                             // C printf %c: converted to unsigned char.
-                            String res = String.valueOf((char) (code & 0xFF));
-                            if (width > 1) {
-                                if (flags.contains("-")) res = res + " ".repeat(width - 1);
-                                else res = " ".repeat(width - 1) + res;
-                            }
-                            b.append(res);
+                            appendPadded(b, String.valueOf((char) (code & 0xFF)), width, flags.contains("-"), allocCap);
                         }
                         case 'd', 'i' -> {
                             // PUC checks the argument (luaL_checkinteger)
@@ -320,63 +338,66 @@ public final class StringLib {
                             // specifier like %#d.
                             long n = checkFormatInteger(v, argIdx);
                             checkFormat(form, "-+ 0", true);
-                            b.append(formatInteger(String.valueOf(spec), flags, width, prec, n));
+                            checkFormatWidthCap(b, width, allocCap);
+                            appendBounded(b, formatInteger(String.valueOf(spec), flags, width, prec, n), allocCap);
                         }
                         case 'u' -> {
                             long n = checkFormatInteger(v, argIdx);
                             checkFormat(form, "-0", true);
-                            b.append(formatInteger("u", flags, width, prec, n));
+                            checkFormatWidthCap(b, width, allocCap);
+                            appendBounded(b, formatInteger("u", flags, width, prec, n), allocCap);
                         }
                         case 'o', 'x', 'X' -> {
                             long n = checkFormatInteger(v, argIdx);
                             checkFormat(form, "-#0", true);
-                            b.append(formatInteger(String.valueOf(spec), flags, width, prec, n));
+                            checkFormatWidthCap(b, width, allocCap);
+                            appendBounded(b, formatInteger(String.valueOf(spec), flags, width, prec, n), allocCap);
                         }
                         case 'a', 'A', 'f', 'e', 'E', 'g', 'G' -> {
                             // Same order as PUC: argument conversion first.
                             double d = checkFormatNumber(v, argIdx);
                             checkFormat(form, "-+ #0", true);
-                            b.append(formatFloat(String.valueOf(spec), flags, width, prec, d));
+                            checkFormatWidthCap(b, width, allocCap);
+                            appendBounded(b, formatFloat(String.valueOf(spec), flags, width, prec, d), allocCap);
                         }
                         case 'p' -> {
                             checkFormat(form, "-", false);
-                            // Strings canonicalize first: equal short strings
-                            // share one object, so their pointers compare
-                            // equal (LuaString interning is lazy).
-                            LuaValue id = (v instanceof LuaString ls) ? LuaString.intern(ls) : v;
-                            String res = (v.isNil() || v.isBoolean() || v.isNumber()) ? "(null)" : "0x" + Long.toHexString(System.identityHashCode(id));
-                            if (width > res.length()) {
-                                if (flags.contains("-")) res = res + " ".repeat(width - res.length());
-                                else res = " ".repeat(width - res.length()) + res;
+                            final String res;
+                            if (v.isNil() || v.isBoolean() || v.isNumber()) {
+                                res = "(null)";
+                            } else if (v instanceof LuaString ls) {
+                                res = "0x" + Long.toHexString(LuaString.pointerId(ls));
+                            } else {
+                                res = "0x" + Long.toHexString(Integer.toUnsignedLong(System.identityHashCode(v)));
                             }
-                            b.append(res);
+                            appendPadded(b, res, width, flags.contains("-"), allocCap);
                         }
                         case 'q' -> {
                             if (form.length() > 2) {
                                 throw new LuaException("specifier '%q' cannot have modifiers");
                             }
                             if (v.isNil()) {
-                                b.append("nil");
+                                appendBounded(b, "nil", allocCap);
                             } else if (v.isBoolean()) {
-                                b.append(v.toBoolean() ? "true" : "false");
+                                appendBounded(b, v.toBoolean() ? "true" : "false", allocCap);
                             } else if (v.isInteger()) {
                                 long n = v.toLong();
                                 if (n == Long.MIN_VALUE) {
-                                    b.append("0x8000000000000000");
+                                    appendBounded(b, "0x8000000000000000", allocCap);
                                 } else {
-                                    b.append(n);
+                                    appendBounded(b, String.valueOf(n), allocCap);
                                 }
                             } else if (v.isFloat()) {
                                 double d = v.toDouble();
                                 if (Double.isInfinite(d)) {
-                                    b.append(d > 0 ? "1e9999" : "-1e9999");
+                                    appendBounded(b, d > 0 ? "1e9999" : "-1e9999", allocCap);
                                 } else if (Double.isNaN(d)) {
-                                    b.append("(0/0)");
+                                    appendBounded(b, "(0/0)", allocCap);
                                 } else {
-                                    b.append(formatHexFloat(false, "", 0, -1, d));
+                                    appendBounded(b, formatHexFloat(false, "", 0, -1, d), allocCap);
                                 }
                             } else if (v.isString()) {
-                                b.append(formatQuoted(v.toLuaString()));
+                                appendBounded(b, formatQuoted(v.toLuaString(), allocCap - b.length()), allocCap);
                             } else {
                                 throw new LuaException("value has no literal form");
                             }
@@ -390,11 +411,7 @@ public final class StringLib {
                             if (prec >= 0 && s.length() > prec) {
                                 s = s.substring(0, prec);
                             }
-                            if (width > s.length()) {
-                                if (flags.contains("-")) s = s + " ".repeat(width - s.length());
-                                else s = " ".repeat(width - s.length()) + s;
-                            }
-                            b.append(s);
+                            appendPadded(b, s, width, flags.contains("-"), allocCap);
                         }
                         // PUC's unknown-conversion branch: a conversion
                         // character string.format does not implement. Distinct
@@ -549,7 +566,42 @@ public final class StringLib {
     }
 
 
-    private static String formatQuoted(String s) {
+    private static void checkFormatWidthCap(StringBuilder b, int width, long allocCap) {
+        if ((long) b.length() + width > allocCap) {
+            throw new LuaException("resulting string too large");
+        }
+    }
+
+    private static void appendPadded(StringBuilder b, String s, int width, boolean leftAlign, long allocCap) {
+        long targetLen = Math.max(s.length(), (long) width);
+        if ((long) b.length() + targetLen > allocCap) {
+            throw new LuaException("resulting string too large");
+        }
+        if (width <= s.length()) {
+            b.append(s);
+            return;
+        }
+        int pad = width - s.length();
+        if (leftAlign) {
+            b.append(s);
+            b.repeat(' ', pad);
+        } else {
+            b.repeat(' ', pad);
+            b.append(s);
+        }
+    }
+
+    private static void appendBounded(StringBuilder b, String s, long allocCap) {
+        if ((long) b.length() + s.length() > allocCap) {
+            throw new LuaException("resulting string too large");
+        }
+        b.append(s);
+    }
+
+    private static String formatQuoted(String s, long remainingCap) {
+        if ((long) s.length() + 2 > remainingCap) {
+            throw new LuaException("resulting string too large");
+        }
         StringBuilder sb = new StringBuilder();
         sb.append('"');
         int len = s.length();
@@ -567,6 +619,12 @@ public final class StringLib {
             } else {
                 sb.append(c);
             }
+            if (sb.length() >= remainingCap) {
+                throw new LuaException("resulting string too large");
+            }
+        }
+        if ((long) sb.length() + 1 > remainingCap) {
+            throw new LuaException("resulting string too large");
         }
         sb.append('"');
         return sb.toString();

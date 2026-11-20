@@ -12,13 +12,23 @@ import org.luava.runtime.LuaState;
 import org.luava.runtime.LuaString;
 import org.luava.runtime.LuaTable;
 import org.luava.runtime.LuaValue;
+import org.luava.runtime.concurrency.LuaCoroutine;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * Per-state tracing collector and finalizer/weak-table manager with a global
+ * fallback for objects constructed outside any active {@link LuaState}.
+ *
+ * <p>Keeping allocation debt, weak tables, finalizers, and mark scratch sets
+ * per-{@link LuaState} eliminates cross-core cache-line contention on a shared
+ * counter and removes JVM-wide collector locking during multi-tenant execution.
+ */
 public final class GCManager {
     public static final class FinalizerEntry {
         public final LuaValue target;
@@ -46,69 +56,393 @@ public final class GCManager {
         }
     }
 
-    private static final long GLOBAL_OWNER_ID = 0L;
-
-    private static final List<FinalizerEntry> FINALIZERS = new ArrayList<>();
-    private static final List<WeakTableEntry> WEAK_TABLES = new ArrayList<>();
-    private static final List<StringRef> LARGE_STRINGS = new ArrayList<>();
-    private static final AtomicLong uncollectedBytes = new AtomicLong();
-    /**
-     * Mark scratch, retained between collections. The live set of a state is
-     * roughly stable from one cycle to the next, so after the first cycle the
-     * mark phase reuses these buffers and allocates nothing. Only the
-     * collector thread touches them ({@code collectInternal} is called under
-     * this class's monitor), so no synchronisation is needed.
-     */
-    private static final IdentitySet<LuaValue> markLive = new IdentitySet<>();
-    private static final IdentitySet<Object> markVisited = new IdentitySet<>();
-    private static final IdentitySet<LuaValue> markLiveAll = new IdentitySet<>();
-    private static final IdentitySet<Object> markVisitedAll = new IdentitySet<>();
-    private static final ArrayDeque<LuaValue> worklistScratch = new ArrayDeque<>();
-    private static volatile boolean runningFinalizer = false;
-    private static volatile boolean gcRunning = true;
-    private static boolean collecting = false;
-    private static volatile long gcThreshold = 256L * 1024;
-
     private static final class StringRef {
         final java.lang.ref.WeakReference<LuaString> ref;
         final long bytes;
+
         StringRef(LuaString s) {
             this.ref = new java.lang.ref.WeakReference<>(s);
-            this.bytes = (long) s.value().length() + 64;
+            this.bytes = (long) s.rawLength() + 64;
         }
     }
 
-    private static volatile LuaString allocatingString = null;
-
-    public static synchronized void onAllocLargeString(LuaString s) {
-        if (s == null) return;
-        allocatingString = s;
-        LARGE_STRINGS.add(new StringRef(s));
+    public interface RootProvider {
+        void provideRoots(java.util.function.Consumer<LuaValue> consumer);
     }
 
-    public static synchronized long getLargeStringsBytes() {
-        long total = 0;
-        for (int i = LARGE_STRINGS.size() - 1; i >= 0; i--) {
-            StringRef sr = LARGE_STRINGS.get(i);
-            if (sr.ref.get() == null) {
-                LARGE_STRINGS.remove(i);
-            } else {
-                total += sr.bytes;
+    private static final long GLOBAL_OWNER_ID = 0L;
+    /** PUC {@code GCSTEPSIZE}: the debt retired by a {@code data == 0} step. */
+    private static final long SMALL_STEP_BYTES = 13L * 1024;
+    private static final long BASE_MEMORY_BYTES = 45L * 1024;
+
+    private static final Object REGISTRY_LOCK = new Object();
+    private static final List<RootProvider> ROOT_PROVIDERS = new ArrayList<>();
+    private static volatile boolean hasRootProviders = false;
+    private static final List<java.lang.ref.WeakReference<LuaState>> STATES = new ArrayList<>();
+    private static final StateGC GLOBAL_GC = new StateGC(null);
+
+    private GCManager() {}
+
+    /**
+     * Per-state collector instance owned by a single {@link LuaState} (or the
+     * shared fallback when {@code owner == null}).
+     */
+    public static final class StateGC {
+        private final LuaState owner;
+        private final List<FinalizerEntry> finalizers = new ArrayList<>();
+        private final List<WeakTableEntry> weakTables = new ArrayList<>();
+        private final List<StringRef> largeStrings = new ArrayList<>();
+        private final Set<LuaString> allocatingLargeStrings =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        private final IdentitySet<LuaValue> markLive = new IdentitySet<>();
+        private final IdentitySet<Object> markVisited = new IdentitySet<>();
+        private final IdentitySet<LuaValue> markLiveAll = new IdentitySet<>();
+        private final IdentitySet<Object> markVisitedAll = new IdentitySet<>();
+        private final ArrayDeque<LuaValue> worklistScratch = new ArrayDeque<>();
+
+        private long uncollectedBytes = 0L;
+        private volatile boolean runningFinalizer = false;
+        private volatile boolean gcRunning = true;
+        private boolean collecting = false;
+        private volatile long gcThreshold = 256L * 1024;
+        private volatile long maxMemoryBytes = 0L;
+        private long liveRetainedBytes = 0L;
+
+        public StateGC(LuaState owner) {
+            this.owner = owner;
+        }
+
+        public void setMaxMemoryBytes(long bytes) {
+            this.maxMemoryBytes = bytes;
+            if (bytes > 0) {
+                long capThresh = Math.max(1024L, bytes / 4);
+                if (gcThreshold > capThresh) {
+                    gcThreshold = capThresh;
+                }
             }
+        }
+
+        public long getMaxMemoryBytes() {
+            return maxMemoryBytes;
+        }
+
+        public long getEstimatedLiveBytes() {
+            return liveRetainedBytes;
+        }
+
+        /** Thread-confined hot-path allocation accounting for an active state. */
+        void onAlloc(long bytes) {
+            long total = uncollectedBytes + bytes;
+            uncollectedBytes = total;
+            if (total < gcThreshold) {
+                return;
+            }
+            if (!gcRunning && maxMemoryBytes <= 0) {
+                return;
+            }
+            collectOnThreshold(bytes);
+        }
+
+        synchronized void onAllocSynchronized(long bytes) {
+            onAlloc(bytes);
+        }
+
+        private synchronized void collectOnThreshold(long pendingAllocBytes) {
+            long memCap = maxMemoryBytes;
+            if (memCap > 0 && pendingAllocBytes > memCap) {
+                throw new org.luava.runtime.LuaException("memory limit exceeded");
+            }
+            if ((!gcRunning && memCap <= 0) || uncollectedBytes < gcThreshold) {
+                return;
+            }
+            if (collecting) {
+                return;
+            }
+            uncollectedBytes = 0;
+            collectInternal();
+            if (memCap > 0 && liveRetainedBytes > memCap) {
+                throw new org.luava.runtime.LuaException("memory limit exceeded");
+            }
+        }
+
+        public synchronized void beginAllocLargeString(LuaString s) {
+            if (s == null) return;
+            allocatingLargeStrings.add(s);
+            largeStrings.add(new StringRef(s));
+        }
+
+        public synchronized void endAllocLargeString(LuaString s) {
+            if (s == null) return;
+            allocatingLargeStrings.remove(s);
+        }
+
+        public synchronized long getLargeStringsBytes() {
+            long total = 0;
+            for (int i = largeStrings.size() - 1; i >= 0; i--) {
+                StringRef sr = largeStrings.get(i);
+                if (sr.ref.get() == null) {
+                    largeStrings.remove(i);
+                } else {
+                    total += sr.bytes;
+                }
+            }
+            return total;
+        }
+
+        public synchronized long getUncollectedBytes() {
+            return uncollectedBytes;
+        }
+
+        public synchronized double getMemoryKb() {
+            long total = BASE_MEMORY_BYTES + uncollectedBytes + getLargeStringsBytes();
+            return (double) total / 1024.0;
+        }
+
+        public synchronized void register(LuaValue target, LuaValue gcHandler) {
+            if (target == null || gcHandler == null || gcHandler.isNil()) return;
+            long id = (owner != null) ? owner.gcOwnerId() : GLOBAL_OWNER_ID;
+            finalizers.add(new FinalizerEntry(target, gcHandler, id));
+        }
+
+        public synchronized void registerWeakTable(LuaTable table) {
+            if (table == null) return;
+            long id = (owner != null) ? owner.gcOwnerId() : GLOBAL_OWNER_ID;
+            weakTables.add(new WeakTableEntry(table, id));
+        }
+
+        public synchronized boolean collect() {
+            return collectInternal();
+        }
+
+        public synchronized boolean step(long stepSizeKb) {
+            if (stepSizeKb > 0) {
+                uncollectedBytes += stepSizeKb * 1024;
+                if (uncollectedBytes < gcThreshold) {
+                    return false;
+                }
+                uncollectedBytes = 0;
+                return collectInternal();
+            }
+            long pending = uncollectedBytes;
+            if (pending <= 0) {
+                return false;
+            }
+            if (pending <= SMALL_STEP_BYTES) {
+                uncollectedBytes = 0;
+                return collectInternal();
+            }
+            uncollectedBytes -= SMALL_STEP_BYTES;
+            return false;
+        }
+
+        public synchronized void reset() {
+            weakTables.clear();
+            largeStrings.clear();
+            allocatingLargeStrings.clear();
+            finalizers.clear();
+            uncollectedBytes = 0;
+            gcRunning = true;
+            runningFinalizer = false;
+            collecting = false;
+            liveRetainedBytes = 0L;
+            long baseThresh = 256L * 1024;
+            gcThreshold = (maxMemoryBytes > 0) ? Math.min(baseThresh, Math.max(1024L, maxMemoryBytes / 4)) : baseThresh;
+        }
+
+        public synchronized void closeAndDrainFinalizers() {
+            weakTables.clear();
+            largeStrings.clear();
+            allocatingLargeStrings.clear();
+            if (finalizers.isEmpty()) {
+                return;
+            }
+            List<FinalizerEntry> toRun = new ArrayList<>(finalizers.size());
+            for (int i = finalizers.size() - 1; i >= 0; i--) {
+                toRun.add(finalizers.get(i));
+            }
+            finalizers.clear();
+            boolean prevRunningFinalizer = runningFinalizer;
+            runningFinalizer = true;
+            LuaState prevBasic = (owner != null) ? LuaValue.pushBasicState(owner) : null;
+            try {
+                runFinalizers(toRun);
+            } finally {
+                if (owner != null) {
+                    LuaValue.popBasicState(prevBasic);
+                }
+                runningFinalizer = prevRunningFinalizer;
+            }
+        }
+
+        private boolean collectInternal() {
+            if (runningFinalizer || collecting) return false;
+            collecting = true;
+            try {
+                uncollectedBytes = 0;
+
+                IdentitySet<LuaValue> liveNormal = markLive;
+                IdentitySet<Object> visitedNormal = markVisited;
+                liveNormal.reset();
+                visitedNormal.reset();
+                List<LuaTable> ephemeronsNormal = new ArrayList<>();
+                ArrayDeque<LuaValue> worklist = worklistScratch;
+                worklist.clear();
+
+                markFromRoots(owner, worklist, visitedNormal, ephemeronsNormal);
+                drainWorklist(worklist, liveNormal, visitedNormal, ephemeronsNormal);
+                convergeEphemerons(liveNormal, visitedNormal, ephemeronsNormal);
+
+                for (int i = weakTables.size() - 1; i >= 0; i--) {
+                    WeakTableEntry entry = weakTables.get(i);
+                    LuaTable tbl = entry.table.get();
+                    if (tbl == null) {
+                        weakTables.remove(i);
+                    } else {
+                        tbl.cleanupWeakValues(liveNormal::contains);
+                    }
+                }
+
+                List<FinalizerEntry> toRun = new ArrayList<>();
+                for (int i = finalizers.size() - 1; i >= 0; i--) {
+                    FinalizerEntry entry = finalizers.get(i);
+                    if (liveNormal.contains(entry.target)) {
+                        continue;
+                    }
+                    finalizers.remove(i);
+                    toRun.add(entry);
+                }
+
+                IdentitySet<LuaValue> liveAll = markLiveAll;
+                IdentitySet<Object> visitedAll = markVisitedAll;
+                liveAll.reset();
+                visitedAll.reset();
+                liveNormal.copyInto(liveAll);
+                visitedNormal.copyInto(visitedAll);
+                List<LuaTable> ephemeronsAll = new ArrayList<>(ephemeronsNormal);
+
+                for (FinalizerEntry entry : toRun) {
+                    if (entry.target != null && LuaTable.isCollectable(entry.target)) worklist.add(entry.target);
+                    if (entry.gcHandler != null && LuaTable.isCollectable(entry.gcHandler)) worklist.add(entry.gcHandler);
+                }
+                drainWorklist(worklist, liveAll, visitedAll, ephemeronsAll);
+                convergeEphemerons(liveAll, visitedAll, ephemeronsAll);
+
+                for (int i = weakTables.size() - 1; i >= 0; i--) {
+                    LuaTable tbl = weakTables.get(i).table.get();
+                    if (tbl == null) {
+                        weakTables.remove(i);
+                    } else {
+                        tbl.cleanupWeakKeys(liveAll::contains);
+                    }
+                }
+
+                for (int i = largeStrings.size() - 1; i >= 0; i--) {
+                    StringRef sr = largeStrings.get(i);
+                    LuaString str = sr.ref.get();
+                    if (str == null || (!allocatingLargeStrings.contains(str) && !liveAll.contains(str))) {
+                        largeStrings.remove(i);
+                    }
+                }
+
+                if (!toRun.isEmpty()) {
+                    runningFinalizer = true;
+                    LuaState previousBasicScope = (owner != null) ? LuaValue.pushBasicState(owner) : null;
+                    try {
+                        runFinalizers(toRun);
+                    } finally {
+                        if (owner != null) {
+                            LuaValue.popBasicState(previousBasicScope);
+                        }
+                        runningFinalizer = false;
+                    }
+                }
+
+                long liveBytes = (long) liveAll.size() * 256L;
+                long baseThresh = Math.max(256L * 1024, Math.min(16L * 1024 * 1024, liveBytes * 2));
+                long memCap = maxMemoryBytes;
+                if (memCap > 0) {
+                    long retained = 0L;
+                    for (LuaValue v : liveAll) {
+                        if (v instanceof LuaTable tbl) {
+                            retained += tbl.estimatedMemoryBytes();
+                        } else if (v instanceof LuaString str) {
+                            retained += 32L + str.rawLength();
+                        } else {
+                            retained += 32L;
+                        }
+                    }
+                    liveRetainedBytes = retained;
+                    long headroom = Math.max(1024L, (memCap - retained) / 4);
+                    gcThreshold = Math.min(baseThresh, headroom);
+                } else {
+                    liveRetainedBytes = 0L;
+                    gcThreshold = baseThresh;
+                }
+                return true;
+            } finally {
+                markLive.reset();
+                markVisited.reset();
+                markLiveAll.reset();
+                markVisitedAll.reset();
+                worklistScratch.clear();
+                collecting = false;
+            }
+        }
+    }
+
+    private static StateGC currentCollector() {
+        LuaState active = LuaValue.activeBasicState();
+        return (active != null) ? active.gcState : GLOBAL_GC;
+    }
+
+    public static void beginAllocLargeString(LuaString s) {
+        LuaState active = LuaValue.activeBasicState();
+        if (active != null) {
+            active.gcState.beginAllocLargeString(s);
+        } else {
+            GLOBAL_GC.beginAllocLargeString(s);
+        }
+    }
+
+    public static void endAllocLargeString(LuaString s) {
+        LuaState active = LuaValue.activeBasicState();
+        if (active != null) {
+            active.gcState.endAllocLargeString(s);
+        } else {
+            GLOBAL_GC.endAllocLargeString(s);
+        }
+    }
+
+    public static long getLargeStringsBytes() {
+        LuaState active = LuaValue.activeBasicState();
+        if (active != null) {
+            return active.gcState.getLargeStringsBytes();
+        }
+        long total = GLOBAL_GC.getLargeStringsBytes();
+        for (LuaState s : snapshotLiveStates()) {
+            total += s.gcState.getLargeStringsBytes();
         }
         return total;
     }
 
-    public static synchronized double getMemoryKb() {
-        long base = 45 * 1024;
-        long total = base + uncollectedBytes.get() + getLargeStringsBytes();
+    public static double getMemoryKb() {
+        LuaState active = LuaValue.activeBasicState();
+        if (active != null) {
+            return active.gcState.getMemoryKb();
+        }
+        long total = BASE_MEMORY_BYTES + GLOBAL_GC.getUncollectedBytes() + GLOBAL_GC.getLargeStringsBytes();
+        for (LuaState s : snapshotLiveStates()) {
+            total += s.gcState.getUncollectedBytes() + s.gcState.getLargeStringsBytes();
+        }
         return (double) total / 1024.0;
     }
 
-    private GCManager() {}
+    public static double getMemoryKb(LuaState state) {
+        return (state != null) ? state.gcState.getMemoryKb() : getMemoryKb();
+    }
 
     public static boolean isRunning() {
-        return gcRunning;
+        return currentCollector().gcRunning;
     }
 
     /**
@@ -117,49 +451,40 @@ public final class GCManager {
      * collector non-reentrant; {@code gc.lua} asserts exactly that.
      */
     public static boolean inFinalizer() {
-        return runningFinalizer;
+        return currentCollector().runningFinalizer;
     }
 
     public static void stop() {
-        gcRunning = false;
+        currentCollector().gcRunning = false;
     }
 
     public static void restart() {
-        gcRunning = true;
-    }
-
-    private static long currentGcOwnerId() {
-        LuaState active = LuaValue.activeBasicState();
-        return (active != null) ? active.gcOwnerId() : GLOBAL_OWNER_ID;
+        currentCollector().gcRunning = true;
     }
 
     /**
-     * Clears all JVM-wide collector bookkeeping. This is a test-harness
-     * operation. It must not be called while unrelated live states exist,
-     * because unlike per-state collection it discards every state's pending
-     * finalizers, weak-table registrations, and roots.
+     * Clears all JVM-wide collector bookkeeping. Test-harness operation.
      */
-    public static synchronized void reset() {
-        WEAK_TABLES.clear();
-        LARGE_STRINGS.clear();
-        FINALIZERS.clear();
-        ROOT_PROVIDERS.clear();
-        STATES.clear();
-        uncollectedBytes.set(0);
-        gcRunning = true;
-        runningFinalizer = false;
-        collecting = false;
-        gcThreshold = 256L * 1024;
+    public static void reset() {
+        List<LuaState> states;
+        synchronized (REGISTRY_LOCK) {
+            states = snapshotLiveStatesLocked();
+            STATES.clear();
+            ROOT_PROVIDERS.clear();
+            hasRootProviders = false;
+        }
+        GLOBAL_GC.reset();
+        for (LuaState s : states) {
+            s.gcState.reset();
+        }
     }
 
-    public static synchronized void register(LuaValue target, LuaValue gcHandler) {
-        if (target == null || gcHandler == null || gcHandler.isNil()) return;
-        FINALIZERS.add(new FinalizerEntry(target, gcHandler, currentGcOwnerId()));
+    public static void register(LuaValue target, LuaValue gcHandler) {
+        currentCollector().register(target, gcHandler);
     }
 
-    public static synchronized void registerWeakTable(LuaTable table) {
-        if (table == null) return;
-        WEAK_TABLES.add(new WeakTableEntry(table, currentGcOwnerId()));
+    public static void registerWeakTable(LuaTable table) {
+        currentCollector().registerWeakTable(table);
     }
 
     public static void onAlloc() {
@@ -167,324 +492,200 @@ public final class GCManager {
     }
 
     public static void onAlloc(long bytes) {
-        try {
-            // Allocation happens on hot paths (especially table construction),
-            // so avoid taking the collector monitor for every object. Only the
-            // thread that crosses the threshold inspects the work lists and can
-            // trigger a collection.
-            long total = uncollectedBytes.addAndGet(bytes);
-            if (!gcRunning || total < gcThreshold) {
-                return;
-            }
-            if (!uncollectedBytes.compareAndSet(total, 0)) {
-                return;
-            }
-            // Scope automatic collection to the allocating state. Running
-            // every state's finalizers / cleaning every state's weak tables
-            // from here corrupts concurrent states (one suite's GC step
-            // mutating another's live table). Host registrations with no
-            // owning state stay global.
-            LuaState active = LuaValue.activeBasicState();
-            if (active != null) {
-                collect(active);
-            } else {
-                collect();
-            }
-        } finally {
-            allocatingString = null;
+        LuaState active = LuaValue.activeBasicState();
+        if (active != null) {
+            active.gcState.onAlloc(bytes);
+        } else {
+            GLOBAL_GC.onAllocSynchronized(bytes);
         }
     }
 
-    public static synchronized long getUncollectedBytes() {
-        return uncollectedBytes.get();
+    public static long getUncollectedBytes() {
+        LuaState active = LuaValue.activeBasicState();
+        if (active != null) {
+            return active.gcState.getUncollectedBytes();
+        }
+        long total = GLOBAL_GC.getUncollectedBytes();
+        for (LuaState s : snapshotLiveStates()) {
+            total += s.gcState.getUncollectedBytes();
+        }
+        return total;
     }
 
-    public static synchronized boolean collect() {
-        return collectInternal(null, false);
+    public static long getUncollectedBytes(LuaState state) {
+        return (state != null) ? state.gcState.getUncollectedBytes() : getUncollectedBytes();
+    }
+
+    public static boolean collect() {
+        LuaState active = LuaValue.activeBasicState();
+        if (active != null) {
+            return active.gcState.collect();
+        }
+        boolean ran = GLOBAL_GC.collect();
+        for (LuaState s : snapshotLiveStates()) {
+            ran |= s.gcState.collect();
+        }
+        return ran;
     }
 
     /**
-     * Runs a collection for one Lua state. Reachability is still checked
-     * across the shared allocator, but finalizers are only run for entries
-     * owned by the requesting state (as well as host registrations made
-     * outside Lua execution, which have no owning state).
+     * Runs a collection for one Lua state without locking unrelated states.
      */
-    public static synchronized boolean collect(LuaState owner) {
+    public static boolean collect(LuaState owner) {
         if (owner == null) {
-            return collectInternal(null, false);
+            return collect();
         }
-        return collectInternal(owner, true);
-    }
-
-    private static boolean collectInternal(LuaState owner, boolean ownedFinalizersOnly) {
-        if (runningFinalizer || collecting) return false;
-        collecting = true;
-        try {
-            uncollectedBytes.set(0);
-
-        // 1. Mark phase from normal roots (excluding dead objects with finalizers)
-        // IdentitySet, not IdentityHashMap: open addressed with the identity
-        // hash cached per entry, so a large live set is re-marked without
-        // re-hashing on grow and without IdentityHashMap's resize cost.
-        IdentitySet<LuaValue> liveNormal = markLive;
-        IdentitySet<Object> visitedNormal = markVisited;
-        liveNormal.reset();
-        visitedNormal.reset();
-        List<LuaTable> ephemeronsNormal = new ArrayList<>();
-        ArrayDeque<LuaValue> worklist = worklistScratch;
-        worklist.clear();
-
-        markFromRoots(worklist, liveNormal, visitedNormal, ephemeronsNormal);
-        drainWorklist(worklist, liveNormal, visitedNormal, ephemeronsNormal);
-        convergeEphemerons(liveNormal, visitedNormal, ephemeronsNormal);
-
-        // 2. Clear weak VALUES from weak tables before separating objects to
-        // be finalized. An owned collection only touches that state's weak
-        // tables: cleaning another live state's table here would mutate its
-        // data mid-execution.
-        for (int i = WEAK_TABLES.size() - 1; i >= 0; i--) {
-            WeakTableEntry entry = WEAK_TABLES.get(i);
-            LuaTable tbl = entry.table.get();
-            if (tbl == null) {
-                WEAK_TABLES.remove(i);
-            } else if (ownedFinalizersOnly && owner != null
-                    && entry.ownerId != GLOBAL_OWNER_ID
-                    && entry.ownerId != owner.gcOwnerId()) {
-                continue;
-            } else {
-                tbl.cleanupWeakValues(liveNormal::contains);
-            }
-        }
-
-        // 3. Separate dead objects with finalizers. An explicit request from
-        // one state must not run finalizers owned by another live state.
-        List<FinalizerEntry> toRun = new ArrayList<>();
-        for (int i = FINALIZERS.size() - 1; i >= 0; i--) {
-            FinalizerEntry entry = FINALIZERS.get(i);
-            if (liveNormal.contains(entry.target)) {
-                continue;
-            }
-            if (ownedFinalizersOnly && owner != null
-                    && entry.ownerId != GLOBAL_OWNER_ID
-                    && entry.ownerId != owner.gcOwnerId()) {
-                continue;
-            }
-            FINALIZERS.remove(i);
-            toRun.add(entry);
-        }
-
-        // 4. Resurrect objects in toRun and mark all reachable from them.
-        // The "all" sets start as copies of the normal ones: an object already
-        // proved live stays live. copyInto reuses the normal sets' storage, so
-        // this is the old addAll but without re-hashing every element.
-        IdentitySet<LuaValue> liveAll = markLiveAll;
-        IdentitySet<Object> visitedAll = markVisitedAll;
-        liveAll.reset();
-        visitedAll.reset();
-        liveNormal.copyInto(liveAll);
-        visitedNormal.copyInto(visitedAll);
-        List<LuaTable> ephemeronsAll = new ArrayList<>(ephemeronsNormal);
-
-        for (FinalizerEntry entry : toRun) {
-            if (entry.target != null && LuaTable.isCollectable(entry.target)) worklist.add(entry.target);
-            if (entry.gcHandler != null && LuaTable.isCollectable(entry.gcHandler)) worklist.add(entry.gcHandler);
-        }
-        drainWorklist(worklist, liveAll, visitedAll, ephemeronsAll);
-        convergeEphemerons(liveAll, visitedAll, ephemeronsAll);
-
-        // 5. Clear weak KEYS from weak tables after resurrection
-        for (int i = WEAK_TABLES.size() - 1; i >= 0; i--) {
-            LuaTable tbl = WEAK_TABLES.get(i).table.get();
-            if (tbl == null) {
-                WEAK_TABLES.remove(i);
-            } else {
-                tbl.cleanupWeakKeys(liveAll::contains);
-            }
-        }
-
-        for (int i = LARGE_STRINGS.size() - 1; i >= 0; i--) {
-            StringRef sr = LARGE_STRINGS.get(i);
-            LuaString str = sr.ref.get();
-            if (str == null || (str != allocatingString && !liveAll.contains(str))) {
-                LARGE_STRINGS.remove(i);
-            }
-        }
-
-        // 6. Run finalizers in toRun. When this collection was requested by a
-        // particular state, execute its finalizers under that state's basic
-        // metatable scope so __gc handlers observe the same string/number
-        // metatables as ordinary code in that state.
-        if (!toRun.isEmpty()) {
-            runningFinalizer = true;
-            LuaState basicScope = (ownedFinalizersOnly && owner != null) ? owner : null;
-            LuaState previousBasicScope = (basicScope != null) ? LuaValue.pushBasicState(basicScope) : null;
-            try {
-                for (FinalizerEntry entry : toRun) {
-                    try {
-                        LuaValue handler = null;
-                        if (entry.target.getMetatable() != null) {
-                            handler = entry.target.getMetatable().rawget(org.luava.runtime.LuaValue.Meta.GC);
-                        }
-                        if (handler == null || handler.isNil()) {
-                            handler = entry.gcHandler;
-                        }
-                        if (handler != null && (handler.isFunction() || (handler.getMetatable() != null && !handler.getMetatable().rawget(org.luava.runtime.LuaValue.Meta.CALL).isNil()))) {
-                            CallStack.setNextCall("__gc", "metamethod", false, true);
-                            handler.call(entry.target);
-                        }
-                    } catch (Throwable t) {
-                        // In Lua 5.4, errors in finalizers during GC do not abort the collector
-                    }
-                }
-            } finally {
-                if (basicScope != null) {
-                    LuaValue.popBasicState(previousBasicScope);
-                }
-                runningFinalizer = false;
-            }
-        }
-
-        // Dynamic GC threshold (Lua 5.4 pause semantics): scale the allocation
-        // threshold with the live heap so "repeat until GC" loops exit fast
-        // on small heaps while allocation-heavy workloads avoid O(N^2).
-        long liveBytes = (long) liveAll.size() * 256L;
-        gcThreshold = Math.max(256L * 1024, Math.min(16L * 1024 * 1024, liveBytes * 2));
-
-        return true;
-        } finally {
-            // Drop the retained references. The scratch keeps its capacity
-            // (so the next cycle allocates nothing) but must not pin the
-            // objects it marked: a long string held in markLiveAll would keep
-            // its LARGE_STRINGS entry alive and inflate
-            // collectgarbage("count"), which gc.lua asserts on.
-            markLive.reset();
-            markVisited.reset();
-            markLiveAll.reset();
-            markVisitedAll.reset();
-            worklistScratch.clear();
-            collecting = false;
-        }
+        return owner.gcState.collect();
     }
 
     /**
-     * PUC {@code lua_gc(LUA_GCSTEP, data)}: adds {@code data} kilobytes to the
-     * collector's debt, runs a full cycle once that debt covers the live-heap
-     * estimate, and reports whether the step ended a cycle.
-     *
-     * <p>Two details from {@code lgc.c} matter and are reproduced here. With
-     * {@code data == 0} the step is a "small" one that only ends a cycle if one
-     * was already under way, so an idle {@code collectgarbage("step")} is
-     * false. And the step temporarily re-enables a stopped collector, so
-     * {@code collectgarbage"stop"} followed by steps still completes cycles -
-     * {@code gc.lua}'s {@code dosteps} depends on both.
+     * PUC {@code lua_gc(LUA_GCSTEP, data)} scoped to the active state.
      */
-    public static synchronized boolean step(long stepSizeKb) {
-        if (stepSizeKb > 0) {
-            uncollectedBytes.addAndGet(stepSizeKb * 1024);
-            if (uncollectedBytes.get() < gcThreshold) {
-                return false;
-            }
-            uncollectedBytes.set(0);
-            return collect();
-        }
-        // data == 0: a small step against whatever debt already exists.
-        long pending = uncollectedBytes.get();
-        if (pending <= 0) {
-            return false;
-        }
-        if (pending <= SMALL_STEP_BYTES) {
-            uncollectedBytes.set(0);
-            return collect();
-        }
-        uncollectedBytes.addAndGet(-SMALL_STEP_BYTES);
-        return false;
+    public static boolean step(long stepSizeKb) {
+        return currentCollector().step(stepSizeKb);
     }
 
-    /** PUC {@code GCSTEPSIZE}: the debt retired by a {@code data == 0} step. */
-    private static final long SMALL_STEP_BYTES = 13L * 1024;
-
-    public static synchronized void checkAndRunDeadFinalizers() {
+    public static void checkAndRunDeadFinalizers() {
         collect();
     }
 
-    public interface RootProvider {
-        void provideRoots(java.util.function.Consumer<LuaValue> consumer);
-    }
-
-    private static final List<RootProvider> ROOT_PROVIDERS = new ArrayList<>();
-    private static final List<java.lang.ref.WeakReference<LuaState>> STATES = new ArrayList<>();
-
-    public static synchronized void addRootProvider(RootProvider provider) {
+    public static void addRootProvider(RootProvider provider) {
         if (provider != null) {
-            ROOT_PROVIDERS.add(provider);
+            synchronized (REGISTRY_LOCK) {
+                ROOT_PROVIDERS.add(provider);
+                hasRootProviders = true;
+            }
         }
     }
 
-    public static synchronized void registerState(LuaState state) {
+    public static void registerState(LuaState state) {
         if (state != null) {
-            STATES.removeIf(ref -> ref.get() == null);
-            STATES.add(new java.lang.ref.WeakReference<>(state));
-            gcRunning = true;
+            synchronized (REGISTRY_LOCK) {
+                STATES.removeIf(ref -> ref.get() == null);
+                STATES.add(new java.lang.ref.WeakReference<>(state));
+            }
+            state.gcState.gcRunning = true;
         }
     }
 
     /**
-     * W4 embedding/ops lifecycle: drops every bookkeeping reference to
-     * {@code state} (collector roots and weak-table/finalizer ownership
-     * aside, which are already owner-scoped per collection). Purely additive:
-     * existing collections never call this. Idempotent and null-tolerant.
+     * Drops bookkeeping references to {@code state} and drains/runs finalizers
+     * owned by {@code state} without taking any lock on unrelated states.
      */
-    public static synchronized void unregisterState(LuaState state) {
+    public static void unregisterState(LuaState state) {
         if (state == null) {
             return;
         }
-        STATES.removeIf(ref -> ref.get() == null || ref.get() == state);
+        synchronized (REGISTRY_LOCK) {
+            STATES.removeIf(ref -> ref.get() == null || ref.get() == state);
+        }
+        state.gcState.closeAndDrainFinalizers();
     }
 
-    public static synchronized boolean isReachable(LuaValue target) {
+    public static boolean isReachable(LuaValue target) {
         if (target == null) return false;
-        // Local sets: isReachable is a query, not a collection, so it must not
-        // share (and reset) the mark scratch used by collectInternal.
+        LuaState active = LuaValue.activeBasicState();
         IdentitySet<LuaValue> liveNormal = new IdentitySet<>();
         IdentitySet<Object> visitedNormal = new IdentitySet<>();
         List<LuaTable> ephemeronsNormal = new ArrayList<>();
         ArrayDeque<LuaValue> worklist = new ArrayDeque<>();
-        markFromRoots(worklist, liveNormal, visitedNormal, ephemeronsNormal);
+        markFromRoots(active, worklist, visitedNormal, ephemeronsNormal);
         drainWorklist(worklist, liveNormal, visitedNormal, ephemeronsNormal);
         convergeEphemerons(liveNormal, visitedNormal, ephemeronsNormal);
         return liveNormal.contains(target);
+    }
+
+    private static List<LuaState> snapshotLiveStates() {
+        synchronized (REGISTRY_LOCK) {
+            return snapshotLiveStatesLocked();
+        }
+    }
+
+    private static List<LuaState> snapshotLiveStatesLocked() {
+        List<LuaState> out = new ArrayList<>(STATES.size());
+        for (int i = STATES.size() - 1; i >= 0; i--) {
+            LuaState s = STATES.get(i).get();
+            if (s == null) {
+                STATES.remove(i);
+            } else {
+                out.add(s);
+            }
+        }
+        return out;
+    }
+
+    private static List<RootProvider> snapshotRootProviders() {
+        synchronized (REGISTRY_LOCK) {
+            return new ArrayList<>(ROOT_PROVIDERS);
+        }
+    }
+
+    /** Executes finalizer entries safely, swallowing errors per Lua 5.4 GC semantics. */
+    private static void runFinalizers(List<FinalizerEntry> toRun) {
+        for (FinalizerEntry entry : toRun) {
+            try {
+                LuaValue handler = null;
+                if (entry.target.getMetatable() != null) {
+                    handler = entry.target.getMetatable().rawget(LuaValue.Meta.GC);
+                }
+                if (handler == null || handler.isNil()) {
+                    handler = entry.gcHandler;
+                }
+                if (handler != null && (handler.isFunction()
+                        || (handler.getMetatable() != null && !handler.getMetatable().rawget(LuaValue.Meta.CALL).isNil()))) {
+                    CallStack.setNextCall("__gc", "metamethod", false, true);
+                    handler.call(entry.target);
+                }
+            } catch (Throwable t) {
+                // In Lua 5.4, errors in finalizers during GC/close do not abort remaining finalizers.
+            }
+        }
     }
 
     private static boolean isTracked(LuaValue v) {
         return v != null && (LuaTable.isCollectable(v) || v instanceof LuaString);
     }
 
-    private static void markFromRoots(ArrayDeque<LuaValue> worklist, Set<LuaValue> liveSet, Set<Object> visited, List<LuaTable> ephemerons) {
-        for (int i = STATES.size() - 1; i >= 0; i--) {
-            LuaState state = STATES.get(i).get();
-            if (state == null) {
-                STATES.remove(i);
-            } else {
-                if (state.getRegistry() != null) worklist.add(state.getRegistry());
-                if (state.getGlobals() != null) worklist.add(state.getGlobals());
-                LuaValue[] oStack = state.getObjectStack();
-                if (oStack != null) {
-                    int top = state.getStackTop();
-                    int max = Math.min(top, oStack.length);
-                    for (int s = 0; s < max; s++) {
-                        LuaValue v = oStack[s];
-                        if (isTracked(v)) worklist.add(v);
-                    }
-                }
+    private static void addStateRoots(LuaState state, ArrayDeque<LuaValue> worklist) {
+        if (state.getRegistry() != null) worklist.add(state.getRegistry());
+        if (state.getGlobals() != null) worklist.add(state.getGlobals());
+        addThreadStackRoots(state.getMainThread(), worklist);
+        LuaCoroutine current = LuaCoroutine.running();
+        if (current != null && current != state.getMainThread()) {
+            addThreadStackRoots(current, worklist);
+        }
+    }
+
+    private static void addThreadStackRoots(LuaCoroutine thread, ArrayDeque<LuaValue> worklist) {
+        if (thread == null) return;
+        LuaValue[] oStack = thread.getObjectStack();
+        if (oStack != null) {
+            int top = thread.getStackTop();
+            int max = Math.min(top, oStack.length);
+            for (int s = 0; s < max; s++) {
+                LuaValue v = oStack[s];
+                if (isTracked(v)) worklist.add(v);
+            }
+        }
+    }
+
+    private static void markFromRoots(LuaState scopedOwner, ArrayDeque<LuaValue> worklist,
+            Set<Object> visited, List<LuaTable> ephemerons) {
+        if (scopedOwner != null) {
+            addStateRoots(scopedOwner, worklist);
+        } else {
+            for (LuaState s : snapshotLiveStates()) {
+                addStateRoots(s, worklist);
             }
         }
 
-        for (int i = 0; i < ROOT_PROVIDERS.size(); i++) {
-            RootProvider rp = ROOT_PROVIDERS.get(i);
-            if (rp != null) {
-                rp.provideRoots(val -> {
-                    if (isTracked(val)) worklist.add(val);
-                });
+        if (hasRootProviders) {
+            for (RootProvider rp : snapshotRootProviders()) {
+                if (rp != null) {
+                    rp.provideRoots(val -> {
+                        if (isTracked(val)) worklist.add(val);
+                    });
+                }
             }
         }
 
@@ -591,7 +792,7 @@ public final class GCManager {
                 continue;
             }
 
-            if (val instanceof org.luava.runtime.concurrency.LuaCoroutine co) {
+            if (val instanceof LuaCoroutine co) {
                 if (co.getEntryFunction() != null) worklist.add(co.getEntryFunction());
                 CallStack.CallStackState state = co.getCallStackState();
                 if (state != null) {

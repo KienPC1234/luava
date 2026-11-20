@@ -6,7 +6,7 @@ Java interop. One jar, no runtime dependency beyond the JDK.
 
     source -> Lexer -> Parser -> AST -> BytecodeCompiler -> LuaProto -> BytecodeVM.execute()
 
-Status: 0.2.5 ("Concord"). The API may change before 1.0.
+Status: 0.2.6 ("Meridian"). The API may change before 1.0.
 
 ## Install
 
@@ -21,18 +21,18 @@ Maven:
 <dependency>
     <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava</artifactId>
-    <version>0.2.5</version>
+    <version>0.2.6</version>
 </dependency>
 ```
 
 Gradle:
 
 ```kotlin
-implementation("io.github.kienpc1234:luava:0.2.5")
+implementation("io.github.kienpc1234:luava:0.2.6")
 ```
 
 ```groovy
-implementation 'io.github.kienpc1234:luava:0.2.5'
+implementation 'io.github.kienpc1234:luava:0.2.6'
 ```
 
 The artifact has zero transitive dependencies.
@@ -43,14 +43,14 @@ Download the jar from the
 [GitHub release](https://github.com/KienPC1234/luava/releases/latest):
 
 ```bash
-javac -cp luava-0.2.5.jar MyApp.java
-java  -cp luava-0.2.5.jar:. MyApp
+javac -cp luava-0.2.6.jar MyApp.java
+java  -cp luava-0.2.6.jar:. MyApp
 ```
 
 Build from source:
 
 ```bash
-mvn package          # target/luava-0.2.5.jar
+mvn package          # target/luava-0.2.6.jar
 mvn test             # PUC Lua 5.4.9 suites + unit tests
 ```
 
@@ -187,11 +187,11 @@ that does nothing when no loader is set.
 ## CLI and REPL
 
 ```bash
-java -jar luava-0.2.5.jar script.lua arg1 arg2   # run a file
-java -jar luava-0.2.5.jar -e "print(1 + 2)"      # evaluate a string
-java -jar luava-0.2.5.jar -i script.lua          # run, then REPL
-java -jar luava-0.2.5.jar                        # interactive REPL (also on a TTY)
-java -jar luava-0.2.5.jar -v                     # version + code name
+java -jar luava-0.2.6.jar script.lua arg1 arg2   # run a file
+java -jar luava-0.2.6.jar -e "print(1 + 2)"      # evaluate a string
+java -jar luava-0.2.6.jar -i script.lua          # run, then REPL
+java -jar luava-0.2.6.jar                        # interactive REPL (also on a TTY)
+java -jar luava-0.2.6.jar -v                     # version + code name
 ```
 
 Flags: `-e stat`/`-E stat` (run a string), `-i`/`--interactive` (REPL),
@@ -208,35 +208,44 @@ through `LuaState` remains the primary use; the
   with 32-bit instructions. PUC-Rio semantics throughout: 1-based arrays, floor
   division, `a - floor(a/b)*b` modulo, `<close>` variables and tail calls.
 - Unboxed hot path: three parallel stacks (`long[]` raw bits, `byte[]` type
-  tags, `LuaValue[]` heap refs) keep numbers and booleans off the boxed heap
-  during arithmetic and loops.
-- Coroutines on virtual threads: each `LuaCoroutine` owns its stacks;
-  `yield`/`resume` park and unpark carrier threads.
+  tags, `LuaValue[]` heap refs) and unboxed `LuaTable` array lanes keep
+  numbers and booleans off the boxed heap during arithmetic and loops.
+- Stackless and virtual-thread coroutines: pure-Lua coroutines execute on
+  the caller stack fast path and graduate automatically to Java virtual
+  threads when yielding across Java or protected boundaries.
 
 ## Tiered JIT
 
 The interpreter is always available and is the deopt target. Hot Lua functions
 whose shape passes a static subset analysis tier up to one JVM method per proto
 (hidden class, unboxed `long` flow, direct `INVOKESTATIC` self-recursion, type
-guards with interpreter resume-at-pc deopt). Coroutines, debug hooks and
-execution timeouts never touch JIT code.
+guards with interpreter resume-at-pc deopt). Guarded execution (`timeout`,
+`instructionLimit` >= 8192, `cancellable`) runs compiled guarded JIT kernels
+that check `LoopGuard.tick()` at loop back-edges; debug hooks, custom
+`maxCallDepth` limits, and sub-8192 instruction budgets stay in the interpreter.
 
 Supported today: integer and float arithmetic (int and float lanes, C99 `^`,
 Lua shift and floor-division rules); `for`/`while`/`repeat`; `if`/`and`/`or` and
 equality; string concat; generic-for (`pairs`, `ipairs`, `gmatch`) for the
 built-in iterators; closure factories; `obj:method()` and string-receiver
-methods (`str:sub`, `str:gmatch`, ...); and the `math.sqrt`, `math.floor`,
+methods (`str:sub`, `str:gmatch`, ...); pure-Lua coroutines (stackless fast path
+with virtual-thread graduation); and the `math.sqrt`, `math.floor`,
 `math.floor(math.sqrt(x))` and `tostring` intrinsics (identity-guarded, so
 reassigning or shadowing them deopts).
 
-Knobs:
+Knobs & reuse:
 
 - `state.jitEnabled(false)` (or `true`, or `null` for the global default)
-  toggles JIT for one state; the process default is `-Dluava.jit=false`.
+  toggles JIT for one state; the process default is `-Dluava.jit=true`
+  (pass `-Dluava.jit=false` to disable globally).
+- `LuaState.compileChunk(src, name)` produces an `AutoCloseable` `CompiledChunk`
+  for reuse across `LuaState` instances or a bounded `LuaStatePool`, preserving
+  compiled bytecode and JIT tier-up state (`close()` invalidates cached kernels).
 - `JitCompiler.prewarm(closure)` compiles a closure tree up front for low
   first-request latency; tier-up otherwise compiles on a background thread
   (`-Dluava.jit.sync=true` for deterministic measurement).
-- Compiled classes are bounded by an LRU cache (512), so Metaspace cannot leak.
+- Compiled classes are bounded by a second-chance LRU cache (512), so
+  Metaspace cannot leak.
 - Hotness thresholds use `-Dluava.jit.hotThreshold=N` (default 50) and
   `-Dluava.jit.loopThreshold=N` (default 8192); `-Dluava.jit.debug=true` logs
   tier-up decisions to stderr. See the
@@ -245,9 +254,10 @@ Knobs:
 ## Conformance
 
 - 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` files pass, asserted by
-  `OfficialSuiteEvaluationTest`, so a regression fails the build. 366 unit tests
-  run alongside, including a byte-for-byte differential suite against stock PUC
-  Lua 5.4 and a fixed stdlib sweep under JIT both on and off.
+  `OfficialSuiteEvaluationTest`, so a regression fails the build. The unit,
+  sandbox/adversarial security, lifecycle hardening, and differential suites
+  against stock PUC Lua 5.4 pass with JIT off, default async JIT, and sync
+  `-Dluava.jit.hotThreshold=1`.
 - `all.lua`, the PUC driver, runs in user-test mode (`_U`): it re-runs every
   suite through its `string.dump`/`load` wrapper, adding a round-trip pass over
   the corpus.
@@ -265,10 +275,27 @@ Knobs:
 
 ## Benchmarks
 
-Paired interleave against stock LuaJ 3.0.1 (order-flipped, median, pinned,
-warm=6, iters=10, `-Dluava.jit.sync=true`), all 10 tasks won:
+Current Luava timings (`Bench <file> 6 10`, 6 warmup, 10 measured iterations,
+`-Dluava.jit.sync=true`):
 
-| Task | Luava ms | LuaJ ms | LuaJ/Luava |
+| Task | Luava range (ms) |
+| :--- | ---: |
+| `01_arithmetic` | 36.43 - 36.79 |
+| `02_loops` | 235.90 - 238.11 |
+| `03_table_array` | 12.53 - 15.77 |
+| `04_string_concat` | 6.10 - 10.35 |
+| `05_closures` | 16.01 - 21.45 |
+| `06_coroutines` | 90.71 - 93.96 |
+| `07_hash_table` | 47.09 - 75.60 |
+| `08_oop_metatables` | 304.49 - 308.16 |
+| `09_string_patterns` | 49.92 - 70.61 |
+| `10_sieve` | 121.74 - 138.99 |
+
+Reference paired interleave against stock LuaJ 3.0.1 (earlier 0.2.5 baseline,
+order-flipped, median, pinned, warm=6, iters=10, `-Dluava.jit.sync=true`),
+all 10 tasks won:
+
+| Task | Baseline Luava ms | LuaJ ms | LuaJ/Luava |
 | :--- | ---: | ---: | ---: |
 | arithmetic loop | 33.7 | 285.6 | 8.47x |
 | recursive fib | 243.8 | 2538.6 | 10.41x |

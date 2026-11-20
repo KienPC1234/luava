@@ -19,6 +19,21 @@ public final class JitRuntime {
     private JitRuntime() {}
 
     /**
+     * Safepoint called periodically from JIT loop back-edges and call entries
+     * to honor instruction/timeout guards without forcing guarded states to
+     * run interpreted.
+     */
+    public static void safepoint(LuaClosure self, int cost) {
+        org.luava.runtime.LuaState s = self.getState();
+        if (s != null) {
+            org.luava.runtime.LuaState.LoopGuard g = s.loopGuard;
+            if (g != null) {
+                g.tickBatch(cost);
+            }
+        }
+    }
+
+    /**
      * Invokes an already-compiled callee on the shared register window.
      * The callee is pure (checked by the caller), so a guard failure inside
      * simply deopts the whole outer call for interpreter restart.
@@ -117,10 +132,22 @@ public final class JitRuntime {
      * and enters the compiled callee once it is ready.
      */
     public static void requestCallee(org.luava.runtime.bytecode.LuaProto proto) {
+        requestCallee(proto, false);
+    }
+
+    public static void requestCalleeGuarded(org.luava.runtime.bytecode.LuaProto proto) {
+        requestCallee(proto, true);
+    }
+
+    public static void requestCallee(org.luava.runtime.bytecode.LuaProto proto, boolean guarded) {
         try {
-            org.luava.runtime.jit.JitCompiler.requestCompile(proto);
+            org.luava.runtime.jit.JitCompiler.requestCompile(proto, guarded);
         } catch (Throwable t) {
-            proto.jitDisabled = true;
+            if (guarded) {
+                proto.guardedJitDisabled = true;
+            } else {
+                proto.jitDisabled = true;
+            }
         }
     }
 
@@ -138,23 +165,64 @@ public final class JitRuntime {
      * complete atomically throws a structural {@link DeoptSignal}; a nested
      * deopt restores the window before propagating.
      */
+    private static JitCode resolveCalleeSlow(LuaClosure closure, org.luava.runtime.bytecode.LuaProto proto,
+            int resumePc, boolean resultUsed) throws DeoptSignal {
+        org.luava.runtime.LuaState st = closure.getState();
+        if (st != null && org.luava.runtime.bytecode.BytecodeVM.jitBlockedByGuard(st)) {
+            throw new DeoptSignal(resumePc, true);
+        }
+        boolean guarded = st != null && st.loopGuard != null;
+        JitCode jc = guarded ? proto.guardedJitCode : proto.jitCode;
+        if (jc == null) {
+            requestCallee(proto, guarded);
+            throw new DeoptSignal(resumePc, true);
+        }
+        if (!jc.callSafe || (resultUsed && jc.returnsVoid)) {
+            throw new DeoptSignal(resumePc, true);
+        }
+        if (!jc.recentlyUsed) {
+            jc.recentlyUsed = true;
+        }
+        return jc;
+    }
+
     public static void callFast(LuaValue callee, long[] p, byte[] t, LuaValue[] o,
             int argBase, int nArgs, int resumePc, boolean resultUsed) throws Throwable {
         if (!(callee instanceof LuaClosure closure)) {
             throw new DeoptSignal(resumePc, true);
         }
         org.luava.runtime.bytecode.LuaProto proto = closure.proto;
-        JitCode jc = proto.jitCode;
-        if (jc == null) {
-            requestCallee(proto);
-            throw new DeoptSignal(resumePc, true);
+        org.luava.runtime.LuaState st = closure.getState();
+        JitCode jc;
+        if (st == null || st.loopGuard == null) {
+            jc = proto.jitCode;
+            if (jc == null || !jc.callSafe || (resultUsed && jc.returnsVoid)) {
+                jc = resolveCalleeSlow(closure, proto, resumePc, resultUsed);
+            } else if (!jc.recentlyUsed) {
+                jc.recentlyUsed = true;
+            }
+        } else {
+            jc = resolveCalleeSlow(closure, proto, resumePc, resultUsed);
         }
-        if (!jc.pure) {
-            throw new DeoptSignal(resumePc, true);
+        if (jc.leafNoWindow && nArgs == proto.numParams && argBase + proto.maxStackSize <= p.length) {
+            int dst = argBase - 1;
+            if (jc.returnsInt) {
+                p[dst] = (long) jc.handle.invokeExact(closure, (Object[]) closure.upvals, p, t, o, argBase);
+                t[dst] = org.luava.runtime.bytecode.BytecodeVM.TYPE_INT;
+                o[dst] = null;
+            } else {
+                LuaValue r = (LuaValue) jc.objHandle.invokeExact(closure, (Object[]) closure.upvals,
+                        p, t, o, argBase);
+                org.luava.runtime.bytecode.BytecodeVM.setLuaValue(p, t, o, dst, r);
+            }
+            return;
         }
-        if (resultUsed && jc.returnsVoid) {
-            throw new DeoptSignal(resumePc, true);
-        }
+        callFastWithWindow(closure, proto, jc, p, t, o, argBase, nArgs, resumePc);
+    }
+
+    private static void callFastWithWindow(LuaClosure closure, org.luava.runtime.bytecode.LuaProto proto,
+            JitCode jc, long[] p, byte[] t, LuaValue[] o, int argBase, int nArgs, int resumePc)
+            throws Throwable {
         int numParams = proto.numParams;
         if (nArgs < numParams) {
             nilFill(p, t, o, argBase + nArgs, argBase + numParams);
@@ -297,8 +365,12 @@ public final class JitRuntime {
     public static void closeAt(org.luava.runtime.bytecode.LuaClosure self, int fromIdx) {
         org.luava.runtime.LuaState state = self.getState();
         org.luava.runtime.concurrency.LuaCoroutine thread = state.getCurrentThread();
-        state.closeUpvalues(thread, fromIdx);
-        state.closeTbc(thread, fromIdx, null);
+        if (thread.getOpenUpvaluesHead() != null) {
+            state.closeUpvalues(thread, fromIdx);
+        }
+        if (thread.getTbcHead() != null) {
+            state.closeTbc(thread, fromIdx, null);
+        }
     }
 
     /**
@@ -391,6 +463,83 @@ public final class JitRuntime {
         return null;
     }
 
+    private record SelfHop(
+            org.luava.runtime.LuaTable mt,
+            long mtVer,
+            org.luava.runtime.LuaTable idx,
+            long idxVer,
+            LuaValue method) {}
+
+    public static final class SelfCache {
+        volatile SelfHop hop;
+    }
+
+    /**
+     * Inline-cached {@code OP_SELF} dispatch for constant method keys. Guards
+     * the common case (table instance without own method override, monomorphic
+     * metatable + {@code __index} table versions) with a 64-bit key bloom check
+     * and one immutable {@link SelfHop} record load.
+     */
+    public static LuaValue selfMethodCached(org.luava.runtime.bytecode.LuaClosure self,
+            long[] p, byte[] t, LuaValue[] o, int objIdx, LuaValue key, SelfCache cache) {
+        if (t[objIdx] == org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT
+                && o[objIdx] instanceof org.luava.runtime.LuaTable tbl) {
+            if (key instanceof org.luava.runtime.LuaString ks && tbl.hasMaybeStringKey(ks)) {
+                LuaValue own = tbl.rawget(ks);
+                if (!own.isNil()) {
+                    return own;
+                }
+            } else if (!(key instanceof org.luava.runtime.LuaString)) {
+                LuaValue own = tbl.rawget(key);
+                if (!own.isNil()) {
+                    return own;
+                }
+            }
+            org.luava.runtime.LuaTable mt = tbl.getMetatable();
+            SelfHop h = cache.hop;
+            if (mt != null && h != null && h.mt == mt
+                    && h.idx.readVersion() == h.idxVer && mt.readVersion() == h.mtVer) {
+                return h.method;
+            }
+        }
+        return selfMethodCachedMiss(self, p, t, o, objIdx, key, cache);
+    }
+
+    private static LuaValue selfMethodCachedMiss(org.luava.runtime.bytecode.LuaClosure self,
+            long[] p, byte[] t, LuaValue[] o, int objIdx, LuaValue key, SelfCache cache) {
+        if (t[objIdx] != org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT) {
+            return null;
+        }
+        LuaValue obj = o[objIdx];
+        org.luava.runtime.LuaTable mt;
+        if (obj instanceof org.luava.runtime.LuaTable tbl) {
+            mt = tbl.getMetatable();
+        } else if (obj instanceof org.luava.runtime.LuaString && key instanceof org.luava.runtime.LuaString) {
+            mt = self.getState() != null
+                    ? self.getState().basicMetatable(org.luava.runtime.LuaType.STRING)
+                    : org.luava.runtime.LuaValue.getBasicMetatable(org.luava.runtime.LuaType.STRING);
+        } else {
+            return null;
+        }
+        if (mt == null) {
+            return null;
+        }
+        long mtVer = mt.readVersion();
+        LuaValue handler = mt.rawget(org.luava.runtime.LuaValue.Meta.INDEX);
+        if (!(handler instanceof org.luava.runtime.LuaTable idx)) {
+            return null;
+        }
+        long idxVer = idx.readVersion();
+        LuaValue viaIdx = idx.rawget(key);
+        if (viaIdx.isNil()) {
+            return null;
+        }
+        if (mtVer != -1L && idxVer != -1L) {
+            cache.hop = new SelfHop(mt, mtVer, idx, idxVer, viaIdx);
+        }
+        return viaIdx;
+    }
+
     /**
      * Concatenates registers {@code [from, to)} into one string, mirroring
      * the interpreter's {@code OP_CONCAT}. Returns {@code null} when any
@@ -399,24 +548,87 @@ public final class JitRuntime {
      */
     public static org.luava.runtime.LuaValue concatRange(long[] p, byte[] t, LuaValue[] o,
             int from, int to) {
-        org.luava.runtime.LuaValue res =
-                org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, from);
-        if (!isConcatable(res)) {
-            return null;
+        int count = to - from;
+        if (count == 2) {
+            return concatTwo(p, t, o, from);
         }
-        for (int i = from + 1; i < to; i++) {
-            org.luava.runtime.LuaValue v =
-                    org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, i);
-            if (!isConcatable(v)) {
-                return null;
+        org.luava.runtime.LuaString[] parts = new org.luava.runtime.LuaString[count];
+        long total = 0;
+        for (int i = 0; i < count; i++) {
+            int idx = from + i;
+            if (t[idx] == org.luava.runtime.bytecode.BytecodeVM.TYPE_INT) {
+                total += org.luava.runtime.LuaString.longStringLength(p[idx]);
+            } else {
+                org.luava.runtime.LuaString s = toConcatString(p, t, o, idx);
+                if (s == null) return null;
+                parts[i] = s;
+                total += s.rawLength();
             }
-            res = res.concat(v);
         }
-        return res;
+        if (total > org.luava.runtime.LuaState.allocationLimit()) {
+            throw new org.luava.runtime.LuaException("string length overflow");
+        }
+        if (total == 0) return org.luava.runtime.LuaString.EMPTY;
+        byte[] out = new byte[(int) total];
+        int pos = 0;
+        for (int i = 0; i < count; i++) {
+            org.luava.runtime.LuaString s = parts[i];
+            if (s != null) {
+                int len = s.rawLength();
+                if (len > 0) {
+                    System.arraycopy(s.rawBytesUnsafe(), s.rawOffset(), out, pos, len);
+                    pos += len;
+                }
+            } else {
+                long iv = p[from + i];
+                int len = org.luava.runtime.LuaString.longStringLength(iv);
+                pos += len;
+                org.luava.runtime.LuaString.writeLongBytes(iv, out, pos);
+            }
+        }
+        return org.luava.runtime.LuaString.fromOwnedBytes(out);
     }
 
-    private static boolean isConcatable(org.luava.runtime.LuaValue v) {
-        return v.isString() || v.isNumber();
+    private static org.luava.runtime.LuaValue concatTwo(long[] p, byte[] t, LuaValue[] o, int from) {
+        byte t0 = t[from];
+        byte t1 = t[from + 1];
+        if (t0 == org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT && t1 == org.luava.runtime.bytecode.BytecodeVM.TYPE_INT) {
+            if (!(o[from] instanceof org.luava.runtime.LuaString ls)) {
+                return null;
+            }
+            int lLen = ls.rawLength();
+            long iv = p[from + 1];
+            if (lLen == 0) return org.luava.runtime.LuaString.fromLong(iv);
+            int rLen = org.luava.runtime.LuaString.longStringLength(iv);
+            long total = (long) lLen + rLen;
+            if (total > org.luava.runtime.LuaState.allocationLimit()) {
+                throw new org.luava.runtime.LuaException("string length overflow");
+            }
+            byte[] out = new byte[(int) total];
+            System.arraycopy(ls.rawBytesUnsafe(), ls.rawOffset(), out, 0, lLen);
+            org.luava.runtime.LuaString.writeLongBytes(iv, out, (int) total);
+            return org.luava.runtime.LuaString.fromOwnedBytes(out);
+        }
+        org.luava.runtime.LuaString s0 = toConcatString(p, t, o, from);
+        org.luava.runtime.LuaString s1 = toConcatString(p, t, o, from + 1);
+        if (s0 == null || s1 == null) return null;
+        return s0.concat(s1);
+    }
+
+    private static org.luava.runtime.LuaString toConcatString(long[] p, byte[] t, LuaValue[] o, int idx) {
+        return switch (t[idx]) {
+            case org.luava.runtime.bytecode.BytecodeVM.TYPE_INT -> org.luava.runtime.LuaString.fromLong(p[idx]);
+            case org.luava.runtime.bytecode.BytecodeVM.TYPE_FLOAT -> org.luava.runtime.LuaString.valueOf(
+                    org.luava.runtime.LuaFloat.valueOf(Double.longBitsToDouble(p[idx])).toLuaString());
+            case org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT -> {
+                LuaValue v = o[idx];
+                if (v instanceof org.luava.runtime.LuaString s) yield s;
+                if (v instanceof org.luava.runtime.LuaInteger li) yield org.luava.runtime.LuaString.fromLong(li.toLong());
+                if (v != null && (v.isString() || v.isNumber())) yield org.luava.runtime.LuaString.valueOf(v.toLuaString());
+                yield null;
+            }
+            default -> null;
+        };
     }
 
     /**
@@ -579,7 +791,7 @@ public final class JitRuntime {
             if (state.basicMetatable(org.luava.runtime.LuaType.NUMBER) != null) {
                 return null;
             }
-            return org.luava.runtime.LuaString.valueOf(Long.toString(p[argIdx]));
+            return org.luava.runtime.LuaString.fromLong(p[argIdx]);
         }
         if (tag == org.luava.runtime.bytecode.BytecodeVM.TYPE_FLOAT) {
             if (state.basicMetatable(org.luava.runtime.LuaType.NUMBER) != null) {
@@ -612,10 +824,9 @@ public final class JitRuntime {
     public static void setList(long[] p, byte[] t, LuaValue[] o, int funcIdx, int n, int last) {
         org.luava.runtime.LuaValue tbl =
                 org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx);
-        if (tbl instanceof org.luava.runtime.LuaTable lt) {
+        if (tbl instanceof org.luava.runtime.LuaTable lt && lt.getMetatable() == null) {
             for (int i = 1; i <= n; i++) {
-                lt.rawset(org.luava.runtime.LuaInteger.valueOf(last + i),
-                        org.luava.runtime.bytecode.BytecodeVM.getLuaValue(p, t, o, funcIdx + i));
+                lt.rawsetIntFromStack(last + i, p, t, o, funcIdx + i);
             }
         } else {
             for (int i = 1; i <= n; i++) {

@@ -48,6 +48,9 @@ public final class VmContext {
      */
     public LuaValue[] osrTopResult;
     public boolean varargPrepRan;
+    public boolean stackless;
+    public boolean stacklessYielded;
+    public boolean stacklessPromoted;
     /** Scratch in/out slot for tiny helpers (e.g. callable resolution). */
     public int scratch0;
 

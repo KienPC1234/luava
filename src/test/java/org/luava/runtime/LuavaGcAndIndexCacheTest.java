@@ -247,7 +247,7 @@ public class LuavaGcAndIndexCacheTest {
         LuaState s = new LuaState();
         // Exercises the retained-scratch path across many cycles: allocate in a
         // loop so onAlloc crosses the threshold repeatedly.
-        double before = GCManager.getMemoryKb();
+        double before = GCManager.getMemoryKb(s);
         s.eval("""
                 local keep = {}
                 for i = 1, 200000 do keep[i % 64 + 1] = {i, tostring(i)} end
@@ -256,12 +256,12 @@ public class LuavaGcAndIndexCacheTest {
         // even if nothing was collected. Accounted memory is explicit (not JVM
         // GC), so these three facts are deterministic and actually test the
         // claim in the test name.
-        double peak = GCManager.getMemoryKb();
+        double peak = GCManager.getMemoryKb(s);
         assertTrue(peak > before, "allocating 200k tables must raise accounted memory");
         GCManager.collect(s);
-        double after = GCManager.getMemoryKb();
+        double after = GCManager.getMemoryKb(s);
         assertTrue(after < peak, "collect must release accounted bytes: peak=" + peak + " after=" + after);
-        assertEquals(0L, GCManager.getUncollectedBytes(), "collect resets the pending counter");
+        assertEquals(0L, GCManager.getUncollectedBytes(s), "collect resets the pending counter");
     }
 
     @Test

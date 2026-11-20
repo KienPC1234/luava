@@ -38,9 +38,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
@@ -68,10 +72,25 @@ public final class LuaState implements AutoCloseable {
     private final AtomicLong statsCalls = new AtomicLong();
     private final AtomicLong statsInstructions = new AtomicLong();
     /** Set by {@link #close()}; further entries fail fast via {@link #ensureOpen()}. */
+    private final AtomicBoolean closing = new AtomicBoolean(false);
     private volatile boolean closed;
+    /** Per-state garbage collector bookkeeping (zero cross-state lock/counter contention). */
+    public final org.luava.runtime.eval.GCManager.StateGC gcState =
+            new org.luava.runtime.eval.GCManager.StateGC(this);
+    /** Tracks the root host thread currently executing on this state to detect unsupported concurrent use. */
+    private final AtomicReference<Thread> executingRootThread = new AtomicReference<>();
+    private int executingDepth = 0;
+    private final Object asyncLock = new Object();
+    private CompletableFuture<Void> asyncTail = CompletableFuture.completedFuture(null);
+    private static final ExecutorService ASYNC_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
     private final LuaTable globals = new LuaTable();
     private final LuaTable registry = new LuaTable();
     private final LuaCoroutine mainThread = LuaCoroutine.createMainThread();
+    private volatile long maxMemoryBytes = 0L;
+    private volatile int maxCoroutines = 0;
+    private volatile int maxCallDepth = 0;
+    public volatile boolean cancelled = false;
+    private final java.util.concurrent.atomic.AtomicInteger liveCoroutines = new java.util.concurrent.atomic.AtomicInteger();
     private final EnumMap<LuaType, LuaTable> basicMetatables = new EnumMap<>(LuaType.class);
     private final Environment rootEnvironment;
     private final List<ModuleBinder.ModuleInfo> registeredModules = new ArrayList<>();
@@ -117,6 +136,13 @@ public final class LuaState implements AutoCloseable {
      */
     public interface LoopGuard {
         void tick();
+
+        /** Batched safepoint tick used by JIT kernels to account for {@code steps} VM ops. */
+        default void tickBatch(int steps) {
+            for (int i = 0; i < steps; i++) {
+                tick();
+            }
+        }
     }
 
     /**
@@ -134,6 +160,7 @@ public final class LuaState implements AutoCloseable {
         private int countdown;
         private volatile boolean tripped;
         private volatile boolean cancelRequested;
+        private volatile boolean explicitCancel;
         private volatile boolean timeoutTrip;
 
         Guard(long maxInstr, long timeoutNanos) {
@@ -150,6 +177,7 @@ public final class LuaState implements AutoCloseable {
             if (!cancelRequested) {
                 this.tripped = false;
                 this.timeoutTrip = false;
+                this.explicitCancel = false;
             }
         }
 
@@ -159,6 +187,24 @@ public final class LuaState implements AutoCloseable {
             this.timeoutTrip = true;
             this.cancelRequested = true;
             this.tripped = true;
+        }
+
+        void cancelExplicit() {
+            this.explicitCancel = true;
+            this.timeoutTrip = false;
+            this.cancelRequested = true;
+            this.tripped = true;
+        }
+
+        void clearCancel() {
+            this.explicitCancel = false;
+            this.cancelRequested = false;
+            this.timeoutTrip = false;
+            this.tripped = false;
+        }
+
+        boolean isCancelled() {
+            return cancelRequested;
         }
 
         @Override
@@ -181,7 +227,41 @@ public final class LuaState implements AutoCloseable {
             }
         }
 
+        @Override
+        public void tickBatch(int steps) {
+            if (tripped) {
+                throw trip();
+            }
+            if (maxInstr > 0) {
+                remaining -= steps;
+                if (remaining < 0) {
+                    tripped = true;
+                    timeoutTrip = false;
+                    throw trip();
+                }
+            }
+            if (timeoutNanos > 0) {
+                countdown -= steps;
+                if (countdown <= 0) {
+                    countdown = 4096;
+                    if (System.nanoTime() - deadline >= 0) {
+                        tripped = true;
+                        timeoutTrip = true;
+                        throw trip();
+                    }
+                }
+            }
+        }
+
+        /** True when instruction budget requires per-instruction interpreter granularity. */
+        public boolean hasSmallInstrBudget() {
+            return maxInstr > 0 && maxInstr < 8192;
+        }
+
         private LuaException trip() {
+            if (explicitCancel) {
+                return new LuaException("execution cancelled");
+            }
             return timeoutTrip
                     ? new GuardTimeout("execution timed out")
                     : new LuaException("instruction limit exceeded");
@@ -204,6 +284,67 @@ public final class LuaState implements AutoCloseable {
 
     /** Active state for stdlib guard checks (set around a top-level run). */
     private static final ThreadLocal<LuaState> ACTIVE_STATE = new ThreadLocal<>();
+    /** Logical root host thread for the active execution (propagated across coroutines for reentrancy checks). */
+    private static final ThreadLocal<Thread> ACTIVE_ROOT_THREAD = new ThreadLocal<>();
+
+    public static LuaState activeState() {
+        return ACTIVE_STATE.get();
+    }
+
+    public static LuaState swapActiveState(LuaState state) {
+        LuaState prev = ACTIVE_STATE.get();
+        if (state == null) {
+            ACTIVE_STATE.remove();
+        } else {
+            ACTIVE_STATE.set(state);
+        }
+        return prev;
+    }
+
+    public static void restoreActiveState(LuaState prev) {
+        swapActiveState(prev);
+    }
+
+    public static Long activeMaxAlloc() {
+        return ACTIVE_MAX_ALLOC.get();
+    }
+
+    public static Long swapActiveMaxAlloc(Long cap) {
+        Long prev = ACTIVE_MAX_ALLOC.get();
+        if (cap == null || cap <= 0) {
+            ACTIVE_MAX_ALLOC.remove();
+        } else {
+            ACTIVE_MAX_ALLOC.set(cap);
+        }
+        return prev;
+    }
+
+    public static void restoreActiveMaxAlloc(Long prev) {
+        swapActiveMaxAlloc(prev);
+    }
+
+    public static Thread activeRootThread() {
+        Thread t = ACTIVE_ROOT_THREAD.get();
+        return t != null ? t : Thread.currentThread();
+    }
+
+    public static Thread activeRootThreadOrNull() {
+        return ACTIVE_ROOT_THREAD.get();
+    }
+
+    public static Thread swapActiveRootThread(Thread t) {
+        Thread prev = ACTIVE_ROOT_THREAD.get();
+        if (t == null) {
+            ACTIVE_ROOT_THREAD.remove();
+        } else {
+            ACTIVE_ROOT_THREAD.set(t);
+        }
+        return prev;
+    }
+
+    public static void restoreActiveRootThread(Thread prev) {
+        swapActiveRootThread(prev);
+    }
 
     /**
      * Guard check for pure-Java stdlib loops (table.move, pattern matching,
@@ -213,9 +354,138 @@ public final class LuaState implements AutoCloseable {
     public static void checkGuard() {
         LuaState s = ACTIVE_STATE.get();
         if (s != null) {
+            if (s.cancelled) {
+                throw new LuaException("execution cancelled");
+            }
             LoopGuard g = s.loopGuard;
             if (g != null) g.tick();
         }
+    }
+
+    public static void checkGuard(int steps) {
+        LuaState s = ACTIVE_STATE.get();
+        if (s != null) {
+            if (s.cancelled) {
+                throw new LuaException("execution cancelled");
+            }
+            LoopGuard g = s.loopGuard;
+            if (g != null) g.tickBatch(steps);
+        }
+    }
+
+    /**
+     * Bounds retained heap memory for this state (best-effort estimate over live
+     * Lua tables, strings, closures, and coroutines checked synchronously at GC
+     * points; 0 = unlimited).
+     */
+    public LuaState maxMemoryBytes(long bytes) {
+        this.maxMemoryBytes = bytes;
+        this.gcState.setMaxMemoryBytes(bytes);
+        return this;
+    }
+
+    public long getMaxMemoryBytes() {
+        return maxMemoryBytes;
+    }
+
+    /**
+     * Limits the number of simultaneously non-dead coroutines created inside this
+     * state (0 = unlimited). Sequential coroutines that complete or close free
+     * their slots immediately.
+     */
+    public LuaState maxCoroutines(int limit) {
+        this.maxCoroutines = limit;
+        return this;
+    }
+
+    public int getMaxCoroutines() {
+        return maxCoroutines;
+    }
+
+    public int getLiveCoroutineCount() {
+        return liveCoroutines.get();
+    }
+
+    public void onCoroutineCreated() {
+        int cap = maxCoroutines;
+        if (cap > 0) {
+            while (true) {
+                int cur = liveCoroutines.get();
+                if (cur >= cap) {
+                    throw new LuaException("coroutine limit exceeded");
+                }
+                if (liveCoroutines.compareAndSet(cur, cur + 1)) {
+                    return;
+                }
+            }
+        }
+        liveCoroutines.incrementAndGet();
+    }
+
+    public void onCoroutineDead() {
+        int prev;
+        do {
+            prev = liveCoroutines.get();
+        } while (prev > 0 && !liveCoroutines.compareAndSet(prev, prev - 1));
+    }
+
+    /**
+     * Sets a custom Lua call stack frame limit for this state (0 = default
+     * {@link org.luava.runtime.eval.CallStack#MAX_CALL_DEPTH}).
+     */
+    public LuaState maxCallDepth(int depth) {
+        this.maxCallDepth = depth;
+        return this;
+    }
+
+    public int getMaxCallDepth() {
+        return maxCallDepth;
+    }
+
+    /**
+     * Arms a lightweight cooperative cancellation guard on this state even when
+     * no {@code timeout} or {@code instructionLimit} is configured, allowing
+     * {@link #cancel()} from another thread to abort JIT-compiled loops too.
+     */
+    public LuaState cancellable() {
+        if (this.loopGuard == null) {
+            this.loopGuard = new Guard(0, 0);
+        }
+        return this;
+    }
+
+    /**
+     * Cooperatively cancels execution on this state. Safe to invoke from another
+     * host thread while a script, pattern match, or coroutine is running.
+     */
+    public LuaState cancel() {
+        this.cancelled = true;
+        if (loopGuard instanceof Guard g) {
+            g.cancelExplicit();
+        } else {
+            Guard cancelGuard = new Guard(0, 0);
+            cancelGuard.cancelExplicit();
+            this.loopGuard = cancelGuard;
+        }
+        Thread t = executingRootThread.get();
+        if (t != null) {
+            java.util.concurrent.locks.LockSupport.unpark(t);
+        }
+        return this;
+    }
+
+    public boolean isCancelled() {
+        if (cancelled) return true;
+        return loopGuard instanceof Guard g && g.isCancelled();
+    }
+
+    /** Clears an explicit {@link #cancel()} flag so this state can execute again. */
+    public LuaState resetCancellation() {
+        this.cancelled = false;
+        if (loopGuard instanceof Guard g) {
+            g.clearCancel();
+        }
+        return this;
     }
 
     /**
@@ -345,7 +615,12 @@ public final class LuaState implements AutoCloseable {
         registry.rawset(LuaInteger.valueOf(2), globals);
         this.rootEnvironment = new Environment(null, globals);
         org.luava.runtime.eval.GCManager.registerState(this);
-        openStandardLibraries();
+        LuaState prevBasic = LuaValue.pushBasicState(this);
+        try {
+            openStandardLibraries();
+        } finally {
+            LuaValue.popBasicState(prevBasic);
+        }
         savedLoadfile = globals.rawget(LuaString.interned("loadfile"));
         savedDofile = globals.rawget(LuaString.interned("dofile"));
     }
@@ -371,7 +646,7 @@ public final class LuaState implements AutoCloseable {
         lazyLib("coroutine", t -> CoroutineLib.fillInto(t, globals, mainThread));
         lazyLib("utf8", t -> Utf8Lib.fillInto(t, globals));
         lazyLib("os", t -> OsLib.fillInto(t, globals));
-        lazyLib("io", t -> IoLib.fillInto(t, globals));
+        lazyLib("io", t -> IoLib.fillInto(t, this, globals));
         lazyLib("debug", t -> DebugLib.fillInto(t, this, globals));
         LuaTable pkgLib = lazyLib("package", t -> PackageLib.fillInto(t, this, globals));
         LuaTable javaLib = lazyLib("java", t -> org.luava.binding.JavaInteropLib.fillInto(t, globals));
@@ -420,10 +695,23 @@ public final class LuaState implements AutoCloseable {
         return deny("os", "io", "package", "require", "dofile", "loadfile", "java", "luajava", "debug");
     }
 
-    /** Removes the named globals (library tables or functions). */
+    /** Removes the named globals (library tables or functions) and unregisters them from {@code require}. */
     public LuaState deny(String... names) {
+        LuaTable loadedTable = null;
+        LuaValue pkgVal = globals.rawget(LuaString.interned("package"));
+        if (pkgVal instanceof LuaTable pkg && !pkg.isLazyPending()) {
+            LuaValue loadedVal = pkg.rawget(LuaString.interned("loaded"));
+            if (loadedVal instanceof LuaTable t) {
+                loadedTable = t;
+            }
+        }
         for (String name : names) {
-            globals.rawset(LuaString.valueOf(name), LuaNil.NIL);
+            LuaString key = LuaString.valueOf(name);
+            globals.rawset(key, LuaNil.NIL);
+            standardLibs.remove(name);
+            if (loadedTable != null) {
+                loadedTable.rawset(key, LuaNil.NIL);
+            }
         }
         return this;
     }
@@ -445,7 +733,7 @@ public final class LuaState implements AutoCloseable {
             case "coroutine" -> lazyLib("coroutine", t -> CoroutineLib.fillInto(t, globals, mainThread));
             case "utf8" -> lazyLib("utf8", t -> Utf8Lib.fillInto(t, globals));
             case "os" -> lazyLib("os", t -> OsLib.fillInto(t, globals));
-            case "io" -> lazyLib("io", t -> IoLib.fillInto(t, globals));
+            case "io" -> lazyLib("io", t -> IoLib.fillInto(t, this, globals));
             case "debug" -> lazyLib("debug", t -> DebugLib.fillInto(t, this, globals));
             case "java" -> {
                 LuaTable javaLib = lazyLib("java", t -> org.luava.binding.JavaInteropLib.fillInto(t, globals));
@@ -608,17 +896,109 @@ public final class LuaState implements AutoCloseable {
     }
 
     public LuaValue call(String functionName, Object... args) {
+        return runScoped(() -> {
+            statsCalls.incrementAndGet();
+            LuaValue fn = get(functionName);
+            if (!fn.isFunction()) {
+                throw new LuaException("global '" + functionName + "' is not a function");
+            }
+            int argc = (args != null) ? args.length : 0;
+            LuaValue[] luaArgs = new LuaValue[argc];
+            for (int i = 0; i < argc; i++) {
+                luaArgs[i] = LuaDataConverter.toLua(args[i]);
+            }
+            return fn.call(luaArgs);
+        });
+    }
+
+    /**
+     * Executes {@code body} inside this state's complete execution scope:
+     * single-flight/reentrancy check, {@code mainThread} binding, guard arming,
+     * active state, allocation cap, Java access policy, basic-metatable scope,
+     * and host-boundary exception translation.
+     */
+    private <T> T runScoped(java.util.function.Supplier<T> body) {
         ensureOpen();
-        statsCalls.incrementAndGet();
-        LuaValue fn = get(functionName);
-        if (!fn.isFunction()) {
-            throw new LuaException("global '" + functionName + "' is not a function");
+        Thread root = activeRootThread();
+        boolean isTopLevel;
+        if (executingRootThread.get() == root) {
+            isTopLevel = false;
+            executingDepth++;
+        } else {
+            if (!executingRootThread.compareAndSet(null, root)) {
+                throw new LuaException("concurrent execution on the same LuaState is not supported");
+            }
+            isTopLevel = true;
+            executingDepth = 1;
         }
-        LuaValue[] luaArgs = new LuaValue[args.length];
-        for (int i = 0; i < args.length; i++) {
-            luaArgs[i] = LuaDataConverter.toLua(args[i]);
+
+        LuaCoroutine prevCoro = LuaCoroutine.running();
+        LuaState prevActive = ACTIVE_STATE.get();
+        Long prevMax = ACTIVE_MAX_ALLOC.get();
+        JavaAccessPolicy prevPolicy = JavaAccessPolicy.setActive(javaAccessPolicy);
+        LuaState prevBasic = LuaValue.pushBasicState(this);
+        Thread prevRoot = ACTIVE_ROOT_THREAD.get();
+
+        if (prevCoro == null) {
+            LuaCoroutine.setCurrent(mainThread);
         }
-        return guardHostBoundary(() -> fn.call(luaArgs));
+        ACTIVE_STATE.set(this);
+        ACTIVE_ROOT_THREAD.set(root);
+        if (cancelled) {
+            if (prevRoot == null) ACTIVE_ROOT_THREAD.remove(); else ACTIVE_ROOT_THREAD.set(prevRoot);
+            if (prevActive == null) ACTIVE_STATE.remove(); else ACTIVE_STATE.set(prevActive);
+            if (prevCoro == null) LuaCoroutine.setCurrent(null);
+            LuaValue.popBasicState(prevBasic);
+            JavaAccessPolicy.restoreActive(prevPolicy);
+            executingDepth--;
+            if (isTopLevel) {
+                executingRootThread.set(null);
+            }
+            throw new LuaException("execution cancelled");
+        }
+        org.luava.runtime.eval.CallStack.CallStackState mainStack = mainThread.getCallStackState();
+        int prevFrameLimit = mainStack.frameLimit;
+        mainStack.frameLimit = (maxCallDepth > 0)
+                ? Math.min(maxCallDepth, org.luava.runtime.eval.CallStack.MAX_CALL_DEPTH)
+                : org.luava.runtime.eval.CallStack.MAX_CALL_DEPTH;
+        if (maxAllocBytes > 0) {
+            ACTIVE_MAX_ALLOC.set(maxAllocBytes);
+        } else {
+            ACTIVE_MAX_ALLOC.remove();
+        }
+        if (isTopLevel) {
+            armGuard();
+        }
+
+        try {
+            return guardHostBoundary(body);
+        } finally {
+            mainStack.frameLimit = prevFrameLimit;
+            LuaValue.popBasicState(prevBasic);
+            JavaAccessPolicy.restoreActive(prevPolicy);
+            if (prevMax == null) {
+                ACTIVE_MAX_ALLOC.remove();
+            } else {
+                ACTIVE_MAX_ALLOC.set(prevMax);
+            }
+            if (prevRoot == null) {
+                ACTIVE_ROOT_THREAD.remove();
+            } else {
+                ACTIVE_ROOT_THREAD.set(prevRoot);
+            }
+            if (prevActive == null) {
+                ACTIVE_STATE.remove();
+            } else {
+                ACTIVE_STATE.set(prevActive);
+            }
+            if (prevCoro == null) {
+                LuaCoroutine.setCurrent(null);
+            }
+            executingDepth--;
+            if (isTopLevel) {
+                executingRootThread.set(null);
+            }
+        }
     }
 
     /**
@@ -655,47 +1035,81 @@ public final class LuaState implements AutoCloseable {
         }
     }
 
+    /**
+     * Immutable pre-compiled Lua chunk shareable across independent {@link LuaState}
+     * instances while preserving compiled bytecode and JIT tier-up state.
+     */
+    public static final class CompiledChunk implements AutoCloseable {
+        final org.luava.runtime.bytecode.LuaProto proto;
+
+        CompiledChunk(org.luava.runtime.bytecode.LuaProto proto) {
+            this.proto = proto;
+        }
+
+        @Override
+        public void close() {
+            org.luava.runtime.jit.JitCompiler.invalidateTree(proto);
+        }
+    }
+
+    /** Parses and compiles a Lua source chunk independently of any state instance. */
+    public static CompiledChunk compileChunk(String luaSource, String chunkName) {
+        if (luaSource == null) {
+            throw new LuaException("chunk source must not be null");
+        }
+        String effectiveName = chunkName != null ? chunkName : "chunk";
+        try {
+            boolean isFile = effectiveName.startsWith("@");
+            Lexer lexer = new Lexer(luaSource, isFile);
+            List<Token> tokens = lexer.scanTokens();
+            Parser parser = new Parser(tokens);
+            Statements.BlockStmt block = parser.parse();
+            org.luava.runtime.bytecode.LuaProto proto =
+                    org.luava.runtime.bytecode.BytecodeCompiler.compile(block, effectiveName);
+            proto.rawSource = luaSource;
+            return new CompiledChunk(proto);
+        } catch (org.luava.frontend.parser.ParseException pe) {
+            throw new LuaException(pe.format(chunkName != null ? chunkName : luaSource));
+        }
+    }
+
+    public LuaFunction load(CompiledChunk chunk) {
+        return load(chunk, globals);
+    }
+
+    public LuaFunction load(CompiledChunk chunk, LuaValue env) {
+        ensureOpen();
+        if (chunk == null) {
+            throw new LuaException("compiled chunk must not be null");
+        }
+        LuaValue chunkEnvVal = (env != null) ? env : globals;
+        LuaTable chunkGlobals = (chunkEnvVal instanceof LuaTable t) ? t : globals;
+        org.luava.runtime.eval.Upvalue envUpval =
+                new org.luava.runtime.eval.Upvalue("_ENV", chunkEnvVal);
+        return new org.luava.runtime.bytecode.LuaClosure(
+                chunk.proto, new org.luava.runtime.eval.Upvalue[]{envUpval}, chunkGlobals, this);
+    }
+
+    public LuaValue eval(CompiledChunk chunk) {
+        return runScoped(() -> {
+            statsCalls.incrementAndGet();
+            return load(chunk).call();
+        });
+    }
+
     public LuaValue eval(String luaSource) {
         return eval(luaSource, "chunk");
     }
 
     public LuaValue eval(String luaSource, String chunkName) {
-        ensureOpen();
-        statsCalls.incrementAndGet();
-        LuaCoroutine prev = LuaCoroutine.running();
-        if (prev == null) {
-            LuaCoroutine.setCurrent(mainThread);
-        }
-        LuaState prevActive = ACTIVE_STATE.get();
-        if (prevActive == null) {
-            ACTIVE_STATE.set(this);
-        }
-        Long prevMax = ACTIVE_MAX_ALLOC.get();
-        if (prevMax == null && maxAllocBytes > 0) {
-            ACTIVE_MAX_ALLOC.set(maxAllocBytes);
-        }
-        JavaAccessPolicy prevPolicy = JavaAccessPolicy.setActive(javaAccessPolicy);
-        armGuard();
-        try {
-            return guardHostBoundary(() -> {
-                LuaFunction chunk = compile(luaSource, chunkName, globals);
-                if (chunk instanceof org.luava.runtime.bytecode.LuaClosure lc) {
-                    lc.setState(this);
-                }
-                return chunk.call();
-            });
-        } finally {
-            JavaAccessPolicy.restoreActive(prevPolicy);
-            if (prevMax == null) {
-                ACTIVE_MAX_ALLOC.remove();
+        return runScoped(() -> {
+            statsCalls.incrementAndGet();
+            LuaFunction chunk = compile(luaSource, chunkName, globals);
+            if (chunk instanceof org.luava.runtime.bytecode.LuaClosure lc) {
+                lc.setState(this);
             }
-            if (prevActive == null) {
-                ACTIVE_STATE.remove();
-            }
-            if (prev == null) {
-                LuaCoroutine.setCurrent(null);
-            }
-        }
+            return chunk.call();
+        });
     }
 
     public LuaValue eval(String luaSource, Map<String, Object> context) {
@@ -860,23 +1274,7 @@ public final class LuaState implements AutoCloseable {
             proto = protoCache.get(key);
         }
         if (proto == null) {
-            try {
-                boolean isFile = chunkName != null && chunkName.startsWith("@");
-                Lexer lexer = new Lexer(luaSource, isFile);
-                List<Token> tokens = lexer.scanTokens();
-                Parser parser = new Parser(tokens);
-                Statements.BlockStmt block = parser.parse();
-                proto = org.luava.runtime.bytecode.BytecodeCompiler.compile(block, chunkName);
-                // Keep the verbatim chunk text so string.dump can round-trip
-                // through load() with exact line info and semantics. The
-                // AstPrinter fallback reformats source (loses line numbers and
-                // can mis-render some constructs), which broke the PUC suite's
-                // dump/undump harness ("all.lua" dofile wrapper). Nested protos
-                // keep a null rawSource and use the printer.
-                proto.rawSource = luaSource;
-            } catch (org.luava.frontend.parser.ParseException pe) {
-                throw new LuaException(pe.format(chunkName != null ? chunkName : luaSource));
-            }
+            proto = compileChunk(luaSource, chunkName).proto;
             synchronized (protoCache) {
                 protoCache.put(key, proto);
             }
@@ -969,6 +1367,9 @@ public final class LuaState implements AutoCloseable {
 
     /** Whether this state currently uses the JIT (its override or the global default). */
     public boolean isJitEnabled() {
+        if (maxCallDepth > 0) {
+            return false;
+        }
         Boolean o = jitEnabledOverride;
         return o != null ? o : ENABLE_JIT;
     }
@@ -1101,6 +1502,7 @@ public final class LuaState implements AutoCloseable {
         if (mt == null || mt.rawget(LuaValue.Meta.CLOSE).isNil()) {
             throw new LuaException("variable '" + (varName != null ? varName : "?") + "' got a non-closable value");
         }
+        org.luava.runtime.concurrency.LuaCoroutine.promoteIfStackless();
         LuaCoroutine thread = getCurrentThread();
         thread.setTbcHead(new TbcEntry(stackIndex, val, varName, thread.getTbcHead()));
     }
@@ -1183,22 +1585,29 @@ public final class LuaState implements AutoCloseable {
                 statsCalls.get(),
                 jitHits,
                 deopts,
-                org.luava.runtime.eval.GCManager.getUncollectedBytes(),
+                gcState.getUncollectedBytes(),
                 statsInstructions.get());
     }
 
     /**
      * Walks one cached proto tree, returning {@code [compiledKernels,
-     * deopts]}. A kernel disarmed back to the interpreter ({@code jitCode ==
-     * null}) contributes nothing, so {@code jitHits} is a live gauge.
+     * deopts]}. A kernel disarmed back to the interpreter (both {@code jitCode}
+     * and {@code guardedJitCode == null}) contributes nothing, so {@code jitHits}
+     * is a live gauge.
      */
     private static long[] scanJitGauges(org.luava.runtime.bytecode.LuaProto proto) {
         long hits = 0;
         long deopts = 0;
         org.luava.runtime.jit.JitCode jc = proto.jitCode;
-        if (jc != null) {
+        org.luava.runtime.jit.JitCode gjc = proto.guardedJitCode;
+        if (jc != null || gjc != null) {
             hits = 1;
-            deopts = (long) jc.deopts + jc.structuralDeopts;
+            if (jc != null) {
+                deopts += (long) jc.deopts + jc.structuralDeopts;
+            }
+            if (gjc != null) {
+                deopts += (long) gjc.deopts + gjc.structuralDeopts;
+            }
         }
         for (org.luava.runtime.bytecode.LuaProto child : proto.protos) {
             long[] sub = scanJitGauges(child);
@@ -1235,25 +1644,53 @@ public final class LuaState implements AutoCloseable {
      */
     public CompletableFuture<LuaValue> evalAsync(String luaSource, String chunkName) {
         ensureOpen();
-        return CompletableFuture.supplyAsync(() -> eval(luaSource, chunkName));
+        CompletableFuture<LuaValue> result = new CompletableFuture<>();
+        synchronized (asyncLock) {
+            CompletableFuture<Void> prev = asyncTail;
+            CompletableFuture<Void> next = prev.whenCompleteAsync((ignored, err) -> {
+                try {
+                    result.complete(eval(luaSource, chunkName));
+                } catch (Throwable t) {
+                    result.completeExceptionally(t);
+                }
+            }, ASYNC_EXECUTOR);
+            asyncTail = next;
+        }
+        return result;
     }
 
     /**
-     * Releases this state: drops the compiled-proto cache, clears any
-     * instruction/timeout guard, and unregisters from the GC manager so no
-     * collector root or finalizer bookkeeping pins it afterwards. Idempotent;
-     * further {@code eval}/{@code call}/{@code compile} entries fail fast
-     * with a {@link LuaException}.
+     * Releases this state: cancels active runaway guards, invalidates cached
+     * JIT kernels, closes idle top-level {@code <close>} variables, and runs/drops
+     * state-owned GC finalizers and weak-table entries. Idempotent; further
+     * {@code eval}/{@code call}/{@code compile} entries fail fast with a
+     * {@link LuaException}.
      */
     @Override
     public void close() {
-        if (closed) {
+        if (!closing.compareAndSet(false, true)) {
             return;
         }
         closed = true;
+        if (loopGuard instanceof Guard g) {
+            g.cancel();
+        }
         clearGuard();
+        List<org.luava.runtime.bytecode.LuaProto> protos;
         synchronized (protoCache) {
+            protos = new ArrayList<>(protoCache.values());
             protoCache.clear();
+        }
+        for (org.luava.runtime.bytecode.LuaProto proto : protos) {
+            org.luava.runtime.jit.JitCompiler.invalidateTree(proto);
+        }
+        if (executingRootThread.get() == null) {
+            LuaState prevBasic = LuaValue.pushBasicState(this);
+            try {
+                mainThread.closeAllTbc();
+            } finally {
+                LuaValue.popBasicState(prevBasic);
+            }
         }
         org.luava.runtime.eval.GCManager.unregisterState(this);
     }

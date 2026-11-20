@@ -35,7 +35,7 @@ public final class PackageLib {
 
         pkg.rawset(LuaString.interned("loaded"), loaded);
         pkg.rawset(LuaString.interned("preload"), preload);
-        pkg.rawset(LuaString.interned("path"), LuaString.interned("./?.lua;./?/init.lua;tests/lua-5.4.9-tests/?.lua"));
+        pkg.rawset(LuaString.interned("path"), LuaString.interned("./?.lua;./?/init.lua"));
         pkg.rawset(LuaString.interned("cpath"), LuaString.interned("./?.so;./loadall.so"));
         pkg.rawset(LuaString.interned("config"), LuaString.valueOf("/\n;\n?\n!\n-\n"));
 

@@ -189,6 +189,9 @@ public final class LuaPattern {
         int e = ms.p[p + 1] & 0xFF;
         int cont = 1;
         while (++s < ms.srcLen) {
+            if ((s & 0x3FF) == 0) {
+                org.luava.runtime.LuaState.checkGuard(1024);
+            }
             int c = ms.src[s] & 0xFF;
             if (c == e) {
                 if (--cont == 0) return s + 1;
@@ -278,7 +281,7 @@ public final class LuaPattern {
 
     private static int match(MatchState ms, int s, int p) {
         if ((++ms.matchTicks & 0x3FF) == 0) {
-            org.luava.runtime.LuaState.checkGuard();
+            org.luava.runtime.LuaState.checkGuard(1024);
         }
         if (ms.matchdepth-- == 0) {
             throw new LuaException("pattern too complex");
@@ -416,8 +419,7 @@ public final class LuaPattern {
     private static LuaValue pushOneCapture(MatchState ms, int i, int s, int e) {
         if (i >= ms.level) {
             if (i != 0) throw new LuaException("invalid capture index %" + (i + 1));
-            byte[] bytes = Arrays.copyOfRange(ms.src, s, e);
-            return LuaString.valueOf(new String(bytes, StandardCharsets.ISO_8859_1));
+            return LuaString.fromSlice(ms.src, s, e - s);
         } else {
             Capture c = capAt(ms, i);
             int len = c.len;
@@ -426,8 +428,7 @@ public final class LuaPattern {
             } else if (len == CAP_POSITION) {
                 return LuaInteger.valueOf(c.init + 1);
             } else {
-                byte[] bytes = Arrays.copyOfRange(ms.src, c.init, c.init + len);
-                return LuaString.valueOf(new String(bytes, StandardCharsets.ISO_8859_1));
+                return LuaString.fromSlice(ms.src, c.init, len);
             }
         }
     }
@@ -464,15 +465,33 @@ public final class LuaPattern {
     private static int indexOf(byte[] src, int init, byte[] target) {
         if (target.length == 0) return init <= src.length ? init : -1;
         int max = src.length - target.length;
+        int steps = 0;
+        byte first = target[0];
         for (int i = init; i <= max; i++) {
+            if (src[i] != first) {
+                steps++;
+                if ((steps & 0x3FF) == 0) {
+                    org.luava.runtime.LuaState.checkGuard(1024);
+                    steps = 0;
+                }
+                continue;
+            }
             boolean found = true;
-            for (int j = 0; j < target.length; j++) {
+            for (int j = 1; j < target.length; j++) {
+                if ((j & 0xFFF) == 0) {
+                    org.luava.runtime.LuaState.checkGuard(4096);
+                }
                 if (src[i + j] != target[j]) {
                     found = false;
+                    steps += j + 1;
                     break;
                 }
             }
             if (found) return i;
+            if (steps >= 4096) {
+                org.luava.runtime.LuaState.checkGuard(steps);
+                steps = 0;
+            }
         }
         return -1;
     }
@@ -568,8 +587,7 @@ public final class LuaPattern {
         if (s < src.length) {
             b.write(src, s, src.length - s);
         }
-        String res = new String(b.toByteArray(), StandardCharsets.ISO_8859_1);
-        return Varargs.of(LuaString.valueOf(res), LuaInteger.valueOf(n));
+        return Varargs.of(LuaString.fromOwnedBytes(b.toByteArray()), LuaInteger.valueOf(n));
     }
 
     private static boolean add_value(MatchState ms, ByteArrayOutputStream b, int s, int e, LuaValue tr) {
@@ -742,8 +760,11 @@ public final class LuaPattern {
                 if (e != -1 && e != last) {
                     pos = e;
                     lastmatch = e;
+                    if (ms.level <= 1) {
+                        return pushOneCapture(ms, 0, s, e);
+                    }
                     LuaValue[] out = pushCaptures(ms, s, e);
-                    return out.length == 1 ? out[0] : Varargs.of(out);
+                    return Varargs.of(out);
                 }
             }
             pos = srcLen + 1;
@@ -790,7 +811,7 @@ public final class LuaPattern {
                 if (e != last) {
                     pos = e;
                     lastmatch = e;
-                    return LuaString.valueOf(new String(src, s, e - s, StandardCharsets.ISO_8859_1));
+                    return LuaString.fromSlice(src, s, e - s);
                 }
             }
             pos = srcLen + 1;

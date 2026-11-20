@@ -16,13 +16,18 @@ import org.luava.runtime.LuaException;
  * so a script cannot reach {@code java.lang.Runtime}, reflection, the
  * filesystem or {@code System.exit} unless the host explicitly allows it.
  *
- * <p>A class name is allowed when it matches an allow pattern, otherwise
- * denied when it matches a deny pattern, otherwise it falls back to the
- * policy's {@code defaultAllow}. Patterns are either an exact binary class
- * name, a package prefix ending in {@code .*} (for example
- * {@code java.io.*}) or {@code *} for everything.
+ * <p>Rules are ordered and evaluated last-match-wins (with an allow/deny list
+ * in default policies placing dangerous {@code java.util} subpackages/classes
+ * after {@code java.util.*}, while subsequent {@link #withAllow} and
+ * {@link #withDeny} calls append overriding rules). When no rule matches,
+ * {@code isAllowed} falls back to {@code defaultAllow}. Patterns are either an
+ * exact binary class name (also matching inner classes {@code Foo$*}), a
+ * package prefix ending in {@code .*} (for example {@code java.io.*}) or
+ * {@code *} for everything.
  */
 public final class JavaAccessPolicy {
+
+    private record Rule(String pattern, boolean allow) {}
 
     private static final String[] DEFAULT_ALLOW = {
         "java.lang.Math", "java.lang.String", "java.lang.StringBuilder",
@@ -38,83 +43,139 @@ public final class JavaAccessPolicy {
         "java.lang.ProcessHandle", "java.lang.System", "java.lang.Thread",
         "java.lang.ThreadGroup", "java.lang.Class", "java.lang.ClassLoader",
         "java.lang.SecurityManager", "java.lang.reflect.*",
-        "java.lang.invoke.*", "java.io.*", "java.nio.*", "java.net.*",
-        "java.security.*", "javax.script.*", "sun.*", "com.sun.*", "jdk.*"
+        "java.lang.invoke.*", "java.lang.instrument.*", "java.lang.management.*",
+        "java.lang.module.*", "java.lang.foreign.*",
+        "java.io.*", "java.nio.*", "java.net.*", "java.rmi.*", "java.sql.*",
+        "java.security.*", "javax.script.*", "javax.naming.*", "javax.management.*",
+        "javax.tools.*", "javax.xml.*", "javax.sql.*", "javax.net.*",
+        "javax.security.*", "javax.crypto.*",
+        "java.util.Formatter", "java.util.Timer", "java.util.TimerTask",
+        "java.util.ServiceLoader", "java.util.ResourceBundle",
+        "java.util.PropertyResourceBundle",
+        "java.util.logging.*", "java.util.zip.*", "java.util.jar.*",
+        "java.util.concurrent.*", "java.util.prefs.*", "java.util.spi.*",
+        "sun.*", "com.sun.*", "jdk.*",
+        "org.luava.binding.JavaAccessPolicy", "org.luava.binding.JavaInteropLib",
+        "org.luava.binding.JavaFunctionBuilder", "org.luava.binding.LuaDataConverter",
+        "org.luava.binding.ModuleBinder", "org.luava.binding.OverloadResolver",
+        "org.luava.runtime.LuaState", "org.luava.runtime.LuaValue",
+        "org.luava.runtime.LuaUserdata", "org.luava.runtime.LuaFunction",
+        "org.luava.runtime.LuaTable", "org.luava.runtime.LuaString",
+        "org.luava.runtime.LuaInteger", "org.luava.runtime.LuaFloat",
+        "org.luava.runtime.LuaBoolean", "org.luava.runtime.LuaNil",
+        "org.luava.runtime.Varargs", "org.luava.runtime.Stats",
+        "org.luava.runtime.LuaException", "org.luava.runtime.LuaExit",
+        "org.luava.runtime.jit.*", "org.luava.runtime.bytecode.*",
+        "org.luava.runtime.eval.*", "org.luava.runtime.standard.*",
+        "org.luava.runtime.concurrency.*", "org.luava.runtime.interop.*",
+        "org.luava.cli.*", "org.luava.frontend.lexer.*",
+        "org.luava.frontend.parser.*", "org.luava.frontend.ast.*",
+        "org.luava.midend.*", "org.luava.emmydoc.*"
     };
 
     /** Allows every class. Hosts embedding trusted code only. */
     public static final JavaAccessPolicy UNRESTRICTED =
-            new JavaAccessPolicy(new String[0], new String[0], true, "unrestricted");
+            new JavaAccessPolicy(new Rule[0], true, "unrestricted");
 
     /**
      * Default policy for a fresh {@code LuaState}: ordinary application and
-     * collection classes work, but process execution, reflection, file and
-     * network access are denied.
+     * collection classes work, but process execution, reflection, file,
+     * network, engine internals and dangerous {@code java.util} subpackages are denied.
      */
     public static final JavaAccessPolicy DEFAULT =
-            new JavaAccessPolicy(DEFAULT_ALLOW, DEFAULT_DENY, true, "default");
+            new JavaAccessPolicy(buildOrderedRules(DEFAULT_ALLOW, DEFAULT_DENY), true, "default");
 
     /**
      * Strict policy installed by {@link org.luava.runtime.LuaState#sandbox()}:
-     * only the small safe allowlist can be loaded by name; everything else is
-     * denied unless the host adds an explicit allow pattern. The deny list is
-     * still carried so member access on host-registered objects cannot reach
-     * capability classes (ClassLoader, Runtime, reflection, ...).
+     * only the safe subset of the allowlist can be loaded by name; everything
+     * else is denied unless the host adds an explicit allow pattern. The deny
+     * list is evaluated after {@code DEFAULT_ALLOW} so dangerous
+     * {@code java.util} classes and subpackages stay blocked even when
+     * {@code java} is re-enabled.
      */
     public static final JavaAccessPolicy STRICT =
-            new JavaAccessPolicy(DEFAULT_ALLOW, DEFAULT_DENY, false, "strict");
+            new JavaAccessPolicy(buildOrderedRules(DEFAULT_ALLOW, DEFAULT_DENY), false, "strict");
 
-    private final String[] allow;
-    private final String[] deny;
+    private final Rule[] rules;
     private final boolean defaultAllow;
     private final String label;
 
     public JavaAccessPolicy(String[] allow, String[] deny, boolean defaultAllow) {
-        this(allow, deny, defaultAllow, "custom");
+        this(buildCustomRules(allow, deny), defaultAllow, "custom");
     }
 
-    private JavaAccessPolicy(String[] allow, String[] deny, boolean defaultAllow, String label) {
-        this.allow = allow.clone();
-        this.deny = deny.clone();
+    private JavaAccessPolicy(Rule[] rules, boolean defaultAllow, String label) {
+        this.rules = rules.clone();
         this.defaultAllow = defaultAllow;
         this.label = label;
     }
 
+    private static Rule[] buildOrderedRules(String[] firstAllow, String[] thenDeny) {
+        Rule[] out = new Rule[firstAllow.length + thenDeny.length];
+        int idx = 0;
+        for (String p : firstAllow) {
+            out[idx++] = new Rule(p, true);
+        }
+        for (String p : thenDeny) {
+            out[idx++] = new Rule(p, false);
+        }
+        return out;
+    }
+
+    private static Rule[] buildCustomRules(String[] allow, String[] deny) {
+        int aLen = (allow != null) ? allow.length : 0;
+        int dLen = (deny != null) ? deny.length : 0;
+        Rule[] out = new Rule[aLen + dLen];
+        int idx = 0;
+        if (deny != null) {
+            for (String p : deny) {
+                out[idx++] = new Rule(p, false);
+            }
+        }
+        if (allow != null) {
+            for (String p : allow) {
+                out[idx++] = new Rule(p, true);
+            }
+        }
+        return out;
+    }
+
     /** Returns a copy of this policy with additional allow patterns. */
     public JavaAccessPolicy withAllow(String... patterns) {
-        return new JavaAccessPolicy(concat(this.allow, patterns), this.deny, this.defaultAllow, label);
+        return new JavaAccessPolicy(appendRules(this.rules, patterns, true), this.defaultAllow, label);
     }
 
     /** Returns a copy of this policy with additional deny patterns. */
     public JavaAccessPolicy withDeny(String... patterns) {
-        return new JavaAccessPolicy(this.allow, concat(this.deny, patterns), this.defaultAllow, label);
+        return new JavaAccessPolicy(appendRules(this.rules, patterns, false), this.defaultAllow, label);
     }
 
     public boolean isAllowed(String className) {
-        if (className == null) return false;
-        for (String p : allow) {
-            if (matches(p, className)) return true;
-        }
-        for (String p : deny) {
-            if (matches(p, className)) return false;
+        String normalized = normalizeClassName(className);
+        if (normalized == null) return false;
+        for (int i = rules.length - 1; i >= 0; i--) {
+            if (matches(rules[i].pattern, normalized)) {
+                return rules[i].allow;
+            }
         }
         return defaultAllow;
     }
 
     /**
-     * Whether {@code className} is explicitly blacklisted as a capability
-     * class (Runtime, reflection, filesystem, ...). Used for member access on
-     * objects the host has already handed to Lua: host service classes are
-     * not on the deny list and stay usable, while their inherited
-     * {@code getClassLoader()} / reflection paths are cut off.
+     * Whether {@code className} is explicitly denied under the rule chain
+     * (including dangerous JDK subpackages carved out of {@code java.util.*}
+     * and engine internals). Used for member access on objects the host has
+     * already handed to Lua: host service classes do not match any deny rule
+     * and stay usable, while {@code getClassLoader()} / reflection paths are
+     * cut off.
      */
     public boolean isDenied(String className) {
-        if (className == null) return true;
-        for (String p : allow) {
-            if (matches(p, className)) return false; // explicit allow wins
-        }
-        for (String p : deny) {
-            if (matches(p, className)) return true;
+        String normalized = normalizeClassName(className);
+        if (normalized == null) return true;
+        for (int i = rules.length - 1; i >= 0; i--) {
+            if (matches(rules[i].pattern, normalized)) {
+                return !rules[i].allow;
+            }
         }
         return false;
     }
@@ -134,18 +195,42 @@ public final class JavaAccessPolicy {
         return label;
     }
 
+    private static String normalizeClassName(String className) {
+        if (className == null) return null;
+        int i = 0;
+        int len = className.length();
+        while (i < len && className.charAt(i) == '[') {
+            i++;
+        }
+        if (i == 0) {
+            return className;
+        }
+        if (i < len && className.charAt(i) == 'L' && className.endsWith(";")) {
+            return className.substring(i + 1, len - 1);
+        }
+        return className.substring(i);
+    }
+
     private static boolean matches(String pattern, String name) {
+        if (pattern == null) return false;
         if ("*".equals(pattern)) return true;
         if (pattern.endsWith(".*")) {
             return name.startsWith(pattern.substring(0, pattern.length() - 1));
         }
-        return pattern.equals(name);
+        return pattern.equals(name) || (name.length() > pattern.length()
+                && name.charAt(pattern.length()) == '$'
+                && name.startsWith(pattern));
     }
 
-    private static String[] concat(String[] a, String[] b) {
-        String[] out = new String[a.length + b.length];
-        System.arraycopy(a, 0, out, 0, a.length);
-        System.arraycopy(b, 0, out, a.length, b.length);
+    private static Rule[] appendRules(Rule[] existing, String[] patterns, boolean allow) {
+        if (patterns == null || patterns.length == 0) {
+            return existing;
+        }
+        Rule[] out = new Rule[existing.length + patterns.length];
+        System.arraycopy(existing, 0, out, 0, existing.length);
+        for (int i = 0; i < patterns.length; i++) {
+            out[existing.length + i] = new Rule(patterns[i], allow);
+        }
         return out;
     }
 
@@ -156,7 +241,11 @@ public final class JavaAccessPolicy {
     /** Installs {@code policy} as the active one and returns the previous. */
     public static JavaAccessPolicy setActive(JavaAccessPolicy policy) {
         JavaAccessPolicy prev = ACTIVE.get();
-        ACTIVE.set(policy);
+        if (policy == null) {
+            ACTIVE.remove();
+        } else {
+            ACTIVE.set(policy);
+        }
         return prev;
     }
 
@@ -167,6 +256,11 @@ public final class JavaAccessPolicy {
         } else {
             ACTIVE.set(prev);
         }
+    }
+
+    /** Returns the thread's explicitly installed policy, or {@code null} when none is active. */
+    public static JavaAccessPolicy activeOrNull() {
+        return ACTIVE.get();
     }
 
     /**

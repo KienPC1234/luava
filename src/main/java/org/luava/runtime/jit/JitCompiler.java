@@ -27,7 +27,10 @@ import org.luava.runtime.bytecode.LuaProto;
 public final class JitCompiler {
     private static final AtomicInteger CLASS_SEQ = new AtomicInteger();
     private static final JitCodeCache CACHE = new JitCodeCache();
-    private static final LinkedBlockingQueue<LuaProto> QUEUE = new LinkedBlockingQueue<>();
+    private static final int QUEUE_CAPACITY = Integer.getInteger("luava.jit.queueCapacity", 512);
+    private static final int WORKER_THREADS = Math.max(2, Math.min(4,
+            Integer.getInteger("luava.jit.threads", Runtime.getRuntime().availableProcessors())));
+    private static final LinkedBlockingQueue<LuaProto> QUEUE = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
     private static volatile boolean workerStarted;
     /** One-shot "ASM is missing, you are running interpreted" notice. */
     private static volatile boolean asmMissingReported;
@@ -37,25 +40,53 @@ public final class JitCompiler {
     /**
      * Requests compilation of {@code proto}. Synchronous when
      * {@code luava.jit.sync} is set, otherwise enqueued for the background
-     * compiler thread (idempotent; duplicate requests collapse).
+     * compiler pool (idempotent; duplicate requests collapse).
      */
     public static void requestCompile(LuaProto proto) {
-        if (proto.jitCode != null || proto.jitDisabled || proto.jitQueued) {
-            return;
-        }
-        if (Boolean.getBoolean("luava.jit.sync")) {
+        requestCompile(proto, false);
+    }
+
+    /**
+     * Requests compilation of {@code proto}, optionally emitting safepoints
+     * for {@link org.luava.runtime.LuaState.LoopGuard}-protected execution.
+     */
+    public static void requestCompile(LuaProto proto, boolean guarded) {
+        if (!guarded) {
+            if (proto.jitCode != null || proto.jitDisabled || proto.jitQueued) {
+                return;
+            }
+            if (Boolean.getBoolean("luava.jit.sync")) {
+                proto.jitQueued = true;
+                try {
+                    tryCompile(proto, false);
+                } finally {
+                    proto.jitQueued = false;
+                }
+                return;
+            }
             proto.jitQueued = true;
-            try {
-                tryCompile(proto);
-            } finally {
+            startWorker();
+            if (!QUEUE.offer(proto)) {
                 proto.jitQueued = false;
             }
             return;
         }
-        proto.jitQueued = true;
+        if (proto.guardedJitCode != null || proto.guardedJitDisabled || proto.guardedJitQueued) {
+            return;
+        }
+        if (Boolean.getBoolean("luava.jit.sync")) {
+            proto.guardedJitQueued = true;
+            try {
+                tryCompile(proto, true);
+            } finally {
+                proto.guardedJitQueued = false;
+            }
+            return;
+        }
+        proto.guardedJitQueued = true;
         startWorker();
         if (!QUEUE.offer(proto)) {
-            proto.jitQueued = false;
+            proto.guardedJitQueued = false;
         }
     }
 
@@ -93,13 +124,21 @@ public final class JitCompiler {
         if (state != null && !state.isJitEnabled()) {
             return;
         }
-        prewarm(closure);
+        if (closure == null || closure.proto == null) {
+            return;
+        }
+        boolean guarded = state != null && state.loopGuard != null;
+        prewarmProto(closure.proto, guarded);
     }
 
     private static void prewarmProto(LuaProto proto) {
-        tryCompile(proto);
+        prewarmProto(proto, false);
+    }
+
+    private static void prewarmProto(LuaProto proto, boolean guarded) {
+        tryCompile(proto, guarded);
         for (LuaProto child : proto.protos) {
-            prewarmProto(child);
+            prewarmProto(child, guarded);
         }
     }
 
@@ -111,9 +150,11 @@ public final class JitCompiler {
             if (workerStarted) {
                 return;
             }
-            Thread worker = new Thread(JitCompiler::drain, "luava-jit");
-            worker.setDaemon(true);
-            worker.start();
+            for (int i = 0; i < WORKER_THREADS; i++) {
+                Thread worker = new Thread(JitCompiler::drain, "luava-jit-" + i);
+                worker.setDaemon(true);
+                worker.start();
+            }
             workerStarted = true;
         }
     }
@@ -122,10 +163,19 @@ public final class JitCompiler {
         while (true) {
             try {
                 LuaProto proto = QUEUE.take();
-                try {
-                    tryCompile(proto);
-                } finally {
-                    proto.jitQueued = false;
+                if (proto.jitQueued) {
+                    try {
+                        tryCompile(proto, false);
+                    } finally {
+                        proto.jitQueued = false;
+                    }
+                }
+                if (proto.guardedJitQueued) {
+                    try {
+                        tryCompile(proto, true);
+                    } finally {
+                        proto.guardedJitQueued = false;
+                    }
                 }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
@@ -143,71 +193,105 @@ public final class JitCompiler {
      * reported as null and the proto is marked {@code jitDisabled} so the
      * caller stops retrying and continues interpreted. Idempotent.
      */
-    public static synchronized JitCode tryCompile(LuaProto proto) {
-        if (proto.jitCode != null || proto.jitDisabled) {
-            return proto.jitCode;
+    public static JitCode tryCompile(LuaProto proto) {
+        return tryCompile(proto, false);
+    }
+
+    public static JitCode tryCompile(LuaProto proto, boolean guarded) {
+        JitCode existing = guarded ? proto.guardedJitCode : proto.jitCode;
+        if (existing != null || (guarded ? proto.guardedJitDisabled : proto.jitDisabled)) {
+            return existing;
         }
         boolean debug = Boolean.getBoolean("luava.jit.debug");
-        try {
-            LuaToJvmTranslator.Info info = LuaToJvmTranslator.analyze(proto);
-            if (info == null || !eligible(proto)) {
-                proto.jitDisabled = true;
-                if (debug) {
-                    System.err.println("[jit] not eligible: " + proto.name);
+        synchronized (proto) {
+            if (guarded) {
+                if (proto.guardedJitCode != null || proto.guardedJitDisabled) {
+                    return proto.guardedJitCode;
                 }
-                return null;
+            } else if (proto.jitCode != null || proto.jitDisabled) {
+                return proto.jitCode;
             }
-            String name = "org/luava/runtime/jit/Gen$" + CLASS_SEQ.getAndIncrement();
-            LuaToJvmTranslator.Translation tr =
-                    LuaToJvmTranslator.translate(proto, name, org.luava.runtime.LuaState.ENABLE_OSR);
-            if (tr == null) {
-                proto.jitDisabled = true;
-                return null;
-            }
-            MethodHandles.Lookup lookup = MethodHandles.lookup();
-            Class<?> cls = lookup.defineHiddenClass(tr.bytes(), true,
-                    MethodHandles.Lookup.ClassOption.NESTMATE).lookupClass();
-            JitCode code;
-            if (info.returnsInt()) {
-                java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "exec",
-                        MethodType.methodType(long.class, LuaClosure.class, Object[].class,
-                                long[].class, byte[].class, org.luava.runtime.LuaValue[].class, int.class));
-                java.lang.invoke.MethodHandle osr = null;
-                if (tr.osrTargets() != null) {
-                    osr = MethodHandles.lookup().findStatic(cls, "execOsr",
+            try {
+                LuaToJvmTranslator.Info info = LuaToJvmTranslator.analyze(proto);
+                if (info == null || !eligible(proto)) {
+                    if (guarded) {
+                        proto.guardedJitDisabled = true;
+                    } else {
+                        proto.jitDisabled = true;
+                    }
+                    if (debug) {
+                        System.err.println("[jit] not eligible: " + proto.name);
+                    }
+                    return null;
+                }
+                String name = "org/luava/runtime/jit/Gen$" + CLASS_SEQ.getAndIncrement();
+                LuaToJvmTranslator.Translation tr =
+                        LuaToJvmTranslator.translate(proto, name, org.luava.runtime.LuaState.ENABLE_OSR, guarded);
+                if (tr == null) {
+                    if (guarded) {
+                        proto.guardedJitDisabled = true;
+                    } else {
+                        proto.jitDisabled = true;
+                    }
+                    return null;
+                }
+                MethodHandles.Lookup lookup = MethodHandles.lookup();
+                Class<?> cls = lookup.defineHiddenClass(tr.bytes(), true,
+                        MethodHandles.Lookup.ClassOption.NESTMATE).lookupClass();
+                JitCode code;
+                if (info.returnsInt()) {
+                    java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "exec",
                             MethodType.methodType(long.class, LuaClosure.class, Object[].class,
-                                    long[].class, byte[].class, org.luava.runtime.LuaValue[].class,
-                                    int.class, int.class));
-                }
-                code = new JitCode(proto, mh, null, osr, tr.osrTargets(), info.pure(), true,
-                        info.returnsVoid());
-            } else {
-                java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "execObj",
-                        MethodType.methodType(org.luava.runtime.LuaValue.class, LuaClosure.class,
-                                Object[].class, long[].class, byte[].class,
-                                org.luava.runtime.LuaValue[].class, int.class));
-                java.lang.invoke.MethodHandle osr = null;
-                if (tr.osrTargets() != null) {
-                    osr = MethodHandles.lookup().findStatic(cls, "execObjOsr",
+                                    long[].class, byte[].class, org.luava.runtime.LuaValue[].class, int.class));
+                    java.lang.invoke.MethodHandle osr = null;
+                    if (tr.osrTargets() != null) {
+                        osr = MethodHandles.lookup().findStatic(cls, "execOsr",
+                                MethodType.methodType(long.class, LuaClosure.class, Object[].class,
+                                        long[].class, byte[].class, org.luava.runtime.LuaValue[].class,
+                                        int.class, int.class));
+                    }
+                    code = new JitCode(proto, mh, null, osr, tr.osrTargets(), info.pure(),
+                            info.callSafe(), info.leafNoWindow(), true, info.returnsVoid());
+                } else {
+                    java.lang.invoke.MethodHandle mh = MethodHandles.lookup().findStatic(cls, "execObj",
                             MethodType.methodType(org.luava.runtime.LuaValue.class, LuaClosure.class,
                                     Object[].class, long[].class, byte[].class,
-                                    org.luava.runtime.LuaValue[].class, int.class, int.class));
+                                    org.luava.runtime.LuaValue[].class, int.class));
+                    java.lang.invoke.MethodHandle osr = null;
+                    if (tr.osrTargets() != null) {
+                        osr = MethodHandles.lookup().findStatic(cls, "execObjOsr",
+                                MethodType.methodType(org.luava.runtime.LuaValue.class, LuaClosure.class,
+                                        Object[].class, long[].class, byte[].class,
+                                        org.luava.runtime.LuaValue[].class, int.class, int.class));
+                    }
+                    code = new JitCode(proto, null, mh, osr, tr.osrTargets(), info.pure(),
+                            info.callSafe(), info.leafNoWindow(), false, false);
                 }
-                code = new JitCode(proto, null, mh, osr, tr.osrTargets(), info.pure(), false, false);
+                if (guarded ? proto.guardedJitDisabled : proto.jitDisabled) {
+                    return null;
+                }
+                if (guarded) {
+                    proto.guardedJitCode = code;
+                } else {
+                    proto.jitCode = code;
+                }
+                CACHE.put(proto, code);
+                if (debug) {
+                    System.err.println("[jit] compiled" + (guarded ? " (guarded): " : ": ") + proto.name);
+                }
+                return code;
+            } catch (Throwable t) {
+                if (guarded) {
+                    proto.guardedJitDisabled = true;
+                } else {
+                    proto.jitDisabled = true;
+                }
+                reportMissingAsm(t);
+                if (debug) {
+                    System.err.println("[jit] compile failed for " + proto.name + ": " + t);
+                }
+                return null;
             }
-            proto.jitCode = code;
-            CACHE.put(proto, code);
-            if (debug) {
-                System.err.println("[jit] compiled: " + proto.name);
-            }
-            return code;
-        } catch (Throwable t) {
-            proto.jitDisabled = true;
-            reportMissingAsm(t);
-            if (debug) {
-                System.err.println("[jit] compile failed for " + proto.name + ": " + t);
-            }
-            return null;
         }
     }
 
@@ -252,5 +336,30 @@ public final class JitCompiler {
 
     public static int cacheSize() {
         return CACHE.size();
+    }
+
+    /**
+     * Releases all cached JIT kernels and pending queue entries for a proto tree
+     * (used when closing a {@link org.luava.runtime.LuaState}).
+     */
+    public static void invalidateTree(LuaProto proto) {
+        if (proto == null) {
+            return;
+        }
+        synchronized (proto) {
+            proto.jitDisabled = true;
+            proto.guardedJitDisabled = true;
+            proto.jitQueued = false;
+            proto.guardedJitQueued = false;
+            QUEUE.remove(proto);
+            CACHE.remove(proto);
+            proto.jitCode = null;
+            proto.guardedJitCode = null;
+        }
+        if (proto.protos != null) {
+            for (LuaProto child : proto.protos) {
+                invalidateTree(child);
+            }
+        }
     }
 }

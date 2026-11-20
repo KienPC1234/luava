@@ -311,6 +311,7 @@ public abstract class LuaValue {
             }
             throw new LuaException("attempt to call a " + target.typeName() + " value" + desc);
         }
+        org.luava.runtime.concurrency.LuaCoroutine.promoteIfStackless();
         return target.call(currentArgs);
     }
 
@@ -688,15 +689,28 @@ public abstract class LuaValue {
             // A single `..` can double the operand size, so a long chain
             // (x = x..x) is a classic host-OOM vector. Honor the host's
             // per-allocation cap the same way string.rep/pack do.
-            String left = this.toLuaString();
-            String right = other.toLuaString();
-            long resultLen = (long) left.length() + right.length();
+            LuaString ls = asLuaStringForConcat(this);
+            LuaString rs = asLuaStringForConcat(other);
+            int lLen = ls.rawLength();
+            int rLen = rs.rawLength();
+            long resultLen = (long) lLen + rLen;
             if (resultLen > org.luava.runtime.LuaState.allocationLimit()) {
                 throw new LuaException("string length overflow");
             }
-            return LuaString.valueOf(left + right);
+            if (lLen == 0) return rs;
+            if (rLen == 0) return ls;
+            byte[] out = new byte[(int) resultLen];
+            System.arraycopy(ls.rawBytesUnsafe(), ls.rawOffset(), out, 0, lLen);
+            System.arraycopy(rs.rawBytesUnsafe(), rs.rawOffset(), out, lLen, rLen);
+            return LuaString.fromOwnedBytes(out);
         }
         return dispatchBinaryMetamethod(this, other, "__concat", "concatenate");
+    }
+
+    private static LuaString asLuaStringForConcat(LuaValue v) {
+        if (v instanceof LuaString s) return s;
+        if (v instanceof LuaInteger i) return LuaString.fromLong(i.toLong());
+        return LuaString.valueOf(v.toLuaString());
     }
 
     /**

@@ -126,8 +126,25 @@ public final class JavaInteropLib {
                 throw new LuaException("bad argument #1 to 'java.array' (expected component type string or Class)");
             }
 
-            int size = (int) args[1].toLong();
-            Object arr = Array.newInstance(compType, size);
+            long sizeLong = args[1].toLong();
+            if (sizeLong < 0 || sizeLong > Integer.MAX_VALUE - 8) {
+                throw new LuaException("invalid array size: " + sizeLong);
+            }
+            long elemBytes;
+            if (compType == byte.class || compType == boolean.class) {
+                elemBytes = 1L;
+            } else if (compType == short.class || compType == char.class) {
+                elemBytes = 2L;
+            } else if (compType == int.class || compType == float.class) {
+                elemBytes = 4L;
+            } else {
+                elemBytes = 8L;
+            }
+            long allocCap = org.luava.runtime.LuaState.allocationLimit();
+            if (sizeLong > allocCap / elemBytes) {
+                throw new LuaException("array allocation too large");
+            }
+            Object arr = Array.newInstance(compType, (int) sizeLong);
             return new LuaUserdata(arr);
         }));
 

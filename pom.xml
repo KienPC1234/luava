@@ -12,7 +12,7 @@
     -->
     <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava</artifactId>
-    <version>0.2.5</version>
+    <version>0.2.6</version>
     <packaging>jar</packaging>
 
     <name>Luava</name>
@@ -49,12 +49,11 @@
 
         <!--
           Release code name, surfaced in the jar manifest and the CLI's -v.
-          "Concord" covers the 0.2.x line: exact Lua 5.4 standard-library
-          semantics, the object-return JIT call protocol, register-window
-          rollback and the CLI -i script/REPL fix. 0.2.5 folded in the core
-          semantics and stdlib/load fixes found by differential testing.
+          "Meridian" introduces 0.2.6: byte-slice strings and pattern engine,
+          unboxed table array lanes, guarded JIT kernels, stackless coroutines,
+          CompiledChunk/LuaStatePool, and resource/security hardening.
         -->
-        <luava.codename>Concord</luava.codename>
+        <luava.codename>Meridian</luava.codename>
 
         <junit.jupiter.version>5.10.2</junit.jupiter.version>
         <asm.version>9.7</asm.version>

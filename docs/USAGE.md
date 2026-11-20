@@ -10,13 +10,13 @@ If you only want to run scripts or poke at Lua 5.4 syntax, the engine jar is
 executable:
 
 ```bash
-java -jar luava-0.2.5.jar script.lua arg1 arg2   # run a file (arg[0] = script name)
-java -jar luava-0.2.5.jar -e "print(1 + 2)"      # evaluate a string
-java -jar luava-0.2.5.jar -i script.lua          # run, then enter the REPL
-java -jar luava-0.2.5.jar                        # interactive multi-line REPL
-java -jar luava-0.2.5.jar -v                     # version (e.g. "Luava 0.2.5 Concord (Lua 5.4)")
-java -jar luava-0.2.5.jar -h                     # usage
-java -jar luava-0.2.5.jar --sandbox --profile script.lua   # prod smoke-test
+java -jar luava-0.2.6.jar script.lua arg1 arg2   # run a file (arg[0] = script name)
+java -jar luava-0.2.6.jar -e "print(1 + 2)"      # evaluate a string
+java -jar luava-0.2.6.jar -i script.lua          # run, then enter the REPL
+java -jar luava-0.2.6.jar                        # interactive multi-line REPL
+java -jar luava-0.2.6.jar -v                     # version (e.g. "Luava 0.2.6 Meridian (Lua 5.4)")
+java -jar luava-0.2.6.jar -h                     # usage
+java -jar luava-0.2.6.jar --sandbox --profile script.lua   # prod smoke-test
 ```
 
 Flags (only the first argument is inspected, so pass flags before the script):
@@ -391,9 +391,25 @@ state.evalWithTimeout(src, Duration.ofMillis(500));          // one-shot, throws
 state.clearGuard();                                          // remove the guard
 ```
 
+Additional per-state resource and cancellation limits:
+
+```java
+state.maxMemoryBytes(16 * 1024 * 1024);   // bound retained Lua heap (checked at GC points)
+state.maxCoroutines(64);                  // bound simultaneously live (non-dead) coroutines
+state.maxCallDepth(256);                  // bound Lua call stack frame depth (0 = default)
+state.cancellable();                      // allow cancel() to stop tight JIT loops too
+
+// From another host thread:
+state.cancel();
+state.isCancelled();
+state.resetCancellation();                // optional: clear cancel flag to reuse state
+```
+
 A tripped guard raises a catchable Lua error, so `pcall` in Lua and
-`LuaException` in Java both work. While a guard or a debug hook is active, the
-JIT is bypassed (correct, just not accelerated).
+`LuaException` in Java both work. Guarded states (`timeout` and
+`instructionLimit` >= 8192, or `cancellable()`) compile to guarded JIT kernels
+that check `LoopGuard.tick()` at loop back-edges; sub-8192 instruction budgets,
+`maxCallDepth` bounds, and debug hooks stay in the interpreter.
 
 ## Observing a state (stats)
 
@@ -434,8 +450,15 @@ java.util.concurrent.CompletableFuture<org.luava.runtime.LuaValue> f =
 ```
 
 One state still serves one thread at a time: concurrent top-level `eval`
-calls on the *same* state are not supported — use one state per
-thread/tenant (see below) and `evalAsync` for handoff, not parallelism.
+calls on the *same* state are not supported. Use one state per thread/tenant,
+or `LuaStatePool` + `CompiledChunk` for bounded concurrency:
+
+```java
+try (LuaState.CompiledChunk chunk = LuaState.compileChunk(src, "handler.lua");
+     LuaStatePool pool = new LuaStatePool(8)) {
+    LuaValue out = pool.eval(chunk);
+}
+```
 
 ## Production embedding checklist
 
@@ -447,7 +470,10 @@ try (LuaState state = new LuaState()
         .sandbox()                            // drop os/io/package/java
         .instructionLimit(1_000_000)          // per-request budget
         .maxAllocationBytes(16 * 1024 * 1024)
-        .jitEnabled(false)) {                 // optional: deterministic latency
+        .maxMemoryBytes(32 * 1024 * 1024)     // cap retained Lua heap
+        .maxCoroutines(32)                    // cap live coroutines
+        .maxCallDepth(512)                    // cap Lua recursion depth
+        .cancellable()) {                     // support host state.cancel()
     state.setLive("db", readOnlyDb);
     state.eval("local h = require('handler')");   // with resourceLoader, or:
     LuaValue out = state.call("handle", path);    // handle = Lua function
@@ -464,7 +490,9 @@ java -jar luava.jar --dump-bytecode handler.lua   # inspect what ships
 
 ## Coroutines and concurrency
 
-Lua coroutines are supported and run on Java virtual threads:
+Pure-Lua coroutines execute on a stackless VM fast path with zero extra threads
+and automatically graduate to Java virtual threads only when yielding across a
+Java callback or protected boundary:
 
 ```lua
 local co = coroutine.create(function()
@@ -494,7 +522,9 @@ The tiered JIT is on by default and needs no configuration for typical use.
 The interpreter is always the fallback and the deopt target; hot Lua functions
 whose shape passes a static subset analysis tier up to one JVM method per proto
 (unboxed `long` flow, direct self-recursion, type guards with resume-at-pc
-deopt). Coroutines, debug hooks and execution timeouts never enter JIT code.
+deopt). Guarded execution (`timeout`, `instructionLimit` >= 8192,
+`cancellable`) compiles guarded JIT kernels; debug hooks, `maxCallDepth`, and
+sub-8192 instruction budgets stay in the interpreter.
 
 Per-state control:
 
@@ -516,12 +546,14 @@ Process-wide and build-time switches (JVM `-D` flags, read once at startup):
 
 Notes:
 
-- Compiled classes are bounded by an LRU cache (512), so Metaspace cannot leak.
+- Compiled classes are bounded by a second-chance LRU cache (512), so
+  Metaspace cannot leak.
 - Lower `hotThreshold`/`loopThreshold` to force compilation sooner in tests
   (`-Dluava.jit.hotThreshold=1 -Dluava.jit.loopThreshold=1` compiles almost
   everything); raise them to reduce compile overhead on short-lived workloads.
-- While an `instructionLimit`, `timeout` or a debug hook is active, the JIT is
-  bypassed for correctness — the script still runs, just interpreted.
+- When `instructionLimit` >= 8192, `timeout`, or `cancellable` is active, Luava
+  uses guarded JIT kernels (`guardedJitCode`). Debug hooks, `maxCallDepth`, and
+  small instruction budgets (< 8192) remain interpreted.
 
 To remove first-request latency in a server, pre-warm after loading scripts:
 

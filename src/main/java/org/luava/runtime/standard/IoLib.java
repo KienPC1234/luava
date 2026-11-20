@@ -689,11 +689,20 @@ public final class IoLib {
 
     public static void open(LuaTable globals) {
         LuaTable io = new LuaTable();
-        fillInto(io, globals);
+        fillInto(io, null, globals);
         globals.rawset(LuaString.interned("io"), io);
     }
 
     public static void fillInto(LuaTable io, LuaTable globals) {
+        fillInto(io, null, globals);
+    }
+
+    /**
+     * Fills the {@code io} table. When {@code state} is provided, the active
+     * default input/output handles are anchored in {@code state}'s registry so
+     * closing the state releases them instead of pinning a global root provider.
+     */
+    public static void fillInto(LuaTable io, LuaState state, LuaTable globals) {
         LuaTable fileMt = new LuaTable();
         LuaTable fileMethods = new LuaTable();
 
@@ -850,10 +859,17 @@ public final class IoLib {
 
         final LuaUserdata[] currentIn = new LuaUserdata[]{stdinUd};
         final LuaUserdata[] currentOut = new LuaUserdata[]{stdoutUd};
-        org.luava.runtime.eval.GCManager.addRootProvider(consumer -> {
-            if (currentIn[0] != null) consumer.accept(currentIn[0]);
-            if (currentOut[0] != null) consumer.accept(currentOut[0]);
-        });
+        final LuaString ioInputKey = LuaString.interned("_IO_input");
+        final LuaString ioOutputKey = LuaString.interned("_IO_output");
+        if (state != null) {
+            state.getRegistry().rawset(ioInputKey, stdinUd);
+            state.getRegistry().rawset(ioOutputKey, stdoutUd);
+        } else {
+            org.luava.runtime.eval.GCManager.addRootProvider(consumer -> {
+                if (currentIn[0] != null) consumer.accept(currentIn[0]);
+                if (currentOut[0] != null) consumer.accept(currentOut[0]);
+            });
+        }
 
         // io.open
         io.rawset(LuaString.interned("open"), LuaFunction.of(args -> {
@@ -956,12 +972,14 @@ public final class IoLib {
             }
             if (args[0] instanceof LuaUserdata ud && ud.getUserdata() instanceof FileHandle) {
                 currentIn[0] = ud;
+                if (state != null) state.getRegistry().rawset(ioInputKey, ud);
                 return ud;
             }
             if (args[0].isString() || args[0].isNumber()) {
                 LuaValue openRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("r"));
                 if (openRes.isNil()) throw cannotOpen(args[0].toLuaString(), openRes);
                 currentIn[0] = (LuaUserdata) openRes;
+                if (state != null) state.getRegistry().rawset(ioInputKey, openRes);
                 return openRes;
             }
             throw LuaValue.argError(1, "input", "FILE* expected, got " + args[0].typeName());
@@ -973,12 +991,14 @@ public final class IoLib {
             }
             if (args[0] instanceof LuaUserdata ud && ud.getUserdata() instanceof FileHandle) {
                 currentOut[0] = ud;
+                if (state != null) state.getRegistry().rawset(ioOutputKey, ud);
                 return ud;
             }
             if (args[0].isString() || args[0].isNumber()) {
                 LuaValue openRes = io.rawget(LuaString.interned("open")).call(args[0], LuaString.interned("w"));
                 if (openRes.isNil()) throw cannotOpen(args[0].toLuaString(), openRes);
                 currentOut[0] = (LuaUserdata) openRes;
+                if (state != null) state.getRegistry().rawset(ioOutputKey, openRes);
                 return openRes;
             }
             throw LuaValue.argError(1, "output", "FILE* expected, got " + args[0].typeName());

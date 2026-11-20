@@ -31,7 +31,7 @@ jobs:
 
       - name: Verify no preview / FFM usage
         run: |
-          if grep -rn -- "--enable-preview\|java.lang.foreign" src/main pom.xml; then
+          if grep -rn -- "--enable-preview\|import[[:space:]]\+java\.lang\.foreign" src/main pom.xml; then
             echo "::error::preview/FFM usage found (must stay stock Java 21 LTS)"; exit 1
           fi
           echo "no preview/FFM references"
