@@ -54,6 +54,7 @@
           CompiledChunk/LuaStatePool, and resource/security hardening.
         -->
         <luava.codename>Meridian</luava.codename>
+        <luava.jit.sync>true</luava.jit.sync>
 
         <junit.jupiter.version>5.10.2</junit.jupiter.version>
         <asm.version>9.7</asm.version>
@@ -191,7 +192,7 @@
                       on the requesting thread makes those assertions
                       deterministic without changing what they verify.
                     -->
-                    <argLine>-Xmx2g -Duser.timezone=UTC -Dluava.jit.sync=true</argLine>
+                    <argLine>-Xmx2g -Duser.timezone=UTC -Dluava.jit.sync=${luava.jit.sync}</argLine>
                     <systemPropertyVariables>
                         <suite>${suite}</suite>
                     </systemPropertyVariables>

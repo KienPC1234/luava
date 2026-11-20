@@ -27,10 +27,15 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -62,6 +67,46 @@ public class LuavaSecurityAuditSuiteTest {
 
         public String privilegedAdminOp() {
             return "ADMIN_SECRET";
+        }
+    }
+
+    public static final class AttenuatingFactoryService {
+        private final ExposedService delegate = new ExposedService();
+
+        public String safeSummary() {
+            return "summary";
+        }
+
+        public int safeInt() {
+            return 42;
+        }
+
+        public List<String> safeStringList() {
+            return List.of("a", "b");
+        }
+
+        public ExposedService leakedObject() {
+            return delegate;
+        }
+
+        public List<ExposedService> leakedList() {
+            return List.of(delegate);
+        }
+
+        public Map<String, ExposedService> leakedMap() {
+            return Collections.singletonMap("svc", delegate);
+        }
+
+        public Optional<ExposedService> leakedOptional() {
+            return Optional.of(delegate);
+        }
+
+        public ExposedService[] leakedArray() {
+            return new ExposedService[]{delegate};
+        }
+
+        public JavaCapability attenuatedChild() {
+            return new JavaCapability(delegate, "safeOp");
         }
     }
 
@@ -546,6 +591,141 @@ public class LuavaSecurityAuditSuiteTest {
             } finally {
                 exec.shutdownNow();
             }
+        }
+    }
+
+    @Test
+    void capabilityReturnAttenuationTest() {
+        try (LuaState state = new LuaState().sandbox()) {
+            state.setCapability("svc", new AttenuatingFactoryService(),
+                    "safeSummary", "safeInt", "safeStringList",
+                    "leakedObject", "leakedList", "leakedMap", "leakedOptional", "leakedArray",
+                    "attenuatedChild");
+
+            assertEquals("summary", state.eval("return svc:safeSummary()").toLuaString());
+            assertEquals(42L, state.eval("return svc:safeInt()").toLong());
+            assertEquals("a:b", state.eval("local l = svc:safeStringList(); return l[1] .. ':' .. l[2]").toLuaString());
+
+            // Unwrapped Java objects and containers carrying unwrapped Java objects must fail closed.
+            for (String call : List.of(
+                    "return svc:leakedObject()",
+                    "return svc:leakedList()",
+                    "return svc:leakedMap()",
+                    "return svc:leakedOptional()",
+                    "return svc:leakedArray()")) {
+                LuaException err = assertThrows(LuaException.class, () -> state.eval(call));
+                assertTrue(err.getMessage().contains("access denied"),
+                        "Expected access denied for '" + call + "', got: " + err.getMessage());
+            }
+
+            // Explicit JavaCapability returns stay attenuated to their own method allowlist.
+            assertEquals("safe:ok", state.eval("local c = svc:attenuatedChild(); return c:safeOp('ok')").toLuaString());
+            assertTrue(state.eval("local c = svc:attenuatedChild(); return c.privilegedAdminOp == nil").toBoolean());
+            LuaException writeErr = assertThrows(LuaException.class,
+                    () -> state.eval("local c = svc:attenuatedChild(); c.x = 1"));
+            assertTrue(writeErr.getMessage().contains("access denied"));
+        }
+    }
+
+    @Test
+    void asyncLeaseLifecycleRetiresInFlightStateTest() throws Exception {
+        try (LuaStatePool pool = LuaStatePool.stateful(2, ExecutionPolicy.builder()
+                .sandbox(true)
+                .instructionLimit(5_000_000)
+                .build())) {
+            LuaState leakedRef;
+            CompletableFuture<LuaValue> inFlight;
+            try (LuaStatePool.Lease lease = pool.acquireLease()) {
+                leakedRef = lease.state();
+                inFlight = leakedRef.evalAsync("""
+                        local s = 0
+                        for i = 1, 200000 do s = s + i end
+                        marker_from_async = s
+                        return s
+                        """, "async.lua");
+                // Release immediately while async task is queued or active.
+            }
+
+            assertEquals(0, pool.activeCount());
+            assertEquals(0, pool.idleCount(), "state with in-flight async work must be retired, not returned idle");
+            assertEquals(2, pool.availablePermits());
+            assertTrue(leakedRef.isClosed(), "retired state must be closed cleanly");
+
+            ExecutionException asyncErr = assertThrows(ExecutionException.class,
+                    () -> inFlight.get(5, TimeUnit.SECONDS));
+            assertTrue(asyncErr.getCause() instanceof LuaException);
+
+            try (LuaStatePool.Lease next = pool.acquireLease()) {
+                assertTrue(next.eval("return marker_from_async == nil").toBoolean(),
+                        "subsequent borrower must receive a fresh state");
+            }
+        }
+    }
+
+    @Test
+    void duplicateFactoryStateRejectedWithoutCorruptingPoolTest() {
+        LuaState shared = new LuaState();
+        try (LuaStatePool pool = LuaStatePool.builder()
+                .isolationMode(LuaStatePool.IsolationMode.STATEFUL)
+                .maxTotal(2)
+                .maxIdle(2)
+                .factory(() -> shared)
+                .build()) {
+            try (LuaStatePool.Lease first = pool.acquireLease()) {
+                assertEquals(1, pool.activeCount());
+                assertEquals(1, pool.availablePermits());
+
+                LuaException dupErr = assertThrows(LuaException.class, pool::acquireLease);
+                assertTrue(dupErr.getMessage().contains("already managed")
+                        || dupErr.getMessage().contains("already leased"));
+                assertEquals(1, pool.activeCount());
+                assertEquals(1, pool.availablePermits(), "failed acquire must release its permit");
+                assertFalse(first.state().isClosed(), "rejected duplicate must not close active borrower's state");
+                assertEquals(7L, first.eval("return 3 + 4").toLong());
+            }
+            assertEquals(0, pool.activeCount());
+            assertEquals(2, pool.availablePermits());
+        }
+    }
+
+    @Test
+    void staleStateAfterStatefulReleaseIsBlockedInIdleTest() {
+        try (LuaStatePool pool = LuaStatePool.stateful(1, ExecutionPolicy.builder().sandbox(true).build())) {
+            LuaState retained;
+            LuaStatePool.Lease releasedLease;
+            try (LuaStatePool.Lease lease = pool.acquireLease()) {
+                releasedLease = lease;
+                retained = lease.state();
+                assertEquals(10L, lease.eval("x = 10; return x").toLong());
+            }
+            assertEquals(1, pool.idleCount());
+            assertThrows(LuaException.class, releasedLease::state);
+            assertThrows(LuaException.class, () -> releasedLease.eval("return 1"));
+            LuaException idleUse = assertThrows(LuaException.class, () -> retained.eval("x = 999"));
+            assertTrue(idleUse.getMessage().contains("idle"));
+        }
+    }
+
+    @Test
+    void memoryLimitBestEffortPressureTest() {
+        ExecutionPolicy strictMem = ExecutionPolicy.builder()
+                .sandbox(true)
+                .maxMemoryBytes(64 * 1024L)
+                .instructionLimit(5_000_000)
+                .build();
+        try (LuaStatePool pool = LuaStatePool.stateful(1, strictMem)) {
+            try (LuaStatePool.Lease lease = pool.acquireLease()) {
+                LuaException oom = assertThrows(LuaException.class, () -> lease.eval("""
+                        local t = {}
+                        for i = 1, 5000 do
+                            t[i] = { i, i + 1, i + 2, string.rep('x', 128) }
+                        end
+                        """));
+                assertTrue(oom.getMessage().contains("memory"),
+                        "Expected memory limit error, got: " + oom.getMessage());
+            }
+            assertEquals(0, pool.idleCount(), "state tripping maxMemoryBytes must be tainted and discarded");
+            assertEquals(1, pool.availablePermits());
         }
     }
 }

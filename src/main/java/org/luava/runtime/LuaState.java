@@ -116,6 +116,8 @@ public final class LuaState implements AutoCloseable {
     private volatile boolean executedOrLoaded = false;
     private volatile boolean sandboxed = false;
     private volatile boolean tainted = false;
+    private volatile boolean poolIdle = false;
+    private final java.util.concurrent.atomic.AtomicLong leaseGeneration = new java.util.concurrent.atomic.AtomicLong();
     private final LuaTable globals = new LuaTable();
     private final LuaTable registry = new LuaTable();
     private final LuaCoroutine mainThread = LuaCoroutine.createMainThread();
@@ -642,6 +644,40 @@ public final class LuaState implements AutoCloseable {
 
     public int getPendingAsyncTaskCount() {
         return pendingAsyncTasks.get();
+    }
+
+    /** Whether async tasks are currently queued or running via {@link #evalAsync}. */
+    public boolean hasPendingAsyncTasks() {
+        return pendingAsyncTasks.get() > 0;
+    }
+
+    /** Whether a host entry is currently executing on this state. */
+    public boolean isExecuting() {
+        return executingRootThread.get() != null;
+    }
+
+    long nextPoolLeaseGeneration() {
+        poolIdle = false;
+        return leaseGeneration.incrementAndGet();
+    }
+
+    void markPoolIdle(long expectedGen) {
+        if (leaseGeneration.get() == expectedGen && !closed) {
+            poolIdle = true;
+        }
+    }
+
+    void markPoolRetired() {
+        poolIdle = false;
+        leaseGeneration.incrementAndGet();
+    }
+
+    long currentLeaseGeneration() {
+        return leaseGeneration.get();
+    }
+
+    boolean isPoolIdle() {
+        return poolIdle;
     }
 
     /** Configures behavior when {@link #evalAsync} reaches {@link #getMaxPendingAsyncTasks()}. */
@@ -1717,10 +1753,13 @@ public final class LuaState implements AutoCloseable {
     // increments and guards only fire on the new closed state.
     // ---------------------------------------------------------------
 
-    /** Throws when this state was {@link #close() closed}. */
+    /** Throws when this state was {@link #close() closed} or returned idle to a {@link LuaStatePool}. */
     private void ensureOpen() {
         if (closed) {
             throw new LuaException("LuaState is closed");
+        }
+        if (poolIdle) {
+            throw new LuaException("pooled LuaState is idle and cannot be used outside an active lease");
         }
     }
 
@@ -1836,7 +1875,7 @@ public final class LuaState implements AutoCloseable {
             CompletableFuture<Void>[] holder = new CompletableFuture[1];
             CompletableFuture<Void> next = prev.whenCompleteAsync((ignored, err) -> {
                 try {
-                    if (closed) {
+                    if (closed || poolIdle) {
                         result.completeExceptionally(new LuaException("LuaState is closed"));
                     } else if (isCancelled()) {
                         result.completeExceptionally(new LuaException("execution cancelled"));

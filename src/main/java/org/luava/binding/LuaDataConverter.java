@@ -150,6 +150,7 @@ public final class LuaDataConverter {
     public static LuaValue toLua(Object obj) {
         if (obj == null) return LuaNil.NIL;
         if (obj instanceof LuaValue lv) return lv;
+        if (obj instanceof JavaCapability cap) return new LuaUserdata(cap);
         if (obj instanceof Boolean b) return LuaBoolean.valueOf(b);
         if (obj instanceof Integer i) return LuaInteger.valueOf(i);
         if (obj instanceof Long l) return LuaInteger.valueOf(l);
@@ -225,6 +226,7 @@ public final class LuaDataConverter {
     public static LuaValue toLuaLive(Object obj) {
         if (obj == null) return LuaNil.NIL;
         if (obj instanceof LuaValue lv) return lv;
+        if (obj instanceof JavaCapability cap) return new LuaUserdata(cap);
         if (obj instanceof Boolean b) return LuaBoolean.valueOf(b);
         if (obj instanceof Integer i) return LuaInteger.valueOf(i);
         if (obj instanceof Long l) return LuaInteger.valueOf(l);

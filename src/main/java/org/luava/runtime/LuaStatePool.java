@@ -52,19 +52,34 @@ public final class LuaStatePool implements AutoCloseable {
 
     private final Object leaseLock = new Object();
     private final IdentityHashMap<LuaState, Lease> activeLeases = new IdentityHashMap<>();
+    private final IdentityHashMap<LuaState, Boolean> managedStates = new IdentityHashMap<>();
     private volatile boolean closed;
 
-    /** Scoped lease guaranteeing single release back to its owning pool. */
+    /**
+     * Scoped lease guaranteeing single release back to its owning pool.
+     * Callers should execute work through the {@code Lease} (or within its
+     * {@code try}-with-resources scope) rather than retaining {@link #state()}
+     * references past {@link #close()}.
+     */
     public final class Lease implements AutoCloseable {
         private final LuaState state;
+        private final long generation;
         private final AtomicBoolean released = new AtomicBoolean(false);
 
-        private Lease(LuaState state) {
+        private Lease(LuaState state, long generation) {
             this.state = state;
+            this.generation = generation;
         }
 
+        /**
+         * Returns the leased {@link LuaState} while this lease is active.
+         * Retaining this reference past {@link #close()} violates the scoped
+         * contract; pooled states returned to {@code idle} reject calls made
+         * outside an active lease, and states with in-flight async work are
+         * retired on release.
+         */
         public LuaState state() {
-            if (released.get()) {
+            if (released.get() || state.currentLeaseGeneration() != generation) {
                 throw new LuaException("lease has already been released");
             }
             return state;
@@ -74,8 +89,23 @@ public final class LuaStatePool implements AutoCloseable {
             return state().eval(chunk);
         }
 
+        public LuaValue eval(String luaSource) {
+            return state().eval(luaSource);
+        }
+
+        public LuaValue eval(String luaSource, String chunkName) {
+            return state().eval(luaSource, chunkName);
+        }
+
         public LuaValue evalSnapshot(LuaState.CompiledChunk chunk) {
             return snapshotValue(eval(chunk), maxSnapshotDepth);
+        }
+
+        public <T> T withState(Function<LuaState, T> fn) {
+            if (fn == null) {
+                throw new IllegalArgumentException("fn must not be null");
+            }
+            return fn.apply(state());
         }
 
         @Override
@@ -139,19 +169,39 @@ public final class LuaStatePool implements AutoCloseable {
         }
         acquirePermit();
         LuaState state = null;
+        boolean closeOnRollback = true;
         boolean handoffSucceeded = false;
         try {
             if (closed) {
                 throw new LuaException("pool is closed");
             }
+            boolean fromIdle = false;
             state = pollHealthyIdle();
-            if (state == null) {
+            if (state != null) {
+                fromIdle = true;
+            } else {
                 state = createFreshState();
+            }
+            long gen;
+            synchronized (leaseLock) {
+                if (!fromIdle && managedStates.containsKey(state)) {
+                    closeOnRollback = false;
+                    throw new LuaException("pool factory returned a LuaState already managed by this pool");
+                }
+                if (activeLeases.containsKey(state)) {
+                    closeOnRollback = false;
+                    throw new LuaException("LuaState is already actively leased");
+                }
+                if (closed) {
+                    throw new LuaException("pool is closed");
+                }
+                managedStates.put(state, Boolean.TRUE);
+                gen = state.nextPoolLeaseGeneration();
             }
             if (policy != null) {
                 state.applyPolicy(policy);
             }
-            Lease lease = new Lease(state);
+            Lease lease = new Lease(state, gen);
             synchronized (leaseLock) {
                 if (closed) {
                     throw new LuaException("pool is closed");
@@ -162,8 +212,8 @@ public final class LuaStatePool implements AutoCloseable {
             return lease;
         } finally {
             if (!handoffSucceeded) {
-                if (state != null) {
-                    closeQuietly(state);
+                if (state != null && closeOnRollback) {
+                    retireState(state);
                 }
                 permits.release();
             }
@@ -201,20 +251,33 @@ public final class LuaStatePool implements AutoCloseable {
                     activeLeases.remove(state);
                 }
             }
-            if (isolationMode == IsolationMode.ISOLATED || closed || state.isTainted()) {
-                closeQuietly(state);
+            if (isolationMode == IsolationMode.ISOLATED
+                    || closed
+                    || state.isTainted()
+                    || state.hasPendingAsyncTasks()
+                    || state.isExecuting()) {
+                retireState(state);
                 return;
             }
             if (policy != null) {
                 try {
                     policy.applyTo(state);
                 } catch (Throwable t) {
-                    closeQuietly(state);
+                    retireState(state);
                     return;
                 }
             }
+            if (closed || state.isTainted() || state.hasPendingAsyncTasks() || state.isExecuting()) {
+                retireState(state);
+                return;
+            }
+            state.markPoolIdle(expectedLease.generation);
             if (!idle.offer(state)) {
-                closeQuietly(state);
+                retireState(state);
+                return;
+            }
+            if (closed && idle.remove(state)) {
+                retireState(state);
             }
         } finally {
             permits.release();
@@ -263,14 +326,25 @@ public final class LuaStatePool implements AutoCloseable {
                 break;
             }
             LuaState state = null;
+            boolean closeOnRollback = true;
             try {
                 if (closed) {
                     break;
                 }
                 state = createFreshState();
+                long gen;
+                synchronized (leaseLock) {
+                    if (managedStates.containsKey(state)) {
+                        closeOnRollback = false;
+                        throw new LuaException("pool factory returned a LuaState already managed by this pool");
+                    }
+                    managedStates.put(state, Boolean.TRUE);
+                    gen = state.nextPoolLeaseGeneration();
+                }
                 if (policy != null) {
                     state.applyPolicy(policy);
                 }
+                state.markPoolIdle(gen);
                 if (idle.offer(state)) {
                     state = null;
                     created++;
@@ -278,8 +352,8 @@ public final class LuaStatePool implements AutoCloseable {
                     break;
                 }
             } finally {
-                if (state != null) {
-                    closeQuietly(state);
+                if (state != null && closeOnRollback) {
+                    retireState(state);
                 }
                 permits.release();
             }
@@ -326,7 +400,7 @@ public final class LuaStatePool implements AutoCloseable {
         closed = true;
         LuaState state;
         while ((state = idle.poll()) != null) {
-            closeQuietly(state);
+            retireState(state);
         }
     }
 
@@ -346,10 +420,10 @@ public final class LuaStatePool implements AutoCloseable {
     private LuaState pollHealthyIdle() {
         LuaState candidate;
         while ((candidate = idle.poll()) != null) {
-            if (!candidate.isTainted()) {
+            if (!candidate.isTainted() && !candidate.hasPendingAsyncTasks() && !candidate.isExecuting()) {
                 return candidate;
             }
-            closeQuietly(candidate);
+            retireState(candidate);
         }
         return null;
     }
@@ -363,6 +437,14 @@ public final class LuaStatePool implements AutoCloseable {
             throw new LuaException("pool factory returned closed LuaState");
         }
         return created;
+    }
+
+    private void retireState(LuaState state) {
+        synchronized (leaseLock) {
+            managedStates.remove(state);
+        }
+        state.markPoolRetired();
+        closeQuietly(state);
     }
 
     private static void closeQuietly(LuaState state) {

@@ -40,7 +40,40 @@ export LUAVA_JIT_SYNC="${LUAVA_JIT_SYNC:--Dluava.jit.sync=true}"
 # Compile C & Java harnesses if needed
 gcc -O2 -Wall -Wextra $(pkg-config --cflags lua5.4) "$HARNESS_DIR/lua_c_bench.c" $(pkg-config --libs lua5.4) -lm -o "$HARNESS_DIR/lua_c_bench.out"
 javac -cp "$JAR" -d "$HARNESS_DIR" "$HARNESS_DIR/Bench.java"
-javac -cp "$HARNESS_DIR/luaj-jse.jar" -d "$HARNESS_DIR" "$HARNESS_DIR/LuaJBench.java"
+if [ -f "$HARNESS_DIR/luaj-jse.jar" ] && [ -f "$HARNESS_DIR/LuaJBench.java" ]; then
+    javac -cp "$HARNESS_DIR/luaj-jse.jar" -d "$HARNESS_DIR" "$HARNESS_DIR/LuaJBench.java"
+fi
+
+GIT_SHA="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+OUT_DIR="${BENCH_OUT_DIR:-$HARNESS_DIR/results/${RUN_TS}-${MODE}-${GIT_SHA}}"
+mkdir -p "$OUT_DIR"
+RAW_CSV="$OUT_DIR/raw_pairs.csv"
+META_JSON="$OUT_DIR/metadata.json"
+
+CPU_MODEL="$(awk -F: '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | xargs || echo unknown)"
+JDK_VER="$(java -version 2>&1 | head -n 1 | xargs)"
+LUAC_VER="$(pkg-config --modversion lua5.4 2>/dev/null || echo unknown)"
+JVM_FLAGS="${LUAVA_JIT_FLAGS:-} ${LUAVA_JIT_SYNC:-} -XX:+UseG1GC -Xmx1g"
+
+cat > "$META_JSON" <<EOF
+{
+  "timestampUtc": "$RUN_TS",
+  "gitSha": "$GIT_SHA",
+  "jar": "$JAR",
+  "mode": "$MODE",
+  "pairs": $PAIRS,
+  "warmup": $WARM,
+  "iterations": $ITERS,
+  "corePin": "$CORE",
+  "jvmFlags": "$(echo "$JVM_FLAGS" | xargs)",
+  "jdkVersion": "${JDK_VER//\"/\\\"}",
+  "luaCVersion": "$LUAC_VER",
+  "cpuModel": "${CPU_MODEL//\"/\\\"}"
+}
+EOF
+
+printf "task,pair,order,luava_best_ms,luava_median_ms,luava_iqr_ms,luava_cold_ms,luava_alloc_kb,luava_jit_hits,luava_jit_compiled,luava_deopts,luac_best_ms,luac_median_ms,luac_iqr_ms\n" > "$RAW_CSV"
 
 run_luava() {
     local task="$1"
@@ -82,11 +115,11 @@ stats_median_iqr() {
     }'
 }
 
-printf "jar=%s\npairs=%s warm=%s iters=%s core=%s mode=%s\n\n" "$JAR" "$PAIRS" "$WARM" "$ITERS" "$CORE" "$MODE"
+printf "jar=%s\npairs=%s warm=%s iters=%s core=%s mode=%s\nresults=%s\n\n" "$JAR" "$PAIRS" "$WARM" "$ITERS" "$CORE" "$MODE" "$OUT_DIR"
 printf "%-20s | %8s %6s | %8s %6s | %7s | %8s | %9s | %s\n" \
-    "task" "LuavaMed" "IQR" "LuaCMed" "IQR" "LuaC/Lv" "Cold(ms)" "Alloc(KB)" "JIT(hits/deopt)"
+    "task" "LuavaMed" "IQR" "LuaCMed" "IQR" "LuaC/Lv" "Cold(ms)" "Alloc(KB)" "JIT(hits/comp/deopt)"
 printf "%-20s-+-%8s-%6s-+-%8s-%6s-+-%7s-+-%8s-+-%9s-+-%s\n" \
-    "--------------------" "--------" "------" "--------" "------" "-------" "--------" "---------" "---------------"
+    "--------------------" "--------" "------" "--------" "------" "-------" "--------" "---------" "--------------------"
 
 for task in "${TASKS[@]}"; do
     [ -f "$LUA_DIR/$task.lua" ] || { echo "skip missing $task"; continue; }
@@ -97,19 +130,30 @@ for task in "${TASKS[@]}"; do
     last_jit=""
     for ((p=0; p<PAIRS; p++)); do
         if (( p % 2 == 0 )); then
+            order="luava_first"
             lv_line=$(run_luava "$task")
             lc_line=$(run_luac "$task")
         else
+            order="luac_first"
             lc_line=$(run_luac "$task")
             lv_line=$(run_luava "$task")
         fi
-        lv_meds="$lv_meds $(echo "$lv_line" | extract median)"
-        lc_meds="$lc_meds $(echo "$lc_line" | extract median)"
+        lv_best=$(echo "$lv_line" | extract best)
+        lv_m=$(echo "$lv_line" | extract median)
+        lv_i=$(echo "$lv_line" | extract iqr)
+        lc_best=$(echo "$lc_line" | extract best)
+        lc_m=$(echo "$lc_line" | extract median)
+        lc_i=$(echo "$lc_line" | extract iqr)
         last_cold=$(echo "$lv_line" | extract cold)
         last_alloc=$(echo "$lv_line" | extract allocKB)
         jh=$(echo "$lv_line" | extract jitHits)
+        jc=$(echo "$lv_line" | extract jitCompiled)
         jd=$(echo "$lv_line" | extract deopts)
-        last_jit="${jh}/${jd}"
+        lv_meds="$lv_meds $lv_m"
+        lc_meds="$lc_meds $lc_m"
+        last_jit="${jh}/${jc}/${jd}"
+        printf "%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+            "$task" "$p" "$order" "${lv_best:-0}" "${lv_m:-0}" "${lv_i:-0}" "${last_cold:-0}" "${last_alloc:-0}" "${jh:-0}" "${jc:-0}" "${jd:-0}" "${lc_best:-0}" "${lc_m:-0}" "${lc_i:-0}" >> "$RAW_CSV"
     done
     read -r lv_med lv_iqr <<< "$(echo "$lv_meds" | stats_median_iqr)"
     read -r lc_med lc_iqr <<< "$(echo "$lc_meds" | stats_median_iqr)"

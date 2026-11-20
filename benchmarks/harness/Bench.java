@@ -68,7 +68,7 @@ public class Bench {
         Stats stats = st.stats();
         JitCompiler.Telemetry jitStats = JitCompiler.telemetry();
         System.out.printf(
-                "%-28s best=%8.2f avg=%8.2f median=%8.2f iqr=%6.2f cold=%8.2f allocKB=%9.1f jitHits=%d deopts=%d mode=%s ms%n",
+                "%-28s best=%8.2f avg=%8.2f median=%8.2f iqr=%6.2f cold=%8.2f allocKB=%9.1f jitHits=%d jitCompiled=%d deopts=%d mode=%s ms%n",
                 Path.of(file).getFileName(),
                 best,
                 sum / iters,
@@ -76,7 +76,8 @@ public class Bench {
                 p75 - p25,
                 coldMs,
                 allocKb,
-                Math.max(stats.jitHits, jitStats.compiledCount()),
+                stats.jitHits,
+                jitStats.compiledCount(),
                 stats.deoptCount,
                 mode);
 

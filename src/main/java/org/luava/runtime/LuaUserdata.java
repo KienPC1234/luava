@@ -21,10 +21,13 @@ import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -712,11 +715,140 @@ public final class LuaUserdata extends LuaValue {
                 + (target != null ? target.getClass().getName() : "static class"));
     }
 
-    private static LuaValue convertReturn(Class<?> returnType, Object result) {
-        if (returnType == void.class || returnType == Void.class) {
+    private static LuaValue convertReturn(Class<?> returnType, Object result, boolean capabilityGrant) {
+        if (returnType == void.class || returnType == Void.class || result == null) {
             return LuaNil.NIL;
         }
-        return LuaDataConverter.toLua(result);
+        if (!capabilityGrant) {
+            return LuaDataConverter.toLua(result);
+        }
+        return sanitizeCapabilityReturn(result, Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    private static LuaValue sanitizeCapabilityReturn(Object result, Set<Object> visited) {
+        if (result == null) {
+            return LuaNil.NIL;
+        }
+        if (result instanceof JavaCapability cap) {
+            return new LuaUserdata(cap);
+        }
+        if (result instanceof LuaValue lv) {
+            return sanitizeCapabilityLuaValue(lv, visited);
+        }
+        if (result instanceof Boolean
+                || result instanceof Integer
+                || result instanceof Long
+                || result instanceof Short
+                || result instanceof Byte
+                || result instanceof Float
+                || result instanceof Double
+                || result instanceof Character
+                || result instanceof String
+                || result instanceof Enum<?>) {
+            return LuaDataConverter.toLua(result);
+        }
+        if (result instanceof Optional<?> opt) {
+            return opt.isPresent() ? sanitizeCapabilityReturn(opt.get(), visited) : LuaNil.NIL;
+        }
+        if (result instanceof List<?> list) {
+            enterCapabilityContainer(result, visited);
+            try {
+                LuaTable table = new LuaTable(list.size(), 0);
+                for (int i = 0; i < list.size(); i++) {
+                    table.rawset(LuaInteger.valueOf(i + 1), sanitizeCapabilityReturn(list.get(i), visited));
+                }
+                return table;
+            } finally {
+                visited.remove(result);
+            }
+        }
+        if (result instanceof Map<?, ?> map) {
+            enterCapabilityContainer(result, visited);
+            try {
+                LuaTable table = new LuaTable(0, map.size());
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    table.rawset(
+                            sanitizeCapabilityReturn(entry.getKey(), visited),
+                            sanitizeCapabilityReturn(entry.getValue(), visited));
+                }
+                return table;
+            } finally {
+                visited.remove(result);
+            }
+        }
+        if (result instanceof Set<?> set) {
+            enterCapabilityContainer(result, visited);
+            try {
+                LuaTable table = new LuaTable(set.size(), 0);
+                int i = 1;
+                for (Object elem : set) {
+                    table.rawset(LuaInteger.valueOf(i++), sanitizeCapabilityReturn(elem, visited));
+                }
+                return table;
+            } finally {
+                visited.remove(result);
+            }
+        }
+        if (result.getClass().isArray()) {
+            enterCapabilityContainer(result, visited);
+            try {
+                int len = Array.getLength(result);
+                LuaTable table = new LuaTable(len, 0);
+                for (int i = 0; i < len; i++) {
+                    table.rawset(LuaInteger.valueOf(i + 1), sanitizeCapabilityReturn(Array.get(result, i), visited));
+                }
+                return table;
+            } finally {
+                visited.remove(result);
+            }
+        }
+        throw new LuaException("access denied: capability method cannot expose unwrapped Java object of type "
+                + result.getClass().getName());
+    }
+
+    private static LuaValue sanitizeCapabilityLuaValue(LuaValue lv, Set<Object> visited) {
+        if (lv == null || lv.isNil()
+                || lv instanceof LuaBoolean
+                || lv instanceof LuaInteger
+                || lv instanceof LuaFloat
+                || lv instanceof LuaString) {
+            return lv != null ? lv : LuaNil.NIL;
+        }
+        if (lv instanceof LuaUserdata ud) {
+            if (ud.instance instanceof JavaCapability) {
+                return ud;
+            }
+            String type = ud.instance != null ? ud.instance.getClass().getName() : "userdata";
+            throw new LuaException("access denied: capability method cannot expose unwrapped Java object of type "
+                    + type);
+        }
+        if (lv instanceof LuaTable tbl) {
+            enterCapabilityContainer(tbl, visited);
+            try {
+                LuaTable snapshot = new LuaTable();
+                tbl.forEach((k, v) -> snapshot.rawset(
+                        sanitizeCapabilityLuaValue(k, visited),
+                        sanitizeCapabilityLuaValue(v, visited)));
+                return snapshot;
+            } finally {
+                visited.remove(tbl);
+            }
+        }
+        if (lv instanceof Varargs va) {
+            int n = va.count();
+            LuaValue[] items = new LuaValue[n];
+            for (int i = 0; i < n; i++) {
+                items[i] = sanitizeCapabilityLuaValue(va.arg(i + 1), visited);
+            }
+            return Varargs.of(items);
+        }
+        throw new LuaException("access denied: capability method cannot return " + lv.typeName());
+    }
+
+    private static void enterCapabilityContainer(Object container, Set<Object> visited) {
+        if (!visited.add(container)) {
+            throw new LuaException("access denied: capability method cannot return cyclic container");
+        }
     }
 
     private static LuaFunction createLongToLongInvoker(Class<?> ownerClass, Class<?> declaringClass,
@@ -749,7 +881,7 @@ public final class LuaUserdata extends LuaValue {
             checkMethodInvocationPolicy(ownerClass, declaringClass, methodName, capabilityGrant);
             resolveOffset(args, 0, target, methodName);
             try {
-                return convertReturn(returnType, mh.invokeExact());
+                return convertReturn(returnType, mh.invokeExact(), capabilityGrant);
             } catch (Throwable t) {
                 throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }
@@ -768,7 +900,7 @@ public final class LuaUserdata extends LuaValue {
             }
             try {
                 Object j0 = LuaDataConverter.toJava(a0, p0);
-                return convertReturn(returnType, mh.invokeExact(j0));
+                return convertReturn(returnType, mh.invokeExact(j0), capabilityGrant);
             } catch (Throwable t) {
                 throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }
@@ -789,7 +921,7 @@ public final class LuaUserdata extends LuaValue {
             try {
                 Object j0 = LuaDataConverter.toJava(a0, p0);
                 Object j1 = LuaDataConverter.toJava(a1, p1);
-                return convertReturn(returnType, mh.invokeExact(j0, j1));
+                return convertReturn(returnType, mh.invokeExact(j0, j1), capabilityGrant);
             } catch (Throwable t) {
                 throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }
@@ -813,7 +945,7 @@ public final class LuaUserdata extends LuaValue {
                 Object j0 = LuaDataConverter.toJava(a0, p0);
                 Object j1 = LuaDataConverter.toJava(a1, p1);
                 Object j2 = LuaDataConverter.toJava(a2, p2);
-                return convertReturn(returnType, mh.invokeExact(j0, j1, j2));
+                return convertReturn(returnType, mh.invokeExact(j0, j1, j2), capabilityGrant);
             } catch (Throwable t) {
                 throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }
@@ -836,7 +968,7 @@ public final class LuaUserdata extends LuaValue {
                 Object j1 = LuaDataConverter.toJava(args[off + 1], p[1]);
                 Object j2 = LuaDataConverter.toJava(args[off + 2], p[2]);
                 Object j3 = LuaDataConverter.toJava(args[off + 3], p[3]);
-                return convertReturn(returnType, mh.invokeExact(j0, j1, j2, j3));
+                return convertReturn(returnType, mh.invokeExact(j0, j1, j2, j3), capabilityGrant);
             } catch (Throwable t) {
                 throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }
@@ -867,7 +999,7 @@ public final class LuaUserdata extends LuaValue {
                 LuaDataConverter.MethodMeta meta = LuaDataConverter.methodMeta(bestMatch);
                 Object[] javaArgs = convertArgs(meta.paramTypes, meta.isVarArgs, callArgs);
                 Object result = invokeResolved(meta, target, javaArgs);
-                return convertReturn(meta.returnType, result);
+                return convertReturn(meta.returnType, result, capabilityGrant);
             } catch (Throwable t) {
                 throw LuaFunction.hostError("Error invoking Java method " + methodName, t);
             }

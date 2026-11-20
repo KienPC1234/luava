@@ -35,7 +35,7 @@ resource caps (one state per thread or tenant).
 | `set` / `setLive` / `registerFunction` / `registerModule` | Snapshot conversion, live Java objects, lambdas, `@LuaModule` binding, `MethodHandle` cache |
 | `sandbox()` / `deny(...)` / `javaPolicy(...)` | Strip `os`/`io`/`package`/`java` and enforce `JavaAccessPolicy` allow/deny rules |
 | `instructionLimit(n)` / `timeout(d)` / `cancellable()` / `cancel()` | Preemptive execution budgets and cross-thread cancellation |
-| `maxAllocationBytes(n)` / `maxMemoryBytes(n)` / `maxCoroutines(n)` / `maxCallDepth(n)` | Per-state stdlib allocation, retained heap, live coroutine, and stack depth limits |
+| `maxAllocationBytes(n)` / `maxMemoryBytes(n)` / `maxCoroutines(n)` / `maxCallDepth(n)` | Per-state stdlib allocation, best-effort retained heap, live coroutine, and stack depth limits |
 | `stats()` / `close()` | Live call/JIT/deopt/allocation counters and deterministic cleanup |
 
 ## Execution Model & Tiered JIT
@@ -47,22 +47,24 @@ resource caps (one state per thread or tenant).
 
 ## Verification & Benchmarks
 
-- **Conformance**: 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` suites pass (`OfficialSuiteEvaluationTest`), alongside 388 unit, adversarial security, and PUC 5.4 differential tests across JIT ON, JIT OFF (`-Dluava.jit=false`), and synchronous aggressive tier-up (`-Dluava.jit.sync=true -Dluava.jit.hotThreshold=1`).
+- **Conformance**: 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` suites pass (`OfficialSuiteEvaluationTest`), alongside 408 unit, lifecycle, adversarial security, and PUC 5.4 differential tests across sync JIT (`-Dluava.jit.sync=true`), async JIT (`-Dluava.jit.sync=false`), and JIT OFF (`-Dluava.jit=false`).
 
-Paired benchmark across **Luava 0.2.6** (`-Dluava.jit.sync=true`), **LuaJ 3.0.1** (interleaved 5 pairs, pinned core 0 except coroutines, 6 warmup, 10 iters median best ms), and **PUC Lua 5.4.8 C** (6 warmup, 10 iters in-process best ms):
+Reproducible paired benchmark via `benchmarks/harness/audit_bench.sh` (11 interleaved pairs, pinned core 0 except coroutines, 6 warmup, 10 iters, OpenJDK 21.0.13.1 `-Dluava.jit.sync=true -XX:+UseG1GC -Xmx1g` on Intel Xeon Gold 5120T vs PUC Lua 5.4.8 C):
 
-| Task | Luava 0.2.6 (ms) | LuaJ 3.0.1 (ms) | Lua 5.4.8 C (ms) | vs LuaJ | vs Lua C |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| `01_arith_loop` | 36.50 | 258.72 | 60.21 | 7.09x | 1.65x |
-| `02_fibonacci` | 235.18 | 2423.43 | 745.67 | 10.31x | 3.17x |
-| `03_table_ops` | 17.45 | 47.83 | 13.50 | 2.74x | 0.77x |
-| `04_string_concat` | 9.90 | 16.05 | 13.07 | 1.62x | 1.32x |
-| `05_closures` | 27.78 | 63.38 | 22.79 | 2.28x | 0.82x |
-| `06_coroutines` | 89.69 | 2351.69 | 27.22 | 26.22x | 0.30x |
-| `07_hash_table` | 49.76 | 199.87 | 195.47 | 4.02x | 3.93x |
-| `08_oop_metatables` | 289.97 | 595.44 | 222.50 | 2.05x | 0.77x |
-| `09_string_pattern` | 70.73 | 78.94 | 88.33 | 1.12x | 1.25x |
-| `10_sieve` | 123.46 | 307.38 | 144.12 | 2.49x | 1.17x |
+| Task | Exec: Luava (ms / IQR) | Exec: Lua 5.4.8 C (ms / IQR) | Exec LuaC/Luava | E2E: Luava (ms) | E2E: Lua C (ms) | E2E LuaC/Luava |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `01_arith_loop` | 36.23 / 0.56 | 60.35 / 0.78 | 1.67x | 65.52 | 60.16 | 0.92x |
+| `02_fibonacci` | 236.28 / 0.41 | 726.46 / 1.31 | 3.07x | 252.34 | 724.17 | 2.87x |
+| `03_table_ops` | 17.31 / 0.06 | 13.80 / 0.12 | 0.80x | 74.55 | 15.50 | 0.21x |
+| `04_string_concat` | 12.65 / 0.82 | 11.80 / 0.09 | 0.93x | 26.46 | 11.92 | 0.45x |
+| `05_closures` | 28.63 / 1.12 | 23.80 / 0.16 | 0.83x | 66.11 | 24.30 | 0.37x |
+| `06_coroutines` | 66.90 / 1.34 | 28.84 / 0.40 | 0.43x | 75.01 | 28.84 | 0.38x |
+| `07_hash_table` | 152.41 / 6.79 | 212.01 / 0.94 | 1.39x | 230.00 | 205.99 | 0.90x |
+| `08_oop_metatables` | 258.78 / 3.97 | 225.65 / 2.90 | 0.87x | 685.59 | 229.04 | 0.33x |
+| `09_string_pattern` | 83.65 / 4.76 | 92.12 / 0.34 | 1.10x | 193.31 | 92.11 | 0.48x |
+| `10_sieve` | 138.30 / 0.57 | 146.39 / 0.69 | 1.06x | 303.14 | 147.48 | 0.49x |
+
+`Exec` measures precompiled chunk execution (`LuaState.compileChunk` / `luaL_loadfile`); `E2E` includes full parse, bytecode/JIT compilation, and execution per iteration. Raw pair CSVs and metadata can be regenerated with `benchmarks/harness/audit_bench.sh`.
 
 ## License
 

@@ -16,8 +16,9 @@ import java.util.Set;
 /**
  * Capability wrapper restricting Lua access on a host-provided Java object to
  * an explicit allowlist of public method names. Fields, {@code getClass()},
- * monitor methods, array/list/map indexing, and unlisted methods remain
- * inaccessible even if the underlying object exposes dozens of public APIs.
+ * monitor methods, array/list/map indexing, unlisted methods, and unwrapped
+ * non-primitive return values remain inaccessible even if the underlying object
+ * exposes dozens of public APIs.
  */
 public final class JavaCapability {
     private final Object target;
