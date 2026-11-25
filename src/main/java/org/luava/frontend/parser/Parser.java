@@ -7,25 +7,28 @@
  */
 package org.luava.frontend.parser;
 
-import org.luava.frontend.ast.Expression;
-import org.luava.frontend.ast.Expressions;
-import org.luava.frontend.ast.Statement;
-import org.luava.frontend.ast.Statements;
-import org.luava.frontend.lexer.Token;
-import org.luava.frontend.lexer.TokenType;
-
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import org.luava.frontend.ast.Expression;
+import org.luava.frontend.ast.Expressions;
+import org.luava.frontend.ast.Statement;
+import org.luava.frontend.ast.Statements;
+import org.luava.frontend.lexer.Token;
+import org.luava.frontend.lexer.TokenStream;
+import org.luava.frontend.lexer.TokenType;
 
 public final class Parser {
     private final List<Token> tokens;
+    private final TokenStream stream;
+    private final int tokenCount;
     private int current = 0;
+    private TokenType curType;
 
     private static final class Scope {
         final Scope parent;
@@ -162,8 +165,8 @@ public final class Parser {
 
     private void enterNesting() {
         if (++nestingDepth > MAX_NESTING_DEPTH) {
-            Token cur = peek();
-            throw new ParseException("C stack overflow", cur.line(), cur.column());
+            int cur = peekIdx();
+            throw new ParseException("C stack overflow", tokLine(cur), tokCol(cur));
         }
     }
 
@@ -171,22 +174,29 @@ public final class Parser {
         nestingDepth--;
     }
 
-    private void defineLocal(String name, boolean isConst, Token token) {
+    private void defineLocal(String name, boolean isConst, int tokIdx) {
         currentScope.define(name, isConst);
         currentFuncCtx.funcLocals.add(name);
         currentFuncCtx.totalLocals++;
         currentFuncCtx.activeVars.add(name);
         if (currentFuncCtx.activeVars.size() > 200) {
-            int line = currentFuncCtx.lineDefined > 0 ? currentFuncCtx.lineDefined : (token != null ? token.line() : 1);
-            throw new ParseException("too many local variables (limit is 200) in function at line " + line + " near " + formatNear(token), token != null ? token.line() : 1, token != null ? token.column() : 0);
+            int tLine = tokIdx >= 0 ? tokLine(tokIdx) : 1;
+            int tCol = tokIdx >= 0 ? tokCol(tokIdx) : 0;
+            int line = currentFuncCtx.lineDefined > 0 ? currentFuncCtx.lineDefined : tLine;
+            throw new ParseException(
+                    "too many local variables (limit is 200) in function at line " + line + " near " + formatNear(tokIdx),
+                    tLine,
+                    tCol);
         }
     }
 
     private void checkNotConst(Expressions.VariableExpr varExpr) {
         Boolean isConst = currentScope.find(varExpr.name());
         if (Boolean.TRUE.equals(isConst)) {
-            throw new ParseException("attempt to assign to const variable '" + varExpr.name() + "'",
-                                     varExpr.line(), varExpr.column());
+            throw new ParseException(
+                    "attempt to assign to const variable '" + varExpr.name() + "'",
+                    varExpr.line(),
+                    varExpr.column());
         }
         if (isConst == null) {
             FunctionContext ctx = currentFuncCtx;
@@ -194,8 +204,10 @@ public final class Parser {
                 Boolean outerConst = ctx.outerScope.find(varExpr.name());
                 if (outerConst != null) {
                     if (Boolean.TRUE.equals(outerConst)) {
-                        throw new ParseException("attempt to assign to const variable '" + varExpr.name() + "'",
-                                                 varExpr.line(), varExpr.column());
+                        throw new ParseException(
+                                "attempt to assign to const variable '" + varExpr.name() + "'",
+                                varExpr.line(),
+                                varExpr.column());
                     }
                     break;
                 }
@@ -204,7 +216,7 @@ public final class Parser {
         }
     }
 
-    private void checkUpvalue(String varName, Token token) {
+    private void checkUpvalue(String varName, int tokIdx) {
         if (currentFuncCtx.parent == null) {
             return;
         }
@@ -223,23 +235,28 @@ public final class Parser {
         if (isLocalInAncestor) {
             int count = currentFuncCtx.addUpvalue(varName);
             if (count > 255) {
-                int line = currentFuncCtx.lineDefined > 0 ? currentFuncCtx.lineDefined : (token != null ? token.line() : 1);
-                throw new ParseException("too many upvalues (limit is 255) in function at line " + line + " near " + formatNear(token), token != null ? token.line() : 1, token != null ? token.column() : 0);
+                int tLine = tokIdx >= 0 ? tokLine(tokIdx) : 1;
+                int tCol = tokIdx >= 0 ? tokCol(tokIdx) : 0;
+                int line = currentFuncCtx.lineDefined > 0 ? currentFuncCtx.lineDefined : tLine;
+                throw new ParseException(
+                        "too many upvalues (limit is 255) in function at line " + line + " near " + formatNear(tokIdx),
+                        tLine,
+                        tCol);
             }
         }
     }
 
     private boolean isLastInBlock() {
         int idx = current;
-        while (idx < tokens.size()) {
-            TokenType t = tokens.get(idx).type();
+        while (idx < tokenCount) {
+            TokenType t = tokType(idx);
             if (t == TokenType.SEMICOLON) {
                 idx++;
             } else if (t == TokenType.DOUBLE_COLON) {
                 idx++;
-                if (idx < tokens.size() && tokens.get(idx).type() == TokenType.IDENTIFIER) {
+                if (idx < tokenCount && tokType(idx) == TokenType.IDENTIFIER) {
                     idx++;
-                    if (idx < tokens.size() && tokens.get(idx).type() == TokenType.DOUBLE_COLON) {
+                    if (idx < tokenCount && tokType(idx) == TokenType.DOUBLE_COLON) {
                         idx++;
                         continue;
                     }
@@ -249,8 +266,10 @@ public final class Parser {
                 break;
             }
         }
-        if (idx >= tokens.size()) return true;
-        TokenType t = tokens.get(idx).type();
+        if (idx >= tokenCount) {
+            return true;
+        }
+        TokenType t = tokType(idx);
         return t == TokenType.END || t == TokenType.ELSE || t == TokenType.ELSEIF || t == TokenType.EOF;
     }
 
@@ -262,12 +281,11 @@ public final class Parser {
         currentScope = new Scope(currentScope);
         scopeDepth++;
         currentFuncCtx.currentBlock = new BlockContext(
-            currentFuncCtx.currentBlock,
-            currentFuncCtx.activeVars.size(),
-            currentFuncCtx.labelCount(),
-            currentFuncCtx.gotoCount(),
-            isLoop
-        );
+                currentFuncCtx.currentBlock,
+                currentFuncCtx.activeVars.size(),
+                currentFuncCtx.labelCount(),
+                currentFuncCtx.gotoCount(),
+                isLoop);
     }
 
     private void exitScope() {
@@ -296,8 +314,11 @@ public final class Parser {
             } else {
                 if (bl.firstgoto < gotoCount) {
                     GotoRef g = currentFuncCtx.gotos.get(bl.firstgoto);
-                    Token cur = peek();
-                    throw new ParseException("no visible label '" + g.name + "' for <goto> at line " + g.line, cur.line(), cur.column());
+                    int cur = peekIdx();
+                    throw new ParseException(
+                            "no visible label '" + g.name + "' for <goto> at line " + g.line,
+                            tokLine(cur),
+                            tokCol(cur));
                 }
             }
             currentFuncCtx.currentBlock = bl.parent;
@@ -313,14 +334,24 @@ public final class Parser {
 
     public Parser(List<Token> tokens) {
         this.tokens = tokens != null ? tokens : List.of();
+        this.stream = null;
+        this.tokenCount = this.tokens.size();
+        this.curType = this.tokenCount > 0 ? this.tokens.get(0).type() : TokenType.EOF;
+    }
+
+    public Parser(TokenStream stream) {
+        this.stream = Objects.requireNonNull(stream);
+        this.tokens = null;
+        this.tokenCount = stream.size();
+        this.curType = this.tokenCount > 0 ? stream.type(0) : TokenType.EOF;
     }
 
     public Statements.BlockStmt parse() {
         enterScope();
         Statements.BlockStmt block = parseBlockInternal();
         if (!isAtEnd()) {
-            Token t = peek();
-            throw new ParseException("<eof> expected near " + formatNear(t), t.line(), t.column());
+            int t = peekIdx();
+            throw new ParseException("<eof> expected near " + formatNear(t), tokLine(t), tokCol(t));
         }
         exitScope();
         return block;
@@ -328,8 +359,9 @@ public final class Parser {
 
     private Statements.BlockStmt parseBlockInternal() {
         List<Statement> stmts = new ArrayList<>();
-        int startLine = peek().line();
-        int startCol = peek().column();
+        int startIdx = peekIdx();
+        int startLine = startIdx >= 0 ? tokLine(startIdx) : 1;
+        int startCol = startIdx >= 0 ? tokCol(startIdx) : 1;
 
         while (!isAtEnd() && !isBlockEnd()) {
             Statement stmt = parseStatement();
@@ -344,21 +376,21 @@ public final class Parser {
                 // optional semicolons between statements
             }
         }
-        Token lastTok = previous();
-        int endLine = lastTok != null ? lastTok.line() : startLine;
+        int lastTok = previousIdx();
+        int endLine = lastTok >= 0 ? tokLine(lastTok) : startLine;
         return new Statements.BlockStmt(stmts, startLine, startCol, endLine);
     }
 
     private boolean isBlockEnd() {
-        TokenType t = peek().type();
+        TokenType t = curType;
         return t == TokenType.END || t == TokenType.ELSE || t == TokenType.ELSEIF || t == TokenType.UNTIL || t == TokenType.EOF;
     }
 
     private Statement parseStatement() {
         enterNesting();
         try {
-            Token token = peek();
-            return switch (token.type()) {
+            int tok = peekIdx();
+            return switch (tokType(tok)) {
                 case LOCAL -> parseLocalStatement();
                 case IF -> parseIfStatement();
                 case WHILE -> parseWhileStatement();
@@ -367,17 +399,18 @@ public final class Parser {
                 case FUNCTION -> parseFunctionStatement();
                 case DO -> parseDoStatement();
                 case BREAK -> {
-                    advance();
+                    advanceIdx();
+                    int line = tokLine(tok);
+                    int col = tokCol(tok);
                     if (currentFuncCtx.loopDepth == 0) {
-                        throw new ParseException("break outside loop at line " + token.line(),
-                                token.line(), token.column());
+                        throw new ParseException("break outside loop at line " + line, line, col);
                     }
-                    yield new Statements.BreakStmt(token.line(), token.column());
+                    yield new Statements.BreakStmt(line, col);
                 }
                 case GOTO -> {
-                    Token gotoToken = advance();
-                    Token labelToken = consume(TokenType.IDENTIFIER, "<name> expected");
-                    String labelName = labelToken.lexeme();
+                    int gotoTok = advanceIdx();
+                    int labelTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
+                    String labelName = tokLexeme(labelTok);
                     LabelDef found = null;
                     if (currentFuncCtx.labels != null) {
                         for (LabelDef l : currentFuncCtx.labels) {
@@ -387,25 +420,34 @@ public final class Parser {
                             }
                         }
                     }
+                    int gotoLine = tokLine(gotoTok);
+                    int gotoCol = tokCol(gotoTok);
                     if (found == null) {
-                        currentFuncCtx.ensureGotos().add(new GotoRef(labelName, gotoToken.line(), gotoToken.column(), currentFuncCtx.activeVars.size()));
+                        currentFuncCtx.ensureGotos().add(new GotoRef(labelName, gotoLine, gotoCol, currentFuncCtx.activeVars.size()));
                     }
-                    yield new Statements.GotoStmt(labelName, gotoToken.line(), gotoToken.column());
+                    yield new Statements.GotoStmt(labelName, gotoLine, gotoCol);
                 }
                 case DOUBLE_COLON -> {
-                    Token dcol = advance();
-                    Token labelToken = consume(TokenType.IDENTIFIER, "<name> expected");
-                    consume(TokenType.DOUBLE_COLON, "'::' expected");
-                    String labelName = labelToken.lexeme();
+                    int dcolTok = advanceIdx();
+                    int labelTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
+                    consumeIdx(TokenType.DOUBLE_COLON, "'::' expected");
+                    String labelName = tokLexeme(labelTok);
+                    int labelLine = tokLine(labelTok);
+                    int labelCol = tokCol(labelTok);
                     List<LabelDef> lbls = currentFuncCtx.ensureLabels();
                     for (LabelDef existing : lbls) {
                         if (existing.name.equals(labelName)) {
-                            throw new ParseException("label '" + labelName + "' already defined on line " + existing.line, labelToken.line(), labelToken.column());
+                            throw new ParseException(
+                                    "label '" + labelName + "' already defined on line " + existing.line,
+                                    labelLine,
+                                    labelCol);
                         }
                     }
                     boolean isLast = isLastInBlock();
-                    int labelNactvar = isLast ? (currentFuncCtx.currentBlock != null ? currentFuncCtx.currentBlock.nactvar : 0) : currentFuncCtx.activeVars.size();
-                    LabelDef newLabel = new LabelDef(labelName, labelToken.line(), labelNactvar);
+                    int labelNactvar = isLast
+                            ? (currentFuncCtx.currentBlock != null ? currentFuncCtx.currentBlock.nactvar : 0)
+                            : currentFuncCtx.activeVars.size();
+                    LabelDef newLabel = new LabelDef(labelName, labelLine, labelNactvar);
                     lbls.add(newLabel);
                     if (currentFuncCtx.gotos != null) {
                         int firstgoto = currentFuncCtx.currentBlock != null ? currentFuncCtx.currentBlock.firstgoto : 0;
@@ -414,7 +456,10 @@ public final class Parser {
                             if (g.name.equals(labelName)) {
                                 if (g.nactvar < newLabel.nactvar) {
                                     String varName = currentFuncCtx.activeVars.get(g.nactvar);
-                                    throw new ParseException("<goto " + g.name + "> at line " + g.line + " jumps into the scope of local '" + varName + "'", g.line, g.column);
+                                    throw new ParseException(
+                                            "<goto " + g.name + "> at line " + g.line + " jumps into the scope of local '" + varName + "'",
+                                            g.line,
+                                            g.column);
                                 }
                                 currentFuncCtx.gotos.remove(i);
                             } else {
@@ -422,11 +467,11 @@ public final class Parser {
                             }
                         }
                     }
-                    yield new Statements.LabelStmt(labelName, dcol.line(), dcol.column());
+                    yield new Statements.LabelStmt(labelName, tokLine(dcolTok), tokCol(dcolTok));
                 }
                 case RETURN -> parseReturnStatement();
                 case SEMICOLON -> {
-                    advance();
+                    advanceIdx();
                     yield null;
                 }
                 default -> parseAssignmentOrExprStatement();
@@ -437,24 +482,25 @@ public final class Parser {
     }
 
     private Statement parseLocalStatement() {
-        Token localToken = advance(); // consume 'local'
+        int localTok = advanceIdx(); // consume 'local'
         if (match(TokenType.FUNCTION)) {
-            Token funcToken = previous();
-            Token name = consume(TokenType.IDENTIFIER, "<name> expected");
-            defineLocal(name.lexeme(), false, name);
-            Token lparen = consume(TokenType.LPAREN, "'(' expected");
+            int funcTok = previousIdx();
+            int nameTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
+            String funcName = tokLexeme(nameTok);
+            defineLocal(funcName, false, nameTok);
+            int lparenTok = consumeIdx(TokenType.LPAREN, "'(' expected");
             List<String> params = new ArrayList<>();
             boolean isVararg = parseParameterList(params);
-            checkMatch(TokenType.RPAREN, TokenType.LPAREN, lparen);
+            checkMatchIdx(TokenType.RPAREN, TokenType.LPAREN, lparenTok);
             int savedScopeDepth = scopeDepth;
             Scope savedScope = currentScope;
             scopeDepth = 0;
             currentScope = null;
             FunctionContext prevFuncCtx = currentFuncCtx;
-            currentFuncCtx = new FunctionContext(prevFuncCtx, localToken.line(), savedScope);
+            currentFuncCtx = new FunctionContext(prevFuncCtx, tokLine(localTok), savedScope);
             enterScope();
             for (String p : params) {
-                defineLocal(p, false, localToken);
+                defineLocal(p, false, localTok);
             }
             Statements.BlockStmt body;
             try {
@@ -465,31 +511,32 @@ public final class Parser {
                 scopeDepth = savedScopeDepth;
                 currentScope = savedScope;
             }
-            Token endToken = checkMatch(TokenType.END, TokenType.FUNCTION, funcToken);
-            return new Statements.LocalFunctionDefStmt(name.lexeme(), params, isVararg, body, funcToken.line(), funcToken.column(), endToken.line());
+            int endTok = checkMatchIdx(TokenType.END, TokenType.FUNCTION, funcTok);
+            return new Statements.LocalFunctionDefStmt(
+                    funcName, params, isVararg, body, tokLine(funcTok), tokCol(funcTok), tokLine(endTok));
         }
 
         List<Statements.LocalVarBinding> bindings = new ArrayList<>();
         do {
-            Token name = consume(TokenType.IDENTIFIER, "<name> expected");
+            int nameTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
             Statements.VariableAttribute attr = Statements.VariableAttribute.NONE;
             if (match(TokenType.ATTR_CLOSE)) {
                 attr = Statements.VariableAttribute.CLOSE;
             } else if (match(TokenType.ATTR_CONST)) {
                 attr = Statements.VariableAttribute.CONST;
             } else if (match(TokenType.LESS)) {
-                Token attrToken = consume(TokenType.IDENTIFIER, "<name> expected");
-                consume(TokenType.GREATER, "'>' expected");
-                String attrName = attrToken.lexeme();
+                int attrTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
+                consumeIdx(TokenType.GREATER, "'>' expected");
+                String attrName = tokLexeme(attrTok);
                 if ("const".equals(attrName)) {
                     attr = Statements.VariableAttribute.CONST;
                 } else if ("close".equals(attrName)) {
                     attr = Statements.VariableAttribute.CLOSE;
                 } else {
-                    throw new ParseException("unknown attribute '" + attrName + "'", attrToken.line(), attrToken.column());
+                    throw new ParseException("unknown attribute '" + attrName + "'", tokLine(attrTok), tokCol(attrTok));
                 }
             }
-            bindings.add(new Statements.LocalVarBinding(name.lexeme(), attr));
+            bindings.add(new Statements.LocalVarBinding(tokLexeme(nameTok), attr));
         } while (match(TokenType.COMMA));
 
         List<Expression> initializers = new ArrayList<>();
@@ -500,32 +547,32 @@ public final class Parser {
         }
 
         for (Statements.LocalVarBinding binding : bindings) {
-            boolean isConst = (binding.attribute() == Statements.VariableAttribute.CONST ||
-                               binding.attribute() == Statements.VariableAttribute.CLOSE);
-            defineLocal(binding.name(), isConst, localToken);
+            boolean isConst = (binding.attribute() == Statements.VariableAttribute.CONST
+                    || binding.attribute() == Statements.VariableAttribute.CLOSE);
+            defineLocal(binding.name(), isConst, localTok);
         }
 
-        return new Statements.LocalVarDeclStmt(bindings, initializers, localToken.line(), localToken.column());
+        return new Statements.LocalVarDeclStmt(bindings, initializers, tokLine(localTok), tokCol(localTok));
     }
 
     private Statement parseIfStatement() {
-        Token ifToken = advance(); // consume 'if'
+        int ifTok = advanceIdx(); // consume 'if'
         List<Statements.IfBranch> branches = new ArrayList<>();
 
         Expression cond = parseExpression();
-        Token thenToken = consume(TokenType.THEN, "'then' expected");
+        int thenTok = consumeIdx(TokenType.THEN, "'then' expected");
         enterScope();
         Statements.BlockStmt block = parseBlockInternal();
         exitScope();
-        branches.add(new Statements.IfBranch(cond, block, thenToken.line()));
+        branches.add(new Statements.IfBranch(cond, block, tokLine(thenTok)));
 
         while (match(TokenType.ELSEIF)) {
             Expression elseifCond = parseExpression();
-            Token elseifThenToken = consume(TokenType.THEN, "'then' expected");
+            int elseifThenTok = consumeIdx(TokenType.THEN, "'then' expected");
             enterScope();
             Statements.BlockStmt elseifBlock = parseBlockInternal();
             exitScope();
-            branches.add(new Statements.IfBranch(elseifCond, elseifBlock, elseifThenToken.line()));
+            branches.add(new Statements.IfBranch(elseifCond, elseifBlock, tokLine(elseifThenTok)));
         }
 
         Statements.BlockStmt elseBlock = null;
@@ -535,14 +582,14 @@ public final class Parser {
             exitScope();
         }
 
-        checkMatch(TokenType.END, TokenType.IF, ifToken);
-        return new Statements.IfStmt(branches, elseBlock, ifToken.line(), ifToken.column());
+        checkMatchIdx(TokenType.END, TokenType.IF, ifTok);
+        return new Statements.IfStmt(branches, elseBlock, tokLine(ifTok), tokCol(ifTok));
     }
 
     private Statement parseWhileStatement() {
-        Token whileToken = advance(); // consume 'while'
+        int whileTok = advanceIdx(); // consume 'while'
         Expression cond = parseExpression();
-        consume(TokenType.DO, "'do' expected");
+        consumeIdx(TokenType.DO, "'do' expected");
         enterScope();
         currentFuncCtx.loopDepth++;
         Statements.BlockStmt body;
@@ -552,12 +599,12 @@ public final class Parser {
             currentFuncCtx.loopDepth--;
         }
         exitScope();
-        Token endToken = checkMatch(TokenType.END, TokenType.WHILE, whileToken);
-        return new Statements.WhileStmt(cond, body, whileToken.line(), whileToken.column(), endToken.line());
+        int endTok = checkMatchIdx(TokenType.END, TokenType.WHILE, whileTok);
+        return new Statements.WhileStmt(cond, body, tokLine(whileTok), tokCol(whileTok), tokLine(endTok));
     }
 
     private Statement parseRepeatStatement() {
-        Token repeatToken = advance(); // consume 'repeat'
+        int repeatTok = advanceIdx(); // consume 'repeat'
         enterScope();
         currentFuncCtx.loopDepth++;
         Statements.BlockStmt body;
@@ -566,28 +613,28 @@ public final class Parser {
         } finally {
             currentFuncCtx.loopDepth--;
         }
-        checkMatch(TokenType.UNTIL, TokenType.REPEAT, repeatToken);
+        checkMatchIdx(TokenType.UNTIL, TokenType.REPEAT, repeatTok);
         Expression cond = parseExpression();
         exitScope();
-        return new Statements.RepeatStmt(body, cond, repeatToken.line(), repeatToken.column());
+        return new Statements.RepeatStmt(body, cond, tokLine(repeatTok), tokCol(repeatTok));
     }
 
     private Statement parseForStatement() {
-        Token forToken = advance(); // consume 'for'
-        Token varName = consume(TokenType.IDENTIFIER, "<name> expected");
+        int forTok = advanceIdx(); // consume 'for'
+        int varNameTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
+        String firstVarName = tokLexeme(varNameTok);
 
         if (match(TokenType.ASSIGN)) {
-            // Numeric for: for var = init, limit [, step] do
             Expression start = parseExpression();
-            consume(TokenType.COMMA, "',' expected");
+            consumeIdx(TokenType.COMMA, "',' expected");
             Expression limit = parseExpression();
             Expression step = null;
             if (match(TokenType.COMMA)) {
                 step = parseExpression();
             }
-            consume(TokenType.DO, "'do' expected");
+            consumeIdx(TokenType.DO, "'do' expected");
             enterScope();
-            defineLocal(varName.lexeme(), false, varName);
+            defineLocal(firstVarName, false, varNameTok);
             currentFuncCtx.loopDepth++;
             Statements.BlockStmt body;
             try {
@@ -596,28 +643,29 @@ public final class Parser {
                 currentFuncCtx.loopDepth--;
             }
             exitScope();
-            Token endToken = checkMatch(TokenType.END, TokenType.FOR, forToken);
-            return new Statements.ForNumericStmt(varName.lexeme(), start, limit, step, body, forToken.line(), forToken.column(), endToken.line());
+            int endTok = checkMatchIdx(TokenType.END, TokenType.FOR, forTok);
+            return new Statements.ForNumericStmt(
+                    firstVarName, start, limit, step, body, tokLine(forTok), tokCol(forTok), tokLine(endTok));
         } else {
-            // Generic for: for var1, var2 in exp1, exp2 do
             List<String> vars = new ArrayList<>();
-            vars.add(varName.lexeme());
+            vars.add(firstVarName);
             while (match(TokenType.COMMA)) {
-                vars.add(consume(TokenType.IDENTIFIER, "<name> expected").lexeme());
+                vars.add(tokLexeme(consumeIdx(TokenType.IDENTIFIER, "<name> expected")));
             }
             if (vars.size() == 1 && !check(TokenType.IN) && !check(TokenType.ASSIGN)) {
-                throw new ParseException("'=' or 'in' expected near " + formatNear(peek()), peek().line(), peek().column());
+                int cur = peekIdx();
+                throw new ParseException("'=' or 'in' expected near " + formatNear(cur), tokLine(cur), tokCol(cur));
             }
-            consume(TokenType.IN, "'in' expected");
+            consumeIdx(TokenType.IN, "'in' expected");
             List<Expression> iterators = new ArrayList<>();
             do {
                 iterators.add(parseExpression());
             } while (match(TokenType.COMMA));
 
-            consume(TokenType.DO, "'do' expected");
+            consumeIdx(TokenType.DO, "'do' expected");
             enterScope();
             for (String v : vars) {
-                defineLocal(v, false, forToken);
+                defineLocal(v, false, forTok);
             }
             currentFuncCtx.loopDepth++;
             Statements.BlockStmt body;
@@ -627,56 +675,62 @@ public final class Parser {
                 currentFuncCtx.loopDepth--;
             }
             exitScope();
-            Token endToken = checkMatch(TokenType.END, TokenType.FOR, forToken);
-            return new Statements.ForGenericStmt(vars, iterators, body, forToken.line(), forToken.column(), endToken.line());
+            int endTok = checkMatchIdx(TokenType.END, TokenType.FOR, forTok);
+            return new Statements.ForGenericStmt(vars, iterators, body, tokLine(forTok), tokCol(forTok), tokLine(endTok));
         }
     }
 
     private Statement parseFunctionStatement() {
-        Token funcToken = advance(); // consume 'function'
+        int funcTok = advanceIdx(); // consume 'function'
+        int funcLine = tokLine(funcTok);
+        int funcCol = tokCol(funcTok);
         Expression target = new Expressions.VariableExpr(
-            consume(TokenType.IDENTIFIER, "<name> expected").lexeme(),
-            funcToken.line(), funcToken.column()
-        );
+                tokLexeme(consumeIdx(TokenType.IDENTIFIER, "<name> expected")),
+                funcLine,
+                funcCol);
 
         while (match(TokenType.DOT)) {
-            Token member = consume(TokenType.IDENTIFIER, "<name> expected");
+            int memberTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
+            int mLine = tokLine(memberTok);
+            int mCol = tokCol(memberTok);
             target = new Expressions.TableAccessExpr(
-                target,
-                makeStringLiteral(member.lexeme(), member.line(), member.column()),
-                member.line(), member.column()
-            );
+                    target,
+                    makeStringLiteral(tokLexeme(memberTok), mLine, mCol),
+                    mLine,
+                    mCol);
         }
 
         boolean isMethod = false;
         if (match(TokenType.COLON)) {
             isMethod = true;
-            Token method = consume(TokenType.IDENTIFIER, "<name> expected");
+            int methodTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
+            int mLine = tokLine(methodTok);
+            int mCol = tokCol(methodTok);
             target = new Expressions.TableAccessExpr(
-                target,
-                makeStringLiteral(method.lexeme(), method.line(), method.column()),
-                method.line(), method.column()
-            );
+                    target,
+                    makeStringLiteral(tokLexeme(methodTok), mLine, mCol),
+                    mLine,
+                    mCol);
         } else if (target instanceof Expressions.VariableExpr varExpr) {
             checkNotConst(varExpr);
         }
 
-        Token lparen = consume(TokenType.LPAREN, "'(' expected");
+        int lparenTok = consumeIdx(TokenType.LPAREN, "'(' expected");
         List<String> params = new ArrayList<>();
         if (isMethod) {
             params.add("self");
         }
         boolean isVararg = parseParameterList(params);
-        checkMatch(TokenType.RPAREN, TokenType.LPAREN, lparen);
+        checkMatchIdx(TokenType.RPAREN, TokenType.LPAREN, lparenTok);
         int savedScopeDepth = scopeDepth;
         Scope savedScope = currentScope;
         scopeDepth = 0;
         currentScope = null;
         FunctionContext prevFuncCtx = currentFuncCtx;
-        currentFuncCtx = new FunctionContext(prevFuncCtx, funcToken.line(), savedScope);
+        currentFuncCtx = new FunctionContext(prevFuncCtx, funcLine, savedScope);
         enterScope();
         for (String p : params) {
-            defineLocal(p, false, lparen);
+            defineLocal(p, false, lparenTok);
         }
         Statements.BlockStmt body;
         try {
@@ -687,47 +741,51 @@ public final class Parser {
             scopeDepth = savedScopeDepth;
             currentScope = savedScope;
         }
-        Token endToken = checkMatch(TokenType.END, TokenType.FUNCTION, funcToken);
+        int endTok = checkMatchIdx(TokenType.END, TokenType.FUNCTION, funcTok);
 
-        return new Statements.FunctionDefStmt(target, isMethod, params, isVararg, body, funcToken.line(), funcToken.column(), endToken.line());
+        return new Statements.FunctionDefStmt(target, isMethod, params, isVararg, body, funcLine, funcCol, tokLine(endTok));
     }
 
     private Statement parseDoStatement() {
-        Token doToken = advance();
+        int doTok = advanceIdx();
         enterScope();
         Statements.BlockStmt body = parseBlockInternal();
         exitScope();
-        checkMatch(TokenType.END, TokenType.DO, doToken);
+        checkMatchIdx(TokenType.END, TokenType.DO, doTok);
         return body;
     }
 
     private Statement parseReturnStatement() {
-        Token returnToken = advance();
-        if (isBlockEnd() || peek().type() == TokenType.SEMICOLON) {
-            return new Statements.ReturnStmt(List.of(), returnToken.line(), returnToken.column());
+        int returnTok = advanceIdx();
+        int rLine = tokLine(returnTok);
+        int rCol = tokCol(returnTok);
+        if (isBlockEnd() || peekType() == TokenType.SEMICOLON) {
+            return new Statements.ReturnStmt(List.of(), rLine, rCol);
         }
         Expression first = parseExpression();
         if (!match(TokenType.COMMA)) {
-            return new Statements.ReturnStmt(List.of(first), returnToken.line(), returnToken.column());
+            return new Statements.ReturnStmt(List.of(first), rLine, rCol);
         }
         List<Expression> values = new ArrayList<>(4);
         values.add(first);
         do {
             values.add(parseExpression());
         } while (match(TokenType.COMMA));
-        return new Statements.ReturnStmt(values, returnToken.line(), returnToken.column());
+        return new Statements.ReturnStmt(values, rLine, rCol);
     }
 
     private Statement parseAssignmentOrExprStatement() {
-        Token startToken = peek();
+        int startTok = peekIdx();
+        int startLine = tokLine(startTok);
+        int startCol = tokCol(startTok);
         Expression expr = parsePrefixExpression();
 
         if (expr instanceof Expressions.FunctionCallExpr) {
-            return new Statements.ExprStmt(expr, startToken.line(), startToken.column());
+            return new Statements.ExprStmt(expr, startLine, startCol);
         }
 
         if (!(expr instanceof Expressions.VariableExpr) && !(expr instanceof Expressions.TableAccessExpr)) {
-            throw new ParseException("syntax error near " + formatNear(startToken), startToken.line(), startToken.column());
+            throw new ParseException("syntax error near " + formatNear(startTok), startLine, startCol);
         }
 
         List<Expression> targets;
@@ -738,21 +796,23 @@ public final class Parser {
             targets.add(expr);
             do {
                 if (targets.size() >= 200) {
-                    Token cur = peek();
-                    throw new ParseException("C stack overflow", cur.line(), cur.column());
+                    int cur = peekIdx();
+                    throw new ParseException("C stack overflow", tokLine(cur), tokCol(cur));
                 }
                 Expression nextExpr = parsePrefixExpression();
                 if (!(nextExpr instanceof Expressions.VariableExpr) && !(nextExpr instanceof Expressions.TableAccessExpr)) {
-                    throw new ParseException("syntax error near " + formatNear(peek()), peek().line(), peek().column());
+                    int cur = peekIdx();
+                    throw new ParseException("syntax error near " + formatNear(cur), tokLine(cur), tokCol(cur));
                 }
                 targets.add(nextExpr);
             } while (match(TokenType.COMMA));
         }
 
         if (!check(TokenType.ASSIGN)) {
-            throw new ParseException("syntax error near " + formatNear(peek()), peek().line(), peek().column());
+            int cur = peekIdx();
+            throw new ParseException("syntax error near " + formatNear(cur), tokLine(cur), tokCol(cur));
         }
-        consume(TokenType.ASSIGN, "'=' expected");
+        consumeIdx(TokenType.ASSIGN, "'=' expected");
 
         for (int i = 0; i < targets.size(); i++) {
             if (targets.get(i) instanceof Expressions.VariableExpr varExpr) {
@@ -769,14 +829,14 @@ public final class Parser {
             values.add(firstVal);
             do {
                 if (values.size() >= 200) {
-                    Token cur = peek();
-                    throw new ParseException("C stack overflow", cur.line(), cur.column());
+                    int cur = peekIdx();
+                    throw new ParseException("C stack overflow", tokLine(cur), tokCol(cur));
                 }
                 values.add(parseExpression());
             } while (match(TokenType.COMMA));
         }
 
-        return new Statements.AssignmentStmt(targets, values, startToken.line(), startToken.column());
+        return new Statements.AssignmentStmt(targets, values, startLine, startCol);
     }
 
     public Expression parseExpression() {
@@ -791,9 +851,9 @@ public final class Parser {
     private Expression parseLogicalOr() {
         Expression expr = parseLogicalAnd();
         while (match(TokenType.OR)) {
-            Token op = previous();
+            int op = previousIdx();
             Expression right = parseLogicalAnd();
-            expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+            expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
         }
         return expr;
     }
@@ -801,9 +861,9 @@ public final class Parser {
     private Expression parseLogicalAnd() {
         Expression expr = parseRelational();
         while (match(TokenType.AND)) {
-            Token op = previous();
+            int op = previousIdx();
             Expression right = parseRelational();
-            expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+            expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
         }
         return expr;
     }
@@ -811,11 +871,11 @@ public final class Parser {
     private Expression parseRelational() {
         Expression expr = parseBitwiseOr();
         while (match(TokenType.EQUAL_EQUAL, TokenType.TILDE_EQUAL,
-                     TokenType.LESS, TokenType.LESS_EQUAL,
-                     TokenType.GREATER, TokenType.GREATER_EQUAL)) {
-            Token op = previous();
+                TokenType.LESS, TokenType.LESS_EQUAL,
+                TokenType.GREATER, TokenType.GREATER_EQUAL)) {
+            int op = previousIdx();
             Expression right = parseBitwiseOr();
-            expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+            expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
         }
         return expr;
     }
@@ -823,9 +883,9 @@ public final class Parser {
     private Expression parseBitwiseOr() {
         Expression expr = parseBitwiseXor();
         while (match(TokenType.PIPE)) {
-            Token op = previous();
+            int op = previousIdx();
             Expression right = parseBitwiseXor();
-            expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+            expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
         }
         return expr;
     }
@@ -833,9 +893,9 @@ public final class Parser {
     private Expression parseBitwiseXor() {
         Expression expr = parseBitwiseAnd();
         while (match(TokenType.TILDE)) {
-            Token op = previous();
+            int op = previousIdx();
             Expression right = parseBitwiseAnd();
-            expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+            expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
         }
         return expr;
     }
@@ -843,9 +903,9 @@ public final class Parser {
     private Expression parseBitwiseAnd() {
         Expression expr = parseBitwiseShift();
         while (match(TokenType.AMPERSAND)) {
-            Token op = previous();
+            int op = previousIdx();
             Expression right = parseBitwiseShift();
-            expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+            expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
         }
         return expr;
     }
@@ -853,9 +913,9 @@ public final class Parser {
     private Expression parseBitwiseShift() {
         Expression expr = parseConcat();
         while (match(TokenType.SHL, TokenType.SHR)) {
-            Token op = previous();
+            int op = previousIdx();
             Expression right = parseConcat();
-            expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+            expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
         }
         return expr;
     }
@@ -865,10 +925,9 @@ public final class Parser {
         if (match(TokenType.DOT_DOT)) {
             enterNesting();
             try {
-                Token op = previous();
-                // right-associative
+                int op = previousIdx();
                 Expression right = parseConcat();
-                expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+                expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
             } finally {
                 exitNesting();
             }
@@ -879,9 +938,9 @@ public final class Parser {
     private Expression parseAdditive() {
         Expression expr = parseMultiplicative();
         while (match(TokenType.PLUS, TokenType.MINUS)) {
-            Token op = previous();
+            int op = previousIdx();
             Expression right = parseMultiplicative();
-            expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+            expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
         }
         return expr;
     }
@@ -889,9 +948,9 @@ public final class Parser {
     private Expression parseMultiplicative() {
         Expression expr = parseUnary();
         while (match(TokenType.STAR, TokenType.SLASH, TokenType.DOUBLE_SLASH, TokenType.PERCENT)) {
-            Token op = previous();
+            int op = previousIdx();
             Expression right = parseUnary();
-            expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+            expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
         }
         return expr;
     }
@@ -900,9 +959,9 @@ public final class Parser {
         if (match(TokenType.NOT, TokenType.HASH, TokenType.MINUS, TokenType.TILDE)) {
             enterNesting();
             try {
-                Token op = previous();
+                int op = previousIdx();
                 Expression operand = parseUnary();
-                return new Expressions.UnaryExpr(op.type(), operand, op.line(), op.column());
+                return new Expressions.UnaryExpr(tokType(op), operand, tokLine(op), tokCol(op));
             } finally {
                 exitNesting();
             }
@@ -915,10 +974,9 @@ public final class Parser {
         if (match(TokenType.CARET)) {
             enterNesting();
             try {
-                Token op = previous();
-                // right-associative: in Lua, right-hand operand of ^ has unary precedence
+                int op = previousIdx();
                 Expression right = parseUnary();
-                expr = new Expressions.BinaryExpr(expr, op.type(), right, op.line(), op.column());
+                expr = new Expressions.BinaryExpr(expr, tokType(op), right, tokLine(op), tokCol(op));
             } finally {
                 exitNesting();
             }
@@ -927,47 +985,55 @@ public final class Parser {
     }
 
     private Expression parsePrefixExpression() {
-        Token token = peek();
+        int startTok = peekIdx();
+        int startLine = tokLine(startTok);
+        int startCol = tokCol(startTok);
         Expression expr;
 
         if (match(TokenType.LPAREN)) {
-            Token lparen = previous();
+            int lparenTok = previousIdx();
             Expression inner = parseExpression();
-            checkMatch(TokenType.RPAREN, TokenType.LPAREN, lparen);
-            expr = new Expressions.ParenExpr(inner, lparen.line(), lparen.column());
+            checkMatchIdx(TokenType.RPAREN, TokenType.LPAREN, lparenTok);
+            expr = new Expressions.ParenExpr(inner, tokLine(lparenTok), tokCol(lparenTok));
         } else if (match(TokenType.IDENTIFIER)) {
-            Token idToken = previous();
-            checkUpvalue(idToken.lexeme(), idToken);
-            expr = new Expressions.VariableExpr(idToken.lexeme(), token.line(), token.column());
+            int idTok = previousIdx();
+            String idName = tokLexeme(idTok);
+            checkUpvalue(idName, idTok);
+            expr = new Expressions.VariableExpr(idName, startLine, startCol);
         } else {
             return parsePrimaryLiteral();
         }
 
-        // Parse calls and field access
         while (true) {
             if (match(TokenType.LBRACKET)) {
-                Token lbracket = previous();
+                int lbracketTok = previousIdx();
                 Expression index = parseExpression();
-                checkMatch(TokenType.RBRACKET, TokenType.LBRACKET, lbracket);
-                expr = new Expressions.TableAccessExpr(expr, index, token.line(), token.column());
+                checkMatchIdx(TokenType.RBRACKET, TokenType.LBRACKET, lbracketTok);
+                expr = new Expressions.TableAccessExpr(expr, index, startLine, startCol);
             } else if (match(TokenType.DOT)) {
-                Token field = consume(TokenType.IDENTIFIER, "<name> expected");
+                int fieldTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
+                int fLine = tokLine(fieldTok);
+                int fCol = tokCol(fieldTok);
                 expr = new Expressions.TableAccessExpr(
-                    expr,
-                    makeStringLiteral(field.lexeme(), field.line(), field.column()),
-                    field.line(), field.column()
-                );
+                        expr,
+                        makeStringLiteral(tokLexeme(fieldTok), fLine, fCol),
+                        fLine,
+                        fCol);
             } else if (match(TokenType.COLON)) {
-                Token method = consume(TokenType.IDENTIFIER, "<name> expected");
-                Token callToken = peek();
+                int methodTok = consumeIdx(TokenType.IDENTIFIER, "<name> expected");
+                int callTok = peekIdx();
                 List<Expression> args = parseCallArguments();
-                expr = new Expressions.FunctionCallExpr(expr, method.lexeme(), args, callToken.line(), callToken.column());
-            } else if (peek().type() == TokenType.LPAREN || peek().type() == TokenType.LBRACE || peek().type() == TokenType.STRING_LITERAL) {
-                Token callToken = peek();
-                List<Expression> args = parseCallArguments();
-                expr = new Expressions.FunctionCallExpr(expr, null, args, callToken.line(), callToken.column());
+                expr = new Expressions.FunctionCallExpr(
+                        expr, tokLexeme(methodTok), args, tokLine(callTok), tokCol(callTok));
             } else {
-                break;
+                TokenType pt = peekType();
+                if (pt == TokenType.LPAREN || pt == TokenType.LBRACE || pt == TokenType.STRING_LITERAL) {
+                    int callTok = peekIdx();
+                    List<Expression> args = parseCallArguments();
+                    expr = new Expressions.FunctionCallExpr(expr, null, args, tokLine(callTok), tokCol(callTok));
+                } else {
+                    break;
+                }
             }
         }
         return expr;
@@ -977,79 +1043,85 @@ public final class Parser {
         enterNesting();
         try {
             if (match(TokenType.LPAREN)) {
-                Token lparen = previous();
+                int lparenTok = previousIdx();
                 if (match(TokenType.RPAREN)) {
                     return List.of();
                 }
                 List<Expression> args = new ArrayList<>(4);
                 do {
                     if (args.size() >= 255) {
-                        Token cur = peek();
-                        throw new ParseException("function or expression needs too many registers near " + formatNear(cur), cur.line(), cur.column());
+                        int cur = peekIdx();
+                        throw new ParseException(
+                                "function or expression needs too many registers near " + formatNear(cur),
+                                tokLine(cur),
+                                tokCol(cur));
                     }
                     args.add(parseExpression());
                 } while (match(TokenType.COMMA));
-                checkMatch(TokenType.RPAREN, TokenType.LPAREN, lparen);
+                checkMatchIdx(TokenType.RPAREN, TokenType.LPAREN, lparenTok);
                 return args;
-            } else if (peek().type() == TokenType.LBRACE) {
+            } else if (peekType() == TokenType.LBRACE) {
                 return List.of(parseTableConstructor());
-            } else if (peek().type() == TokenType.STRING_LITERAL) {
-                Token str = advance();
-                return List.of(makeStringLiteral((String) str.literal(), str.line(), str.column()));
+            } else if (peekType() == TokenType.STRING_LITERAL) {
+                int strTok = advanceIdx();
+                return List.of(makeStringLiteral(tokStringLiteral(strTok), tokLine(strTok), tokCol(strTok)));
             }
-            throw new ParseException("function arguments expected near " + formatNear(peek()), peek().line(), peek().column());
+            int cur = peekIdx();
+            throw new ParseException("function arguments expected near " + formatNear(cur), tokLine(cur), tokCol(cur));
         } finally {
             exitNesting();
         }
     }
 
     private Expression parsePrimaryLiteral() {
-        Token token = peek();
-        return switch (token.type()) {
+        int tok = peekIdx();
+        int tLine = tokLine(tok);
+        int tCol = tokCol(tok);
+        return switch (tokType(tok)) {
             case NIL -> {
-                advance();
-                yield new Expressions.NilLiteral(token.line(), token.column());
+                advanceIdx();
+                yield new Expressions.NilLiteral(tLine, tCol);
             }
             case TRUE -> {
-                advance();
-                yield new Expressions.BooleanLiteral(true, token.line(), token.column());
+                advanceIdx();
+                yield new Expressions.BooleanLiteral(true, tLine, tCol);
             }
             case FALSE -> {
-                advance();
-                yield new Expressions.BooleanLiteral(false, token.line(), token.column());
+                advanceIdx();
+                yield new Expressions.BooleanLiteral(false, tLine, tCol);
             }
             case INTEGER_LITERAL -> {
-                advance();
-                yield new Expressions.IntegerLiteral((Long) token.literal(), token.line(), token.column());
+                advanceIdx();
+                yield new Expressions.IntegerLiteral(tokLongLiteral(tok), tLine, tCol);
             }
             case FLOAT_LITERAL -> {
-                advance();
-                yield new Expressions.FloatLiteral((Double) token.literal(), token.line(), token.column());
+                advanceIdx();
+                yield new Expressions.FloatLiteral(tokDoubleLiteral(tok), tLine, tCol);
             }
             case STRING_LITERAL -> {
-                advance();
-                yield makeStringLiteral((String) token.literal(), token.line(), token.column());
+                advanceIdx();
+                yield makeStringLiteral(tokStringLiteral(tok), tLine, tCol);
             }
             case DOT_DOT_DOT -> {
-                advance();
-                yield new Expressions.VarargLiteral(token.line(), token.column());
+                advanceIdx();
+                yield new Expressions.VarargLiteral(tLine, tCol);
             }
             case LBRACE -> parseTableConstructor();
             case FUNCTION -> {
-                Token funcToken = advance();
-                Token lparen = consume(TokenType.LPAREN, "'(' expected");
+                int funcTok = advanceIdx();
+                int lparenTok = consumeIdx(TokenType.LPAREN, "'(' expected");
                 List<String> params = new ArrayList<>();
                 boolean isVararg = parseParameterList(params);
-                checkMatch(TokenType.RPAREN, TokenType.LPAREN, lparen);
+                checkMatchIdx(TokenType.RPAREN, TokenType.LPAREN, lparenTok);
                 int savedScopeDepth = scopeDepth;
                 Scope savedScope = currentScope;
                 scopeDepth = 0;
                 currentScope = null;
                 FunctionContext prevFuncCtx = currentFuncCtx;
-                currentFuncCtx = new FunctionContext(prevFuncCtx, funcToken.line(), savedScope);
+                currentFuncCtx = new FunctionContext(prevFuncCtx, tokLine(funcTok), savedScope);
                 enterScope();
                 for (String p : params) {
-                    defineLocal(p, false, lparen);
+                    defineLocal(p, false, lparenTok);
                 }
                 Statements.BlockStmt body;
                 try {
@@ -1060,38 +1132,39 @@ public final class Parser {
                     scopeDepth = savedScopeDepth;
                     currentScope = savedScope;
                 }
-                Token endToken = checkMatch(TokenType.END, TokenType.FUNCTION, funcToken);
-                yield new Expressions.FunctionDefExpr(params, isVararg, body, token.line(), token.column(), endToken.line());
+                int endTok = checkMatchIdx(TokenType.END, TokenType.FUNCTION, funcTok);
+                yield new Expressions.FunctionDefExpr(params, isVararg, body, tLine, tCol, tokLine(endTok));
             }
-            default -> throw new ParseException("unexpected symbol near " + formatNear(token), token.line(), token.column());
+            default -> throw new ParseException("unexpected symbol near " + formatNear(tok), tLine, tCol);
         };
     }
 
     private Expressions.TableConstructorExpr parseTableConstructor() {
         enterNesting();
         try {
-            Token braceToken = consume(TokenType.LBRACE, "'{' expected");
+            int braceTok = consumeIdx(TokenType.LBRACE, "'{' expected");
+            int bLine = tokLine(braceTok);
+            int bCol = tokCol(braceTok);
             if (match(TokenType.RBRACE)) {
-                return new Expressions.TableConstructorExpr(List.of(), braceToken.line(), braceToken.column());
+                return new Expressions.TableConstructorExpr(List.of(), bLine, bCol);
             }
             List<Expressions.TableField> fields = new ArrayList<>(4);
 
             while (!check(TokenType.RBRACE) && !isAtEnd()) {
                 if (match(TokenType.LBRACKET)) {
-                    Token openBracket = previous();
+                    int openBracketTok = previousIdx();
                     Expression key = parseExpression();
-                    checkMatch(TokenType.RBRACKET, TokenType.LBRACKET, openBracket);
-                    consume(TokenType.ASSIGN, "'=' expected");
+                    checkMatchIdx(TokenType.RBRACKET, TokenType.LBRACKET, openBracketTok);
+                    consumeIdx(TokenType.ASSIGN, "'=' expected");
                     Expression value = parseExpression();
                     fields.add(new Expressions.TableField(key, value));
-                } else if (peek().type() == TokenType.IDENTIFIER && peekNext().type() == TokenType.ASSIGN) {
-                    Token keyToken = advance();
-                    advance(); // consume '='
+                } else if (peekType() == TokenType.IDENTIFIER && peekNextType() == TokenType.ASSIGN) {
+                    int keyTok = advanceIdx();
+                    advanceIdx(); // consume '='
                     Expression value = parseExpression();
                     fields.add(new Expressions.TableField(
-                        makeStringLiteral(keyToken.lexeme(), keyToken.line(), keyToken.column()),
-                        value
-                    ));
+                            makeStringLiteral(tokLexeme(keyTok), tokLine(keyTok), tokCol(keyTok)),
+                            value));
                 } else {
                     Expression val = parseExpression();
                     fields.add(new Expressions.TableField(null, val));
@@ -1101,8 +1174,8 @@ public final class Parser {
                     break;
                 }
             }
-            checkMatch(TokenType.RBRACE, TokenType.LBRACE, braceToken);
-            return new Expressions.TableConstructorExpr(fields, braceToken.line(), braceToken.column());
+            checkMatchIdx(TokenType.RBRACE, TokenType.LBRACE, braceTok);
+            return new Expressions.TableConstructorExpr(fields, bLine, bCol);
         } finally {
             exitNesting();
         }
@@ -1117,93 +1190,76 @@ public final class Parser {
                 return true;
             }
             if (check(TokenType.IDENTIFIER)) {
-                Token param = advance();
-                params.add(param.lexeme());
+                int paramTok = advanceIdx();
+                params.add(tokLexeme(paramTok));
                 if (match(TokenType.COMMA)) {
                     if (check(TokenType.RPAREN)) {
-                        throw new ParseException("<name> or '...' expected near " + formatNear(peek()), peek().line(), peek().column());
+                        int cur = peekIdx();
+                        throw new ParseException(
+                                "<name> or '...' expected near " + formatNear(cur),
+                                tokLine(cur),
+                                tokCol(cur));
                     }
                     continue;
                 }
                 break;
             } else {
-                throw new ParseException("<name> or '...' expected near " + formatNear(peek()), peek().line(), peek().column());
+                int cur = peekIdx();
+                throw new ParseException(
+                        "<name> or '...' expected near " + formatNear(cur),
+                        tokLine(cur),
+                        tokCol(cur));
             }
         }
         return false;
     }
 
     private boolean match(TokenType t1) {
-        if (check(t1)) {
-            advance();
+        if (curType == t1) {
+            advanceIdx();
             return true;
         }
         return false;
     }
 
     private boolean match(TokenType t1, TokenType t2) {
-        if (isAtEnd()) {
-            return false;
-        }
-        TokenType cur = peek().type();
+        TokenType cur = curType;
         if (cur == t1 || cur == t2) {
-            advance();
+            advanceIdx();
             return true;
         }
         return false;
     }
 
     private boolean match(TokenType t1, TokenType t2, TokenType t3) {
-        if (isAtEnd()) {
-            return false;
-        }
-        TokenType cur = peek().type();
+        TokenType cur = curType;
         if (cur == t1 || cur == t2 || cur == t3) {
-            advance();
+            advanceIdx();
             return true;
         }
         return false;
     }
 
     private boolean match(TokenType t1, TokenType t2, TokenType t3, TokenType t4) {
-        if (isAtEnd()) {
-            return false;
-        }
-        TokenType cur = peek().type();
+        TokenType cur = curType;
         if (cur == t1 || cur == t2 || cur == t3 || cur == t4) {
-            advance();
+            advanceIdx();
             return true;
         }
         return false;
     }
 
     private boolean match(TokenType t1, TokenType t2, TokenType t3, TokenType t4, TokenType t5, TokenType t6) {
-        if (isAtEnd()) {
-            return false;
-        }
-        TokenType cur = peek().type();
+        TokenType cur = curType;
         if (cur == t1 || cur == t2 || cur == t3 || cur == t4 || cur == t5 || cur == t6) {
-            advance();
+            advanceIdx();
             return true;
         }
         return false;
     }
 
-    private boolean match(TokenType... types) {
-        for (TokenType type : types) {
-            if (check(type)) {
-                advance();
-                return true;
-            }
-        }
-        return false;
-    }
-
     private boolean check(TokenType type) {
-        if (isAtEnd()) {
-            return false;
-        }
-        return peek().type() == type;
+        return curType == type && current < tokenCount;
     }
 
     private String tokenRepresentation(TokenType type) {
@@ -1241,12 +1297,16 @@ public final class Parser {
         };
     }
 
-    private String formatNear(Token token) {
-        if (token == null || token.type() == TokenType.EOF) {
+    private String formatNear(int tokIdx) {
+        if (tokIdx < 0 || tokIdx >= tokenCount) {
             return "<eof>";
         }
-        String lex = token.lexeme();
-        if (token.type() == TokenType.INVALID) {
+        TokenType t = tokType(tokIdx);
+        if (t == TokenType.EOF) {
+            return "<eof>";
+        }
+        String lex = tokLexeme(tokIdx);
+        if (t == TokenType.INVALID) {
             if (lex != null && !lex.isEmpty()) {
                 int c = lex.charAt(0) & 0xFF;
                 if (c < 32 || c >= 127) {
@@ -1254,18 +1314,19 @@ public final class Parser {
                 }
             }
         }
-        if (token.type() == TokenType.STRING_LITERAL) {
+        if (t == TokenType.STRING_LITERAL) {
             if (lex != null && lex.startsWith("[[")) {
                 return "'" + lex + "'";
             } else {
-                return "''" + token.literal() + "''";
+                return "''" + tokRawLiteral(tokIdx) + "''";
             }
         }
         if (lex == null || lex.isEmpty()) {
-            if (token.literal() != null) {
-                return "'" + token.literal() + "'";
+            Object rawLit = tokRawLiteral(tokIdx);
+            if (rawLit != null) {
+                return "'" + rawLit + "'";
             }
-            String fixed = token.type().fixedLexeme();
+            String fixed = t.fixedLexeme();
             if (fixed != null && !fixed.isEmpty()) {
                 return "'" + fixed + "'";
             }
@@ -1280,57 +1341,112 @@ public final class Parser {
         return "'" + lex + "'";
     }
 
-    private Token checkMatch(TokenType what, TokenType who, Token whoToken) {
+    private int checkMatchIdx(TokenType what, TokenType who, int whoIdx) {
         if (check(what)) {
-            return advance();
+            return advanceIdx();
         }
         String whatStr = tokenRepresentation(what);
         String whoStr = tokenRepresentation(who);
-        Token cur = peek();
+        int cur = peekIdx();
+        int curLine = tokLine(cur);
         String msg;
-        if (whoToken != null && whoToken.line() != cur.line()) {
-            msg = whatStr + " expected (to close " + whoStr + " at line " + whoToken.line() + ") near " + formatNear(cur);
+        if (whoIdx >= 0 && tokLine(whoIdx) != curLine) {
+            msg = whatStr + " expected (to close " + whoStr + " at line " + tokLine(whoIdx) + ") near " + formatNear(cur);
         } else {
             msg = whatStr + " expected near " + formatNear(cur);
         }
-        throw new ParseException(msg, cur.line(), cur.column());
+        throw new ParseException(msg, curLine, tokCol(cur));
     }
 
-    private Token consume(TokenType type, String expectedWhat) {
+    private int consumeIdx(TokenType type, String expectedWhat) {
         if (check(type)) {
-            return advance();
+            return advanceIdx();
         }
-        Token cur = peek();
+        int cur = peekIdx();
         String prefix = expectedWhat.endsWith("expected") ? expectedWhat : (expectedWhat + " expected");
-        throw new ParseException(prefix + " near " + formatNear(cur), cur.line(), cur.column());
+        throw new ParseException(prefix + " near " + formatNear(cur), tokLine(cur), tokCol(cur));
     }
 
-    private Token advance() {
-        if (!isAtEnd()) {
-            current++;
+    private int advanceIdx() {
+        if (curType != TokenType.EOF && current < tokenCount) {
+            int prev = current;
+            int next = prev + 1;
+            current = next;
+            if (next < tokenCount) {
+                curType = stream != null ? stream.type(next) : tokens.get(next).type();
+            } else {
+                curType = TokenType.EOF;
+            }
+            return prev;
         }
-        return previous();
+        return previousIdx();
     }
 
-    private Token peek() {
-        return tokens.get(current);
-    }
-
-    private Token peekNext() {
-        if (current + 1 >= tokens.size()) {
-            return tokens.get(tokens.size() - 1);
+    private int peekIdx() {
+        if (tokenCount == 0) {
+            return -1;
         }
-        return tokens.get(current + 1);
+        return current < tokenCount ? current : tokenCount - 1;
     }
 
-    private Token previous() {
+    private TokenType peekType() {
+        return curType;
+    }
+
+    private TokenType peekNextType() {
+        if (tokenCount == 0) {
+            return TokenType.EOF;
+        }
+        int next = current + 1;
+        return tokType(next >= tokenCount ? tokenCount - 1 : next);
+    }
+
+    private int previousIdx() {
         if (current <= 0) {
-            return tokens.isEmpty() ? null : tokens.get(0);
+            return tokenCount == 0 ? -1 : 0;
         }
-        return tokens.get(current - 1);
+        return current - 1;
     }
 
     private boolean isAtEnd() {
-        return current >= tokens.size() || peek().type() == TokenType.EOF;
+        return curType == TokenType.EOF || current >= tokenCount;
+    }
+
+    private TokenType tokType(int idx) {
+        return stream != null ? stream.type(idx) : tokens.get(idx).type();
+    }
+
+    private int tokLine(int idx) {
+        if (idx < 0) {
+            return 1;
+        }
+        return stream != null ? stream.line(idx) : tokens.get(idx).line();
+    }
+
+    private int tokCol(int idx) {
+        if (idx < 0) {
+            return 1;
+        }
+        return stream != null ? stream.column(idx) : tokens.get(idx).column();
+    }
+
+    private String tokLexeme(int idx) {
+        return stream != null ? stream.lexeme(idx) : tokens.get(idx).lexeme();
+    }
+
+    private String tokStringLiteral(int idx) {
+        return stream != null ? stream.stringLiteral(idx) : (String) tokens.get(idx).literal();
+    }
+
+    private long tokLongLiteral(int idx) {
+        return stream != null ? stream.longLiteral(idx) : (Long) tokens.get(idx).literal();
+    }
+
+    private double tokDoubleLiteral(int idx) {
+        return stream != null ? stream.doubleLiteral(idx) : (Double) tokens.get(idx).literal();
+    }
+
+    private Object tokRawLiteral(int idx) {
+        return stream != null ? stream.rawLiteral(idx) : tokens.get(idx).literal();
     }
 }

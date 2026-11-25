@@ -173,10 +173,8 @@ public class FrontendPipelineBenchmark {
 
     /** Pure frontend compilation (Lexer -> Parser -> BytecodeCompiler) without LuaState.load/close. */
     @Benchmark
-    public LuaProto frontendCompileOnly(CompileState s) {
-        List<Token> tokens = new Lexer(s.source, false).scanTokens();
-        Statements.BlockStmt block = new Parser(tokens).parse();
-        return BytecodeCompiler.compile(block, s.chunkName);
+    public CompiledChunk frontendCompileOnly(CompileState s) {
+        return LuaState.compileChunk(s.source, s.chunkName);
     }
 
     /** Full public compileChunk + closure load + chunk close lifecycle. */

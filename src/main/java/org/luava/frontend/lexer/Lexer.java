@@ -14,6 +14,8 @@ import org.luava.runtime.LuaValue;
 
 public final class Lexer {
 
+    private static final int MAX_INITIAL_CAPACITY = 4096;
+
     private final String source;
     private final int length;
     private final boolean skipShebang;
@@ -21,6 +23,8 @@ public final class Lexer {
     private int current = 0;
     private int line = 1;
     private int lineStartOffset = 0;
+    private List<Token> tokenSink;
+    private TokenStream streamSink;
 
     public Lexer(String source) {
         this(source, true);
@@ -32,13 +36,41 @@ public final class Lexer {
         this.skipShebang = skipShebang;
     }
 
+    private int initialCapacity() {
+        return Math.min(MAX_INITIAL_CAPACITY, Math.max(16, length >>> 4));
+    }
+
     public List<Token> scanTokens() {
-        List<Token> tokens = new ArrayList<>(Math.max(16, length >>> 2));
+        List<Token> tokens = new ArrayList<>(initialCapacity());
+        this.tokenSink = tokens;
+        this.streamSink = null;
+        try {
+            scanAll();
+        } finally {
+            this.tokenSink = null;
+        }
+        return tokens;
+    }
+
+    public TokenStream scanStream() {
+        TokenStream stream = new TokenStream(source, initialCapacity());
+        this.tokenSink = null;
+        this.streamSink = stream;
+        try {
+            scanAll();
+        } finally {
+            this.streamSink = null;
+        }
+        return stream;
+    }
+
+    private void scanAll() {
         if (current == 0 && !isAtEnd() && peek() == '\uFEFF') {
             advance();
         }
         int p = current;
-        while (p < length && (source.charAt(p) == ' ' || source.charAt(p) == '\t' || source.charAt(p) == '\r' || source.charAt(p) == '\n')) {
+        while (p < length && (source.charAt(p) == ' ' || source.charAt(p) == '\t'
+                || source.charAt(p) == '\r' || source.charAt(p) == '\n')) {
             p++;
         }
         boolean hasShebang = false;
@@ -63,137 +95,145 @@ public final class Lexer {
         }
         while (!isAtEnd()) {
             start = current;
-            Token token = scanToken();
-            if (token != null) {
-                tokens.add(token);
-            }
+            scanToken();
         }
-        tokens.add(new Token(TokenType.EOF, "", null, line, getColumn()));
-        return tokens;
+        start = current;
+        emitEof();
     }
 
-    private Token scanToken() {
+    private void scanToken() {
         char c = advance();
-        return switch (c) {
-            case ' ', '\t', '\f', '\u000B' -> null;
+        switch (c) {
+            case ' ', '\t', '\f', '\u000B' -> {}
             case '\r' -> {
-                if (peek() == '\n') advance();
+                if (peek() == '\n') {
+                    advance();
+                }
                 line++;
                 lineStartOffset = current;
-                yield null;
             }
             case '\n' -> {
-                if (peek() == '\r') advance();
+                if (peek() == '\r') {
+                    advance();
+                }
                 line++;
                 lineStartOffset = current;
-                yield null;
             }
-            case '(' -> makeToken(TokenType.LPAREN);
-            case ')' -> makeToken(TokenType.RPAREN);
-            case '{' -> makeToken(TokenType.LBRACE);
-            case '}' -> makeToken(TokenType.RBRACE);
-            case ']' -> makeToken(TokenType.RBRACKET);
-            case ';' -> makeToken(TokenType.SEMICOLON);
-            case ',' -> makeToken(TokenType.COMMA);
-            case '#' -> makeToken(TokenType.HASH);
-            case '&' -> makeToken(TokenType.AMPERSAND);
-            case '|' -> makeToken(TokenType.PIPE);
-            case '^' -> makeToken(TokenType.CARET);
-            case '%' -> makeToken(TokenType.PERCENT);
-            case '+' -> makeToken(TokenType.PLUS);
-            case '*' -> makeToken(TokenType.STAR);
+            case '(' -> emitFixed(TokenType.LPAREN);
+            case ')' -> emitFixed(TokenType.RPAREN);
+            case '{' -> emitFixed(TokenType.LBRACE);
+            case '}' -> emitFixed(TokenType.RBRACE);
+            case ']' -> emitFixed(TokenType.RBRACKET);
+            case ';' -> emitFixed(TokenType.SEMICOLON);
+            case ',' -> emitFixed(TokenType.COMMA);
+            case '#' -> emitFixed(TokenType.HASH);
+            case '&' -> emitFixed(TokenType.AMPERSAND);
+            case '|' -> emitFixed(TokenType.PIPE);
+            case '^' -> emitFixed(TokenType.CARET);
+            case '%' -> emitFixed(TokenType.PERCENT);
+            case '+' -> emitFixed(TokenType.PLUS);
+            case '*' -> emitFixed(TokenType.STAR);
 
             case '-' -> {
                 if (match('-')) {
                     skipComment();
-                    yield null;
+                } else {
+                    emitFixed(TokenType.MINUS);
                 }
-                yield makeToken(TokenType.MINUS);
             }
 
             case '/' -> {
                 if (match('/')) {
-                    yield makeToken(TokenType.DOUBLE_SLASH);
+                    emitFixed(TokenType.DOUBLE_SLASH);
+                } else {
+                    emitFixed(TokenType.SLASH);
                 }
-                yield makeToken(TokenType.SLASH);
             }
 
             case '~' -> {
                 if (match('=')) {
-                    yield makeToken(TokenType.TILDE_EQUAL);
+                    emitFixed(TokenType.TILDE_EQUAL);
+                } else {
+                    emitFixed(TokenType.TILDE);
                 }
-                yield makeToken(TokenType.TILDE);
             }
 
             case '=' -> {
                 if (match('=')) {
-                    yield makeToken(TokenType.EQUAL_EQUAL);
+                    emitFixed(TokenType.EQUAL_EQUAL);
+                } else {
+                    emitFixed(TokenType.ASSIGN);
                 }
-                yield makeToken(TokenType.ASSIGN);
             }
 
             case '<' -> {
                 if (match('<')) {
-                    yield makeToken(TokenType.SHL);
+                    emitFixed(TokenType.SHL);
                 } else if (match('=')) {
-                    yield makeToken(TokenType.LESS_EQUAL);
+                    emitFixed(TokenType.LESS_EQUAL);
                 } else if (checkAttribute("close>")) {
-                    yield makeToken(TokenType.ATTR_CLOSE);
+                    emitFixed(TokenType.ATTR_CLOSE);
                 } else if (checkAttribute("const>")) {
-                    yield makeToken(TokenType.ATTR_CONST);
+                    emitFixed(TokenType.ATTR_CONST);
+                } else {
+                    emitFixed(TokenType.LESS);
                 }
-                yield makeToken(TokenType.LESS);
             }
 
             case '>' -> {
                 if (match('>')) {
-                    yield makeToken(TokenType.SHR);
+                    emitFixed(TokenType.SHR);
                 } else if (match('=')) {
-                    yield makeToken(TokenType.GREATER_EQUAL);
+                    emitFixed(TokenType.GREATER_EQUAL);
+                } else {
+                    emitFixed(TokenType.GREATER);
                 }
-                yield makeToken(TokenType.GREATER);
             }
 
             case ':' -> {
                 if (match(':')) {
-                    yield makeToken(TokenType.DOUBLE_COLON);
+                    emitFixed(TokenType.DOUBLE_COLON);
+                } else {
+                    emitFixed(TokenType.COLON);
                 }
-                yield makeToken(TokenType.COLON);
             }
 
             case '.' -> {
                 if (match('.')) {
                     if (match('.')) {
-                        yield makeToken(TokenType.DOT_DOT_DOT);
+                        emitFixed(TokenType.DOT_DOT_DOT);
+                    } else {
+                        emitFixed(TokenType.DOT_DOT);
                     }
-                    yield makeToken(TokenType.DOT_DOT);
+                } else if (isDigit(peek())) {
+                    scanNumber(true);
+                } else {
+                    emitFixed(TokenType.DOT);
                 }
-                if (isDigit(peek())) {
-                    yield scanNumber(true);
-                }
-                yield makeToken(TokenType.DOT);
             }
 
             case '[' -> {
                 int strStartLine = line;
                 int level = checkLongBracketOpening();
                 if (level >= 0) {
-                    yield scanLongString(level, strStartLine);
+                    scanLongString(level, strStartLine);
+                } else {
+                    emitFixed(TokenType.LBRACKET);
                 }
-                yield makeToken(TokenType.LBRACKET);
             }
 
             case '"', '\'' -> scanShortString(c);
 
             default -> {
                 if (isDigit(c)) {
-                    yield scanNumber(false);
+                    scanNumber(false);
                 } else if (isAlphaOrUnderscore(c)) {
-                    yield scanIdentifierOrKeyword();
+                    scanIdentifierOrKeyword();
+                } else {
+                    emitInvalid(c);
                 }
-                yield makeToken(TokenType.INVALID, String.valueOf(c));
             }
-        };
+        }
     }
 
     private boolean checkAttribute(String attr) {
@@ -230,12 +270,16 @@ public final class Lexer {
             advance();
             if (peek() == '\r') {
                 advance();
-                if (peek() == '\n') advance();
+                if (peek() == '\n') {
+                    advance();
+                }
                 line++;
                 lineStartOffset = current;
             } else if (peek() == '\n') {
                 advance();
-                if (peek() == '\r') advance();
+                if (peek() == '\r') {
+                    advance();
+                }
                 line++;
                 lineStartOffset = current;
             }
@@ -252,11 +296,15 @@ public final class Lexer {
             }
             char ch = advance();
             if (ch == '\r') {
-                if (peek() == '\n') advance();
+                if (peek() == '\n') {
+                    advance();
+                }
                 line++;
                 lineStartOffset = current;
             } else if (ch == '\n') {
-                if (peek() == '\r') advance();
+                if (peek() == '\r') {
+                    advance();
+                }
                 line++;
                 lineStartOffset = current;
             }
@@ -280,20 +328,25 @@ public final class Lexer {
         return false;
     }
 
-    private Token scanLongString(int level, int startLine) {
+    private void scanLongString(int level, int startLine) {
         StringBuilder sb = new StringBuilder();
         while (!isAtEnd()) {
             if (peek() == ']' && checkLongBracketClosing(level)) {
-                return makeToken(TokenType.STRING_LITERAL, sb.toString());
+                emitString(sb.toString());
+                return;
             }
             char ch = advance();
             if (ch == '\r') {
-                if (peek() == '\n') advance();
+                if (peek() == '\n') {
+                    advance();
+                }
                 line++;
                 lineStartOffset = current;
                 sb.append('\n');
             } else if (ch == '\n') {
-                if (peek() == '\r') advance();
+                if (peek() == '\r') {
+                    advance();
+                }
                 line++;
                 lineStartOffset = current;
                 sb.append('\n');
@@ -338,7 +391,7 @@ public final class Lexer {
         return source.substring(start, Math.min(current, length));
     }
 
-    private Token scanShortString(char quote) {
+    private void scanShortString(char quote) {
         int contentStart = current;
         StringBuilder sb = null;
         while (!isAtEnd()) {
@@ -348,7 +401,8 @@ public final class Lexer {
                 String value = (sb == null)
                         ? source.substring(contentStart, current - 1)
                         : sb.toString();
-                return new Token(TokenType.STRING_LITERAL, source, start, current, value, line, getColumn());
+                emitString(value);
+                return;
             }
             if (p == '\n' || p == '\r') {
                 throw new ParseException("unfinished string near '" + errorSnippet() + "'", line, getColumn());
@@ -467,7 +521,7 @@ public final class Lexer {
         throw new ParseException("unfinished string near <eof>", line, getColumn());
     }
 
-    private Token scanNumber(boolean startedWithDot) {
+    private void scanNumber(boolean startedWithDot) {
         char expoLower = 'e';
         char expoUpper = 'E';
         boolean simpleDecimalInt = !startedWithDot;
@@ -510,7 +564,8 @@ public final class Lexer {
             for (int i = start; i < current; i++) {
                 val = val * 10 + (source.charAt(i) - '0');
             }
-            return new Token(TokenType.INTEGER_LITERAL, source, start, current, val, line, getColumn());
+            emitInteger(val);
+            return;
         }
 
         LuaValue num = LuaValue.parseNumber(source, start, current);
@@ -519,22 +574,28 @@ public final class Lexer {
         }
 
         if (num.isInteger()) {
-            return new Token(TokenType.INTEGER_LITERAL, source, start, current, num.toLong(), line, getColumn());
+            emitInteger(num.toLong());
         } else {
-            return new Token(TokenType.FLOAT_LITERAL, source, start, current, num.toDouble(), line, getColumn());
+            emitFloat(num.toDouble());
         }
     }
 
-    private Token scanIdentifierOrKeyword() {
+    private void scanIdentifierOrKeyword() {
         while (isAlphaNumeric(peek())) {
             advance();
         }
         TokenType kw = matchKeyword(start, current);
         if (kw != null) {
-            return new Token(kw, kw.fixedLexeme(), null, line, getColumn());
+            emitFixed(kw);
+            return;
         }
         String text = source.substring(start, current);
-        return new Token(TokenType.IDENTIFIER, text, text, line, getColumn());
+        int col = getColumn();
+        if (streamSink != null) {
+            streamSink.add(TokenType.IDENTIFIER, line, col, start, current, text, 0L);
+        } else {
+            tokenSink.add(new Token(TokenType.IDENTIFIER, text, text, line, col));
+        }
     }
 
     private TokenType matchKeyword(int s, int e) {
@@ -602,13 +663,6 @@ public final class Lexer {
         return source.charAt(current);
     }
 
-    private char peekNext() {
-        if (current + 1 >= length) {
-            return '\0';
-        }
-        return source.charAt(current + 1);
-    }
-
     private static boolean isLuaWhitespace(char c) {
         return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\u000B';
     }
@@ -637,20 +691,63 @@ public final class Lexer {
         return start - lineStartOffset + 1;
     }
 
-    private Token makeToken(TokenType type) {
-        String lexeme = type.fixedLexeme();
-        if (lexeme == null) {
-            lexeme = source.substring(start, current);
+    private void emitFixed(TokenType type) {
+        int col = getColumn();
+        if (streamSink != null) {
+            streamSink.add(type, line, col, start, current, null, 0L);
+        } else {
+            String lexeme = type.fixedLexeme();
+            if (lexeme == null) {
+                lexeme = source.substring(start, current);
+            }
+            tokenSink.add(new Token(type, lexeme, null, line, col));
         }
-        return new Token(type, lexeme, null, line, getColumn());
     }
 
-    private Token makeToken(TokenType type, Object literal) {
-        String lexeme = type.fixedLexeme();
-        if (lexeme == null) {
-            lexeme = source.substring(start, current);
+    private void emitString(String value) {
+        int col = getColumn();
+        if (streamSink != null) {
+            streamSink.add(TokenType.STRING_LITERAL, line, col, start, current, value, 0L);
+        } else {
+            tokenSink.add(new Token(TokenType.STRING_LITERAL, source.substring(start, current), value, line, col));
         }
-        return new Token(type, lexeme, literal, line, getColumn());
+    }
+
+    private void emitInteger(long val) {
+        int col = getColumn();
+        if (streamSink != null) {
+            streamSink.add(TokenType.INTEGER_LITERAL, line, col, start, current, null, val);
+        } else {
+            tokenSink.add(new Token(TokenType.INTEGER_LITERAL, source.substring(start, current), val, line, col));
+        }
+    }
+
+    private void emitFloat(double val) {
+        int col = getColumn();
+        if (streamSink != null) {
+            streamSink.add(TokenType.FLOAT_LITERAL, line, col, start, current, null, Double.doubleToRawLongBits(val));
+        } else {
+            tokenSink.add(new Token(TokenType.FLOAT_LITERAL, source.substring(start, current), val, line, col));
+        }
+    }
+
+    private void emitInvalid(char c) {
+        String s = String.valueOf(c);
+        int col = getColumn();
+        if (streamSink != null) {
+            streamSink.add(TokenType.INVALID, line, col, start, current, s, 0L);
+        } else {
+            tokenSink.add(new Token(TokenType.INVALID, s, s, line, col));
+        }
+    }
+
+    private void emitEof() {
+        int col = getColumn();
+        if (streamSink != null) {
+            streamSink.add(TokenType.EOF, line, col, current, current, null, 0L);
+        } else {
+            tokenSink.add(new Token(TokenType.EOF, "", null, line, col));
+        }
     }
 
     public static class LexerException extends ParseException {

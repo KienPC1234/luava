@@ -14,7 +14,6 @@ import org.luava.binding.ModuleBinder;
 import org.luava.emmydoc.EmmyDocGenerator;
 import org.luava.frontend.ast.Statements;
 import org.luava.frontend.lexer.Lexer;
-import org.luava.frontend.lexer.Token;
 import org.luava.frontend.parser.Parser;
 import org.luava.runtime.eval.Environment;
 import org.luava.runtime.standard.BaseLib;
@@ -1284,7 +1283,7 @@ public final class LuaState implements AutoCloseable {
         try {
             boolean isFile = effectiveName.startsWith("@");
             Lexer lexer = new Lexer(luaSource, isFile);
-            List<Token> tokens = lexer.scanTokens();
+            org.luava.frontend.lexer.TokenStream tokens = lexer.scanStream();
             Parser parser = new Parser(tokens);
             Statements.BlockStmt block = parser.parse();
             org.luava.runtime.bytecode.LuaProto proto =

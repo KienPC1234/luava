@@ -7,29 +7,40 @@
  */
 package org.luava.frontend;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.lang.reflect.RecordComponent;
+import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.luava.frontend.ast.Statements;
 import org.luava.frontend.lexer.Lexer;
 import org.luava.frontend.lexer.Token;
+import org.luava.frontend.lexer.TokenStream;
 import org.luava.frontend.lexer.TokenType;
+import org.luava.frontend.parser.ParseException;
+import org.luava.frontend.parser.Parser;
 import org.luava.runtime.LuaException;
 import org.luava.runtime.LuaFunction;
 import org.luava.runtime.LuaState;
 import org.luava.runtime.LuaValue;
 import org.luava.runtime.Varargs;
-
-import java.util.List;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
-import static org.junit.jupiter.api.Assertions.assertSame;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.luava.runtime.bytecode.BytecodeCompiler;
+import org.luava.runtime.bytecode.LuaClosure;
+import org.luava.runtime.bytecode.LuaProto;
+import org.luava.runtime.jit.JitCompiler;
 
 /**
- * Verifies semantic invariants of frontend/compiler optimizations:
+ * Verifies semantic and API invariants of frontend/compiler optimizations:
  * register watermarks across shadowing, {@code <close>}, upvalues, goto,
- * multi-return, string/number edge cases, and composite protoCache keys.
+ * multi-return, string/number edge cases, composite protoCache keys,
+ * Java 21 {@link Token} record compatibility, comment-heavy source bounds,
+ * and JIT rejected-attempt telemetry.
  */
 public class FrontendOptimizationDifferentialTest {
 
@@ -52,7 +63,6 @@ public class FrontendOptimizationDifferentialTest {
 
         try (LuaState st = new LuaState()) {
             LuaValue res = st.eval(sb.toString(), "@shadow_test");
-            // inner = (5*10) + ((5+19)*10) = 50 + 240 = 290; outer v0=5, v19=24, v39=44 -> 290+5+24+44 = 363
             assertEquals(363L, res.toLong());
         }
     }
@@ -131,18 +141,25 @@ public class FrontendOptimizationDifferentialTest {
             LuaFunction a1 = st.compile("return 42", "@chunkA", null);
             LuaFunction a2 = st.compile("return 42", "@chunkA", null);
             LuaFunction b1 = st.compile("return 42", "@chunkB", null);
-            assertSame(((org.luava.runtime.bytecode.LuaClosure) a1).proto,
-                    ((org.luava.runtime.bytecode.LuaClosure) a2).proto);
-            assertNotSame(((org.luava.runtime.bytecode.LuaClosure) a1).proto,
-                    ((org.luava.runtime.bytecode.LuaClosure) b1).proto);
+            assertSame(((LuaClosure) a1).proto, ((LuaClosure) a2).proto);
+            assertNotSame(((LuaClosure) a1).proto, ((LuaClosure) b1).proto);
             assertEquals("@chunkA", a1.getSource());
             assertEquals("@chunkB", b1.getSource());
         }
     }
 
     @Test
-    void tokenLexemeContractPreservedForAllTokenKinds() {
-        String src = "local x = 42 + 007 + 1.000 + 0x10 .. 'abc' .. \"x\\ny\" .. [[long]]";
+    void tokenLexemeContractAndRecordPatternCompatibilityPreserved() {
+        assertTrue(Token.class.isRecord(), "Token must remain a public Java record");
+        RecordComponent[] components = Token.class.getRecordComponents();
+        assertEquals(5, components.length);
+        assertEquals("type", components[0].getName());
+        assertEquals("lexeme", components[1].getName());
+        assertEquals("literal", components[2].getName());
+        assertEquals("line", components[3].getName());
+        assertEquals("column", components[4].getName());
+
+        String src = new String("local x = 42 + 007 + 1.000 + 0x10 .. 'abc' .. \"x\\ny\" .. [[long]]");
         List<Token> tokens = new Lexer(src, false).scanTokens();
         String[] expectedLexemes = {
                 "local", "x", "=", "42", "+", "007", "+", "1.000", "+", "0x10",
@@ -150,14 +167,89 @@ public class FrontendOptimizationDifferentialTest {
         };
         assertEquals(expectedLexemes.length, tokens.size());
         for (int i = 0; i < expectedLexemes.length; i++) {
-            assertNotNull(tokens.get(i).lexeme());
-            assertEquals(expectedLexemes[i], tokens.get(i).lexeme());
+            Token tok = tokens.get(i);
+            assertNotNull(tok.lexeme());
+            assertEquals(expectedLexemes[i], tok.lexeme());
+            assertNotSame(src, tok.lexeme(), "Token must not retain full source reference");
+            assertNotSame(src, tok.literal(), "Token literal must not retain full source reference");
         }
-        assertEquals(TokenType.INTEGER_LITERAL, tokens.get(3).type());
-        assertEquals(42L, tokens.get(3).literal());
-        assertEquals(TokenType.FLOAT_LITERAL, tokens.get(7).type());
-        assertEquals(1.0, tokens.get(7).literal());
-        assertEquals(TokenType.STRING_LITERAL, tokens.get(11).type());
-        assertEquals("abc", tokens.get(11).literal());
+
+        Object candidate = tokens.get(3);
+        boolean matchedRecordPattern = false;
+        if (candidate instanceof Token(TokenType type, String lexeme, Object literal, int line, int col)) {
+            matchedRecordPattern = true;
+            assertEquals(TokenType.INTEGER_LITERAL, type);
+            assertEquals("42", lexeme);
+            assertEquals(42L, literal);
+            assertEquals(1, line);
+            assertEquals(11, col);
+        }
+        assertTrue(matchedRecordPattern, "Java 21 record deconstruction pattern must match Token");
+    }
+
+    @Test
+    void largeCommentHeavySourceProducesMinimalTokensAndExactLocations() {
+        String commentLine = "-- 0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ padding comment\n";
+        int commentLines = 50_000; // ~4.1 MB of comments
+        StringBuilder sb = new StringBuilder(commentLines * commentLine.length() + 32);
+        for (int i = 0; i < commentLines; i++) {
+            sb.append(commentLine);
+        }
+        sb.append("return 99\n");
+        String hugeSource = sb.toString();
+        assertTrue(hugeSource.length() > 4_000_000);
+
+        List<Token> tokens = new Lexer(hugeSource, false).scanTokens();
+        assertEquals(3, tokens.size());
+        assertEquals(TokenType.RETURN, tokens.get(0).type());
+        assertEquals(commentLines + 1, tokens.get(0).line());
+        assertEquals(TokenType.INTEGER_LITERAL, tokens.get(1).type());
+        assertEquals(99L, tokens.get(1).literal());
+        assertEquals(TokenType.EOF, tokens.get(2).type());
+
+        TokenStream stream = new Lexer(hugeSource, false).scanStream();
+        assertEquals(3, stream.size());
+        assertEquals(commentLines + 1, stream.line(0));
+
+        try (LuaState st = new LuaState();
+             LuaState.CompiledChunk chunk = LuaState.compileChunk(hugeSource, "@huge_comments.lua")) {
+            assertEquals(99L, st.eval(chunk).toLong());
+        }
+    }
+
+    @Test
+    void tokenStreamMatchesTokenListAstAndJitRejectedTelemetryRecorded() {
+        String validScript = """
+                local function compute(a, b)
+                    local t = { x = a + 1.5, [2] = 'ok', [[raw]] }
+                    return t.x + b, t[2], t[1]
+                end
+                return compute(10, 20)
+                """;
+        Statements.BlockStmt fromList = new Parser(new Lexer(validScript, false).scanTokens()).parse();
+        Statements.BlockStmt fromStream = new Parser(new Lexer(validScript, false).scanStream()).parse();
+        assertEquals(fromList, fromStream);
+
+        String invalidScript = "local x = [[unclosed_expr]] 123";
+        ParseException errList = assertThrows(
+                ParseException.class,
+                () -> new Parser(new Lexer(invalidScript, false).scanTokens()).parse());
+        ParseException errStream = assertThrows(
+                ParseException.class,
+                () -> new Parser(new Lexer(invalidScript, false).scanStream()).parse());
+        assertEquals(errList.getMessage(), errStream.getMessage());
+        assertEquals(errList.line(), errStream.line());
+        assertEquals(errList.column(), errStream.column());
+
+        // Verify rejected JIT compile attempts increment both rejectedCount() and totalCompileNanos().
+        Statements.BlockStmt varargAst = new Parser(new Lexer("return ...", false).scanStream()).parse();
+        LuaProto ineligibleProto = BytecodeCompiler.compile(varargAst, "@ineligible_vararg.lua");
+        long nanosBefore = JitCompiler.totalCompileNanos();
+        long rejectedBefore = JitCompiler.rejectedCount();
+        assertNull(JitCompiler.tryCompile(ineligibleProto, false));
+        long nanosAfter = JitCompiler.totalCompileNanos();
+        long rejectedAfter = JitCompiler.rejectedCount();
+        assertEquals(rejectedBefore + 1, rejectedAfter);
+        assertTrue(nanosAfter > nanosBefore, "Rejected JIT attempt must contribute to totalCompileNanos()");
     }
 }

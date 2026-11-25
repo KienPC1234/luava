@@ -10,7 +10,6 @@ package org.luava.runtime.standard;
 import org.luava.frontend.ast.AstPrinter;
 import org.luava.frontend.ast.Statements;
 import org.luava.frontend.lexer.Lexer;
-import org.luava.frontend.lexer.Token;
 import org.luava.frontend.parser.Parser;
 import org.luava.runtime.*;
 import org.luava.runtime.eval.Environment;
@@ -162,7 +161,7 @@ public final class ChunkSerializer {
 
         LuaState.checkGuard();
         Lexer lexer = new Lexer(code);
-        List<Token> tokens = lexer.scanTokens();
+        org.luava.frontend.lexer.TokenStream tokens = lexer.scanStream();
         Parser parser = new Parser(tokens);
         Statements.BlockStmt body;
         try {

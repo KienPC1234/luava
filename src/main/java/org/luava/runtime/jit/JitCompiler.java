@@ -36,6 +36,7 @@ public final class JitCompiler {
 
     private static final AtomicInteger CLASS_SEQ = new AtomicInteger();
     private static final AtomicLong COMPILED_COUNT = new AtomicLong();
+    private static final AtomicLong REJECTED_COUNT = new AtomicLong();
     private static final AtomicLong FAILED_COUNT = new AtomicLong();
     private static final AtomicLong VM_ERROR_COUNT = new AtomicLong();
     private static final AtomicLong TOTAL_COMPILE_NANOS = new AtomicLong();
@@ -253,6 +254,7 @@ public final class JitCompiler {
             try {
                 LuaToJvmTranslator.AnalysisResult analysis = LuaToJvmTranslator.analyzeFull(proto);
                 if (analysis == null) {
+                    REJECTED_COUNT.incrementAndGet();
                     if (guarded) {
                         proto.guardedJitDisabled = true;
                     } else {
@@ -273,6 +275,7 @@ public final class JitCompiler {
                 LuaToJvmTranslator.Translation tr =
                         LuaToJvmTranslator.translate(proto, analysis, name, org.luava.runtime.LuaState.ENABLE_OSR, guarded);
                 if (tr == null) {
+                    REJECTED_COUNT.incrementAndGet();
                     if (guarded) {
                         proto.guardedJitDisabled = true;
                     } else {
@@ -314,6 +317,7 @@ public final class JitCompiler {
                             info.callSafe(), info.leafNoWindow(), false, false);
                 }
                 if (guarded ? proto.guardedJitDisabled : proto.jitDisabled) {
+                    REJECTED_COUNT.incrementAndGet();
                     return null;
                 }
                 if (guarded) {
@@ -323,7 +327,6 @@ public final class JitCompiler {
                 }
                 CACHE.put(proto, code);
                 COMPILED_COUNT.incrementAndGet();
-                TOTAL_COMPILE_NANOS.addAndGet(System.nanoTime() - t0);
                 if (debug) {
                     System.err.println("[jit] compiled" + (guarded ? " (guarded): " : ": ") + proto.name);
                 }
@@ -355,6 +358,8 @@ public final class JitCompiler {
                     System.err.println("[jit] compile failed for " + proto.name + ": " + t);
                 }
                 return null;
+            } finally {
+                TOTAL_COMPILE_NANOS.addAndGet(System.nanoTime() - t0);
             }
         }
     }
@@ -391,6 +396,10 @@ public final class JitCompiler {
 
     public static long totalCompileNanos() {
         return TOTAL_COMPILE_NANOS.get();
+    }
+
+    public static long rejectedCount() {
+        return REJECTED_COUNT.get();
     }
 
     public static Telemetry telemetry() {

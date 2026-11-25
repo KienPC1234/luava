@@ -6,12 +6,13 @@
 
     <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava-frontend-jmh</artifactId>
-    <version>0.2.7</version>
+    <version>${luava.version}</version>
 
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <luava.version>0.2.7</luava.version>
         <jmh.version>1.37</jmh.version>
     </properties>
 
@@ -19,9 +20,7 @@
         <dependency>
             <groupId>io.github.kienpc1234</groupId>
             <artifactId>luava</artifactId>
-            <version>0.2.7</version>
-            <scope>system</scope>
-            <systemPath>${project.basedir}/../../target/luava-0.2.7.jar</systemPath>
+            <version>${luava.version}</version>
         </dependency>
         <dependency>
             <groupId>org.openjdk.jmh</groupId>
@@ -37,6 +36,15 @@
     </dependencies>
 
     <build>
+        <resources>
+            <resource>
+                <directory>${project.basedir}/../lua</directory>
+                <targetPath>org/luava/bench/lua</targetPath>
+                <includes>
+                    <include>*.lua</include>
+                </includes>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

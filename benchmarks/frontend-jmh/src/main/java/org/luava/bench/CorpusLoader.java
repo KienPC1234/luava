@@ -1,5 +1,17 @@
 package org.luava.bench;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 import org.luava.frontend.ast.Expression;
 import org.luava.frontend.ast.Expressions;
 import org.luava.frontend.ast.Statement;
@@ -10,18 +22,14 @@ import org.luava.frontend.parser.Parser;
 import org.luava.runtime.bytecode.BytecodeCompiler;
 import org.luava.runtime.bytecode.LuaProto;
 
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-
 /**
  * Deterministic Lua 5.4 source corpus and static frontend metrics collector
  * covering file-size tiers (small 1-5 KB, medium 20-100 KB, large 500 KB-1 MB)
  * and targeted frontend/compiler stress patterns.
+ *
+ * <p>Sources are resolved lazily per workload and packaged as classpath resources
+ * under {@code /org/luava/bench/lua/} (with optional {@code -Dluava.bench.corpusDir}
+ * override), so the shaded JMH jar executes independently of the working directory.
  */
 public final class CorpusLoader {
 
@@ -33,20 +41,29 @@ public final class CorpusLoader {
             int bytecodeCount,
             int protoCount) {}
 
-    private static final Map<String, String> CORPUS = buildCorpus();
+    private static final Map<String, Supplier<String>> CORPUS_SUPPLIERS = buildSuppliers();
+    private static final Map<String, String> RESOLVED_CACHE = new ConcurrentHashMap<>();
 
     private CorpusLoader() {}
 
     public static String sourceFor(String name) {
-        String src = CORPUS.get(name);
-        if (src == null) {
+        Supplier<String> supplier = CORPUS_SUPPLIERS.get(name);
+        if (supplier == null) {
             throw new IllegalArgumentException("Unknown workload: " + name);
         }
-        return src;
+        return RESOLVED_CACHE.computeIfAbsent(name, k -> supplier.get());
+    }
+
+    public static Set<String> workloadNames() {
+        return Collections.unmodifiableSet(CORPUS_SUPPLIERS.keySet());
     }
 
     public static Map<String, String> allSources() {
-        return CORPUS;
+        Map<String, String> all = new LinkedHashMap<>();
+        for (String name : CORPUS_SUPPLIERS.keySet()) {
+            all.put(name, sourceFor(name));
+        }
+        return Collections.unmodifiableMap(all);
     }
 
     public static WorkloadMetrics measureMetrics(String name) {
@@ -169,25 +186,47 @@ public final class CorpusLoader {
         };
     }
 
-    private static Map<String, String> buildCorpus() {
-        Map<String, String> m = new LinkedHashMap<>();
-        m.put("small_3kb", generateMixedScript(12));
-        m.put("medium_50kb", generateMixedScript(190));
-        m.put("large_600kb", generateMixedScript(2300));
-        m.put("many_locals", generateManyLocals(20));
-        m.put("nested_closures", generateNestedClosures(35));
-        m.put("table_constructors", generateTableConstructors(120));
-        m.put("escaped_strings", generateEscapedStrings(220));
-        m.put("deep_exprs", generateDeepExprs(80));
-        m.put("heavy_comments", generateHeavyComments(180));
-        m.put("jit_kernel", generateJitKernel());
-        m.put("jit_oop_ctor", generateJitOopCtor());
-        m.put("exec_table_ops", loadBenchLua("03_table_ops.lua"));
-        m.put("exec_oop_metatables", loadBenchLua("08_oop_metatables.lua"));
+    private static Map<String, Supplier<String>> buildSuppliers() {
+        Map<String, Supplier<String>> m = new LinkedHashMap<>();
+        m.put("small_3kb", () -> generateMixedScript(12));
+        m.put("medium_50kb", () -> generateMixedScript(190));
+        m.put("large_600kb", () -> generateMixedScript(2300));
+        m.put("many_locals", () -> generateManyLocals(20));
+        m.put("nested_closures", () -> generateNestedClosures(35));
+        m.put("table_constructors", () -> generateTableConstructors(120));
+        m.put("escaped_strings", () -> generateEscapedStrings(220));
+        m.put("deep_exprs", () -> generateDeepExprs(80));
+        m.put("heavy_comments", () -> generateHeavyComments(180));
+        m.put("jit_kernel", CorpusLoader::generateJitKernel);
+        m.put("jit_oop_ctor", CorpusLoader::generateJitOopCtor);
+        m.put("exec_table_ops", () -> loadBenchLua("03_table_ops.lua"));
+        m.put("exec_oop_metatables", () -> loadBenchLua("08_oop_metatables.lua"));
         return m;
     }
 
     private static String loadBenchLua(String fileName) {
+        String customDir = System.getProperty("luava.bench.corpusDir");
+        if (customDir != null && !customDir.isBlank()) {
+            Path customPath = Path.of(customDir, fileName);
+            if (!Files.isRegularFile(customPath)) {
+                throw new IllegalStateException("Missing benchmark file in luava.bench.corpusDir: " + customPath);
+            }
+            try {
+                return Files.readString(customPath, StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                throw new IllegalStateException("Failed to read " + customPath, e);
+            }
+        }
+
+        String resourcePath = "/org/luava/bench/lua/" + fileName;
+        try (InputStream in = CorpusLoader.class.getResourceAsStream(resourcePath)) {
+            if (in != null) {
+                return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            }
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to read classpath resource " + resourcePath, e);
+        }
+
         Path[] candidates = {
                 Path.of("benchmarks/lua", fileName),
                 Path.of("../lua", fileName),
@@ -202,7 +241,7 @@ public final class CorpusLoader {
                 }
             }
         }
-        throw new IllegalStateException("Cannot locate benchmarks/lua/" + fileName);
+        throw new IllegalStateException("Cannot locate benchmark Lua source " + fileName + " on classpath or disk");
     }
 
     private static String generateMixedScript(int blocks) {

@@ -133,17 +133,31 @@ jobs:
           java-version: '21'
           cache: maven
 
-      - name: Package shaded engine and JMH harness
+      - name: Install shaded engine and package JMH harness
         run: |
-          mvn -B -ntp package -DskipTests
-          mvn -B -ntp -f benchmarks/frontend-jmh/pom.xml package
+          ROOT_VER="$(mvn -B -ntp help:evaluate -Dexpression=project.version -q -DforceStdout)"
+          JMH_VER="$(mvn -B -ntp -f benchmarks/frontend-jmh/pom.xml help:evaluate -Dexpression=luava.version -q -DforceStdout)"
+          if [ "$ROOT_VER" != "$JMH_VER" ]; then
+            echo "::error::Version mismatch: root pom.xml=$ROOT_VER vs benchmarks/frontend-jmh/pom.xml luava.version=$JMH_VER"
+            exit 1
+          fi
+          mvn -B -ntp install -DskipTests
+          mvn -B -ntp -f benchmarks/frontend-jmh/pom.xml package -Dluava.version="$ROOT_VER"
 
-      - name: List JMH benchmarks and run smoke test
+      - name: List JMH benchmarks and run standalone smoke test from /tmp
         run: |
-          java -cp target/luava-0.2.7.jar:benchmarks/frontend-jmh/target/jmh-benchmarks.jar \
-            org.openjdk.jmh.Main -l
+          JMH_JAR="$GITHUB_WORKSPACE/benchmarks/frontend-jmh/target/jmh-benchmarks.jar"
+          cd /tmp
+          java -jar "$JMH_JAR" -l
           java -Xms256m -Xmx1g -Dluava.jit=true -Dluava.jit.sync=true \
-            -cp target/luava-0.2.7.jar:benchmarks/frontend-jmh/target/jmh-benchmarks.jar \
-            org.openjdk.jmh.Main -f 0 -wi 1 -i 1 -w 50ms -r 50ms \
-            "org.luava.bench.FrontendPipelineBenchmark\.(lexOnly|frontendCompileOnly|compileAndLoad|jitCompile)" \
+            -jar "$JMH_JAR" -f 0 -wi 1 -i 1 -w 50ms -r 50ms \
+            "org.luava.bench.FrontendPipelineBenchmark\.(lexOnly|frontendCompileOnly|compileAndLoad)" \
             -p workload=jit_kernel
+          java -Xms256m -Xmx1g -Dluava.jit=true -Dluava.jit.sync=true \
+            -jar "$JMH_JAR" -f 0 -wi 1 -i 1 -w 50ms -r 50ms \
+            "org.luava.bench.FrontendPipelineBenchmark\.jitCompile" \
+            -p workload=jit_kernel,jit_oop_ctor
+          java -Xms256m -Xmx1g -Dluava.jit=true -Dluava.jit.sync=true \
+            -jar "$JMH_JAR" -f 0 -wi 1 -i 1 -w 50ms -r 50ms \
+            "org.luava.bench.FrontendPipelineBenchmark\.warmExecute" \
+            -p workload=exec_table_ops
