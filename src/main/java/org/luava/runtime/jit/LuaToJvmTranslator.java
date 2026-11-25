@@ -109,10 +109,20 @@ public final class LuaToJvmTranslator implements Opcodes {
      */
     public static Translation translate(LuaProto proto, String internalName, boolean wantOsr,
             boolean emitSafepoints) {
-        Info info = analyze(proto);
-        if (info == null) {
+        AnalysisResult analysis = analyzeFull(proto);
+        if (analysis == null) {
             return null;
         }
+        return translate(proto, analysis, internalName, wantOsr, emitSafepoints);
+    }
+
+    static Translation translate(LuaProto proto, AnalysisResult analysis, String internalName,
+            boolean wantOsr, boolean emitSafepoints) {
+        if (analysis == null) {
+            return null;
+        }
+        Info info = analysis.info();
+        boolean[] jumpTargets = analysis.jumpTargets();
         boolean pure = info.pure();
         int len = proto.code.length;
         // Loop instructions at which OSR may enter: a jump back-edge or a
@@ -178,29 +188,22 @@ public final class LuaToJvmTranslator implements Opcodes {
         // registers (otherwise a nested deopt could re-read a clobbered
         // operand); a parameter-writing proto routes self calls through the
         // snapshot-wrapped general helper. Pointless for impure protos.
-        boolean selfSafe = !writesParams(proto, proto.code);
+        boolean selfSafe = !analysis.writesParams();
+        boolean[] skipStore = new boolean[len];
+        int[] fusedDef = new int[len];
+        for (int i = 0; i < len; i++) {
+            fusedDef[i] = -1;
+        }
         if (pure && selfSafe) {
             for (int pc = 0; pc < len; pc++) {
                 int inst = proto.code[pc];
                 int op = Instruction.getOp(inst);
                 if (op == OpCode.OP_CALL || op == OpCode.OP_TAILCALL) {
-                    fusedUp[pc] = fusedUpvalue(proto.code, pc, Instruction.getA(inst));
-                }
-            }
-        }
-        boolean[] skipStore = new boolean[len];
-        int[] fusedDef = new int[len];
-        for (int pc = 0; pc < len; pc++) {
-            fusedDef[pc] = -1;
-            if (fusedUp[pc] >= 0) {
-                int def = lastWrite(proto.code, pc, Instruction.getA(proto.code[pc]));
-                if (def >= 0) {
-                    fusedDef[pc] = def;
-                    // Skipping the GETUPVAL store is only sound when resume
-                    // recomputes it: pure protos resume fused calls at the
-                    // def pc (prefix is side-effect free); impure leaves
-                    // always materialize so any resume pc sees valid regs.
-                    if (pure) {
+                    int funcReg = Instruction.getA(inst);
+                    int def = lastWrite(proto.code, pc, funcReg);
+                    if (def >= 0 && isFusedUpvalueDef(proto.code, def, pc, funcReg, jumpTargets)) {
+                        fusedUp[pc] = Instruction.getB(proto.code[def]);
+                        fusedDef[pc] = def;
                         skipStore[def] = true;
                     }
                 }
@@ -1343,37 +1346,37 @@ public final class LuaToJvmTranslator implements Opcodes {
     public record Info(boolean pure, boolean callSafe, boolean leafNoWindow,
             boolean returnsInt, boolean returnsVoid, int[][] types) {}
 
-    // Register abstract types for return-kind inference.
-    private static final int T_UNKNOWN = 0;
-    private static final int T_INT = 1;
-    private static final int T_OBJ = 2;
-    /**
-     * A number whose subtype (integer vs float) is not statically known.
-     * Arithmetic on it is emitted as a runtime numeric dispatch: the
-     * integer lane when both operands are ints, otherwise the float lane.
-     */
-    private static final int T_NUM = 3;
+    /** Combined analysis bundle shared across eligibility and translation (J01/J02). */
+    static final class AnalysisResult {
+        private final Info info;
+        private final boolean writesParams;
+        private final boolean[] jumpTargets;
 
-    /**
-     * Analyzes a proto for the JIT subset. Returns null when any shape is
-     * unsupported. Safety rules: a proto with calls must be pure (no
-     * upvalue/table writes and no closure creation), because a nested deopt
-     * re-invokes the callee from scratch; impure leaves resume at the
-     * faulting pc with committed state intact.
-     *
-     * <p>Return-kind inference runs a forward type analysis
-     * (UNKNOWN/INT/OBJ, conflict rejects). Parameters seed INT, which is
-     * sound because every type-specific use in generated code is
-     * runtime-guarded: a wrong guess only costs a deopt, never wrong
-     * behavior. Object-returning protos must be call-free leaves (their
-     * results cannot feed the integer call protocol).
-     */
+        AnalysisResult(Info info, boolean writesParams, boolean[] jumpTargets) {
+            this.info = info;
+            this.writesParams = writesParams;
+            this.jumpTargets = jumpTargets;
+        }
+
+        Info info() {
+            return info;
+        }
+
+        boolean writesParams() {
+            return writesParams;
+        }
+
+        boolean[] jumpTargets() {
+            return jumpTargets;
+        }
+    }
+
     public static Info analyze(LuaProto proto) {
-        // A vararg proto is only rejected when it actually reads `...`: the
-        // `VARARG`/`VARARGPREP` opcodes are outside the allow-list below, so
-        // they reject the proto there. A vararg signature that never uses
-        // `...` is indistinguishable from a fixed-arity one (extra args are
-        // ignored, missing ones nil-filled) and is safe to compile.
+        AnalysisResult res = analyzeFull(proto);
+        return res != null ? res.info() : null;
+    }
+
+    static AnalysisResult analyzeFull(LuaProto proto) {
         int[] code = proto.code;
         if (code.length == 0 || code.length > 200) {
             return null;
@@ -1382,6 +1385,7 @@ public final class LuaToJvmTranslator implements Opcodes {
         if (proto.maxStackSize > 64 || proto.numParams > 16) {
             return null;
         }
+        boolean[] jumpTargets = computeJumpTargets(code);
         // Purity is a whole-proto property. A write is pure when its target is
         // a table provably created by a NEWTABLE in this same straight-line
         // region and still unaliased: the write only affects a value this
@@ -1414,14 +1418,14 @@ public final class LuaToJvmTranslator implements Opcodes {
                     otherImpure = true;
                 }
                 case OpCode.OP_SETFIELD, OpCode.OP_SETI, OpCode.OP_SETTABLE, OpCode.OP_SETLIST -> {
-                    if (!writesFreshTable(proto, code, pc, Instruction.getA(code[pc]))) {
+                    if (!writesFreshTable(proto, code, pc, Instruction.getA(code[pc]), jumpTargets)) {
                         impure = true;
                         otherImpure = true;
                     }
                 }
                 case OpCode.OP_CALL, OpCode.OP_TAILCALL -> {
                     if (isSetmetatableIntrinsic(proto, code, pc)
-                            && !writesFreshTable(proto, code, pc, Instruction.getA(code[pc]) + 1)) {
+                            && !writesFreshTable(proto, code, pc, Instruction.getA(code[pc]) + 1, jumpTargets)) {
                         impure = true;
                         otherImpure = true;
                     }
@@ -1750,10 +1754,29 @@ public final class LuaToJvmTranslator implements Opcodes {
             restartSafeLeaf = safe;
         }
         boolean callSafe = !impure || restartSafeLeaf;
-        boolean leafNoWindow = callSafe && !writesParams(proto, code)
+        boolean writesParams = writesParams(proto, code);
+        boolean leafNoWindow = callSafe && !writesParams
                 && !hasCalls && !hasTailCall && !proto.isVararg;
         int[][] defTypes = computeDefiniteTypes(proto, code, reach, regs);
-        return new Info(!impure, callSafe, leafNoWindow, returnsInt, returnsVoid, defTypes);
+        Info info = new Info(!impure, callSafe, leafNoWindow, returnsInt, returnsVoid, defTypes);
+        return new AnalysisResult(info, writesParams, jumpTargets);
+    }
+
+    // Register abstract types for return-kind inference.
+    private static final int T_UNKNOWN = 0;
+    private static final int T_INT = 1;
+    private static final int T_OBJ = 2;
+    private static final int T_NUM = 3;
+
+    private static boolean[] computeJumpTargets(int[] code) {
+        boolean[] targets = new boolean[code.length];
+        for (int pc = 0; pc < code.length; pc++) {
+            int jt = jumpTarget(code[pc], pc);
+            if (jt >= 0 && jt < code.length) {
+                targets[jt] = true;
+            }
+        }
+        return targets;
     }
 
     /**
@@ -4756,7 +4779,7 @@ public final class LuaToJvmTranslator implements Opcodes {
      * may enter or leave the span, so the definition dominates the write on
      * every path.
      */
-    private static boolean writesFreshTable(LuaProto proto, int[] code, int pc, int reg) {
+    private static boolean writesFreshTable(LuaProto proto, int[] code, int pc, int reg, boolean[] jumpTargets) {
         if (reg < 0 || reg >= Math.max(proto.maxStackSize, proto.numParams)) {
             return false;
         }
@@ -4769,9 +4792,8 @@ public final class LuaToJvmTranslator implements Opcodes {
                 return false;
             }
         }
-        for (int t = 0; t < code.length; t++) {
-            int jt = jumpTarget(code[t], t);
-            if (jt > def && jt < pc) {
+        for (int t = def + 1; t < pc; t++) {
+            if (jumpTargets[t]) {
                 return false;
             }
         }
@@ -4834,34 +4856,30 @@ public final class LuaToJvmTranslator implements Opcodes {
     }
 
     /**
-     * Returns the upvalue index when the CALL's function register is fed
-     * straight-line by one GETUPVAL with no intervening read, else -1.
+     * Verifies straight-line upvalue load from {@code def} to {@code callPc}
+     * without intervening branches, reads, or clobbering writes.
      */
-    private static int fusedUpvalue(int[] code, int callPc, int funcReg) {
-        int def = lastWrite(code, callPc, funcReg);
+    private static boolean isFusedUpvalueDef(int[] code, int def, int callPc, int funcReg, boolean[] jumpTargets) {
         if (def < 0 || Instruction.getOp(code[def]) != OpCode.OP_GETUPVAL) {
-            return -1;
+            return false;
         }
-        // No branches may enter or leave the (def, callPc) span, and no
-        // instruction inside may read funcReg or write it again.
         for (int i = def; i < callPc; i++) {
             int op = Instruction.getOp(code[i]);
             if (op == OpCode.OP_JMP || isBranch(code[i])) {
-                return -1;
+                return false;
             }
         }
-        for (int t = 0; t < code.length; t++) {
-            int jt = jumpTarget(code[t], t);
-            if (jt > def && jt < callPc) {
-                return -1;
+        for (int t = def + 1; t < callPc; t++) {
+            if (jumpTargets[t]) {
+                return false;
             }
         }
         for (int i = def + 1; i < callPc; i++) {
             if (readsReg(code[i], funcReg) || writesReg(code[i], funcReg)) {
-                return -1;
+                return false;
             }
         }
-        return Instruction.getB(code[def]);
+        return true;
     }
 
     private static int lastWrite(int[] code, int callPc, int reg) {

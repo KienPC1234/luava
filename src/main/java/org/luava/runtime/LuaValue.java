@@ -473,35 +473,46 @@ public abstract class LuaValue {
 
     public static LuaValue parseNumber(String raw) {
         if (raw == null) return null;
-        String s = trimLuaWhitespace(raw);
-        if (s.isEmpty()) return null;
+        return parseNumber(raw, 0, raw.length());
+    }
+
+    public static LuaValue parseNumber(String raw, int rangeStart, int rangeEnd) {
+        if (raw == null) return null;
+        int start = rangeStart;
+        int end = rangeEnd;
+        while (start < end && isLuaWhitespace(raw.charAt(start))) {
+            start++;
+        }
+        while (end > start && isLuaWhitespace(raw.charAt(end - 1))) {
+            end--;
+        }
+        if (start >= end) return null;
 
         boolean negative = false;
-        int idx = 0;
-        char first = s.charAt(0);
+        char first = raw.charAt(start);
         if (first == '-') {
             negative = true;
-            idx++;
+            start++;
         } else if (first == '+') {
-            idx++;
+            start++;
         }
-        if (idx >= s.length()) return null;
+        if (start >= end) return null;
 
-        String rest = s.substring(idx);
-        if (rest.startsWith("0x") || rest.startsWith("0X")) {
-            String hexBody = rest.substring(2);
-            if (hexBody.isEmpty()) return null;
+        int rem = end - start;
+        if (rem >= 2 && raw.charAt(start) == '0' && (raw.charAt(start + 1) == 'x' || raw.charAt(start + 1) == 'X')) {
+            int hexStart = start + 2;
+            if (hexStart >= end) return null;
             boolean hasDot = false;
             boolean hasP = false;
-            for (int i = 0; i < hexBody.length(); i++) {
-                char c = hexBody.charAt(i);
+            for (int i = hexStart; i < end; i++) {
+                char c = raw.charAt(i);
                 if (c == '.') {
                     if (hasDot || hasP) return null;
                     hasDot = true;
                 } else if (c == 'p' || c == 'P') {
                     if (hasP) return null;
                     hasP = true;
-                    if (i + 1 < hexBody.length() && (hexBody.charAt(i + 1) == '+' || hexBody.charAt(i + 1) == '-')) {
+                    if (i + 1 < end && (raw.charAt(i + 1) == '+' || raw.charAt(i + 1) == '-')) {
                         i++;
                     }
                 } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
@@ -510,6 +521,7 @@ public abstract class LuaValue {
             }
 
             if (hasDot || hasP) {
+                String rest = raw.substring(start, end);
                 String hexFloat = (negative ? "-" : "") + rest;
                 if (!hasP) {
                     hexFloat = hexFloat + "p0";
@@ -522,8 +534,8 @@ public abstract class LuaValue {
                 }
             } else {
                 long val = 0;
-                for (int i = 0; i < hexBody.length(); i++) {
-                    char c = hexBody.charAt(i);
+                for (int i = hexStart; i < end; i++) {
+                    char c = raw.charAt(i);
                     int d = Character.digit(c, 16);
                     if (d < 0) return null;
                     val = val * 16 + d;
@@ -534,15 +546,15 @@ public abstract class LuaValue {
         } else {
             boolean hasDot = false;
             boolean hasE = false;
-            for (int i = 0; i < rest.length(); i++) {
-                char c = rest.charAt(i);
+            for (int i = start; i < end; i++) {
+                char c = raw.charAt(i);
                 if (c == '.') {
                     if (hasDot || hasE) return null;
                     hasDot = true;
                 } else if (c == 'e' || c == 'E') {
                     if (hasE) return null;
                     hasE = true;
-                    if (i + 1 < rest.length() && (rest.charAt(i + 1) == '+' || rest.charAt(i + 1) == '-')) {
+                    if (i + 1 < end && (raw.charAt(i + 1) == '+' || raw.charAt(i + 1) == '-')) {
                         i++;
                     }
                 } else if (c < '0' || c > '9') {
@@ -550,6 +562,17 @@ public abstract class LuaValue {
                 }
             }
 
+            if (!hasDot && !hasE && rem <= 18) {
+                long val = 0;
+                for (int i = start; i < end; i++) {
+                    val = val * 10 + (raw.charAt(i) - '0');
+                }
+                return LuaInteger.valueOf(negative ? -val : val);
+            }
+
+            String s = (rangeStart == 0 && rangeEnd == raw.length() && !negative && first != '+')
+                    ? raw
+                    : (negative ? "-" + raw.substring(start, end) : raw.substring(start, end));
             if (hasDot || hasE) {
                 try {
                     double d = Double.parseDouble(s);

@@ -142,9 +142,35 @@ public final class LuaState implements AutoCloseable {
     private LuaValue savedLoadfile;
     private LuaValue savedDofile;
 
+    /** Composite key for {@link #protoCache} avoiding full-source string concatenation. */
+    private static final class ProtoCacheKey {
+        final String chunkName;
+        final String source;
+        final int hash;
+
+        ProtoCacheKey(String chunkName, String source) {
+            this.chunkName = chunkName;
+            this.source = source;
+            this.hash = 31 * chunkName.hashCode() + source.hashCode();
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            return obj instanceof ProtoCacheKey other
+                    && hash == other.hash
+                    && chunkName.equals(other.chunkName)
+                    && source.equals(other.source);
+        }
+    }
+
     /**
      * Bounded cache of compiled {@code LuaProto} trees keyed by
-     * {@code chunkName + '\0' + source}. A server that evaluates the same
+     * {@code (chunkName, source)}. A server that evaluates the same
      * script on every request otherwise rebuilds a fresh proto each time, so
      * its hot functions can never reach the JIT tier-up threshold (the
      * documented "eval again per request never tiers up" limitation).
@@ -154,10 +180,10 @@ public final class LuaState implements AutoCloseable {
      * cannot grow it without limit. Protos are immutable after compilation
      * except for JIT state, which is exactly what must persist.
      */
-    private final Map<String, org.luava.runtime.bytecode.LuaProto> protoCache =
+    private final Map<ProtoCacheKey, org.luava.runtime.bytecode.LuaProto> protoCache =
             new java.util.LinkedHashMap<>(64, 0.75f, true) {
                 @Override
-                protected boolean removeEldestEntry(Map.Entry<String, org.luava.runtime.bytecode.LuaProto> eldest) {
+                protected boolean removeEldestEntry(Map.Entry<ProtoCacheKey, org.luava.runtime.bytecode.LuaProto> eldest) {
                     return size() > PROTO_CACHE_MAX;
                 }
             };
@@ -1480,7 +1506,7 @@ public final class LuaState implements AutoCloseable {
         // sharing is semantically transparent. This is what lets a server
         // that eval's the same script per request accumulate JIT hotness
         // instead of rebuilding a cold proto every time.
-        String key = (chunkName != null ? chunkName : "chunk") + '\0' + luaSource;
+        ProtoCacheKey key = new ProtoCacheKey(chunkName != null ? chunkName : "chunk", luaSource);
         org.luava.runtime.bytecode.LuaProto proto;
         synchronized (protoCache) {
             proto = protoCache.get(key);

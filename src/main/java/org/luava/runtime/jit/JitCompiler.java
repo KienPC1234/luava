@@ -38,6 +38,7 @@ public final class JitCompiler {
     private static final AtomicLong COMPILED_COUNT = new AtomicLong();
     private static final AtomicLong FAILED_COUNT = new AtomicLong();
     private static final AtomicLong VM_ERROR_COUNT = new AtomicLong();
+    private static final AtomicLong TOTAL_COMPILE_NANOS = new AtomicLong();
     private static final JitCodeCache CACHE = new JitCodeCache();
     private static final int QUEUE_CAPACITY = Integer.getInteger("luava.jit.queueCapacity", 512);
     private static final int WORKER_THREADS = Math.max(2, Math.min(4,
@@ -248,9 +249,10 @@ public final class JitCompiler {
             } else if (proto.jitCode != null || proto.jitDisabled) {
                 return proto.jitCode;
             }
+            long t0 = System.nanoTime();
             try {
-                LuaToJvmTranslator.Info info = LuaToJvmTranslator.analyze(proto);
-                if (info == null || !eligible(proto)) {
+                LuaToJvmTranslator.AnalysisResult analysis = LuaToJvmTranslator.analyzeFull(proto);
+                if (analysis == null) {
                     if (guarded) {
                         proto.guardedJitDisabled = true;
                     } else {
@@ -261,9 +263,11 @@ public final class JitCompiler {
                     }
                     return null;
                 }
+                proto.mayYield = false;
+                LuaToJvmTranslator.Info info = analysis.info();
                 String name = "org/luava/runtime/jit/Gen$" + CLASS_SEQ.getAndIncrement();
                 LuaToJvmTranslator.Translation tr =
-                        LuaToJvmTranslator.translate(proto, name, org.luava.runtime.LuaState.ENABLE_OSR, guarded);
+                        LuaToJvmTranslator.translate(proto, analysis, name, org.luava.runtime.LuaState.ENABLE_OSR, guarded);
                 if (tr == null) {
                     if (guarded) {
                         proto.guardedJitDisabled = true;
@@ -315,6 +319,7 @@ public final class JitCompiler {
                 }
                 CACHE.put(proto, code);
                 COMPILED_COUNT.incrementAndGet();
+                TOTAL_COMPILE_NANOS.addAndGet(System.nanoTime() - t0);
                 if (debug) {
                     System.err.println("[jit] compiled" + (guarded ? " (guarded): " : ": ") + proto.name);
                 }
@@ -391,6 +396,10 @@ public final class JitCompiler {
 
     public static int cacheSize() {
         return CACHE.size();
+    }
+
+    public static long totalCompileNanos() {
+        return TOTAL_COMPILE_NANOS.get();
     }
 
     public static Telemetry telemetry() {

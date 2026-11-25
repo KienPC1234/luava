@@ -9,50 +9,11 @@ package org.luava.runtime;
 
 
 public final class LuaString extends LuaValue {
-    public static final LuaString EMPTY = new LuaString("", true);
-    /**
-     * Pre-allocated PUC memory-error message ({@code MEMERRMSG}). When the JVM
-     * heap is exhausted, building the error message must not allocate again or
-     * the second {@code OutOfMemoryError} escapes past {@code pcall}. PUC
-     * solves this with a pre-created message string; this is the same idea.
-     */
-    public static final LuaString MEMORY_ERROR = new LuaString("not enough memory");
-    private static final LuaString[] ASCII_CACHE = new LuaString[256];
-    static {
-        for (int i = 0; i < 256; i++) {
-            ASCII_CACHE[i] = new LuaString(String.valueOf((char) i), true);
-        }
-    }
     private static final int MAX_SHORT_STRING = 40;
     private static final int MAX_INTERN_ENTRIES = 65_536;
     private static final int INT_CACHE_SIZE = 1024;
     private static final int SLICE_SHARE_SMALL_CAP = 256;
-    private static final LuaString[] INT_STRING_CACHE = new LuaString[INT_CACHE_SIZE];
-    private static final LuaString MIN_LONG_STRING = new LuaString(Long.toString(Long.MIN_VALUE));
-    private static final byte[] DIGIT_TENS = new byte[100];
-    private static final byte[] DIGIT_ONES = new byte[100];
-    static {
-        for (int i = 0; i < 100; i++) {
-            DIGIT_TENS[i] = (byte) ('0' + (i / 10));
-            DIGIT_ONES[i] = (byte) ('0' + (i % 10));
-        }
-        for (int i = 0; i < INT_CACHE_SIZE; i++) {
-            INT_STRING_CACHE[i] = (i < 10) ? ASCII_CACHE['0' + i] : new LuaString(Integer.toString(i));
-        }
-    }
-    /**
-     * Intern pool for short strings, mirroring Lua's global string table:
-     * equal short strings share one object while they are alive (required by
-     * Lua 5.4 semantics, e.g. {@code string.format('%p', s1) ==
-     * string.format('%p', s2)} for equal short strings). The pool is
-     * <em>weak</em> on both sides: the key is only strongly reachable through
-     * the interned {@code LuaString}'s value, and the value is a
-     * {@link WeakReference}. So a long-running server that churns unique
-     * short strings does not pin them forever — once the interpreter drops a
-     * string, both the entry and the string are collected. An unbounded
-     * strong map here was a real leak (200k unique ids grew it to 200k
-     * entries held for the JVM's life).
-     */
+
     /**
      * Canonical pool for {@link #interned} (compiler constants, metamethod
      * and stdlib registration names — all bounded, program-shaped sets, not
@@ -86,6 +47,34 @@ public final class LuaString extends LuaValue {
     }
 
     private static final ThreadLocal<ProbeKey> PROBE = ThreadLocal.withInitial(ProbeKey::new);
+
+    public static final LuaString EMPTY = new LuaString("", true);
+    /**
+     * Pre-allocated PUC memory-error message ({@code MEMERRMSG}). When the JVM
+     * heap is exhausted, building the error message must not allocate again or
+     * the second {@code OutOfMemoryError} escapes past {@code pcall}. PUC
+     * solves this with a pre-created message string; this is the same idea.
+     */
+    public static final LuaString MEMORY_ERROR = new LuaString("not enough memory");
+    private static final LuaString[] ASCII_CACHE = new LuaString[256];
+    static {
+        for (int i = 0; i < 256; i++) {
+            ASCII_CACHE[i] = new LuaString(String.valueOf((char) i), true);
+        }
+    }
+    private static final LuaString[] INT_STRING_CACHE = new LuaString[INT_CACHE_SIZE];
+    private static final LuaString MIN_LONG_STRING = new LuaString(Long.toString(Long.MIN_VALUE));
+    private static final byte[] DIGIT_TENS = new byte[100];
+    private static final byte[] DIGIT_ONES = new byte[100];
+    static {
+        for (int i = 0; i < 100; i++) {
+            DIGIT_TENS[i] = (byte) ('0' + (i / 10));
+            DIGIT_ONES[i] = (byte) ('0' + (i % 10));
+        }
+        for (int i = 0; i < INT_CACHE_SIZE; i++) {
+            INT_STRING_CACHE[i] = (i < 10) ? ASCII_CACHE['0' + i] : new LuaString(Integer.toString(i));
+        }
+    }
 
     private volatile String value;
     private volatile byte[] rawBytes;

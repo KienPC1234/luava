@@ -9,61 +9,72 @@ package org.luava.frontend.lexer;
 
 public enum TokenType {
     // Keywords
-    AND, BREAK, DO, ELSE, ELSEIF, END, FALSE, FOR, FUNCTION,
-    GOTO, IF, IN, LOCAL, NIL, NOT, OR, REPEAT, RETURN,
-    THEN, TRUE, UNTIL, WHILE,
+    AND("and"), BREAK("break"), DO("do"), ELSE("else"), ELSEIF("elseif"), END("end"),
+    FALSE("false"), FOR("for"), FUNCTION("function"), GOTO("goto"), IF("if"), IN("in"),
+    LOCAL("local"), NIL("nil"), NOT("not"), OR("or"), REPEAT("repeat"), RETURN("return"),
+    THEN("then"), TRUE("true"), UNTIL("until"), WHILE("while"),
 
     // Lua 5.4 Attributes
-    ATTR_CLOSE,  // <close>
-    ATTR_CONST,  // <const>
+    ATTR_CLOSE("<close>"),
+    ATTR_CONST("<const>"),
 
     // Literals
-    IDENTIFIER,
-    STRING_LITERAL,
-    INTEGER_LITERAL,
-    FLOAT_LITERAL,
+    IDENTIFIER(null),
+    STRING_LITERAL(null),
+    INTEGER_LITERAL(null),
+    FLOAT_LITERAL(null),
 
     // Arithmetic Operators
-    PLUS,       // +
-    MINUS,      // -
-    STAR,       // *
-    SLASH,      // /
-    DOUBLE_SLASH, // // (floor division)
-    CARET,      // ^ (exponentiation)
-    PERCENT,    // % (modulo)
+    PLUS("+"),
+    MINUS("-"),
+    STAR("*"),
+    SLASH("/"),
+    DOUBLE_SLASH("//"),
+    CARET("^"),
+    PERCENT("%"),
 
     // Bitwise Operators (Lua 5.3 / 5.4)
-    AMPERSAND,  // &
-    TILDE,      // ~ (bitwise NOT / XOR)
-    PIPE,       // |
-    SHL,        // <<
-    SHR,        // >>
+    AMPERSAND("&"),
+    TILDE("~"),
+    PIPE("|"),
+    SHL("<<"),
+    SHR(">>"),
 
     // Relational Operators
-    EQUAL_EQUAL, // ==
-    TILDE_EQUAL, // ~=
-    LESS,        // <
-    LESS_EQUAL,  // <=
-    GREATER,     // >
-    GREATER_EQUAL,// >=
+    EQUAL_EQUAL("=="),
+    TILDE_EQUAL("~="),
+    LESS("<"),
+    LESS_EQUAL("<="),
+    GREATER(">"),
+    GREATER_EQUAL(">="),
 
     // Other Operators & Delimiters
-    ASSIGN,      // =
-    HASH,        // # (length operator)
-    DOT_DOT,     // .. (concatenation)
-    DOT_DOT_DOT, // ... (vararg)
-    DOUBLE_COLON,// :: (labels)
-    SEMICOLON,   // ;
-    COMMA,       // ,
-    DOT,         // .
-    COLON,       // :
-    LPAREN,      // (
-    RPAREN,      // )
-    LBRACKET,    // [
-    RBRACKET,    // ]
-    LBRACE,      // {
-    RBRACE,      // }
+    ASSIGN("="),
+    HASH("#"),
+    DOT_DOT(".."),
+    DOT_DOT_DOT("..."),
+    DOUBLE_COLON("::"),
+    SEMICOLON(";"),
+    COMMA(","),
+    DOT("."),
+    COLON(":"),
+    LPAREN("("),
+    RPAREN(")"),
+    LBRACKET("["),
+    RBRACKET("]"),
+    LBRACE("{"),
+    RBRACE("}"),
 
-    INVALID,
-    EOF
+    INVALID(null),
+    EOF("");
+
+    private final String fixedLexeme;
+
+    TokenType(String fixedLexeme) {
+        this.fixedLexeme = fixedLexeme;
+    }
+
+    public String fixedLexeme() {
+        return fixedLexeme;
+    }
 }

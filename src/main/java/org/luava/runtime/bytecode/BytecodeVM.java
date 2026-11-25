@@ -3080,14 +3080,18 @@ public final class BytecodeVM {
         if (ctx.jitBackEdges == 0) {
             ctx.jitBackEdges = LuaState.JIT_LOOP_THRESHOLD;
         } else if (--ctx.jitBackEdges <= 0) {
+            boolean guarded = state.loopGuard != null;
+            LuaProto proto = ctx.proto;
+            boolean disabled = guarded ? proto.guardedJitDisabled : proto.jitDisabled;
+            if (disabled || !state.isJitEnabled()) {
+                ctx.jitBackEdges = 65536;
+                return;
+            }
             ctx.jitBackEdges = LuaState.JIT_LOOP_THRESHOLD;
-            if (state.isJitEnabled() && !jitBlockedByGuard(state) && !ctx.thread.hooksActive) {
-                boolean guarded = state.loopGuard != null;
-                LuaProto proto = ctx.proto;
+            if (!jitBlockedByGuard(state) && !ctx.thread.hooksActive) {
                 JitCode jc = guarded ? proto.guardedJitCode : proto.jitCode;
-                boolean disabled = guarded ? proto.guardedJitDisabled : proto.jitDisabled;
                 if (jc == null) {
-                    if (!disabled && !proto.loopCompileRequested) {
+                    if (!proto.loopCompileRequested) {
                         proto.loopCompileRequested = true;
                         try {
                             JitCompiler.requestCompile(proto, guarded);

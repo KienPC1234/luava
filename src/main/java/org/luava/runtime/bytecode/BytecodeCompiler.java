@@ -59,6 +59,47 @@ public final class BytecodeCompiler {
         return proto;
     }
 
+    /** Primitive growable {@code int} buffer avoiding Integer boxing in bytecode emission. */
+    private static final class IntVector {
+        private int[] data;
+        private int size;
+
+        IntVector(int initialCapacity) {
+            this.data = new int[initialCapacity];
+        }
+
+        void add(int value) {
+            if (size == data.length) {
+                data = Arrays.copyOf(data, data.length << 1);
+            }
+            data[size++] = value;
+        }
+
+        int get(int index) {
+            return data[index];
+        }
+
+        void set(int index, int value) {
+            data[index] = value;
+        }
+
+        int size() {
+            return size;
+        }
+
+        boolean isEmpty() {
+            return size == 0;
+        }
+
+        int last() {
+            return data[size - 1];
+        }
+
+        int[] toArray() {
+            return Arrays.copyOf(data, size);
+        }
+    }
+
     private static final class LocalVar {
         final String name;
         final int reg;
@@ -67,6 +108,8 @@ public final class BytecodeCompiler {
         int startPc;
         int endPc;
         int locVarIndex = -1;
+        int prevMinFreereg = 0;
+        LocalVar shadowed;
 
         LocalVar(String name, int reg, Statements.VariableAttribute attr) {
             this.name = name;
@@ -77,7 +120,7 @@ public final class BytecodeCompiler {
 
     private static final class LoopInfo {
         final int startPc;
-        final List<Integer> breakList = new ArrayList<>();
+        final IntVector breakList = new IntVector(4);
         final int baseLocals;
 
         LoopInfo(int startPc, int baseLocals) {
@@ -125,8 +168,8 @@ public final class BytecodeCompiler {
         final boolean isVararg;
         final int numParams;
 
-        final List<Integer> code = new ArrayList<>();
-        final List<Integer> lineInfo = new ArrayList<>();
+        final IntVector code = new IntVector(32);
+        final IntVector lineInfo = new IntVector(32);
         final List<LuaValue> constants = new ArrayList<>();
         final Map<LuaValue, Integer> constMap = new HashMap<>();
         final List<LuaProto> protos = new ArrayList<>();
@@ -134,11 +177,13 @@ public final class BytecodeCompiler {
         final Map<String, Integer> upvalMap = new HashMap<>();
 
         final List<LocalVar> locals = new ArrayList<>();
+        Map<String, LocalVar> activeLocals = null;
         final List<LuaProto.LocVarInfo> allLocVars = new ArrayList<>();
         final Deque<LoopInfo> loopStack = new ArrayDeque<>();
         final List<LabelDesc> labelList = new ArrayList<>();
         final List<GotoDesc> pendingGotos = new ArrayList<>();
         int freereg = 0;
+        int minFreeregWatermark = 0;
         int maxstacksize = 2;
         boolean hasTbc = false;
         int currentBlockFirstGoto = 0;
@@ -155,6 +200,20 @@ public final class BytecodeCompiler {
         LocalVar registerLocal(String name, int reg, Statements.VariableAttribute attr) {
             LocalVar lv = new LocalVar(name, reg, attr);
             lv.locVarIndex = allLocVars.size();
+            lv.prevMinFreereg = minFreeregWatermark;
+            if (reg + 1 > minFreeregWatermark) {
+                minFreeregWatermark = reg + 1;
+            }
+            if (activeLocals == null && locals.size() >= 8) {
+                activeLocals = new HashMap<>(32);
+                for (int i = 0; i < locals.size(); i++) {
+                    LocalVar existing = locals.get(i);
+                    existing.shadowed = activeLocals.put(existing.name, existing);
+                }
+            }
+            if (activeLocals != null) {
+                lv.shadowed = activeLocals.put(name, lv);
+            }
             locals.add(lv);
             allLocVars.add(new LuaProto.LocVarInfo(name, reg, code.size(), -1));
             return lv;
@@ -173,7 +232,7 @@ public final class BytecodeCompiler {
         int emit(int inst, int line) {
             int pc = code.size();
             code.add(inst);
-            lineInfo.add(line > 0 ? line : (lineInfo.isEmpty() ? 1 : lineInfo.get(lineInfo.size() - 1)));
+            lineInfo.add(line > 0 ? line : (lineInfo.isEmpty() ? 1 : lineInfo.last()));
             return pc;
         }
 
@@ -187,12 +246,14 @@ public final class BytecodeCompiler {
             code.set(jmpPc, Instruction.setsJ(inst, offset));
         }
 
-        private int minFreereg() {
-            int minReg = 0;
-            for (LocalVar lv : locals) {
-                if (lv.reg + 1 > minReg) minReg = lv.reg + 1;
+        void patchBreakList(LoopInfo loop, int targetPc) {
+            for (int i = 0; i < loop.breakList.size(); i++) {
+                patchJmp(loop.breakList.get(i), targetPc);
             }
-            return minReg;
+        }
+
+        private int minFreereg() {
+            return minFreeregWatermark;
         }
 
         int allocReg() {
@@ -261,6 +322,9 @@ public final class BytecodeCompiler {
         }
 
         LocalVar findLocal(String name) {
+            if (activeLocals != null) {
+                return activeLocals.get(name);
+            }
             for (int i = locals.size() - 1; i >= 0; i--) {
                 LocalVar v = locals.get(i);
                 if (v.name.equals(name)) {
@@ -353,6 +417,15 @@ public final class BytecodeCompiler {
             int curPc = code.size();
             while (locals.size() > baseLocals) {
                 LocalVar lv = locals.remove(locals.size() - 1);
+                minFreeregWatermark = lv.prevMinFreereg;
+                if (activeLocals != null) {
+                    if (lv.shadowed != null) {
+                        activeLocals.put(lv.name, lv.shadowed);
+                    } else {
+                        activeLocals.remove(lv.name);
+                    }
+                    lv.shadowed = null;
+                }
                 // Record variable exit pc so debug.getlocal only observes live variables in current scope
                 if (lv.locVarIndex >= 0 && lv.locVarIndex < allLocVars.size()) {
                     LuaProto.LocVarInfo old = allLocVars.get(lv.locVarIndex);
@@ -901,9 +974,7 @@ public final class BytecodeCompiler {
 
             int loopEnd = code.size();
             patchJmp(falseJmp, loopEnd);
-            for (int brk : loop.breakList) {
-                patchJmp(brk, loopEnd);
-            }
+            patchBreakList(loop, loopEnd);
             loopStack.pop();
         }
 
@@ -980,9 +1051,7 @@ public final class BytecodeCompiler {
             freeRegs(baseFreereg);
 
             int loopEnd = code.size();
-            for (int brk : loop.breakList) {
-                patchJmp(brk, loopEnd);
-            }
+            patchBreakList(loop, loopEnd);
             loopStack.pop();
         }
 
@@ -1030,9 +1099,7 @@ public final class BytecodeCompiler {
             code.set(loopPc, Instruction.encodeABx(OpCode.OP_FORLOOP, initReg, loopOffset));
 
             int loopEnd = code.size();
-            for (int brk : loop.breakList) {
-                patchJmp(brk, loopEnd);
-            }
+            patchBreakList(loop, loopEnd);
             loopStack.pop();
             closeLocalsTo(baseLocals, fns.endLine());
             freeRegs(baseFreereg);
@@ -1116,9 +1183,7 @@ public final class BytecodeCompiler {
             code.set(loopPc, Instruction.encodeABx(OpCode.OP_TFORLOOP, fReg, backOffset));
 
             int loopEnd = code.size();
-            for (int brk : loop.breakList) {
-                patchJmp(brk, loopEnd);
-            }
+            patchBreakList(loop, loopEnd);
             loopStack.pop();
             closeLocalsTo(baseLocals, fgs.endLine());
             freeRegs(baseFreereg);
@@ -1847,11 +1912,8 @@ public final class BytecodeCompiler {
         }
 
         LuaProto toProto() {
-            int[] codeArr = new int[code.size()];
-            for (int i = 0; i < code.size(); i++) codeArr[i] = code.get(i);
-
-            int[] lineArr = new int[lineInfo.size()];
-            for (int i = 0; i < lineInfo.size(); i++) lineArr[i] = lineInfo.get(i);
+            int[] codeArr = code.toArray();
+            int[] lineArr = lineInfo.toArray();
 
             LuaValue[] constArr = constants.toArray(new LuaValue[0]);
             LuaProto[] protoArr = protos.toArray(new LuaProto[0]);

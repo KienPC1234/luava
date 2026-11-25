@@ -29,19 +29,25 @@ public final class Parser {
 
     private static final class Scope {
         final Scope parent;
-        final Map<String, Boolean> locals = new HashMap<>();
+        Map<String, Boolean> locals;
 
         Scope(Scope parent) {
             this.parent = parent;
         }
 
         void define(String name, boolean isConst) {
+            if (locals == null) {
+                locals = new HashMap<>(4);
+            }
             locals.put(name, isConst);
         }
 
         Boolean find(String name) {
-            if (locals.containsKey(name)) {
-                return locals.get(name);
+            if (locals != null) {
+                Boolean val = locals.get(name);
+                if (val != null) {
+                    return val;
+                }
             }
             if (parent != null) {
                 return parent.find(name);
@@ -96,12 +102,12 @@ public final class Parser {
         final FunctionContext parent;
         final int lineDefined;
         final Scope outerScope;
-        final Set<String> upvalues = new LinkedHashSet<>();
-        final Set<String> funcLocals = new HashSet<>();
+        Set<String> upvalues;
+        final Set<String> funcLocals = new HashSet<>(8);
         int totalLocals = 0;
-        final List<String> activeVars = new ArrayList<>();
-        final List<LabelDef> labels = new ArrayList<>();
-        final List<GotoRef> gotos = new ArrayList<>();
+        final List<String> activeVars = new ArrayList<>(8);
+        List<LabelDef> labels;
+        List<GotoRef> gotos;
         BlockContext currentBlock = null;
         /**
          * Number of enclosing loops in this function. PUC rejects a
@@ -115,6 +121,36 @@ public final class Parser {
             this.parent = parent;
             this.lineDefined = lineDefined;
             this.outerScope = outerScope;
+        }
+
+        int labelCount() {
+            return labels == null ? 0 : labels.size();
+        }
+
+        int gotoCount() {
+            return gotos == null ? 0 : gotos.size();
+        }
+
+        List<LabelDef> ensureLabels() {
+            if (labels == null) {
+                labels = new ArrayList<>(4);
+            }
+            return labels;
+        }
+
+        List<GotoRef> ensureGotos() {
+            if (gotos == null) {
+                gotos = new ArrayList<>(4);
+            }
+            return gotos;
+        }
+
+        int addUpvalue(String name) {
+            if (upvalues == null) {
+                upvalues = new LinkedHashSet<>(4);
+            }
+            upvalues.add(name);
+            return upvalues.size();
         }
     }
 
@@ -185,8 +221,8 @@ public final class Parser {
             p = p.parent;
         }
         if (isLocalInAncestor) {
-            currentFuncCtx.upvalues.add(varName);
-            if (currentFuncCtx.upvalues.size() > 255) {
+            int count = currentFuncCtx.addUpvalue(varName);
+            if (count > 255) {
                 int line = currentFuncCtx.lineDefined > 0 ? currentFuncCtx.lineDefined : (token != null ? token.line() : 1);
                 throw new ParseException("too many upvalues (limit is 255) in function at line " + line + " near " + formatNear(token), token != null ? token.line() : 1, token != null ? token.column() : 0);
             }
@@ -228,8 +264,8 @@ public final class Parser {
         currentFuncCtx.currentBlock = new BlockContext(
             currentFuncCtx.currentBlock,
             currentFuncCtx.activeVars.size(),
-            currentFuncCtx.labels.size(),
-            currentFuncCtx.gotos.size(),
+            currentFuncCtx.labelCount(),
+            currentFuncCtx.gotoCount(),
             isLoop
         );
     }
@@ -244,16 +280,21 @@ public final class Parser {
             while (currentFuncCtx.activeVars.size() > bl.nactvar) {
                 currentFuncCtx.activeVars.remove(currentFuncCtx.activeVars.size() - 1);
             }
-            while (currentFuncCtx.labels.size() > bl.firstlabel) {
-                currentFuncCtx.labels.remove(currentFuncCtx.labels.size() - 1);
+            if (currentFuncCtx.labels != null) {
+                while (currentFuncCtx.labels.size() > bl.firstlabel) {
+                    currentFuncCtx.labels.remove(currentFuncCtx.labels.size() - 1);
+                }
             }
+            int gotoCount = currentFuncCtx.gotoCount();
             if (bl.parent != null) {
-                for (int i = bl.firstgoto; i < currentFuncCtx.gotos.size(); i++) {
-                    GotoRef g = currentFuncCtx.gotos.get(i);
-                    g.nactvar = bl.nactvar;
+                if (currentFuncCtx.gotos != null) {
+                    for (int i = bl.firstgoto; i < gotoCount; i++) {
+                        GotoRef g = currentFuncCtx.gotos.get(i);
+                        g.nactvar = bl.nactvar;
+                    }
                 }
             } else {
-                if (bl.firstgoto < currentFuncCtx.gotos.size()) {
+                if (bl.firstgoto < gotoCount) {
                     GotoRef g = currentFuncCtx.gotos.get(bl.firstgoto);
                     Token cur = peek();
                     throw new ParseException("no visible label '" + g.name + "' for <goto> at line " + g.line, cur.line(), cur.column());
@@ -338,14 +379,16 @@ public final class Parser {
                     Token labelToken = consume(TokenType.IDENTIFIER, "<name> expected");
                     String labelName = labelToken.lexeme();
                     LabelDef found = null;
-                    for (LabelDef l : currentFuncCtx.labels) {
-                        if (l.name.equals(labelName)) {
-                            found = l;
-                            break;
+                    if (currentFuncCtx.labels != null) {
+                        for (LabelDef l : currentFuncCtx.labels) {
+                            if (l.name.equals(labelName)) {
+                                found = l;
+                                break;
+                            }
                         }
                     }
                     if (found == null) {
-                        currentFuncCtx.gotos.add(new GotoRef(labelName, gotoToken.line(), gotoToken.column(), currentFuncCtx.activeVars.size()));
+                        currentFuncCtx.ensureGotos().add(new GotoRef(labelName, gotoToken.line(), gotoToken.column(), currentFuncCtx.activeVars.size()));
                     }
                     yield new Statements.GotoStmt(labelName, gotoToken.line(), gotoToken.column());
                 }
@@ -354,7 +397,8 @@ public final class Parser {
                     Token labelToken = consume(TokenType.IDENTIFIER, "<name> expected");
                     consume(TokenType.DOUBLE_COLON, "'::' expected");
                     String labelName = labelToken.lexeme();
-                    for (LabelDef existing : currentFuncCtx.labels) {
+                    List<LabelDef> lbls = currentFuncCtx.ensureLabels();
+                    for (LabelDef existing : lbls) {
                         if (existing.name.equals(labelName)) {
                             throw new ParseException("label '" + labelName + "' already defined on line " + existing.line, labelToken.line(), labelToken.column());
                         }
@@ -362,18 +406,20 @@ public final class Parser {
                     boolean isLast = isLastInBlock();
                     int labelNactvar = isLast ? (currentFuncCtx.currentBlock != null ? currentFuncCtx.currentBlock.nactvar : 0) : currentFuncCtx.activeVars.size();
                     LabelDef newLabel = new LabelDef(labelName, labelToken.line(), labelNactvar);
-                    currentFuncCtx.labels.add(newLabel);
-                    int firstgoto = currentFuncCtx.currentBlock != null ? currentFuncCtx.currentBlock.firstgoto : 0;
-                    for (int i = firstgoto; i < currentFuncCtx.gotos.size(); ) {
-                        GotoRef g = currentFuncCtx.gotos.get(i);
-                        if (g.name.equals(labelName)) {
-                            if (g.nactvar < newLabel.nactvar) {
-                                String varName = currentFuncCtx.activeVars.get(g.nactvar);
-                                throw new ParseException("<goto " + g.name + "> at line " + g.line + " jumps into the scope of local '" + varName + "'", g.line, g.column);
+                    lbls.add(newLabel);
+                    if (currentFuncCtx.gotos != null) {
+                        int firstgoto = currentFuncCtx.currentBlock != null ? currentFuncCtx.currentBlock.firstgoto : 0;
+                        for (int i = firstgoto; i < currentFuncCtx.gotos.size(); ) {
+                            GotoRef g = currentFuncCtx.gotos.get(i);
+                            if (g.name.equals(labelName)) {
+                                if (g.nactvar < newLabel.nactvar) {
+                                    String varName = currentFuncCtx.activeVars.get(g.nactvar);
+                                    throw new ParseException("<goto " + g.name + "> at line " + g.line + " jumps into the scope of local '" + varName + "'", g.line, g.column);
+                                }
+                                currentFuncCtx.gotos.remove(i);
+                            } else {
+                                i++;
                             }
-                            currentFuncCtx.gotos.remove(i);
-                        } else {
-                            i++;
                         }
                     }
                     yield new Statements.LabelStmt(labelName, dcol.line(), dcol.column());
@@ -657,12 +703,18 @@ public final class Parser {
 
     private Statement parseReturnStatement() {
         Token returnToken = advance();
-        List<Expression> values = new ArrayList<>();
-        if (!isBlockEnd() && peek().type() != TokenType.SEMICOLON) {
-            do {
-                values.add(parseExpression());
-            } while (match(TokenType.COMMA));
+        if (isBlockEnd() || peek().type() == TokenType.SEMICOLON) {
+            return new Statements.ReturnStmt(List.of(), returnToken.line(), returnToken.column());
         }
+        Expression first = parseExpression();
+        if (!match(TokenType.COMMA)) {
+            return new Statements.ReturnStmt(List.of(first), returnToken.line(), returnToken.column());
+        }
+        List<Expression> values = new ArrayList<>(4);
+        values.add(first);
+        do {
+            values.add(parseExpression());
+        } while (match(TokenType.COMMA));
         return new Statements.ReturnStmt(values, returnToken.line(), returnToken.column());
     }
 
@@ -678,18 +730,23 @@ public final class Parser {
             throw new ParseException("syntax error near " + formatNear(startToken), startToken.line(), startToken.column());
         }
 
-        List<Expression> targets = new ArrayList<>();
-        targets.add(expr);
-        while (match(TokenType.COMMA)) {
-            if (targets.size() >= 200) {
-                Token cur = peek();
-                throw new ParseException("C stack overflow", cur.line(), cur.column());
-            }
-            Expression nextExpr = parsePrefixExpression();
-            if (!(nextExpr instanceof Expressions.VariableExpr) && !(nextExpr instanceof Expressions.TableAccessExpr)) {
-                throw new ParseException("syntax error near " + formatNear(peek()), peek().line(), peek().column());
-            }
-            targets.add(nextExpr);
+        List<Expression> targets;
+        if (!match(TokenType.COMMA)) {
+            targets = List.of(expr);
+        } else {
+            targets = new ArrayList<>(4);
+            targets.add(expr);
+            do {
+                if (targets.size() >= 200) {
+                    Token cur = peek();
+                    throw new ParseException("C stack overflow", cur.line(), cur.column());
+                }
+                Expression nextExpr = parsePrefixExpression();
+                if (!(nextExpr instanceof Expressions.VariableExpr) && !(nextExpr instanceof Expressions.TableAccessExpr)) {
+                    throw new ParseException("syntax error near " + formatNear(peek()), peek().line(), peek().column());
+                }
+                targets.add(nextExpr);
+            } while (match(TokenType.COMMA));
         }
 
         if (!check(TokenType.ASSIGN)) {
@@ -697,20 +754,27 @@ public final class Parser {
         }
         consume(TokenType.ASSIGN, "'=' expected");
 
-        for (Expression target : targets) {
-            if (target instanceof Expressions.VariableExpr varExpr) {
+        for (int i = 0; i < targets.size(); i++) {
+            if (targets.get(i) instanceof Expressions.VariableExpr varExpr) {
                 checkNotConst(varExpr);
             }
         }
 
-        List<Expression> values = new ArrayList<>();
-        do {
-            if (values.size() >= 200) {
-                Token cur = peek();
-                throw new ParseException("C stack overflow", cur.line(), cur.column());
-            }
-            values.add(parseExpression());
-        } while (match(TokenType.COMMA));
+        Expression firstVal = parseExpression();
+        List<Expression> values;
+        if (!match(TokenType.COMMA)) {
+            values = List.of(firstVal);
+        } else {
+            values = new ArrayList<>(4);
+            values.add(firstVal);
+            do {
+                if (values.size() >= 200) {
+                    Token cur = peek();
+                    throw new ParseException("C stack overflow", cur.line(), cur.column());
+                }
+                values.add(parseExpression());
+            } while (match(TokenType.COMMA));
+        }
 
         return new Statements.AssignmentStmt(targets, values, startToken.line(), startToken.column());
     }
@@ -914,16 +978,17 @@ public final class Parser {
         try {
             if (match(TokenType.LPAREN)) {
                 Token lparen = previous();
-                List<Expression> args = new ArrayList<>();
-                if (!check(TokenType.RPAREN)) {
-                    do {
-                        if (args.size() >= 255) {
-                            Token cur = peek();
-                            throw new ParseException("function or expression needs too many registers near " + formatNear(cur), cur.line(), cur.column());
-                        }
-                        args.add(parseExpression());
-                    } while (match(TokenType.COMMA));
+                if (match(TokenType.RPAREN)) {
+                    return List.of();
                 }
+                List<Expression> args = new ArrayList<>(4);
+                do {
+                    if (args.size() >= 255) {
+                        Token cur = peek();
+                        throw new ParseException("function or expression needs too many registers near " + formatNear(cur), cur.line(), cur.column());
+                    }
+                    args.add(parseExpression());
+                } while (match(TokenType.COMMA));
                 checkMatch(TokenType.RPAREN, TokenType.LPAREN, lparen);
                 return args;
             } else if (peek().type() == TokenType.LBRACE) {
@@ -1006,7 +1071,10 @@ public final class Parser {
         enterNesting();
         try {
             Token braceToken = consume(TokenType.LBRACE, "'{' expected");
-            List<Expressions.TableField> fields = new ArrayList<>();
+            if (match(TokenType.RBRACE)) {
+                return new Expressions.TableConstructorExpr(List.of(), braceToken.line(), braceToken.column());
+            }
+            List<Expressions.TableField> fields = new ArrayList<>(4);
 
             while (!check(TokenType.RBRACE) && !isAtEnd()) {
                 if (match(TokenType.LBRACKET)) {
@@ -1061,6 +1129,62 @@ public final class Parser {
             } else {
                 throw new ParseException("<name> or '...' expected near " + formatNear(peek()), peek().line(), peek().column());
             }
+        }
+        return false;
+    }
+
+    private boolean match(TokenType t1) {
+        if (check(t1)) {
+            advance();
+            return true;
+        }
+        return false;
+    }
+
+    private boolean match(TokenType t1, TokenType t2) {
+        if (isAtEnd()) {
+            return false;
+        }
+        TokenType cur = peek().type();
+        if (cur == t1 || cur == t2) {
+            advance();
+            return true;
+        }
+        return false;
+    }
+
+    private boolean match(TokenType t1, TokenType t2, TokenType t3) {
+        if (isAtEnd()) {
+            return false;
+        }
+        TokenType cur = peek().type();
+        if (cur == t1 || cur == t2 || cur == t3) {
+            advance();
+            return true;
+        }
+        return false;
+    }
+
+    private boolean match(TokenType t1, TokenType t2, TokenType t3, TokenType t4) {
+        if (isAtEnd()) {
+            return false;
+        }
+        TokenType cur = peek().type();
+        if (cur == t1 || cur == t2 || cur == t3 || cur == t4) {
+            advance();
+            return true;
+        }
+        return false;
+    }
+
+    private boolean match(TokenType t1, TokenType t2, TokenType t3, TokenType t4, TokenType t5, TokenType t6) {
+        if (isAtEnd()) {
+            return false;
+        }
+        TokenType cur = peek().type();
+        if (cur == t1 || cur == t2 || cur == t3 || cur == t4 || cur == t5 || cur == t6) {
+            advance();
+            return true;
         }
         return false;
     }
@@ -1121,8 +1245,8 @@ public final class Parser {
         if (token == null || token.type() == TokenType.EOF) {
             return "<eof>";
         }
+        String lex = token.lexeme();
         if (token.type() == TokenType.INVALID) {
-            String lex = token.lexeme();
             if (lex != null && !lex.isEmpty()) {
                 int c = lex.charAt(0) & 0xFF;
                 if (c < 32 || c >= 127) {
@@ -1130,21 +1254,27 @@ public final class Parser {
                 }
             }
         }
-        String lex = token.lexeme();
+        if (token.type() == TokenType.STRING_LITERAL) {
+            if (lex != null && lex.startsWith("[[")) {
+                return "'" + lex + "'";
+            } else {
+                return "''" + token.literal() + "''";
+            }
+        }
         if (lex == null || lex.isEmpty()) {
+            if (token.literal() != null) {
+                return "'" + token.literal() + "'";
+            }
+            String fixed = token.type().fixedLexeme();
+            if (fixed != null && !fixed.isEmpty()) {
+                return "'" + fixed + "'";
+            }
             return "<eof>";
         }
         if (lex.length() == 1) {
             int c = lex.charAt(0) & 0xFF;
             if (c < 32 || c >= 127) {
                 return "'<\\" + c + ">'";
-            }
-        }
-        if (token.type() == TokenType.STRING_LITERAL) {
-            if (lex.startsWith("[[")) {
-                return "'" + lex + "'";
-            } else {
-                return "''" + token.literal() + "''";
             }
         }
         return "'" + lex + "'";

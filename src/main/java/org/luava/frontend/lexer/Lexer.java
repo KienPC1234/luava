@@ -8,39 +8,11 @@
 package org.luava.frontend.lexer;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import org.luava.frontend.parser.ParseException;
 import org.luava.runtime.LuaValue;
 
 public final class Lexer {
-    private static final Map<String, TokenType> KEYWORDS = new HashMap<>();
-
-    static {
-        KEYWORDS.put("and", TokenType.AND);
-        KEYWORDS.put("break", TokenType.BREAK);
-        KEYWORDS.put("do", TokenType.DO);
-        KEYWORDS.put("else", TokenType.ELSE);
-        KEYWORDS.put("elseif", TokenType.ELSEIF);
-        KEYWORDS.put("end", TokenType.END);
-        KEYWORDS.put("false", TokenType.FALSE);
-        KEYWORDS.put("for", TokenType.FOR);
-        KEYWORDS.put("function", TokenType.FUNCTION);
-        KEYWORDS.put("goto", TokenType.GOTO);
-        KEYWORDS.put("if", TokenType.IF);
-        KEYWORDS.put("in", TokenType.IN);
-        KEYWORDS.put("local", TokenType.LOCAL);
-        KEYWORDS.put("nil", TokenType.NIL);
-        KEYWORDS.put("not", TokenType.NOT);
-        KEYWORDS.put("or", TokenType.OR);
-        KEYWORDS.put("repeat", TokenType.REPEAT);
-        KEYWORDS.put("return", TokenType.RETURN);
-        KEYWORDS.put("then", TokenType.THEN);
-        KEYWORDS.put("true", TokenType.TRUE);
-        KEYWORDS.put("until", TokenType.UNTIL);
-        KEYWORDS.put("while", TokenType.WHILE);
-    }
 
     private final String source;
     private final int length;
@@ -61,7 +33,7 @@ public final class Lexer {
     }
 
     public List<Token> scanTokens() {
-        List<Token> tokens = new ArrayList<>();
+        List<Token> tokens = new ArrayList<>(Math.max(16, length >>> 2));
         if (current == 0 && !isAtEnd() && peek() == '\uFEFF') {
             advance();
         }
@@ -351,34 +323,46 @@ public final class Lexer {
         }
     }
 
-    private int readHexDigit(StringBuilder tokenBuff) {
+    private int readHexDigit() {
         if (isAtEnd()) {
-            throw new ParseException("hexadecimal digit expected near '" + tokenBuff + "'", line, getColumn());
+            throw new ParseException("hexadecimal digit expected near '" + errorSnippet() + "'", line, getColumn());
         }
         char c = advance();
-        tokenBuff.append(c);
         if (!isHexDigit(c)) {
-            throw new ParseException("hexadecimal digit expected near '" + tokenBuff + "'", line, getColumn());
+            throw new ParseException("hexadecimal digit expected near '" + errorSnippet() + "'", line, getColumn());
         }
         return Character.digit(c, 16);
     }
 
+    private String errorSnippet() {
+        return source.substring(start, Math.min(current, length));
+    }
+
     private Token scanShortString(char quote) {
-        StringBuilder sb = new StringBuilder();
-        StringBuilder tokenBuff = new StringBuilder();
-        tokenBuff.append(quote);
-        while (!isAtEnd() && peek() != quote) {
-            if (peek() == '\n' || peek() == '\r') {
-                throw new ParseException("unfinished string near '" + tokenBuff + "'", line, getColumn());
+        int contentStart = current;
+        StringBuilder sb = null;
+        while (!isAtEnd()) {
+            char p = peek();
+            if (p == quote) {
+                advance();
+                String value = (sb == null)
+                        ? source.substring(contentStart, current - 1)
+                        : sb.toString();
+                return new Token(TokenType.STRING_LITERAL, null, value, line, getColumn());
+            }
+            if (p == '\n' || p == '\r') {
+                throw new ParseException("unfinished string near '" + errorSnippet() + "'", line, getColumn());
             }
             char c = advance();
-            tokenBuff.append(c);
             if (c == '\\') {
+                if (sb == null) {
+                    sb = new StringBuilder(Math.max(16, (current - contentStart) + 8));
+                    sb.append(source, contentStart, current - 1);
+                }
                 if (isAtEnd()) {
                     throw new ParseException("unfinished string near <eof>", line, getColumn());
                 }
                 char esc = advance();
-                tokenBuff.append(esc);
                 switch (esc) {
                     case 'a' -> sb.append('\u0007');
                     case 'b' -> sb.append('\b');
@@ -393,7 +377,6 @@ public final class Lexer {
                     case '\n' -> {
                         if (peek() == '\r') {
                             advance();
-                            tokenBuff.append('\r');
                         }
                         line++;
                         lineStartOffset = current;
@@ -402,7 +385,6 @@ public final class Lexer {
                     case '\r' -> {
                         if (peek() == '\n') {
                             advance();
-                            tokenBuff.append('\n');
                         }
                         line++;
                         lineStartOffset = current;
@@ -411,18 +393,15 @@ public final class Lexer {
                     case 'z' -> {
                         while (!isAtEnd() && isLuaWhitespace(peek())) {
                             char ws = advance();
-                            tokenBuff.append(ws);
                             if (ws == '\r') {
                                 if (peek() == '\n') {
                                     advance();
-                                    tokenBuff.append('\n');
                                 }
                                 line++;
                                 lineStartOffset = current;
                             } else if (ws == '\n') {
                                 if (peek() == '\r') {
                                     advance();
-                                    tokenBuff.append('\r');
                                 }
                                 line++;
                                 lineStartOffset = current;
@@ -430,35 +409,34 @@ public final class Lexer {
                         }
                     }
                     case 'x' -> {
-                        int h1 = readHexDigit(tokenBuff);
-                        int h2 = readHexDigit(tokenBuff);
+                        int h1 = readHexDigit();
+                        int h2 = readHexDigit();
                         sb.append((char) ((h1 << 4) | h2));
                     }
                     case 'u' -> {
                         if (isAtEnd() || peek() != '{') {
                             if (!isAtEnd()) {
-                                tokenBuff.append(advance());
+                                advance();
                             }
-                            throw new ParseException("missing '{' near '" + tokenBuff + "'", line, getColumn());
+                            throw new ParseException("missing '{' near '" + errorSnippet() + "'", line, getColumn());
                         }
-                        tokenBuff.append(advance()); // consume '{'
-                        int firstHex = readHexDigit(tokenBuff);
+                        advance(); // consume '{'
+                        int firstHex = readHexDigit();
                         long r = firstHex;
                         while (!isAtEnd() && isHexDigit(peek())) {
                             char nextHex = advance();
-                            tokenBuff.append(nextHex);
                             if (r > (0x7FFFFFFFL >> 4)) {
-                                throw new ParseException("UTF-8 value too large near '" + tokenBuff + "'", line, getColumn());
+                                throw new ParseException("UTF-8 value too large near '" + errorSnippet() + "'", line, getColumn());
                             }
                             r = (r << 4) | Character.digit(nextHex, 16);
                         }
                         if (isAtEnd() || peek() != '}') {
                             if (!isAtEnd()) {
-                                tokenBuff.append(advance());
+                                advance();
                             }
-                            throw new ParseException("missing '}' near '" + tokenBuff + "'", line, getColumn());
+                            throw new ParseException("missing '}' near '" + errorSnippet() + "'", line, getColumn());
                         }
-                        tokenBuff.append(advance()); // consume '}'
+                        advance(); // consume '}'
                         appendUtf8(sb, r);
                     }
                     default -> {
@@ -467,51 +445,54 @@ public final class Lexer {
                             int count = 1;
                             while (count < 3 && !isAtEnd() && isDigit(peek())) {
                                 char d = advance();
-                                tokenBuff.append(d);
                                 r = r * 10 + (d - '0');
                                 count++;
                             }
                             if (r > 255) {
                                 if (!isAtEnd()) {
-                                    tokenBuff.append(advance());
+                                    advance();
                                 }
-                                throw new ParseException("decimal escape too large near '" + tokenBuff + "'", line, getColumn());
+                                throw new ParseException("decimal escape too large near '" + errorSnippet() + "'", line, getColumn());
                             }
                             sb.append((char) r);
                         } else {
-                            throw new ParseException("invalid escape sequence near '" + tokenBuff + "'", line, getColumn());
+                            throw new ParseException("invalid escape sequence near '" + errorSnippet() + "'", line, getColumn());
                         }
                     }
                 }
-            } else {
+            } else if (sb != null) {
                 sb.append(c);
             }
         }
-        if (isAtEnd()) {
-            throw new ParseException("unfinished string near <eof>", line, getColumn());
-        }
-        advance(); // consume closing quote
-        return makeToken(TokenType.STRING_LITERAL, sb.toString());
+        throw new ParseException("unfinished string near <eof>", line, getColumn());
     }
 
     private Token scanNumber(boolean startedWithDot) {
-        String expo = "Ee";
+        char expoLower = 'e';
+        char expoUpper = 'E';
+        boolean simpleDecimalInt = !startedWithDot;
         char first = source.charAt(start);
         if (startedWithDot) {
             advance(); // consume the first digit after dot
         } else if (first == '0' && (peek() == 'x' || peek() == 'X')) {
-            expo = "Pp";
+            expoLower = 'p';
+            expoUpper = 'P';
+            simpleDecimalInt = false;
             advance(); // consume 'x' / 'X'
         }
 
         while (!isAtEnd()) {
             char p = peek();
-            if (p == expo.charAt(0) || p == expo.charAt(1)) {
+            if (p == expoLower || p == expoUpper) {
+                simpleDecimalInt = false;
                 advance();
                 if (!isAtEnd() && (peek() == '+' || peek() == '-')) {
                     advance();
                 }
+            } else if (isDigit(p)) {
+                advance();
             } else if (isHexDigit(p) || p == '.') {
+                simpleDecimalInt = false;
                 advance();
             } else {
                 break;
@@ -519,19 +500,29 @@ public final class Lexer {
         }
 
         if (!isAtEnd() && isAlphaOrUnderscore(peek())) {
+            simpleDecimalInt = false;
             advance(); // force an error
         }
 
+        if (simpleDecimalInt && (current - start) <= 18
+                && (current - start == 1 || source.charAt(start) != '0')) {
+            long val = 0;
+            for (int i = start; i < current; i++) {
+                val = val * 10 + (source.charAt(i) - '0');
+            }
+            return new Token(TokenType.INTEGER_LITERAL, null, val, line, getColumn());
+        }
+
         String raw = source.substring(start, current);
-        LuaValue num = LuaValue.parseNumber(raw);
+        LuaValue num = LuaValue.parseNumber(raw, 0, raw.length());
         if (num == null) {
             throw new ParseException("malformed number near '" + raw + "'", line, getColumn());
         }
 
         if (num.isInteger()) {
-            return makeToken(TokenType.INTEGER_LITERAL, num.toLong());
+            return new Token(TokenType.INTEGER_LITERAL, raw, num.toLong(), line, getColumn());
         } else {
-            return makeToken(TokenType.FLOAT_LITERAL, num.toDouble());
+            return new Token(TokenType.FLOAT_LITERAL, raw, num.toDouble(), line, getColumn());
         }
     }
 
@@ -539,9 +530,58 @@ public final class Lexer {
         while (isAlphaNumeric(peek())) {
             advance();
         }
+        TokenType kw = matchKeyword(start, current);
+        if (kw != null) {
+            return new Token(kw, kw.fixedLexeme(), null, line, getColumn());
+        }
         String text = source.substring(start, current);
-        TokenType type = KEYWORDS.getOrDefault(text, TokenType.IDENTIFIER);
-        return makeToken(type, text);
+        return new Token(TokenType.IDENTIFIER, text, text, line, getColumn());
+    }
+
+    private TokenType matchKeyword(int s, int e) {
+        int len = e - s;
+        return switch (len) {
+            case 2 -> {
+                char c0 = source.charAt(s);
+                char c1 = source.charAt(s + 1);
+                if (c0 == 'd' && c1 == 'o') yield TokenType.DO;
+                if (c0 == 'i' && c1 == 'f') yield TokenType.IF;
+                if (c0 == 'i' && c1 == 'n') yield TokenType.IN;
+                if (c0 == 'o' && c1 == 'r') yield TokenType.OR;
+                yield null;
+            }
+            case 3 -> {
+                if (source.regionMatches(s, "end", 0, 3)) yield TokenType.END;
+                if (source.regionMatches(s, "and", 0, 3)) yield TokenType.AND;
+                if (source.regionMatches(s, "for", 0, 3)) yield TokenType.FOR;
+                if (source.regionMatches(s, "nil", 0, 3)) yield TokenType.NIL;
+                if (source.regionMatches(s, "not", 0, 3)) yield TokenType.NOT;
+                yield null;
+            }
+            case 4 -> {
+                if (source.regionMatches(s, "then", 0, 4)) yield TokenType.THEN;
+                if (source.regionMatches(s, "else", 0, 4)) yield TokenType.ELSE;
+                if (source.regionMatches(s, "true", 0, 4)) yield TokenType.TRUE;
+                if (source.regionMatches(s, "goto", 0, 4)) yield TokenType.GOTO;
+                yield null;
+            }
+            case 5 -> {
+                if (source.regionMatches(s, "local", 0, 5)) yield TokenType.LOCAL;
+                if (source.regionMatches(s, "false", 0, 5)) yield TokenType.FALSE;
+                if (source.regionMatches(s, "until", 0, 5)) yield TokenType.UNTIL;
+                if (source.regionMatches(s, "while", 0, 5)) yield TokenType.WHILE;
+                if (source.regionMatches(s, "break", 0, 5)) yield TokenType.BREAK;
+                yield null;
+            }
+            case 6 -> {
+                if (source.regionMatches(s, "return", 0, 6)) yield TokenType.RETURN;
+                if (source.regionMatches(s, "elseif", 0, 6)) yield TokenType.ELSEIF;
+                if (source.regionMatches(s, "repeat", 0, 6)) yield TokenType.REPEAT;
+                yield null;
+            }
+            case 8 -> source.regionMatches(s, "function", 0, 8) ? TokenType.FUNCTION : null;
+            default -> null;
+        };
     }
 
     private boolean match(char expected) {
@@ -599,11 +639,18 @@ public final class Lexer {
     }
 
     private Token makeToken(TokenType type) {
-        return makeToken(type, null);
+        String lexeme = type.fixedLexeme();
+        if (lexeme == null) {
+            lexeme = source.substring(start, current);
+        }
+        return new Token(type, lexeme, null, line, getColumn());
     }
 
     private Token makeToken(TokenType type, Object literal) {
-        String lexeme = source.substring(start, current);
+        String lexeme = type.fixedLexeme();
+        if (lexeme == null) {
+            lexeme = source.substring(start, current);
+        }
         return new Token(type, lexeme, literal, line, getColumn());
     }
 

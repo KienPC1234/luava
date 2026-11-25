@@ -184,6 +184,10 @@ public final class GCManager {
             if (collecting) {
                 return;
             }
+            if (memCap <= 0 && weakTables.isEmpty() && finalizers.isEmpty() && largeStrings.isEmpty()) {
+                uncollectedBytes = 0;
+                return;
+            }
             uncollectedBytes = 0;
             collectInternal();
             if (memCap > 0 && (liveRetainedBytes > memCap || pendingAllocBytes > (memCap - liveRetainedBytes))) {
