@@ -160,6 +160,9 @@ public final class BaseLib {
      * interpreter instead.
      */
     public static LuaValue setmetatableCore(LuaTable t, LuaValue mt) {
+        if (mt instanceof LuaTable fastMt && t.trySetPlainMetatable(fastMt)) {
+            return t;
+        }
         LuaTable oldMt = t.getMetatable();
         if (oldMt != null) {
             LuaValue protectedVal = oldMt.rawget(LuaValue.Meta.METATABLE);

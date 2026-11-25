@@ -16,6 +16,12 @@ import java.util.Map;
 import org.luava.runtime.bytecode.BytecodeVM;
 
 public final class LuaTable extends LuaValue {
+    private static final byte FLAG_ALL_CANONICAL = 1;
+    private static final byte FLAG_LAZY_PENDING = 2;
+    private static final byte FLAG_WEAK_KEYS = 4;
+    private static final byte FLAG_WEAK_VALUES = 8;
+    private static final byte FLAG_MAY_HAVE_GC_OR_MODE = 16;
+
     // Unboxed array storage: arrT holds BytecodeVM.TYPE_* (TYPE_NIL == 0, so
     // fresh byte[] slots are nil without an init loop); arrO is allocated
     // lazily only when a non-primitive object is written to the array.
@@ -23,65 +29,137 @@ public final class LuaTable extends LuaValue {
     private byte[] arrT;
     private LuaValue[] arrO;
     private int arrLen;
+    private int modCount;
 
-    // Lazy hash storage: stays null for pure arrays and empty tables.
-    // Tables with up to 4 non-weak string hash entries (e.g. OOP objects like
-    // {x = x, y = y}) store them unboxed in SmallFields, spilling to hashPart on
-    // a 5th key, a non-string hash key, or weak mode.
-    private static final class SmallFields {
-        LuaString k0, k1, k2, k3;
-        long p0, p1, p2, p3;
-        byte t0, t1, t2, t3;
-        LuaValue o0, o1, o2, o3;
+    // Inline unboxed storage for the first 2 non-weak string-keyed fields
+    // directly on LuaTable (zero auxiliary object allocation for 0..2 field
+    // records such as {x = x, y = y}). Keys 3..4 spill to OverflowFields in
+    // hashOrOverflow, and 5+ keys or non-string/weak entries spill to HashMap.
+    private long hashKeyBloom;
+    private long p0;
+    private long p1;
+    private byte flags = FLAG_ALL_CANONICAL;
+    private byte inlineSize;
+    private byte t0;
+    private byte t1;
+    private LuaString k0;
+    private LuaString k1;
+    private LuaValue o0;
+    private LuaValue o1;
+    private LuaTable metatable;
+    private Object hashOrOverflow;
+    private TableAux aux;
+
+    private static final class OverflowFields {
+        LuaString k2;
+        LuaString k3;
+        long p2;
+        long p3;
+        byte t2;
+        byte t3;
+        LuaValue o2;
+        LuaValue o3;
         int size;
-        boolean allCanonical = true;
     }
 
-    private SmallFields smallFields;
-    private HashMap<LuaValue, LuaValue> hashPart;
-    private long hashKeyBloom;
-    private LuaTable metatable;
-    // Cold-start hook: installed only on standard-library placeholder tables
-    // (null for every ordinary table). Plain tables pay one predictable
-    // null-check; the class stays final so JIT devirtualization is intact.
-    //
-    // Plain (non-volatile) by design: every other field here (arrayPart,
-    // hashPart, metatable, modCount) is already plain, so the table is
-    // thread-confined like the rest of the engine — the volatile bought
-    // nothing. The synchronized fill-once below preserves exactly-once
-    // filling; fillers are idempotent stdlib initializers, so even a stale
-    // re-entry is harmless.
-    private Runnable lazyFiller;
+    private record IndexHop(LuaTable mt, long mtVersion, LuaValue handler) {}
+
+    private static final class TableAux {
+        Runnable lazyFiller;
+        IndexHop indexHop;
+        Iterator<Map.Entry<LuaValue, LuaValue>> nextIterator;
+        LuaValue lastReturnedKey;
+        int rehashThreshold = 64;
+    }
+
+    private TableAux ensureAux() {
+        TableAux a = this.aux;
+        if (a == null) {
+            a = new TableAux();
+            this.aux = a;
+        }
+        return a;
+    }
+
+    private void bumpModCount() {
+        int next = this.modCount + 1;
+        this.modCount = (next >= 0) ? next : 1;
+    }
+
+    private void clearTraversalCache() {
+        TableAux a = this.aux;
+        if (a != null) {
+            a.lastReturnedKey = null;
+            a.nextIterator = null;
+        }
+    }
 
     public void setLazyFiller(Runnable filler) {
-        this.lazyFiller = filler;
+        if (filler != null) {
+            ensureAux().lazyFiller = filler;
+            this.flags |= FLAG_LAZY_PENDING;
+        } else {
+            if (this.aux != null) {
+                this.aux.lazyFiller = null;
+            }
+            this.flags &= ~FLAG_LAZY_PENDING;
+        }
     }
 
     boolean isLazyPending() {
-        return lazyFiller != null;
+        return (this.flags & FLAG_LAZY_PENDING) != 0;
     }
 
     void ensureFilled() {
-        if (lazyFiller != null) {
+        if ((this.flags & FLAG_LAZY_PENDING) != 0) {
             ensureFilledSlow();
         }
     }
 
     private void ensureFilledSlow() {
-        Runnable f = lazyFiller;
-        if (f != null) {
+        TableAux a = this.aux;
+        if (a != null && a.lazyFiller != null) {
             synchronized (this) {
-                f = lazyFiller;
+                Runnable f = a.lazyFiller;
                 if (f != null) {
-                    lazyFiller = null;
+                    a.lazyFiller = null;
+                    this.flags &= ~FLAG_LAZY_PENDING;
                     f.run();
+                } else {
+                    this.flags &= ~FLAG_LAZY_PENDING;
                 }
             }
+        } else {
+            this.flags &= ~FLAG_LAZY_PENDING;
         }
     }
 
     public LuaTable() {
         org.luava.runtime.eval.GCManager.onAlloc();
+    }
+
+    private LuaTable(LuaState ownerState) {
+        if (ownerState != null) {
+            ownerState.gcState.onAlloc(100);
+        } else {
+            org.luava.runtime.eval.GCManager.onAlloc(100);
+        }
+    }
+
+    /** Fast factory for empty or small-record (`arrayCapacity == 0 && hashCapacity <= 4`) constructors. */
+    public static LuaTable allocSmall(org.luava.runtime.bytecode.LuaClosure cl) {
+        return new LuaTable(cl != null ? cl.getState() : null);
+    }
+
+    /** State-aware empty/small table factory avoiding ThreadLocal lookup in BytecodeVM. */
+    public static LuaTable allocState(LuaState ownerState) {
+        return new LuaTable(ownerState);
+    }
+
+    /** State-aware constructor avoiding ThreadLocal lookup during VM/JIT `OP_NEWTABLE`. */
+    public static LuaTable allocClosure(
+            org.luava.runtime.bytecode.LuaClosure cl, int arrayCapacity, int hashCapacity) {
+        return new LuaTable(arrayCapacity, hashCapacity, cl != null ? cl.getState() : null);
     }
 
     /**
@@ -92,11 +170,19 @@ public final class LuaTable extends LuaValue {
      * therefore where {@code table.insert} puts a new element.
      */
     public LuaTable(int arrayCapacity, int hashCapacity) {
+        this(arrayCapacity, hashCapacity, null);
+    }
+
+    public LuaTable(int arrayCapacity, int hashCapacity, LuaState ownerState) {
         if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
             long preBytes = (arrayCapacity > 0 ? (long) arrayCapacity * 9L : 0L)
                     + (hashCapacity > 0 ? (long) hashCapacity * 64L : 0L);
             if (preBytes > 0) {
-                org.luava.runtime.eval.GCManager.preAllocCheck(preBytes);
+                if (ownerState != null) {
+                    ownerState.gcState.preAllocCheck(preBytes);
+                } else {
+                    org.luava.runtime.eval.GCManager.preAllocCheck(preBytes);
+                }
             }
         }
         if (arrayCapacity > 0) {
@@ -105,9 +191,13 @@ public final class LuaTable extends LuaValue {
             this.arrLen = arrayCapacity;
         }
         if (hashCapacity > 4) {
-            this.hashPart = new HashMap<>(Math.max(16, (hashCapacity * 4) / 3 + 1));
+            this.hashOrOverflow = new HashMap<LuaValue, LuaValue>(Math.max(16, (hashCapacity * 4) / 3 + 1));
         }
-        org.luava.runtime.eval.GCManager.onAlloc();
+        if (ownerState != null) {
+            ownerState.gcState.onAlloc(100);
+        } else {
+            org.luava.runtime.eval.GCManager.onAlloc(100);
+        }
     }
 
     @Override
@@ -120,72 +210,100 @@ public final class LuaTable extends LuaValue {
         return true;
     }
 
-    private boolean weakKeys = false;
-    private boolean weakValues = false;
-    private int weakQueryCount = 0;
-    /**
-     * Read-version counter bumped by every mutation that can change read
-     * results ({@code set}/{@code rawset}/{@code rawsetInt}/
-     * {@code setMetatable}). Powers the VM's {@code OP_GETTABUP} site cache:
-     * {@link #readVersion()} returns -1 while a metatable could affect reads
-     * (uncacheable), otherwise the counter, so any store through any path
-     * invalidates cached lookups.
-     */
-    private long modCount = 0;
-
-    /**
-     * Cached first {@code __index} hop for metatable-backed reads, so a
-     * {@code self.x} / {@code obj:m()} miss costs one hash probe instead of
-     * two (the field, then the metatable's {@code __index} slot).
-     *
-     * <p>Guarded by the metatable's identity and {@link #readVersion()}, so
-     * {@code Mt.__index = other} or any string-keyed write to {@code Mt}
-     * misses. Integer-keyed writes do not bump {@code modCount}, which is
-     * sound here because {@code __index} is always a string key. A metatable
-     * that itself has a metatable reports -1 and is never cached.
-     *
-     * <p>Invalidated on this table's own {@code modCount++}, so
-     * {@code setmetatable} cannot leave a stale hop behind. The interpreter,
-     * the JIT and every library read go through {@link #get}, so one cache
-     * covers all three.
-     *
-     * <p>The triple lives in one immutable object rather than three fields:
-     * the table is documented thread-confined, but {@code lazyFiller} is
-     * filled under {@code synchronized (this)}, and unlike a redundant (and
-     * idempotent) re-fill, observing a mismatched pair would hand back the
-     * wrong {@code __index} instead of merely recomputing it.
-     */
-    private record IndexHop(LuaTable mt, long mtVersion, LuaValue handler) {}
-
-    private transient IndexHop indexHop;
-
     /** VM site-cache guard; public for the bytecode package. */
     public long readVersion() {
         return metatable == null ? modCount : -1L;
     }
 
+    public int currentModCount() {
+        return modCount;
+    }
+
+    public boolean fastVersionMatch(int expectedModCount) {
+        return metatable == null
+                && (flags & (FLAG_LAZY_PENDING | FLAG_WEAK_VALUES)) == 0
+                && modCount == expectedModCount;
+    }
+
     /**
-     * The metatable's {@code __index}, memoized per (metatable, its version).
-     * Semantically identical to {@code mt.rawget(Meta.INDEX)} on a miss.
+     * Pre-allocates backing array storage for an unguarded sequential 1-based
+     * fill loop without altering {@link #arrLen} (so Lua length/iteration
+     * semantics remain identical at every step).
      */
+    public void reserveSequentialCapacity(long curIdx, long rem, long step) {
+        if (step == 1L
+                && curIdx >= 1L
+                && rem >= 16L
+                && curIdx == (long) this.arrLen + 1L
+                && (this.flags & (FLAG_LAZY_PENDING | FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) == 0
+                && !org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
+            long end = curIdx + rem;
+            if (end > curIdx && end <= 2_097_152L) {
+                int targetCap = (int) end;
+                if (arrT == null) {
+                    arrP = new long[targetCap];
+                    arrT = new byte[targetCap];
+                } else if (targetCap > arrT.length) {
+                    arrP = Arrays.copyOf(arrP, targetCap);
+                    arrT = Arrays.copyOf(arrT, targetCap);
+                    if (arrO != null) {
+                        arrO = Arrays.copyOf(arrO, targetCap);
+                    }
+                }
+            }
+        }
+    }
+
+    public int plainIntArrayLen() {
+        return ((flags & (FLAG_LAZY_PENDING | FLAG_WEAK_VALUES)) == 0) ? arrLen : 0;
+    }
+
+    public byte[] rawArrT() {
+        return arrT;
+    }
+
+    public long[] rawArrP() {
+        return arrP;
+    }
+
+    /**
+     * Fast metatable assignment when this table has no existing metatable and
+     * {@code mt} is known to carry neither {@code __gc} nor {@code __mode}.
+     */
+    public boolean trySetPlainMetatable(LuaTable mt) {
+        if (this.metatable == null
+                && (this.flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) == 0
+                && (mt.flags & (FLAG_LAZY_PENDING | FLAG_MAY_HAVE_GC_OR_MODE)) == 0) {
+            this.metatable = mt;
+            bumpModCount();
+            return true;
+        }
+        return false;
+    }
+
     private LuaValue cachedIndexHandler(LuaTable mt) {
         long mtVersion = mt.readVersion();
-        IndexHop hop = indexHop;
+        TableAux a = this.aux;
+        IndexHop hop = (a != null) ? a.indexHop : null;
         if (hop != null && hop.mt == mt && hop.mtVersion == mtVersion) {
             return hop.handler;
         }
         LuaValue handler = mt.rawget(LuaValue.Meta.INDEX);
         if (mtVersion != -1L) {
-            indexHop = new IndexHop(mt, mtVersion, handler);
+            ensureAux().indexHop = new IndexHop(mt, mtVersion, handler);
         }
         return handler;
     }
-    private transient Iterator<Map.Entry<LuaValue, LuaValue>> nextIterator = null;
-    private transient LuaValue lastReturnedKey = null;
+
+    @SuppressWarnings("unchecked")
+    private HashMap<LuaValue, LuaValue> hashMap() {
+        Object h = this.hashOrOverflow;
+        return (h instanceof HashMap<?, ?>) ? (HashMap<LuaValue, LuaValue>) h : null;
+    }
 
     private void ensureArrayCapacity(int minCap) {
         if (arrT == null) {
-            int cap = Math.max(4, minCap);
+            int cap = Math.max(16, minCap);
             if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
                 org.luava.runtime.eval.GCManager.preAllocCheck((long) cap * 9L);
             }
@@ -197,7 +315,7 @@ public final class LuaTable extends LuaValue {
         if (minCap <= cur) {
             return;
         }
-        int doubled = (cur <= (Integer.MAX_VALUE >> 1)) ? Math.max(8, cur << 1) : (Integer.MAX_VALUE - 8);
+        int doubled = (cur <= (Integer.MAX_VALUE >> 1)) ? Math.max(16, cur << 1) : (Integer.MAX_VALUE - 8);
         int newCap = Math.max(minCap, doubled);
         if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
             long elemBytes = (arrO != null) ? 16L : 9L;
@@ -240,7 +358,7 @@ public final class LuaTable extends LuaValue {
             ensureArrO();
             arrT[idx0] = BytecodeVM.TYPE_OBJECT;
             arrP[idx0] = 0L;
-            arrO[idx0] = (weakValues && isCollectable(val) && !(val instanceof WeakVal)) ? new WeakVal(val) : val;
+            arrO[idx0] = (isWeakValues() && isCollectable(val) && !(val instanceof WeakVal)) ? new WeakVal(val) : val;
         }
     }
 
@@ -261,7 +379,8 @@ public final class LuaTable extends LuaValue {
             ensureArrO();
             arrT[idx0] = BytecodeVM.TYPE_OBJECT;
             arrP[idx0] = 0L;
-            arrO[idx0] = (weakValues && isCollectable(oVal) && !(oVal instanceof WeakVal)) ? new WeakVal(oVal) : oVal;
+            arrO[idx0] = (isWeakValues() && isCollectable(oVal) && !(oVal instanceof WeakVal))
+                    ? new WeakVal(oVal) : oVal;
         }
     }
 
@@ -289,136 +408,148 @@ public final class LuaTable extends LuaValue {
         };
     }
 
-    private int hashEntryCount() {
-        if (smallFields != null) {
-            return smallFields.size;
+    private int totalInlineSlots() {
+        int n = inlineSize;
+        if (n == 0) return 0;
+        if (hashOrOverflow instanceof OverflowFields ov) {
+            return n + ov.size;
         }
-        return hashPart != null ? hashPart.size() : 0;
+        return n;
+    }
+
+    private int hashEntryCount() {
+        HashMap<LuaValue, LuaValue> map = hashMap();
+        if (map != null) {
+            return map.size();
+        }
+        return totalInlineSlots();
     }
 
     private void markBloom(LuaValue key) {
         hashKeyBloom |= (1L << (key.hashCode() & 63));
     }
 
+    private void noteStringKeyMeta(LuaString ks) {
+        if (!ks.isCanonical()) {
+            flags &= ~FLAG_ALL_CANONICAL;
+            int len = ks.rawLength();
+            if ((len == 4 && ks.equals(LuaValue.Meta.GC))
+                    || (len == 6 && ks.equals(LuaValue.Meta.MODE))) {
+                flags |= FLAG_MAY_HAVE_GC_OR_MODE;
+            }
+        } else if (ks == LuaValue.Meta.GC || ks == LuaValue.Meta.MODE) {
+            flags |= FLAG_MAY_HAVE_GC_OR_MODE;
+        }
+    }
+
     public boolean hasMaybeStringKey(LuaString ks) {
-        return (smallFields != null || hashPart != null)
-                && (hashKeyBloom & (1L << (ks.fastHash() & 63))) != 0L;
+        if ((flags & FLAG_LAZY_PENDING) == 0 && hashOrOverflow == null
+                && (flags & FLAG_ALL_CANONICAL) != 0 && ks.isCanonical()) {
+            return (k0 == ks && t0 != BytecodeVM.TYPE_NIL) || (k1 == ks && t1 != BytecodeVM.TYPE_NIL);
+        }
+        return (inlineSize != 0 || hashOrOverflow != null || (flags & FLAG_LAZY_PENDING) != 0)
+                && ((flags & FLAG_LAZY_PENDING) != 0 || (hashKeyBloom & (1L << (ks.fastHash() & 63))) != 0L);
+    }
+
+    public boolean hasNonNilStringKey(LuaString ks) {
+        if ((flags & (FLAG_LAZY_PENDING | FLAG_WEAK_VALUES)) == 0) {
+            if (k0 == ks) return t0 != BytecodeVM.TYPE_NIL;
+            if (k1 == ks) return t1 != BytecodeVM.TYPE_NIL;
+            if (hashOrOverflow == null && (flags & FLAG_ALL_CANONICAL) != 0 && ks.isCanonical()) {
+                return false;
+            }
+            if ((hashKeyBloom & (1L << (ks.fastHash() & 63))) == 0L) {
+                return false;
+            }
+        }
+        return !rawget(ks).isNil();
     }
 
     private HashMap<LuaValue, LuaValue> ensureHashPart() {
-        if (smallFields != null) {
-            spillSmallToHash();
+        HashMap<LuaValue, LuaValue> map = hashMap();
+        if (map != null) {
+            return map;
         }
-        if (hashPart == null) {
-            hashPart = new HashMap<>();
+        spillInlineToHash();
+        map = hashMap();
+        if (map == null) {
+            map = new HashMap<>();
+            this.hashOrOverflow = map;
         }
-        return hashPart;
+        return map;
     }
 
-    private static int findSmallSlot(SmallFields sf, LuaString ks) {
-        int n = sf.size;
-        if (n >= 1 && sf.k0 == ks) return 0;
-        if (n >= 2 && sf.k1 == ks) return 1;
-        if (n >= 3 && sf.k2 == ks) return 2;
-        if (n >= 4 && sf.k3 == ks) return 3;
-        if (ks.isCanonical() && sf.allCanonical) return -1;
-        if (n >= 1 && sf.k0.equals(ks)) return 0;
-        if (n >= 2 && sf.k1.equals(ks)) return 1;
-        if (n >= 3 && sf.k2.equals(ks)) return 2;
-        if (n >= 4 && sf.k3.equals(ks)) return 3;
+    private int findInlineSlot(LuaString ks) {
+        int n = inlineSize;
+        if (n == 0) return -1;
+        if (k0 == ks) return 0;
+        if (n >= 2 && k1 == ks) return 1;
+        OverflowFields ov = (hashOrOverflow instanceof OverflowFields o) ? o : null;
+        if (ov != null) {
+            if (ov.size >= 1 && ov.k2 == ks) return 2;
+            if (ov.size >= 2 && ov.k3 == ks) return 3;
+        }
+        if (ks.isCanonical() && (flags & FLAG_ALL_CANONICAL) != 0) {
+            return -1;
+        }
+        if (k0.equals(ks)) return 0;
+        if (n >= 2 && k1.equals(ks)) return 1;
+        if (ov != null) {
+            if (ov.size >= 1 && ov.k2.equals(ks)) return 2;
+            if (ov.size >= 2 && ov.k3.equals(ks)) return 3;
+        }
         return -1;
     }
 
-    private static void writeSmallRaw(SmallFields sf, int slot, byte tag, long prim, LuaValue obj) {
+    private void writeInlineRaw(int slot, byte tag, long prim, LuaValue obj) {
         LuaValue cleanObj = (tag == BytecodeVM.TYPE_OBJECT) ? obj : null;
         if (tag == BytecodeVM.TYPE_OBJECT && (obj == null || obj == LuaNil.NIL || obj.isNil())) {
             tag = BytecodeVM.TYPE_NIL;
             prim = 0L;
             cleanObj = null;
+        } else if (tag != BytecodeVM.TYPE_OBJECT) {
+            cleanObj = null;
         }
         switch (slot) {
-            case 0 -> { sf.t0 = tag; sf.p0 = prim; sf.o0 = cleanObj; }
-            case 1 -> { sf.t1 = tag; sf.p1 = prim; sf.o1 = cleanObj; }
-            case 2 -> { sf.t2 = tag; sf.p2 = prim; sf.o2 = cleanObj; }
-            default -> { sf.t3 = tag; sf.p3 = prim; sf.o3 = cleanObj; }
+            case 0 -> { t0 = tag; p0 = prim; o0 = cleanObj; }
+            case 1 -> { t1 = tag; p1 = prim; o1 = cleanObj; }
+            case 2 -> {
+                OverflowFields ov = (OverflowFields) hashOrOverflow;
+                ov.t2 = tag; ov.p2 = prim; ov.o2 = cleanObj;
+            }
+            default -> {
+                OverflowFields ov = (OverflowFields) hashOrOverflow;
+                ov.t3 = tag; ov.p3 = prim; ov.o3 = cleanObj;
+            }
         }
     }
 
-    private static void writeSmallLuaValue(SmallFields sf, int slot, LuaValue val) {
-        if (val == null || val == LuaNil.NIL || val.isNil()) {
-            writeSmallRaw(sf, slot, BytecodeVM.TYPE_NIL, 0L, null);
-        } else if (val instanceof LuaInteger li) {
-            writeSmallRaw(sf, slot, BytecodeVM.TYPE_INT, li.toLong(), null);
-        } else if (val instanceof LuaFloat lf) {
-            writeSmallRaw(sf, slot, BytecodeVM.TYPE_FLOAT, Double.doubleToRawLongBits(lf.toDouble()), null);
-        } else if (val instanceof LuaBoolean lb) {
-            writeSmallRaw(sf, slot, BytecodeVM.TYPE_BOOLEAN, lb.toBoolean() ? 1L : 0L, null);
-        } else {
-            writeSmallRaw(sf, slot, BytecodeVM.TYPE_OBJECT, 0L, val);
-        }
-    }
-
-    private static LuaString smallKeyAt(SmallFields sf, int slot) {
+    private LuaString inlineKeyAt(int slot) {
         return switch (slot) {
-            case 0 -> sf.k0;
-            case 1 -> sf.k1;
-            case 2 -> sf.k2;
-            default -> sf.k3;
+            case 0 -> k0;
+            case 1 -> k1;
+            case 2 -> ((OverflowFields) hashOrOverflow).k2;
+            default -> ((OverflowFields) hashOrOverflow).k3;
         };
     }
 
-    private static LuaValue smallValAt(SmallFields sf, int slot) {
-        byte tag;
-        long prim;
-        LuaValue obj;
-        switch (slot) {
-            case 0 -> { tag = sf.t0; prim = sf.p0; obj = sf.o0; }
-            case 1 -> { tag = sf.t1; prim = sf.p1; obj = sf.o1; }
-            case 2 -> { tag = sf.t2; prim = sf.p2; obj = sf.o2; }
-            default -> { tag = sf.t3; prim = sf.p3; obj = sf.o3; }
-        }
-        return BytecodeVM.getLuaValueFromRaw(prim, tag, obj);
+    private LuaValue inlineValAt(int slot) {
+        return switch (slot) {
+            case 0 -> BytecodeVM.getLuaValueFromRaw(p0, t0, o0);
+            case 1 -> BytecodeVM.getLuaValueFromRaw(p1, t1, o1);
+            case 2 -> {
+                OverflowFields ov = (OverflowFields) hashOrOverflow;
+                yield BytecodeVM.getLuaValueFromRaw(ov.p2, ov.t2, ov.o2);
+            }
+            default -> {
+                OverflowFields ov = (OverflowFields) hashOrOverflow;
+                yield BytecodeVM.getLuaValueFromRaw(ov.p3, ov.t3, ov.o3);
+            }
+        };
     }
 
-    private static boolean smallGetToStack(
-            SmallFields sf, LuaString ks, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
-        int n = sf.size;
-        if (n >= 1 && sf.k0 == ks) {
-            byte tag = sf.t0;
-            if (tag == BytecodeVM.TYPE_NIL) return false;
-            tStack[dst] = tag;
-            pStack[dst] = sf.p0;
-            oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? sf.o0 : null;
-            return true;
-        }
-        if (n >= 2 && sf.k1 == ks) {
-            byte tag = sf.t1;
-            if (tag == BytecodeVM.TYPE_NIL) return false;
-            tStack[dst] = tag;
-            pStack[dst] = sf.p1;
-            oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? sf.o1 : null;
-            return true;
-        }
-        if (n >= 3 && sf.k2 == ks) {
-            byte tag = sf.t2;
-            if (tag == BytecodeVM.TYPE_NIL) return false;
-            tStack[dst] = tag;
-            pStack[dst] = sf.p2;
-            oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? sf.o2 : null;
-            return true;
-        }
-        if (n >= 4 && sf.k3 == ks) {
-            byte tag = sf.t3;
-            if (tag == BytecodeVM.TYPE_NIL) return false;
-            tStack[dst] = tag;
-            pStack[dst] = sf.p3;
-            oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? sf.o3 : null;
-            return true;
-        }
-        if (ks.isCanonical() && sf.allCanonical) {
-            return false;
-        }
-        int slot = findSmallSlotEquals(sf, ks);
+    private boolean inlineGetToStack(LuaString ks, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
+        int slot = findInlineSlot(ks);
         if (slot < 0) {
             return false;
         }
@@ -426,122 +557,238 @@ public final class LuaTable extends LuaValue {
         long prim;
         LuaValue obj;
         switch (slot) {
-            case 0 -> { tag = sf.t0; prim = sf.p0; obj = sf.o0; }
-            case 1 -> { tag = sf.t1; prim = sf.p1; obj = sf.o1; }
-            case 2 -> { tag = sf.t2; prim = sf.p2; obj = sf.o2; }
-            default -> { tag = sf.t3; prim = sf.p3; obj = sf.o3; }
+            case 0 -> { tag = t0; prim = p0; obj = o0; }
+            case 1 -> { tag = t1; prim = p1; obj = o1; }
+            case 2 -> {
+                OverflowFields ov = (OverflowFields) hashOrOverflow;
+                tag = ov.t2; prim = ov.p2; obj = ov.o2;
+            }
+            default -> {
+                OverflowFields ov = (OverflowFields) hashOrOverflow;
+                tag = ov.t3; prim = ov.p3; obj = ov.o3;
+            }
         }
         if (tag == BytecodeVM.TYPE_NIL) {
             return false;
         }
         tStack[dst] = tag;
         pStack[dst] = prim;
-        oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT) ? obj : null;
+        oStack[dst] = obj;
         return true;
     }
 
-    private static int findSmallSlotEquals(SmallFields sf, LuaString ks) {
-        int n = sf.size;
-        if (n >= 1 && sf.k0.equals(ks)) return 0;
-        if (n >= 2 && sf.k1.equals(ks)) return 1;
-        if (n >= 3 && sf.k2.equals(ks)) return 2;
-        if (n >= 4 && sf.k3.equals(ks)) return 3;
-        return -1;
-    }
-
-    private void spillSmallToHash() {
-        SmallFields sf = this.smallFields;
-        if (sf == null) {
+    private void spillInlineToHash() {
+        if (hashOrOverflow instanceof HashMap<?, ?>) {
             return;
         }
-        this.smallFields = null;
-        HashMap<LuaValue, LuaValue> map = this.hashPart;
-        if (map == null) {
-            map = new HashMap<>(8);
-            this.hashPart = map;
+        int n = inlineSize;
+        OverflowFields ov = (hashOrOverflow instanceof OverflowFields o) ? o : null;
+        if (n == 0 && ov == null) {
+            return;
         }
-        int n = sf.size;
-        if (n >= 1) map.put(sf.k0, BytecodeVM.getLuaValueFromRaw(sf.p0, sf.t0, sf.o0));
-        if (n >= 2) map.put(sf.k1, BytecodeVM.getLuaValueFromRaw(sf.p1, sf.t1, sf.o1));
-        if (n >= 3) map.put(sf.k2, BytecodeVM.getLuaValueFromRaw(sf.p2, sf.t2, sf.o2));
-        if (n >= 4) map.put(sf.k3, BytecodeVM.getLuaValueFromRaw(sf.p3, sf.t3, sf.o3));
+        HashMap<LuaValue, LuaValue> map = new HashMap<>(8);
+        if (n >= 1 && t0 != BytecodeVM.TYPE_NIL) {
+            map.put(k0, BytecodeVM.getLuaValueFromRaw(p0, t0, o0));
+        }
+        if (n >= 2 && t1 != BytecodeVM.TYPE_NIL) {
+            map.put(k1, BytecodeVM.getLuaValueFromRaw(p1, t1, o1));
+        }
+        if (ov != null) {
+            if (ov.size >= 1 && ov.t2 != BytecodeVM.TYPE_NIL) {
+                map.put(ov.k2, BytecodeVM.getLuaValueFromRaw(ov.p2, ov.t2, ov.o2));
+            }
+            if (ov.size >= 2 && ov.t3 != BytecodeVM.TYPE_NIL) {
+                map.put(ov.k3, BytecodeVM.getLuaValueFromRaw(ov.p3, ov.t3, ov.o3));
+            }
+        }
+        inlineSize = 0;
+        t0 = 0;
+        t1 = 0;
+        p0 = 0L;
+        p1 = 0L;
+        k0 = null;
+        k1 = null;
+        o0 = null;
+        o1 = null;
+        this.hashOrOverflow = map;
     }
 
-    private void putSmallRaw(LuaString ks, byte tag, long prim, LuaValue obj) {
+    private void putInlineRaw(LuaString ks, byte tag, long prim, LuaValue obj) {
+        noteStringKeyMeta(ks);
         boolean isNil = (tag == BytecodeVM.TYPE_NIL)
                 || (tag == BytecodeVM.TYPE_OBJECT && (obj == null || obj == LuaNil.NIL || obj.isNil()));
-        SmallFields sf = this.smallFields;
-        if (sf == null) {
-            if (isNil) {
-                return;
-            }
-            if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
-                org.luava.runtime.eval.GCManager.preAllocCheck(64L);
-            }
-            sf = new SmallFields();
-            sf.k0 = ks;
-            sf.size = 1;
-            sf.allCanonical = ks.isCanonical();
-            writeSmallRaw(sf, 0, tag, prim, obj);
-            this.smallFields = sf;
-            hashKeyBloom |= (1L << (ks.fastHash() & 63));
-            return;
-        }
-        int slot = findSmallSlot(sf, ks);
+        int slot = findInlineSlot(ks);
         if (slot >= 0) {
-            writeSmallRaw(sf, slot, tag, prim, obj);
+            writeInlineRaw(slot, tag, prim, obj);
             return;
         }
         if (isNil) {
             return;
         }
-        int n = sf.size;
-        if (n < 4) {
-            if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
-                org.luava.runtime.eval.GCManager.preAllocCheck(64L);
-            }
-            switch (n) {
-                case 0 -> sf.k0 = ks;
-                case 1 -> sf.k1 = ks;
-                case 2 -> sf.k2 = ks;
-                default -> sf.k3 = ks;
-            }
-            sf.size = n + 1;
-            sf.allCanonical &= ks.isCanonical();
-            writeSmallRaw(sf, n, tag, prim, obj);
+        if (org.luava.runtime.eval.GCManager.ANY_MEMORY_CAP) {
+            org.luava.runtime.eval.GCManager.preAllocCheck(64L);
+        }
+        int sz = inlineSize;
+        if (sz == 0) {
+            k0 = ks;
+            inlineSize = 1;
+            writeInlineRaw(0, tag, prim, obj);
             hashKeyBloom |= (1L << (ks.fastHash() & 63));
             return;
         }
-        spillSmallToHash();
+        if (sz == 1) {
+            k1 = ks;
+            inlineSize = 2;
+            writeInlineRaw(1, tag, prim, obj);
+            hashKeyBloom |= (1L << (ks.fastHash() & 63));
+            return;
+        }
+        OverflowFields ov = (hashOrOverflow instanceof OverflowFields o) ? o : null;
+        if (ov == null) {
+            ov = new OverflowFields();
+            ov.k2 = ks;
+            ov.size = 1;
+            this.hashOrOverflow = ov;
+            writeInlineRaw(2, tag, prim, obj);
+            hashKeyBloom |= (1L << (ks.fastHash() & 63));
+            return;
+        }
+        if (ov.size == 1) {
+            ov.k3 = ks;
+            ov.size = 2;
+            writeInlineRaw(3, tag, prim, obj);
+            hashKeyBloom |= (1L << (ks.fastHash() & 63));
+            return;
+        }
+        spillInlineToHash();
         hashKeyBloom |= (1L << (ks.fastHash() & 63));
-        putHashEntry(this.hashPart, ks, BytecodeVM.getLuaValueFromRaw(prim, tag, obj));
+        putHashEntry(hashMap(), ks, BytecodeVM.getLuaValueFromRaw(prim, tag, obj));
     }
 
-    private void putSmallValue(LuaString ks, LuaValue value) {
+    private void putInlineValue(LuaString ks, LuaValue value) {
         if (value == null || value == LuaNil.NIL || value.isNil()) {
-            SmallFields sf = this.smallFields;
-            if (sf != null) {
-                int slot = findSmallSlot(sf, ks);
-                if (slot >= 0) {
-                    writeSmallRaw(sf, slot, BytecodeVM.TYPE_NIL, 0L, null);
-                }
+            int slot = findInlineSlot(ks);
+            if (slot >= 0) {
+                writeInlineRaw(slot, BytecodeVM.TYPE_NIL, 0L, null);
             }
             return;
         }
         if (value instanceof LuaInteger li) {
-            putSmallRaw(ks, BytecodeVM.TYPE_INT, li.toLong(), null);
+            putInlineRaw(ks, BytecodeVM.TYPE_INT, li.toLong(), null);
         } else if (value instanceof LuaFloat lf) {
-            putSmallRaw(ks, BytecodeVM.TYPE_FLOAT, Double.doubleToRawLongBits(lf.toDouble()), null);
+            putInlineRaw(ks, BytecodeVM.TYPE_FLOAT, Double.doubleToRawLongBits(lf.toDouble()), null);
         } else if (value instanceof LuaBoolean lb) {
-            putSmallRaw(ks, BytecodeVM.TYPE_BOOLEAN, lb.toBoolean() ? 1L : 0L, null);
+            putInlineRaw(ks, BytecodeVM.TYPE_BOOLEAN, lb.toBoolean() ? 1L : 0L, null);
         } else {
-            putSmallRaw(ks, BytecodeVM.TYPE_OBJECT, 0L, value);
+            putInlineRaw(ks, BytecodeVM.TYPE_OBJECT, 0L, value);
         }
     }
 
+    /**
+     * Specialized constructor-field store for JIT-verified fresh plain tables
+     * where {@code ks} is a compile-time canonical string other than
+     * {@code __gc}/{@code __mode}.
+     */
+    public void putFreshCanonicalFromStack(
+            LuaString ks, long bloomBit, long[] pStack, byte[] tStack, LuaValue[] oStack, int src) {
+        byte tag = tStack[src];
+        if (tag == BytecodeVM.TYPE_NIL) {
+            if (k0 == ks) { t0 = BytecodeVM.TYPE_NIL; p0 = 0L; o0 = null; bumpModCount(); }
+            else if (k1 == ks) { t1 = BytecodeVM.TYPE_NIL; p1 = 0L; o1 = null; bumpModCount(); }
+            else if (hashOrOverflow != null) { bumpModCount(); putInlineValue(ks, LuaNil.NIL); }
+            return;
+        }
+        LuaValue obj = null;
+        long prim = 0L;
+        if (tag == BytecodeVM.TYPE_OBJECT) {
+            obj = oStack[src];
+            if (obj == null || obj == LuaNil.NIL || obj.isNil()) {
+                if (k0 == ks) { t0 = BytecodeVM.TYPE_NIL; p0 = 0L; o0 = null; bumpModCount(); }
+                else if (k1 == ks) { t1 = BytecodeVM.TYPE_NIL; p1 = 0L; o1 = null; bumpModCount(); }
+                else if (hashOrOverflow != null) { bumpModCount(); putInlineValue(ks, LuaNil.NIL); }
+                return;
+            }
+        } else {
+            prim = pStack[src];
+        }
+        int sz = inlineSize;
+        if (sz == 0 && hashOrOverflow == null) {
+            k0 = ks;
+            t0 = tag;
+            p0 = prim;
+            o0 = obj;
+            inlineSize = 1;
+            hashKeyBloom = bloomBit;
+            modCount = 1;
+            return;
+        }
+        if (sz == 1 && k0 != ks && hashOrOverflow == null) {
+            k1 = ks;
+            t1 = tag;
+            p1 = prim;
+            o1 = obj;
+            inlineSize = 2;
+            hashKeyBloom |= bloomBit;
+            bumpModCount();
+            return;
+        }
+        bumpModCount();
+        putInlineRaw(ks, tag, prim, obj);
+    }
+
+    /** Constant-value counterpart to {@link #putFreshCanonicalFromStack}. */
+    public void putFreshCanonicalConst(LuaString ks, long bloomBit, LuaValue val) {
+        if (val == null || val == LuaNil.NIL || val.isNil()) {
+            if (k0 == ks) { t0 = BytecodeVM.TYPE_NIL; p0 = 0L; o0 = null; bumpModCount(); }
+            else if (k1 == ks) { t1 = BytecodeVM.TYPE_NIL; p1 = 0L; o1 = null; bumpModCount(); }
+            else if (hashOrOverflow != null) { bumpModCount(); putInlineValue(ks, LuaNil.NIL); }
+            return;
+        }
+        byte tag;
+        long prim = 0L;
+        LuaValue obj = null;
+        if (val instanceof LuaInteger li) {
+            tag = BytecodeVM.TYPE_INT;
+            prim = li.toLong();
+        } else if (val instanceof LuaFloat lf) {
+            tag = BytecodeVM.TYPE_FLOAT;
+            prim = Double.doubleToRawLongBits(lf.toDouble());
+        } else if (val instanceof LuaBoolean lb) {
+            tag = BytecodeVM.TYPE_BOOLEAN;
+            prim = lb.toBoolean() ? 1L : 0L;
+        } else {
+            tag = BytecodeVM.TYPE_OBJECT;
+            obj = val;
+        }
+        int sz = inlineSize;
+        if (sz == 0 && hashOrOverflow == null) {
+            k0 = ks;
+            t0 = tag;
+            p0 = prim;
+            o0 = obj;
+            inlineSize = 1;
+            hashKeyBloom = bloomBit;
+            modCount = 1;
+            return;
+        }
+        if (sz == 1 && k0 != ks && hashOrOverflow == null) {
+            k1 = ks;
+            t1 = tag;
+            p1 = prim;
+            o1 = obj;
+            inlineSize = 2;
+            hashKeyBloom |= bloomBit;
+            bumpModCount();
+            return;
+        }
+        bumpModCount();
+        putInlineRaw(ks, tag, prim, obj);
+    }
+
     private void removeIntShadowFromHash(long idx) {
-        if (hashPart != null && !hashPart.isEmpty()) {
-            hashPart.remove(LuaInteger.valueOf(idx));
+        HashMap<LuaValue, LuaValue> map = hashMap();
+        if (map != null && !map.isEmpty()) {
+            map.remove(LuaInteger.valueOf(idx));
         }
     }
 
@@ -621,15 +868,16 @@ public final class LuaTable extends LuaValue {
     }
 
     public boolean isWeakKeys() {
-        return weakKeys;
+        return (flags & FLAG_WEAK_KEYS) != 0;
     }
 
     public boolean isWeakValues() {
-        return weakValues;
+        return (flags & FLAG_WEAK_VALUES) != 0;
     }
 
     public static boolean isCollectable(LuaValue val) {
-        return val != null && (val.isTable() || val.isFunction() || val.isUserdata() || val instanceof org.luava.runtime.concurrency.LuaCoroutine);
+        return val != null && (val.isTable() || val.isFunction() || val.isUserdata()
+                || val instanceof org.luava.runtime.concurrency.LuaCoroutine);
     }
 
     public void updateWeakMode() {
@@ -637,22 +885,25 @@ public final class LuaTable extends LuaValue {
             LuaValue mode = metatable.rawget(LuaValue.Meta.MODE);
             if (mode.isString()) {
                 String s = mode.toLuaString();
-                weakKeys = s.contains("k");
-                weakValues = s.contains("v");
-                if (weakKeys || weakValues) {
+                boolean wk = s.contains("k");
+                boolean wv = s.contains("v");
+                flags = (byte) ((flags & ~(FLAG_WEAK_KEYS | FLAG_WEAK_VALUES))
+                        | (wk ? FLAG_WEAK_KEYS : 0)
+                        | (wv ? FLAG_WEAK_VALUES : 0));
+                if (wk || wv) {
                     org.luava.runtime.eval.GCManager.registerWeakTable(this);
                     convertToWeak();
                 }
                 return;
             }
         }
-        weakKeys = false;
-        weakValues = false;
+        flags &= ~(FLAG_WEAK_KEYS | FLAG_WEAK_VALUES);
     }
 
     private void convertToWeak() {
-        spillSmallToHash();
-        if (weakValues) {
+        spillInlineToHash();
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
+        if (isWeakValues()) {
             for (int i = 0; i < arrLen; i++) {
                 if (arrT[i] == BytecodeVM.TYPE_OBJECT && arrO != null) {
                     LuaValue v = arrO[i];
@@ -670,7 +921,7 @@ public final class LuaTable extends LuaValue {
                 }
             }
         }
-        if (weakKeys && hashPart != null) {
+        if (isWeakKeys() && hashPart != null) {
             HashMap<LuaValue, LuaValue> newHash = new HashMap<>(Math.max(16, hashPart.size() * 2));
             for (Map.Entry<LuaValue, LuaValue> entry : hashPart.entrySet()) {
                 LuaValue k = entry.getKey();
@@ -691,7 +942,7 @@ public final class LuaTable extends LuaValue {
     }
 
     public void cleanupWeakValues(java.util.function.Predicate<LuaValue> isAlive) {
-        if (!weakValues) return;
+        if (!isWeakValues()) return;
         if (arrO != null) {
             for (int i = 0; i < arrLen; i++) {
                 if (arrT[i] == BytecodeVM.TYPE_OBJECT) {
@@ -708,6 +959,7 @@ public final class LuaTable extends LuaValue {
                 }
             }
         }
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
         if (hashPart != null) {
             hashPart.entrySet().removeIf(entry -> {
                 LuaValue v = entry.getValue();
@@ -724,7 +976,8 @@ public final class LuaTable extends LuaValue {
     }
 
     public void cleanupWeakKeys(java.util.function.Predicate<LuaValue> isAlive) {
-        if (!weakKeys || hashPart == null) return;
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
+        if (!isWeakKeys() || hashPart == null) return;
         hashPart.entrySet().removeIf(entry -> {
             LuaValue k = entry.getKey();
             if (k instanceof WeakKey wk) {
@@ -742,13 +995,13 @@ public final class LuaTable extends LuaValue {
         for (int i = 0; i < arrLen; i++) {
             consumer.accept(LuaInteger.valueOf(i + 1));
         }
-        if (smallFields != null) {
-            SmallFields sf = smallFields;
-            for (int i = 0; i < sf.size; i++) {
-                consumer.accept(smallKeyAt(sf, i));
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
+        if (hashPart == null) {
+            int n = totalInlineSlots();
+            for (int i = 0; i < n; i++) {
+                consumer.accept(inlineKeyAt(i));
             }
-        }
-        if (hashPart != null) {
+        } else {
             for (LuaValue k : hashPart.keySet()) {
                 if (k instanceof WeakKey wk) k = wk.get();
                 if (k != null && !k.isNil()) {
@@ -766,16 +1019,26 @@ public final class LuaTable extends LuaValue {
     @Override
     public void setMetatable(LuaTable mt) {
         this.metatable = mt;
-        modCount++;
-        // The cached __index hop belonged to the previous metatable.
-        indexHop = null;
+        bumpModCount();
+        if (this.aux != null) {
+            this.aux.indexHop = null;
+        }
+        if (mt == null) {
+            flags &= ~(FLAG_WEAK_KEYS | FLAG_WEAK_VALUES);
+            return;
+        }
+        if ((mt.flags & (FLAG_LAZY_PENDING | FLAG_MAY_HAVE_GC_OR_MODE)) == 0) {
+            flags &= ~(FLAG_WEAK_KEYS | FLAG_WEAK_VALUES);
+            return;
+        }
         updateWeakMode();
     }
 
     private static LuaValue normalizeKey(LuaValue key) {
         if (key != null && key.isFloat()) {
             double d = key.toDouble();
-            if (!Double.isInfinite(d) && !Double.isNaN(d) && d >= (double) Long.MIN_VALUE && d < 9223372036854775808.0) {
+            if (!Double.isInfinite(d) && !Double.isNaN(d)
+                    && d >= (double) Long.MIN_VALUE && d < 9223372036854775808.0) {
                 long l = (long) d;
                 if ((double) l == d) {
                     return LuaInteger.valueOf(l);
@@ -785,33 +1048,28 @@ public final class LuaTable extends LuaValue {
         return key;
     }
 
-    /**
-     * Integer-keyed fast lanes for the VM ({@code OP_GETI} / {@code OP_SETI}).
-     * Identical semantics to {@code rawget(LuaInteger)}/{@code rawset} for
-     * plain tables, but without boxing the index. Callers must only use
-     * these when the table has no metatable (weak modes always imply one).
-     */
     public LuaValue rawgetInt(long idx) {
-        if (lazyFiller != null) {
+        if ((flags & FLAG_LAZY_PENDING) != 0) {
             ensureFilledSlow();
         }
         if (idx >= 1 && idx <= arrLen) {
-            LuaValue val = readArraySlot( (int) (idx - 1));
+            LuaValue val = readArraySlot((int) (idx - 1));
             if (val != null && !val.isNil()) {
                 return val;
             }
         }
-        if (hashEntryCount() == 0) {
+        HashMap<LuaValue, LuaValue> map = hashMap();
+        if (map == null || map.isEmpty()) {
             return LuaNil.NIL;
         }
         return rawget(LuaInteger.valueOf(idx));
     }
 
     public void rawgetIntToStack(long idx, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
-        if (lazyFiller == null && idx >= 1 && idx <= arrLen) {
+        if ((flags & FLAG_LAZY_PENDING) == 0 && idx >= 1 && idx <= arrLen) {
             int i = (int) (idx - 1);
             byte tag = arrT[i];
-            if (!weakValues || tag != BytecodeVM.TYPE_OBJECT) {
+            if ((flags & FLAG_WEAK_VALUES) == 0 || tag != BytecodeVM.TYPE_OBJECT) {
                 tStack[dst] = tag;
                 pStack[dst] = arrP[i];
                 oStack[dst] = (tag == BytecodeVM.TYPE_OBJECT && arrO != null) ? arrO[i] : null;
@@ -822,14 +1080,15 @@ public final class LuaTable extends LuaValue {
     }
 
     private void rawgetIntToStackSlow(long idx, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
-        if (lazyFiller != null) {
+        if ((flags & FLAG_LAZY_PENDING) != 0) {
             ensureFilledSlow();
         }
         if (idx >= 1 && idx <= arrLen) {
             BytecodeVM.setLuaValue(pStack, tStack, oStack, dst, readArraySlot((int) (idx - 1)));
             return;
         }
-        if (hashEntryCount() == 0) {
+        HashMap<LuaValue, LuaValue> map = hashMap();
+        if (map == null || map.isEmpty()) {
             tStack[dst] = BytecodeVM.TYPE_NIL;
             pStack[dst] = 0L;
             oStack[dst] = null;
@@ -839,22 +1098,17 @@ public final class LuaTable extends LuaValue {
     }
 
     public void rawsetInt(long idx, LuaValue value) {
-        if (lazyFiller != null) {
+        if ((flags & FLAG_LAZY_PENDING) != 0) {
             ensureFilledSlow();
         }
-        // No version bump: integer writes never change string-key reads (the
-        // only shape the VM site-caches), and only drop integer shadows from
-        // the hash part. The rawset() fallthrough below bumps as usual.
-        // Reference-compare nil first: the virtual isNil() is pure overhead
-        // for the 99.99% of values that are neither null nor exotic-nil.
         LuaValue toSet = (value == null || value == LuaNil.NIL || value.isNil()) ? LuaNil.NIL : value;
         if (idx == arrLen + 1 && toSet != LuaNil.NIL) {
             ensureArrayCapacity(arrLen + 1);
             writeArraySlotFromValue(arrLen++, toSet);
-            if (hashEntryCount() > 0) removeIntShadowFromHash(idx);
+            removeIntShadowFromHash(idx);
             return;
         } else if (idx >= 1 && idx <= arrLen) {
-            if (hashEntryCount() > 0) removeIntShadowFromHash(idx);
+            removeIntShadowFromHash(idx);
             writeArraySlotFromValue((int) (idx - 1), toSet);
             return;
         }
@@ -862,7 +1116,7 @@ public final class LuaTable extends LuaValue {
     }
 
     public void rawsetIntFromStack(long idx, long[] pStack, byte[] tStack, LuaValue[] oStack, int src) {
-        if (lazyFiller == null && hashPart == null) {
+        if ((flags & FLAG_LAZY_PENDING) == 0 && !(hashOrOverflow instanceof HashMap<?, ?>)) {
             byte tag = tStack[src];
             if (tag != BytecodeVM.TYPE_OBJECT) {
                 if (idx >= 1 && idx <= arrLen) {
@@ -885,7 +1139,7 @@ public final class LuaTable extends LuaValue {
     }
 
     private void rawsetIntFromStackSlow(long idx, long[] pStack, byte[] tStack, LuaValue[] oStack, int src) {
-        if (lazyFiller != null) {
+        if ((flags & FLAG_LAZY_PENDING) != 0) {
             ensureFilledSlow();
         }
         byte tag = tStack[src];
@@ -896,10 +1150,10 @@ public final class LuaTable extends LuaValue {
         if (idx == arrLen + 1 && !isNil) {
             ensureArrayCapacity(arrLen + 1);
             writeArraySlotFromStack(arrLen++, tag, pVal, oVal);
-            if (hashPart != null && !hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
+            removeIntShadowFromHash(idx);
             return;
         } else if (idx >= 1 && idx <= arrLen) {
-            if (hashPart != null && !hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
+            removeIntShadowFromHash(idx);
             writeArraySlotFromStack((int) (idx - 1), tag, pVal, oVal);
             return;
         }
@@ -907,17 +1161,19 @@ public final class LuaTable extends LuaValue {
     }
 
     public void rawsetIntLong(long idx, long val) {
-        if (lazyFiller == null && hashPart == null && arrO == null) {
-            if (idx >= 1 && idx <= arrLen) {
+        if ((flags & FLAG_LAZY_PENDING) == 0 && !(hashOrOverflow instanceof HashMap<?, ?>) && arrO == null) {
+            int len = this.arrLen;
+            if (idx >= 1 && idx <= len) {
                 int i = (int) (idx - 1);
                 arrT[i] = BytecodeVM.TYPE_INT;
                 arrP[i] = val;
                 return;
             }
-            if (idx == arrLen + 1 && arrT != null && arrLen < arrT.length) {
-                int i = arrLen++;
-                arrT[i] = BytecodeVM.TYPE_INT;
-                arrP[i] = val;
+            byte[] at = this.arrT;
+            if (idx == (long) len + 1L && at != null && len < at.length) {
+                this.arrLen = len + 1;
+                at[len] = BytecodeVM.TYPE_INT;
+                arrP[len] = val;
                 return;
             }
         }
@@ -925,20 +1181,20 @@ public final class LuaTable extends LuaValue {
     }
 
     private void rawsetIntLongSlow(long idx, long val) {
-        if (lazyFiller != null) {
+        if ((flags & FLAG_LAZY_PENDING) != 0) {
             ensureFilledSlow();
         }
-        if (idx == arrLen + 1) {
+        if (idx == (long) arrLen + 1L) {
             ensureArrayCapacity(arrLen + 1);
             int i = arrLen++;
             arrT[i] = BytecodeVM.TYPE_INT;
             arrP[i] = val;
             if (arrO != null) arrO[i] = null;
-            if (hashPart != null && !hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
+            removeIntShadowFromHash(idx);
             return;
         }
         if (idx >= 1 && idx <= arrLen) {
-            if (hashPart != null && !hashPart.isEmpty()) hashPart.remove(LuaInteger.valueOf(idx));
+            removeIntShadowFromHash(idx);
             int i = (int) (idx - 1);
             arrT[i] = BytecodeVM.TYPE_INT;
             arrP[i] = val;
@@ -948,53 +1204,69 @@ public final class LuaTable extends LuaValue {
         rawset(LuaInteger.valueOf(idx), LuaInteger.valueOf(val));
     }
 
-    public boolean tryRawgetToStack(LuaValue key, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
-        if (lazyFiller == null && !weakValues && key instanceof LuaString ks) {
-            if ((hashKeyBloom & (1L << (ks.fastHash() & 63))) == 0L) {
+    public boolean tryRawgetStringToStack(
+            LuaString ks, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
+        if ((flags & (FLAG_LAZY_PENDING | FLAG_WEAK_VALUES)) == 0) {
+            if (k0 == ks) {
+                byte tag = t0;
+                if (tag == BytecodeVM.TYPE_NIL) return false;
+                tStack[dst] = tag;
+                pStack[dst] = p0;
+                oStack[dst] = o0;
+                return true;
+            }
+            if (k1 == ks) {
+                byte tag = t1;
+                if (tag == BytecodeVM.TYPE_NIL) return false;
+                tStack[dst] = tag;
+                pStack[dst] = p1;
+                oStack[dst] = o1;
+                return true;
+            }
+            if (hashOrOverflow == null && (flags & FLAG_ALL_CANONICAL) != 0 && ks.isCanonical()) {
                 return false;
             }
-            SmallFields sf = this.smallFields;
-            if (sf != null) {
-                return smallGetToStack(sf, ks, pStack, tStack, oStack, dst);
-            }
-            HashMap<LuaValue, LuaValue> map = this.hashPart;
-            if (map == null) {
-                return false;
-            }
-            LuaValue val = map.get(ks);
-            if (val == null || val == LuaNil.NIL) {
-                return false;
-            }
-            BytecodeVM.setLuaValue(pStack, tStack, oStack, dst, val);
-            return true;
         }
-        return tryRawgetToStackSlow(key, pStack, tStack, oStack, dst);
+        return tryRawgetStringToStackSlow(ks, pStack, tStack, oStack, dst);
     }
 
-    private boolean tryRawgetToStackSlow(LuaValue key, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
-        ensureFilled();
-        if (key instanceof LuaString ks) {
-            if (smallFields != null) {
-                return smallGetToStack(smallFields, ks, pStack, tStack, oStack, dst);
-            }
-            if (hashPart == null) {
-                return false;
-            }
-            LuaValue val = hashPart.get(key);
-            if (val instanceof WeakVal wv) {
-                LuaValue actual = wv.get();
-                if (actual == null) {
-                    hashPart.remove(key);
-                    return false;
-                }
-                val = actual;
-            }
-            if (val == null || val == LuaNil.NIL || val.isNil()) {
-                return false;
-            }
-            BytecodeVM.setLuaValue(pStack, tStack, oStack, dst, val);
-            return true;
+    private boolean tryRawgetStringToStackSlow(
+            LuaString ks, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
+        if ((flags & FLAG_LAZY_PENDING) != 0) {
+            ensureFilledSlow();
         }
+        if ((flags & FLAG_WEAK_VALUES) == 0 && (hashKeyBloom & (1L << (ks.fastHash() & 63))) == 0L) {
+            return false;
+        }
+        HashMap<LuaValue, LuaValue> map = hashMap();
+        if (map == null) {
+            return inlineGetToStack(ks, pStack, tStack, oStack, dst);
+        }
+        LuaValue val = map.get(ks);
+        if (val instanceof WeakVal wv) {
+            LuaValue actual = wv.get();
+            if (actual == null) {
+                map.remove(ks);
+                return false;
+            }
+            val = actual;
+        }
+        if (val == null || val == LuaNil.NIL || val.isNil()) {
+            return false;
+        }
+        BytecodeVM.setLuaValue(pStack, tStack, oStack, dst, val);
+        return true;
+    }
+
+    public boolean tryRawgetToStack(LuaValue key, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
+        if (key instanceof LuaString ks) {
+            return tryRawgetStringToStack(ks, pStack, tStack, oStack, dst);
+        }
+        return tryRawgetToStackNonString(key, pStack, tStack, oStack, dst);
+    }
+
+    private boolean tryRawgetToStackNonString(LuaValue key, long[] pStack, byte[] tStack, LuaValue[] oStack, int dst) {
+        ensureFilled();
         LuaValue val = rawget(key);
         if (val == null || val == LuaNil.NIL || val.isNil()) {
             return false;
@@ -1004,18 +1276,23 @@ public final class LuaTable extends LuaValue {
     }
 
     public LuaValue rawget(LuaValue key) {
-        if (lazyFiller == null && !weakValues && key instanceof LuaString ks) {
+        if ((flags & (FLAG_LAZY_PENDING | FLAG_WEAK_VALUES)) == 0 && key instanceof LuaString ks) {
+            if (k0 == ks) {
+                return t0 != BytecodeVM.TYPE_NIL ? BytecodeVM.getLuaValueFromRaw(p0, t0, o0) : LuaNil.NIL;
+            }
+            if (k1 == ks) {
+                return t1 != BytecodeVM.TYPE_NIL ? BytecodeVM.getLuaValueFromRaw(p1, t1, o1) : LuaNil.NIL;
+            }
+            if (hashOrOverflow == null && (flags & FLAG_ALL_CANONICAL) != 0 && ks.isCanonical()) {
+                return LuaNil.NIL;
+            }
             if ((hashKeyBloom & (1L << (ks.fastHash() & 63))) == 0L) {
                 return LuaNil.NIL;
             }
-            SmallFields sf = this.smallFields;
-            if (sf != null) {
-                int slot = findSmallSlot(sf, ks);
-                return slot >= 0 ? smallValAt(sf, slot) : LuaNil.NIL;
-            }
-            HashMap<LuaValue, LuaValue> map = this.hashPart;
+            HashMap<LuaValue, LuaValue> map = hashMap();
             if (map == null) {
-                return LuaNil.NIL;
+                int slot = findInlineSlot(ks);
+                return slot >= 0 ? inlineValAt(slot) : LuaNil.NIL;
             }
             LuaValue val = map.get(ks);
             return val != null ? val : LuaNil.NIL;
@@ -1025,13 +1302,11 @@ public final class LuaTable extends LuaValue {
 
     private LuaValue rawgetSlow(LuaValue key) {
         ensureFilled();
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
         if (key instanceof LuaString ks) {
-            if (smallFields != null) {
-                int slot = findSmallSlot(smallFields, ks);
-                return slot >= 0 ? smallValAt(smallFields, slot) : LuaNil.NIL;
-            }
             if (hashPart == null) {
-                return LuaNil.NIL;
+                int slot = findInlineSlot(ks);
+                return slot >= 0 ? inlineValAt(slot) : LuaNil.NIL;
             }
             LuaValue val = hashPart.get(key);
             if (val instanceof WeakVal wv) {
@@ -1081,23 +1356,27 @@ public final class LuaTable extends LuaValue {
 
     public void rawset(LuaValue key, LuaValue value) {
         ensureFilled();
-        modCount++;
-        lastReturnedKey = null;
-        nextIterator = null;
-        if (key instanceof LuaString ks && !weakKeys && !weakValues) {
-            if (hashPart == null) {
-                putSmallValue(ks, value);
+        bumpModCount();
+        clearTraversalCache();
+        if (key instanceof LuaString ks && (flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) == 0) {
+            HashMap<LuaValue, LuaValue> map = hashMap();
+            if (map == null) {
+                putInlineValue(ks, value);
                 return;
             }
+            noteStringKeyMeta(ks);
             if (value == null || value == LuaNil.NIL || value.isNil()) {
-                if (hashPart.containsKey(ks)) {
-                    hashPart.put(ks, LuaNil.NIL);
+                if (map.containsKey(ks)) {
+                    map.put(ks, LuaNil.NIL);
                 }
             } else {
                 hashKeyBloom |= (1L << (ks.fastHash() & 63));
-                putHashEntry(hashPart, ks, value);
+                putHashEntry(map, ks, value);
             }
             return;
+        }
+        if (key instanceof LuaString ks) {
+            noteStringKeyMeta(ks);
         }
         key = normalizeKey(key);
         if (key == null || key.isNil()) {
@@ -1108,7 +1387,7 @@ public final class LuaTable extends LuaValue {
         }
         LuaValue toSet = (value == null || value.isNil()) ? LuaNil.NIL : value;
         LuaValue toStore = toSet;
-        if (weakValues && isCollectable(toSet)) {
+        if (isWeakValues() && isCollectable(toSet)) {
             toStore = new WeakVal(toSet);
         }
 
@@ -1117,10 +1396,12 @@ public final class LuaTable extends LuaValue {
             if (idx == arrLen + 1 && !toSet.isNil()) {
                 ensureArrayCapacity(arrLen + 1);
                 writeArraySlotFromValue(arrLen++, toSet);
-                if (hashPart != null && !hashPart.isEmpty()) hashPart.remove(key);
+                HashMap<LuaValue, LuaValue> map = hashMap();
+                if (map != null && !map.isEmpty()) map.remove(key);
                 return;
             } else if (idx >= 1 && idx <= arrLen) {
-                if (hashPart != null && !hashPart.isEmpty()) hashPart.remove(key);
+                HashMap<LuaValue, LuaValue> map = hashMap();
+                if (map != null && !map.isEmpty()) map.remove(key);
                 writeArraySlotFromValue((int) (idx - 1), toSet);
                 return;
             } else if (!toSet.isNil() && storeIntGap(idx, key, toSet)) {
@@ -1128,19 +1409,20 @@ public final class LuaTable extends LuaValue {
             }
         }
 
+        HashMap<LuaValue, LuaValue> map = hashMap();
         if (toSet.isNil()) {
-            if (hashPart != null && hashPart.containsKey(key)) {
-                hashPart.put(key, LuaNil.NIL);
+            if (map != null && map.containsKey(key)) {
+                map.put(key, LuaNil.NIL);
             }
-        } else if (!weakKeys && !weakValues) {
+        } else if ((flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) == 0) {
             markBloom(key);
             putHashEntry(ensureHashPart(), key, toStore);
         } else {
-            HashMap<LuaValue, LuaValue> map = ensureHashPart();
+            map = ensureHashPart();
             if (!map.containsKey(key)) {
                 pruneDeadKeys();
             }
-            LuaValue keyToStore = (weakKeys && isCollectable(key)) ? new WeakKey(key) : key;
+            LuaValue keyToStore = (isWeakKeys() && isCollectable(key)) ? new WeakKey(key) : key;
             markBloom(keyToStore);
             putHashEntry(map, keyToStore, toStore);
         }
@@ -1148,22 +1430,23 @@ public final class LuaTable extends LuaValue {
 
     public void rawsetFromStack(LuaValue key, long[] pStack, byte[] tStack, LuaValue[] oStack, int src) {
         ensureFilled();
-        if (key instanceof LuaString ks && !weakKeys && !weakValues) {
-            modCount++;
-            lastReturnedKey = null;
-            nextIterator = null;
-            if (hashPart == null) {
-                putSmallRaw(ks, tStack[src], pStack[src], oStack[src]);
+        if (key instanceof LuaString ks && (flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) == 0) {
+            bumpModCount();
+            clearTraversalCache();
+            HashMap<LuaValue, LuaValue> map = hashMap();
+            if (map == null) {
+                putInlineRaw(ks, tStack[src], pStack[src], oStack[src]);
                 return;
             }
+            noteStringKeyMeta(ks);
             LuaValue val = BytecodeVM.getLuaValue(pStack, tStack, oStack, src);
             if (val.isNil()) {
-                if (hashPart.containsKey(ks)) {
-                    hashPart.put(ks, LuaNil.NIL);
+                if (map.containsKey(ks)) {
+                    map.put(ks, LuaNil.NIL);
                 }
             } else {
                 hashKeyBloom |= (1L << (ks.fastHash() & 63));
-                putHashEntry(hashPart, ks, val);
+                putHashEntry(map, ks, val);
             }
             return;
         }
@@ -1171,15 +1454,16 @@ public final class LuaTable extends LuaValue {
     }
 
     public boolean trySetFieldFromStack(LuaValue key, long[] pStack, byte[] tStack, LuaValue[] oStack, int src) {
-        if (lazyFiller == null && metatable == null && !weakKeys && !weakValues && key instanceof LuaString ks) {
-            modCount++;
-            lastReturnedKey = null;
-            nextIterator = null;
-            HashMap<LuaValue, LuaValue> map = this.hashPart;
+        if (metatable == null && (flags & (FLAG_LAZY_PENDING | FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) == 0
+                && key instanceof LuaString ks) {
+            bumpModCount();
+            clearTraversalCache();
+            HashMap<LuaValue, LuaValue> map = hashMap();
             if (map == null) {
-                putSmallRaw(ks, tStack[src], pStack[src], oStack[src]);
+                putInlineRaw(ks, tStack[src], pStack[src], oStack[src]);
                 return true;
             }
+            noteStringKeyMeta(ks);
             LuaValue val = BytecodeVM.getLuaValue(pStack, tStack, oStack, src);
             if (val == LuaNil.NIL) {
                 if (map.containsKey(ks)) map.put(ks, LuaNil.NIL);
@@ -1205,15 +1489,16 @@ public final class LuaTable extends LuaValue {
     }
 
     public boolean trySetField(LuaValue key, LuaValue val) {
-        if (lazyFiller == null && metatable == null && !weakKeys && !weakValues && key instanceof LuaString ks) {
-            modCount++;
-            lastReturnedKey = null;
-            nextIterator = null;
-            HashMap<LuaValue, LuaValue> map = this.hashPart;
+        if (metatable == null && (flags & (FLAG_LAZY_PENDING | FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) == 0
+                && key instanceof LuaString ks) {
+            bumpModCount();
+            clearTraversalCache();
+            HashMap<LuaValue, LuaValue> map = hashMap();
             if (map == null) {
-                putSmallValue(ks, val);
+                putInlineValue(ks, val);
                 return true;
             }
+            noteStringKeyMeta(ks);
             if (val == null || val == LuaNil.NIL || val.isNil()) {
                 if (map.containsKey(ks)) map.put(ks, LuaNil.NIL);
             } else {
@@ -1237,17 +1522,11 @@ public final class LuaTable extends LuaValue {
         return true;
     }
 
-    /**
-     * Array-part growth trigger for out-of-range integer inserts.
-     * Gated by hash occupancy so sparse keys (t[1000000] = x) stay in the
-     * hash part instead of forcing a huge array; skipped for weak tables.
-     */
-    private int rehashThreshold = 64;
-
     private boolean storeIntGap(long idx, LuaValue key, LuaValue toStore) {
         maybeRehashForInt(idx);
         if (idx >= 1 && idx <= arrLen) {
-            if (hashPart != null && !hashPart.isEmpty()) hashPart.remove(key);
+            HashMap<LuaValue, LuaValue> map = hashMap();
+            if (map != null && !map.isEmpty()) map.remove(key);
             writeArraySlotFromValue((int) (idx - 1), toStore);
             return true;
         }
@@ -1255,47 +1534,38 @@ public final class LuaTable extends LuaValue {
     }
 
     private void maybeRehashForInt(long idx) {
-        if (weakKeys || weakValues) {
+        if ((flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) != 0) {
             return;
         }
         long near = (long) arrLen * 2L + 2L;
-        if (idx <= near || hashEntryCount() >= rehashThreshold) {
+        int rehashThresh = (aux != null) ? aux.rehashThreshold : 64;
+        if (idx <= near || hashEntryCount() >= rehashThresh) {
             rehash(idx);
         }
     }
 
-    /** Maximum array-part size (2^24 slots); larger integer
-     * keys stay in the hash part. Bounds memory on hostile sparse inserts. */
     private static final long MAX_ARRAY_SIZE = 1L << 24;
 
-    /**
-     * Density bucket for an array index: {@code ceil(log2(key))}, matching PUC's
-     * {@code nums[luaO_ceillog2(arrayindex(k))]}. Bucket {@code i} therefore
-     * holds the keys in {@code (2^(i-1), 2^i]}.
-     */
     private static int arrayBucket(long key) {
         if (key <= 1) return 0;
         return 32 - Integer.numberOfLeadingZeros((int) Math.min(key - 1, 0x7FFFFFFFL));
     }
 
-    /**
-     * Lua-style rehash: size the array part to the largest power of two
-     * that dense integer keys fill beyond half, then migrate those keys
-     * out of the hash part. Sparse leftovers stay hashed. Never shrinks.
-     */
     private void rehash(long pendingKey) {
         int[] nums = new int[32];
         int na = 0;
+        boolean wv = isWeakValues();
         for (int i = 0; i < arrLen; i++) {
             if (arrT[i] != BytecodeVM.TYPE_NIL) {
-                LuaValue v = weakValues ? readArraySlot(i) : null;
-                if (!weakValues || (v != null && !v.isNil())) {
+                LuaValue v = wv ? readArraySlot(i) : null;
+                if (!wv || (v != null && !v.isNil())) {
                     int b = arrayBucket(i + 1L);
                     if (b < nums.length) nums[b]++;
                     na++;
                 }
             }
         }
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
         if (hashPart != null) {
             for (LuaValue k : hashPart.keySet()) {
                 if (k != null && k.isInteger()) {
@@ -1324,7 +1594,8 @@ public final class LuaTable extends LuaValue {
             }
         }
         if (optimal <= arrLen) {
-            rehashThreshold = Math.max(rehashThreshold * 2, hashEntryCount() + 1);
+            TableAux ta = ensureAux();
+            ta.rehashThreshold = Math.max(ta.rehashThreshold * 2, hashEntryCount() + 1);
             return;
         }
         ensureArrayCapacity(optimal);
@@ -1333,7 +1604,7 @@ public final class LuaTable extends LuaValue {
             arrLen = optimal;
         }
         if (hashPart != null) {
-            java.util.Iterator<Map.Entry<LuaValue, LuaValue>> it = hashPart.entrySet().iterator();
+            Iterator<Map.Entry<LuaValue, LuaValue>> it = hashPart.entrySet().iterator();
             while (it.hasNext()) {
                 Map.Entry<LuaValue, LuaValue> e = it.next();
                 LuaValue k = e.getKey();
@@ -1349,7 +1620,8 @@ public final class LuaTable extends LuaValue {
     }
 
     private void pruneDeadKeys() {
-        if ((!weakKeys && !weakValues) || hashPart == null) return;
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
+        if ((flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) == 0 || hashPart == null) return;
         hashPart.entrySet().removeIf(entry -> {
             LuaValue v = entry.getValue();
             if (v == null || v.isNil() || (v instanceof WeakVal wv && wv.get() == null)) return true;
@@ -1388,10 +1660,6 @@ public final class LuaTable extends LuaValue {
     @Override
     public void set(LuaValue key, LuaValue value) {
         ensureFilled();
-        // Fast path: no metatable means no __newindex chain; the rawget
-        // probe below would be pure overhead (a second hash lookup on top
-        // of rawset's own). Semantics identical: the loop's first iteration
-        // with mt == null does exactly rawset(key, value).
         if (getMetatable() == null) {
             rawset(key, value);
             return;
@@ -1442,7 +1710,7 @@ public final class LuaTable extends LuaValue {
         if (tag == BytecodeVM.TYPE_NIL) {
             return true;
         }
-        if (weakValues && tag == BytecodeVM.TYPE_OBJECT && arrO != null && arrO[idx0] instanceof WeakVal wv) {
+        if (isWeakValues() && tag == BytecodeVM.TYPE_OBJECT && arrO != null && arrO[idx0] instanceof WeakVal wv) {
             LuaValue actual = wv.get();
             if (actual == null) {
                 arrT[idx0] = BytecodeVM.TYPE_NIL;
@@ -1458,6 +1726,7 @@ public final class LuaTable extends LuaValue {
         if (idx >= 1 && idx <= arrLen) {
             return isArraySlotNil((int) (idx - 1));
         }
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
         if (hashPart == null || hashPart.isEmpty()) {
             return true;
         }
@@ -1466,12 +1735,11 @@ public final class LuaTable extends LuaValue {
 
     public int rawlen() {
         ensureFilled();
-        // Mirror C luaH_getn/unbound_search: trim trailing nils, then if
-        // t[n+1] is present (possibly in hash) search upward for a border.
         int n = arrLen;
         while (n > 0 && isArraySlotNil(n - 1)) {
             n--;
         }
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
         if (hashPart == null || hashPart.isEmpty()) {
             return n;
         }
@@ -1482,11 +1750,11 @@ public final class LuaTable extends LuaValue {
     }
 
     private int unboundSearch(long j) {
-        long i = j; // i is zero or a present index
+        long i = j;
         j++;
         while (!isIntNil(j)) {
             i = j;
-            if (j > 0x7FFFFFFFL / 2) { // overflow guard: linear fallback
+            if (j > 0x7FFFFFFFL / 2) {
                 i = 1;
                 while (!isIntNil(i)) i++;
                 return (int) Math.min(i - 1, Integer.MAX_VALUE);
@@ -1504,8 +1772,8 @@ public final class LuaTable extends LuaValue {
     public Varargs next(LuaValue currentKey) {
         ensureFilled();
         currentKey = normalizeKey(currentKey);
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
 
-        // 1. Starting traversal (currentKey is nil)
         if (currentKey == null || currentKey.isNil()) {
             if (hashPart != null) {
                 pruneDeadKeys();
@@ -1522,18 +1790,16 @@ public final class LuaTable extends LuaValue {
                     }
                 }
             }
-            if (smallFields != null) {
-                SmallFields sf = smallFields;
-                for (int i = 0; i < sf.size; i++) {
-                    LuaValue val = smallValAt(sf, i);
+            if (hashPart == null) {
+                int n = totalInlineSlots();
+                for (int i = 0; i < n; i++) {
+                    LuaValue val = inlineValAt(i);
                     if (!val.isNil()) {
-                        lastReturnedKey = null;
-                        nextIterator = null;
-                        return Varargs.of(smallKeyAt(sf, i), val);
+                        clearTraversalCache();
+                        return Varargs.of(inlineKeyAt(i), val);
                     }
                 }
-            }
-            if (hashPart != null) {
+            } else {
                 Iterator<Map.Entry<LuaValue, LuaValue>> iter = hashPart.entrySet().iterator();
                 while (iter.hasNext()) {
                     Map.Entry<LuaValue, LuaValue> entry = iter.next();
@@ -1543,18 +1809,17 @@ public final class LuaTable extends LuaValue {
                     LuaValue val = entry.getValue();
                     if (val instanceof WeakVal wv) val = wv.get();
                     if (val != null && !val.isNil()) {
-                        lastReturnedKey = k;
-                        nextIterator = iter;
+                        TableAux ta = ensureAux();
+                        ta.lastReturnedKey = k;
+                        ta.nextIterator = iter;
                         return Varargs.of(k, val);
                     }
                 }
             }
-            lastReturnedKey = null;
-            nextIterator = null;
+            clearTraversalCache();
             return Varargs.of(LuaNil.NIL);
         }
 
-        // 2. Traversal within array part
         if (currentKey.isInteger()) {
             long k = currentKey.toLong();
             if (k >= 1 && k <= arrLen) {
@@ -1566,18 +1831,16 @@ public final class LuaTable extends LuaValue {
                         }
                     }
                 }
-                if (smallFields != null) {
-                    SmallFields sf = smallFields;
-                    for (int i = 0; i < sf.size; i++) {
-                        LuaValue val = smallValAt(sf, i);
+                if (hashPart == null) {
+                    int n = totalInlineSlots();
+                    for (int i = 0; i < n; i++) {
+                        LuaValue val = inlineValAt(i);
                         if (!val.isNil()) {
-                            lastReturnedKey = null;
-                            nextIterator = null;
-                            return Varargs.of(smallKeyAt(sf, i), val);
+                            clearTraversalCache();
+                            return Varargs.of(inlineKeyAt(i), val);
                         }
                     }
-                }
-                if (hashPart != null) {
+                } else {
                     Iterator<Map.Entry<LuaValue, LuaValue>> iter = hashPart.entrySet().iterator();
                     while (iter.hasNext()) {
                         Map.Entry<LuaValue, LuaValue> entry = iter.next();
@@ -1587,57 +1850,56 @@ public final class LuaTable extends LuaValue {
                         LuaValue val = entry.getValue();
                         if (val instanceof WeakVal wv) val = wv.get();
                         if (val != null && !val.isNil()) {
-                            lastReturnedKey = hk;
-                            nextIterator = iter;
+                            TableAux ta = ensureAux();
+                            ta.lastReturnedKey = hk;
+                            ta.nextIterator = iter;
                             return Varargs.of(hk, val);
                         }
                     }
                 }
-                lastReturnedKey = null;
-                nextIterator = null;
+                clearTraversalCache();
                 return Varargs.of(LuaNil.NIL);
             }
         }
 
-        // 3. Traversal within hash / smallFields part
-        if (smallFields != null) {
-            SmallFields sf = smallFields;
-            int foundIdx = -1;
-            if (currentKey instanceof LuaString ks) {
-                foundIdx = findSmallSlot(sf, ks);
-            }
-            if (foundIdx < 0) {
-                throw new LuaException("invalid key to 'next'");
-            }
-            for (int i = foundIdx + 1; i < sf.size; i++) {
-                LuaValue val = smallValAt(sf, i);
-                if (!val.isNil()) {
-                    return Varargs.of(smallKeyAt(sf, i), val);
-                }
-            }
-            return Varargs.of(LuaNil.NIL);
-        }
         if (hashPart == null) {
-            lastReturnedKey = null;
-            nextIterator = null;
+            int n = totalInlineSlots();
+            if (n > 0) {
+                int foundIdx = -1;
+                if (currentKey instanceof LuaString ks) {
+                    foundIdx = findInlineSlot(ks);
+                }
+                if (foundIdx < 0) {
+                    throw new LuaException("invalid key to 'next'");
+                }
+                for (int i = foundIdx + 1; i < n; i++) {
+                    LuaValue val = inlineValAt(i);
+                    if (!val.isNil()) {
+                        return Varargs.of(inlineKeyAt(i), val);
+                    }
+                }
+                return Varargs.of(LuaNil.NIL);
+            }
+            clearTraversalCache();
             throw new LuaException("invalid key to 'next'");
         }
 
-        if (lastReturnedKey != null && currentKey.equals(lastReturnedKey) && nextIterator != null) {
-            while (nextIterator.hasNext()) {
-                Map.Entry<LuaValue, LuaValue> entry = nextIterator.next();
+        TableAux ta = this.aux;
+        if (ta != null && ta.lastReturnedKey != null && currentKey.equals(ta.lastReturnedKey) && ta.nextIterator != null) {
+            while (ta.nextIterator.hasNext()) {
+                Map.Entry<LuaValue, LuaValue> entry = ta.nextIterator.next();
                 LuaValue k = entry.getKey();
                 if (k instanceof WeakKey wk) k = wk.get();
                 if (k == null) continue;
                 LuaValue val = entry.getValue();
                 if (val instanceof WeakVal wv) val = wv.get();
                 if (val != null && !val.isNil()) {
-                    lastReturnedKey = k;
+                    ta.lastReturnedKey = k;
                     return Varargs.of(k, val);
                 }
             }
-            lastReturnedKey = null;
-            nextIterator = null;
+            ta.lastReturnedKey = null;
+            ta.nextIterator = null;
             return Varargs.of(LuaNil.NIL);
         }
 
@@ -1653,16 +1915,16 @@ public final class LuaTable extends LuaValue {
                 LuaValue val = entry.getValue();
                 if (val instanceof WeakVal wv) val = wv.get();
                 if (val != null && !val.isNil()) {
-                    lastReturnedKey = k;
-                    nextIterator = iter;
+                    TableAux auxOut = ensureAux();
+                    auxOut.lastReturnedKey = k;
+                    auxOut.nextIterator = iter;
                     return Varargs.of(k, val);
                 }
             } else if (k.equals(currentKey)) {
                 found = true;
             }
         }
-        lastReturnedKey = null;
-        nextIterator = null;
+        clearTraversalCache();
         if (!found) {
             throw new LuaException("invalid key to 'next'");
         }
@@ -1679,16 +1941,16 @@ public final class LuaTable extends LuaValue {
                 }
             }
         }
-        if (smallFields != null) {
-            SmallFields sf = smallFields;
-            for (int i = 0; i < sf.size; i++) {
-                LuaValue v = smallValAt(sf, i);
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
+        if (hashPart == null) {
+            int n = totalInlineSlots();
+            for (int i = 0; i < n; i++) {
+                LuaValue v = inlineValAt(i);
                 if (!v.isNil()) {
-                    list.add(smallKeyAt(sf, i));
+                    list.add(inlineKeyAt(i));
                 }
             }
-        }
-        if (hashPart != null) {
+        } else {
             for (Map.Entry<LuaValue, LuaValue> entry : hashPart.entrySet()) {
                 LuaValue k = entry.getKey();
                 LuaValue v = entry.getValue();
@@ -1709,7 +1971,6 @@ public final class LuaTable extends LuaValue {
             if (!handler.isNil()) {
                 org.luava.runtime.concurrency.LuaCoroutine.promoteIfStackless();
                 LuaValue res = firstValue(handler.call(this));
-                // luaL_tolstring accepts a numeric result too (lua_isstring).
                 if (!res.isString() && !res.isNumber()) {
                     throw new LuaException("'__tostring' must return a string");
                 }
@@ -1726,7 +1987,9 @@ public final class LuaTable extends LuaValue {
     /** Rough retained heap byte estimate used by {@code LuaState.maxMemoryBytes(long)}. */
     public long estimatedMemoryBytes() {
         long arrBytes = (arrT != null) ? (long) arrT.length * (arrO != null ? 16L : 9L) : 0L;
-        long h = (hashPart != null) ? (long) hashPart.size() * 64L : (smallFields != null ? 96L : 0L);
+        long h = (hashOrOverflow instanceof HashMap<?, ?> map)
+                ? (long) map.size() * 64L
+                : (hashOrOverflow instanceof OverflowFields ? 64L : 0L);
         return 64L + arrBytes + h;
     }
 
@@ -1739,16 +2002,16 @@ public final class LuaTable extends LuaValue {
                 }
             }
         }
-        if (smallFields != null) {
-            SmallFields sf = smallFields;
-            for (int i = 0; i < sf.size; i++) {
-                LuaValue v = smallValAt(sf, i);
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
+        if (hashPart == null) {
+            int n = totalInlineSlots();
+            for (int i = 0; i < n; i++) {
+                LuaValue v = inlineValAt(i);
                 if (!v.isNil()) {
-                    consumer.accept(smallKeyAt(sf, i), v);
+                    consumer.accept(inlineKeyAt(i), v);
                 }
             }
-        }
-        if (hashPart != null) {
+        } else {
             for (Map.Entry<LuaValue, LuaValue> entry : hashPart.entrySet()) {
                 LuaValue k = entry.getKey();
                 if (k instanceof WeakKey wk) k = wk.get();
@@ -1762,11 +2025,6 @@ public final class LuaTable extends LuaValue {
         }
     }
 
-    /**
-     * Plain-table zero-StringBuilder concatenation over integer keys
-     * {@code [start..last]}. Reads unboxed array slots and {@link LuaString}
-     * backing bytes directly into one growing {@code byte[]} buffer.
-     */
     public LuaString concatPlainBytes(byte[] sep, int sepOff, int sepLen,
             long start, long last, long allocCap) {
         if (last < start) {
@@ -1776,6 +2034,7 @@ public final class LuaTable extends LuaValue {
         long hint = Math.min(allocCap, Math.max(64L, Math.min(1L << 20, count * 8L)));
         byte[] buf = new byte[(int) hint];
         int pos = 0;
+        boolean wv = isWeakValues();
 
         for (long idx = start; idx <= last; idx++) {
             if ((idx & 0xFF) == 0) {
@@ -1787,7 +2046,7 @@ public final class LuaTable extends LuaValue {
                 pos += sepLen;
             }
             LuaString elem;
-            if (idx <= arrLen && !weakValues) {
+            if (idx <= arrLen && !wv) {
                 int slot = (int) idx - 1;
                 byte tag = arrT[slot];
                 if (tag == BytecodeVM.TYPE_OBJECT) {

@@ -113,6 +113,7 @@ public final class LuaCoroutine extends LuaValue {
 
     /** Refresh the top frame's pc/line from {@link #vmPcMirror} (Lua frames only). */
     public void syncTopFrameFromMirror() {
+        materializePendingYieldFrame();
         int mpc = vmPcMirror;
         if (mpc < 0) return;
         CallStack.Frame f = getCallStackState().getFrame(0);
@@ -148,9 +149,15 @@ public final class LuaCoroutine extends LuaValue {
     private LuaState installedBasicState;
     private Thread installedRootThread;
     private volatile Status status = Status.SUSPENDED;
-    private static final java.util.concurrent.atomic.AtomicReferenceFieldUpdater<LuaCoroutine, Status>
-            STATUS_UPDATER = java.util.concurrent.atomic.AtomicReferenceFieldUpdater.newUpdater(
-                    LuaCoroutine.class, Status.class, "status");
+    private static final java.lang.invoke.VarHandle STATUS_VH;
+    static {
+        try {
+            STATUS_VH = java.lang.invoke.MethodHandles.lookup()
+                    .findVarHandle(LuaCoroutine.class, "status", Status.class);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
     private volatile Throwable error;
 
     public Throwable getError() {
@@ -243,6 +250,9 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public CallStack.CallStackState getCallStackState() {
+        if (hasPendingYieldFrame && status == Status.SUSPENDED) {
+            materializePendingYieldFrame();
+        }
         return callStackState;
     }
 
@@ -306,6 +316,9 @@ public final class LuaCoroutine extends LuaValue {
         }
         boolean wasActive = hooksActive;
         hooksActive = active;
+        if (active) {
+            trampolineReady = false;
+        }
         if (ownerState != null) {
             ownerState.updateHookPresence(wasActive, active);
         }
@@ -526,8 +539,21 @@ public final class LuaCoroutine extends LuaValue {
     private LuaState stacklessState;
     public int yieldFuncIdx;
     public int yieldNResults;
+    public boolean hasPendingYieldFrame;
+    private boolean trampolineReady;
     public byte handoffSingleTag;
     public long handoffSinglePrim;
+
+    public void materializePendingYieldFrame() {
+        if (hasPendingYieldFrame) {
+            hasPendingYieldFrame = false;
+            org.luava.runtime.bytecode.VmContext ctx = this.stacklessCtx;
+            if (ctx != null) {
+                org.luava.runtime.bytecode.BytecodeVM.stampYieldFrame(
+                        this.stacklessState, ctx, this.yieldFuncIdx);
+            }
+        }
+    }
 
     public static final int TRAMPOLINE_DENIED = -1;
     public static final int TRAMPOLINE_START = 0;
@@ -693,9 +719,15 @@ public final class LuaCoroutine extends LuaValue {
             handoffSingleTag = 0;
         } else if (count == 1) {
             handoffResult = null;
-            handoffSingleTag = singleTag;
-            handoffSinglePrim = singlePrim;
-            handoffSingleResult = singleObj;
+            if (singleTag == 0 || singleTag == org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT) {
+                handoffSingleTag = 0;
+                handoffSinglePrim = 0L;
+                handoffSingleResult = singleObj != null ? singleObj : LuaNil.NIL;
+            } else {
+                handoffSingleTag = singleTag;
+                handoffSinglePrim = singlePrim;
+                handoffSingleResult = null;
+            }
         } else {
             handoffSingleTag = 0;
             handoffSingleResult = null;
@@ -731,11 +763,12 @@ public final class LuaCoroutine extends LuaValue {
         this.activeStacklessCtx = null;
         this.yieldFuncIdx = funcIdx;
         this.yieldNResults = nResults;
+        this.hasPendingYieldFrame = true;
         this.handoffResultCount = yieldCount;
         this.handoffSingleTag = 0;
         this.handoffSingleResult = singleYield;
         this.handoffResult = multiYield;
-        this.status = Status.SUSPENDED;
+        STATUS_VH.setRelease(this, Status.SUSPENDED);
     }
 
     public void suspendStacklessRaw(org.luava.runtime.bytecode.VmContext ctx, LuaState state,
@@ -746,12 +779,69 @@ public final class LuaCoroutine extends LuaValue {
         this.activeStacklessCtx = null;
         this.yieldFuncIdx = funcIdx;
         this.yieldNResults = nResults;
+        this.hasPendingYieldFrame = true;
         this.handoffResultCount = yieldCount;
-        this.handoffSingleTag = singleTag;
-        this.handoffSinglePrim = singlePrim;
-        this.handoffSingleResult = singleObj;
-        this.handoffResult = multiYield;
-        this.status = Status.SUSPENDED;
+        if (yieldCount == 1) {
+            if (singleTag == 0 || singleTag == org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT) {
+                this.handoffSingleTag = 0;
+                this.handoffSinglePrim = 0L;
+                this.handoffSingleResult = singleObj != null ? singleObj : LuaNil.NIL;
+            } else {
+                this.handoffSingleTag = singleTag;
+                this.handoffSinglePrim = singlePrim;
+                this.handoffSingleResult = null;
+            }
+            this.handoffResult = null;
+        } else {
+            this.handoffSingleTag = 0;
+            this.handoffSinglePrim = 0L;
+            this.handoffSingleResult = null;
+            this.handoffResult = multiYield;
+        }
+        STATUS_VH.setRelease(this, Status.SUSPENDED);
+    }
+
+    public void suspendStacklessTrampolineRaw(org.luava.runtime.bytecode.VmContext ctx, LuaState state,
+            int funcIdx, int nResults, int yieldCount, byte singleTag, long singlePrim, LuaValue singleObj) {
+        this.stacklessCtx = ctx;
+        this.stacklessState = state;
+        this.activeStacklessCtx = null;
+        this.yieldFuncIdx = funcIdx;
+        this.yieldNResults = nResults;
+        this.hasPendingYieldFrame = true;
+        this.handoffResultCount = yieldCount;
+        if (yieldCount == 1) {
+            if (singleTag == 0 || singleTag == org.luava.runtime.bytecode.BytecodeVM.TYPE_OBJECT) {
+                this.handoffSingleTag = 0;
+                this.handoffSinglePrim = 0L;
+                this.handoffSingleResult = singleObj != null ? singleObj : LuaNil.NIL;
+            } else {
+                this.handoffSingleTag = singleTag;
+                this.handoffSinglePrim = singlePrim;
+                this.handoffSingleResult = null;
+            }
+        } else {
+            this.handoffSingleTag = 0;
+            this.handoffSinglePrim = 0L;
+            this.handoffSingleResult = null;
+        }
+        this.handoffResult = null;
+        this.trampolineReady = !this.hooksActive && this.virtualThread == null
+                && this.callStackState.errorTop == 0 && this.callStackState.deathTop == 0
+                && !this.callStackState.preserveForDeath;
+        STATUS_VH.setRelease(this, Status.SUSPENDED);
+    }
+
+    public void suspendFromFastSlice(
+            org.luava.runtime.bytecode.VmContext ctx, LuaState state, int funcIdx, int nResults) {
+        this.stacklessCtx = ctx;
+        this.stacklessState = state;
+        this.activeStacklessCtx = null;
+        this.yieldFuncIdx = funcIdx;
+        this.yieldNResults = nResults;
+        this.hasPendingYieldFrame = true;
+        this.trampolineReady = true;
+        STATUS_VH.setRelease(this, Status.SUSPENDED);
     }
 
     public void suspendTrampoline(
@@ -761,22 +851,24 @@ public final class LuaCoroutine extends LuaValue {
         this.activeStacklessCtx = null;
         this.yieldFuncIdx = funcIdx;
         this.yieldNResults = nResults;
-        this.status = Status.SUSPENDED;
+        this.hasPendingYieldFrame = true;
+        this.trampolineReady = !this.hooksActive && this.virtualThread == null
+                && this.callStackState.errorTop == 0 && this.callStackState.deathTop == 0
+                && !this.callStackState.preserveForDeath;
+        STATUS_VH.setRelease(this, Status.SUSPENDED);
     }
 
     /** Attempts to enter stackless trampoline mode without launching/parking a VirtualThread. */
     public int tryBeginTrampoline(LuaCoroutine callerCoro, LuaState callerState) {
-        if (stacklessCtx != null && virtualThread == null && !hooksActive && callerCoro != null
-                && stacklessState == callerState && callerCoro.nestedDepth + 1 < MAX_NESTED_COROUTINES
-                && callStackState.errorTop == 0 && callStackState.deathTop == 0 && !callStackState.preserveForDeath) {
-            if (STATUS_UPDATER.compareAndSet(this, Status.SUSPENDED, Status.RUNNING)) {
-                if (virtualThread == null && !hooksActive && stacklessCtx != null && stacklessState == callerState) {
-                    this.nestedDepth = callerCoro.nestedDepth + 1;
-                    callerCoro.status = Status.NORMAL;
-                    return TRAMPOLINE_RESUME;
-                }
-                STATUS_UPDATER.set(this, Status.SUSPENDED);
+        if (trampolineReady && stacklessState == callerState && callerCoro != null
+                && callerCoro.nestedDepth < MAX_NESTED_COROUTINES - 1
+                && STATUS_VH.compareAndSet(this, Status.SUSPENDED, Status.RUNNING)) {
+            if (trampolineReady && stacklessCtx != null) {
+                this.nestedDepth = callerCoro.nestedDepth + 1;
+                STATUS_VH.setOpaque(callerCoro, Status.NORMAL);
+                return TRAMPOLINE_RESUME;
             }
+            STATUS_VH.setRelease(this, Status.SUSPENDED);
         }
         return tryBeginTrampolineSlow(callerCoro, callerState);
     }
@@ -798,7 +890,7 @@ public final class LuaCoroutine extends LuaValue {
             return TRAMPOLINE_DENIED;
         }
         this.nestedDepth = depth;
-        callerCoro.status = Status.NORMAL;
+        STATUS_VH.setOpaque(callerCoro, Status.NORMAL);
         this.status = Status.RUNNING;
         if (this.error != null) {
             this.error = null;
@@ -813,10 +905,12 @@ public final class LuaCoroutine extends LuaValue {
     }
 
     public void markRunningFromTrampoline() {
-        this.status = Status.RUNNING;
+        STATUS_VH.setOpaque(this, Status.RUNNING);
     }
 
     public void clearStacklessOnExit() {
+        this.hasPendingYieldFrame = false;
+        this.trampolineReady = false;
         this.activeStacklessCtx = null;
         this.stacklessCtx = null;
         this.stacklessState = null;
@@ -855,6 +949,7 @@ public final class LuaCoroutine extends LuaValue {
             String msg = t.getMessage() != null ? t.getMessage() : t.toString();
             errVal = LuaString.valueOf(msg);
         }
+        handoffSingleTag = 0;
         handoffResult = new LuaValue[]{errVal};
         handoffSingleResult = errVal;
         handoffResultCount = 1;
@@ -865,6 +960,8 @@ public final class LuaCoroutine extends LuaValue {
     public void graduateToVirtualThread(LuaState state, org.luava.runtime.bytecode.VmContext ctx) {
         long seenYield;
         synchronized (this) {
+            this.trampolineReady = false;
+            materializePendingYieldFrame();
             this.resumerThread = Thread.currentThread();
             captureCallerContext();
             this.stacklessCtx = null;
@@ -937,6 +1034,7 @@ public final class LuaCoroutine extends LuaValue {
             }
 
             if (!runStackless) {
+                trampolineReady = false;
                 resumerThread = callerThread;
                 handoffArgCount = argCount;
                 handoffSingleArg = singleArg;
@@ -1349,10 +1447,12 @@ public final class LuaCoroutine extends LuaValue {
             this.nestedDepth = depth;
 
             if (virtualThread == null) {
+                trampolineReady = false;
                 if (stacklessCtx != null && tbcHead != null) {
                     if (callerCoro != null) {
                         callerCoro.status = Status.NORMAL;
                     }
+                    materializePendingYieldFrame();
                     org.luava.runtime.bytecode.VmContext closeCtx = stacklessCtx;
                     LuaState closeState = stacklessState;
                     stacklessCtx = null;

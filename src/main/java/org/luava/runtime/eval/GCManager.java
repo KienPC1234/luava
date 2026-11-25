@@ -151,7 +151,7 @@ public final class GCManager {
             collectOnThreshold(bytes);
         }
 
-        void preAllocCheck(long pendingBytes) {
+        public void preAllocCheck(long pendingBytes) {
             long memCap = maxMemoryBytes;
             if (memCap <= 0 || pendingBytes <= 0) {
                 return;

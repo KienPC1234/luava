@@ -73,6 +73,27 @@ public final class LuaProto {
      * recompute identically). */
     public volatile boolean factoryAnalyzed;
 
+    /** Per-instruction inline cache entry for {@code OP_GETTABUP} / {@code OP_GETFIELD}. */
+    public static final class FieldIC {
+        public org.luava.runtime.LuaTable tbl;
+        public int modCount;
+        public int misses;
+        public byte tag;
+        public long prim;
+        public LuaValue obj;
+    }
+
+    public transient FieldIC[] fieldIc;
+
+    public FieldIC[] ensureFieldIc() {
+        FieldIC[] ic = this.fieldIc;
+        if (ic == null) {
+            ic = new FieldIC[this.code.length];
+            this.fieldIc = ic;
+        }
+        return ic;
+    }
+
     /** Capture source per child upvalue: 0 = caller arg, 1 = nil,
      * 2 = constant, 3 = shared parent upvalue. */
     public static final class FactoryInfo {

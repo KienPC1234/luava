@@ -273,7 +273,8 @@ public final class JitCompiler {
                 LuaToJvmTranslator.Info info = analysis.info();
                 String name = "org/luava/runtime/jit/Gen$" + CLASS_SEQ.getAndIncrement();
                 LuaToJvmTranslator.Translation tr =
-                        LuaToJvmTranslator.translate(proto, analysis, name, org.luava.runtime.LuaState.ENABLE_OSR, guarded);
+                        LuaToJvmTranslator.translate(
+                                proto, analysis, name, org.luava.runtime.LuaState.ENABLE_OSR, guarded, true);
                 if (tr == null) {
                     REJECTED_COUNT.incrementAndGet();
                     if (guarded) {
@@ -284,7 +285,7 @@ public final class JitCompiler {
                     return null;
                 }
                 MethodHandles.Lookup lookup = MethodHandles.lookup();
-                Class<?> cls = lookup.defineHiddenClass(tr.bytes(), true,
+                Class<?> cls = lookup.defineHiddenClassWithClassData(tr.bytes(), proto.constants, true,
                         MethodHandles.Lookup.ClassOption.NESTMATE).lookupClass();
                 JitEntry entry = (JitEntry) cls.getDeclaredConstructor().newInstance();
                 JitCode code;

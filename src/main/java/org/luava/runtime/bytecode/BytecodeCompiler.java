@@ -872,69 +872,170 @@ public final class BytecodeCompiler {
          * two instructions instead of the materialise-a-boolean + TEST +
          * JMP sequence. Everything else keeps the general value + TEST path.
          */
-        int emitConditionFalseJump(Expression condition, int line) {
-            if (condition instanceof Expressions.BinaryExpr be) {
-                int op = -1;
-                // k=0: the VM skips the following JMP when the comparison
-                // holds, so the JMP fires exactly when the condition is
-                // false (matching the TEST k=0 path below).
-                switch (be.operator()) {
-                    case LESS -> op = OpCode.OP_LT;
-                    case LESS_EQUAL -> op = OpCode.OP_LE;
-                    case EQUAL_EQUAL -> op = OpCode.OP_EQ;
-                    default -> op = -1;
-                }
-                if (op >= 0) {
-                    // PUC codeorderI: `x <op> small_int` uses the immediate
-                    // form (LEI/LTI/EQI), avoiding a LOADI/LOADK.
-                    if (be.right() instanceof Expressions.IntegerLiteral cil) {
-                        long iv = cil.value();
-                        if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
-                            int b = compileExprToAnyReg(be.left(), be.line());
-                            int iop = switch (be.operator()) {
-                                case LESS -> OpCode.OP_LTI;
-                                case LESS_EQUAL -> OpCode.OP_LEI;
-                                case EQUAL_EQUAL -> OpCode.OP_EQI;
-                                default -> -1;
-                            };
-                            emit(Instruction.encodeABCsB(iop, b, (int) iv), be.line());
-                            return emitJmp(line);
-                        }
-                    }
-                    int b = compileExprToAnyReg(be.left(), be.line());
-                    int c = compileExprToAnyReg(be.right());
-                    emit(Instruction.encodeABC(op, b, c, 0, 0), be.line());
-                    return emitJmp(line);
-                }
-                // GREATER / GREATER_EQUAL are lowered to swapped LT/LE:
-                // a > b == b < a, a >= b == b <= a. PUC codeorder handles the
-                // "immediate on the left" case as GTI/GEI.
-                if (be.operator() == TokenType.GREATER || be.operator() == TokenType.GREATER_EQUAL) {
-                    boolean ge = be.operator() == TokenType.GREATER_EQUAL;
-                    if (be.left() instanceof Expressions.IntegerLiteral cil) {
-                        long iv = cil.value();
-                        if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
-                            int b = compileExprToAnyReg(be.right(), be.line());
-                            int iop = ge ? OpCode.OP_GEI : OpCode.OP_GTI;
-                            emit(Instruction.encodeABCsB(iop, b, (int) iv), be.line());
-                            return emitJmp(line);
-                        }
-                    }
-                    int b = compileExprToAnyReg(be.left(), be.line());
-                    int c = compileExprToAnyReg(be.right());
-                    emit(Instruction.encodeABC(ge ? OpCode.OP_LE : OpCode.OP_LT, c, b, 0, 0), be.line());
-                    return emitJmp(line);
-                }
+        void patchJmpList(IntVector jmps, int targetPc) {
+            for (int i = 0; i < jmps.size(); i++) {
+                patchJmp(jmps.get(i), targetPc);
             }
-            int condReg = compileExprToAnyReg(condition, line);
-            emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0), line);
-            return emitJmp(line);
         }
 
-        void compileIf(Statements.IfStmt is) {            List<Integer> exitJmps = new ArrayList<>();
+        boolean isAlwaysTruthyLiteral(Expression e) {
+            return (e instanceof Expressions.BooleanLiteral bl && bl.value())
+                    || e instanceof Expressions.IntegerLiteral
+                    || e instanceof Expressions.FloatLiteral
+                    || e instanceof Expressions.StringLiteral;
+        }
+
+        boolean isAlwaysFalsyLiteral(Expression e) {
+            return e instanceof Expressions.NilLiteral
+                    || (e instanceof Expressions.BooleanLiteral bl && !bl.value());
+        }
+
+        /**
+         * Emits control-flow jump(s) appending to {@code jmpList} that fire when
+         * {@code rawCond} evaluates to {@code jumpWhenTrue}, falling through
+         * otherwise. Mirrors PUC {@code luaK_goiftrue}/{@code luaK_goiffalse}:
+         * constant literals, {@code not}, short-circuit {@code and}/{@code or},
+         * equality ({@code ==}/{@code ~=} with {@code EQI}/{@code EQK}/{@code EQ}),
+         * and ordered comparisons lower directly to branch instructions without
+         * materializing intermediate booleans.
+         */
+        void emitConditionJump(Expression rawCond, boolean jumpWhenTrue, IntVector jmpList, int line) {
+            Expression condition = org.luava.midend.optimizer.ConstantFolder.fold(rawCond);
+            while (condition instanceof Expressions.ParenExpr pe) {
+                condition = org.luava.midend.optimizer.ConstantFolder.fold(pe.expression());
+            }
+            if (isAlwaysTruthyLiteral(condition)) {
+                if (jumpWhenTrue) {
+                    jmpList.add(emitJmp(line));
+                }
+                return;
+            }
+            if (isAlwaysFalsyLiteral(condition)) {
+                if (!jumpWhenTrue) {
+                    jmpList.add(emitJmp(line));
+                }
+                return;
+            }
+            if (condition instanceof Expressions.UnaryExpr ue && ue.operator() == TokenType.NOT) {
+                emitConditionJump(ue.operand(), !jumpWhenTrue, jmpList, line);
+                return;
+            }
+            if (condition instanceof Expressions.BinaryExpr be) {
+                TokenType bop = be.operator();
+                if (bop == TokenType.AND) {
+                    if (!jumpWhenTrue) {
+                        emitConditionJump(be.left(), false, jmpList, be.line());
+                        emitConditionJump(be.right(), false, jmpList, line);
+                    } else {
+                        IntVector skipRight = new IntVector(2);
+                        emitConditionJump(be.left(), false, skipRight, be.line());
+                        emitConditionJump(be.right(), true, jmpList, line);
+                        patchJmpList(skipRight, code.size());
+                    }
+                    return;
+                }
+                if (bop == TokenType.OR) {
+                    if (jumpWhenTrue) {
+                        emitConditionJump(be.left(), true, jmpList, be.line());
+                        emitConditionJump(be.right(), true, jmpList, line);
+                    } else {
+                        IntVector skipRight = new IntVector(2);
+                        emitConditionJump(be.left(), true, skipRight, be.line());
+                        emitConditionJump(be.right(), false, jmpList, line);
+                        patchJmpList(skipRight, code.size());
+                    }
+                    return;
+                }
+                if (bop == TokenType.EQUAL_EQUAL || bop == TokenType.TILDE_EQUAL) {
+                    int saveFree = freereg;
+                    int k = (bop == TokenType.TILDE_EQUAL) ? (jumpWhenTrue ? 0 : 1) : (jumpWhenTrue ? 1 : 0);
+                    Expression left = org.luava.midend.optimizer.ConstantFolder.fold(be.left());
+                    Expression right = org.luava.midend.optimizer.ConstantFolder.fold(be.right());
+                    if (right instanceof Expressions.IntegerLiteral ril
+                            && ril.value() >= -Instruction.OFFSET_sC
+                            && ril.value() <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                        int rb = compileExprToAnyReg(left, be.line());
+                        emit(Instruction.encodeABCsBk(OpCode.OP_EQI, rb, (int) ril.value(), k), be.line());
+                        jmpList.add(emitJmp(line));
+                        freeRegs(saveFree);
+                        return;
+                    }
+                    if (left instanceof Expressions.IntegerLiteral lil
+                            && lil.value() >= -Instruction.OFFSET_sC
+                            && lil.value() <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                        int rb = compileExprToAnyReg(right, be.line());
+                        emit(Instruction.encodeABCsBk(OpCode.OP_EQI, rb, (int) lil.value(), k), be.line());
+                        jmpList.add(emitJmp(line));
+                        freeRegs(saveFree);
+                        return;
+                    }
+                    int rConst = constIndexOf(right);
+                    if (rConst >= 0 && rConst <= 255) {
+                        int rb = compileExprToAnyReg(left, be.line());
+                        emit(Instruction.encodeABC(OpCode.OP_EQK, rb, rConst, 0, k), be.line());
+                        jmpList.add(emitJmp(line));
+                        freeRegs(saveFree);
+                        return;
+                    }
+                    int lConst = constIndexOf(left);
+                    if (lConst >= 0 && lConst <= 255) {
+                        int rb = compileExprToAnyReg(right, be.line());
+                        emit(Instruction.encodeABC(OpCode.OP_EQK, rb, lConst, 0, k), be.line());
+                        jmpList.add(emitJmp(line));
+                        freeRegs(saveFree);
+                        return;
+                    }
+                    int rb = compileExprToAnyReg(left, be.line());
+                    int rc = compileExprToAnyReg(right);
+                    emit(Instruction.encodeABC(OpCode.OP_EQ, rb, rc, 0, k), be.line());
+                    jmpList.add(emitJmp(line));
+                    freeRegs(saveFree);
+                    return;
+                }
+                if (bop == TokenType.LESS || bop == TokenType.LESS_EQUAL
+                        || bop == TokenType.GREATER || bop == TokenType.GREATER_EQUAL) {
+                    int saveFree = freereg;
+                    int k = jumpWhenTrue ? 1 : 0;
+                    Expression left = org.luava.midend.optimizer.ConstantFolder.fold(be.left());
+                    Expression right = org.luava.midend.optimizer.ConstantFolder.fold(be.right());
+                    if (right instanceof Expressions.IntegerLiteral cil) {
+                        long iv = cil.value();
+                        if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                            int rb = compileExprToAnyReg(left, be.line());
+                            int iop = compareIOpcode(bop);
+                            emit(Instruction.encodeABCsBk(iop, rb, (int) iv, k), be.line());
+                            jmpList.add(emitJmp(line));
+                            freeRegs(saveFree);
+                            return;
+                        }
+                    }
+                    int rb = compileExprToAnyReg(left, be.line());
+                    int rc = compileExprToAnyReg(right);
+                    if (bop == TokenType.LESS || bop == TokenType.LESS_EQUAL) {
+                        int op = (bop == TokenType.LESS) ? OpCode.OP_LT : OpCode.OP_LE;
+                        emit(Instruction.encodeABC(op, rb, rc, 0, k), be.line());
+                    } else {
+                        int op = (bop == TokenType.GREATER) ? OpCode.OP_LT : OpCode.OP_LE;
+                        emit(Instruction.encodeABC(op, rc, rb, 0, k), be.line());
+                    }
+                    jmpList.add(emitJmp(line));
+                    freeRegs(saveFree);
+                    return;
+                }
+            }
+            int saveFree = freereg;
+            int condReg = compileExprToAnyReg(condition, line);
+            emit(Instruction.encodeABC(OpCode.OP_TEST, condReg, 0, 0, jumpWhenTrue ? 1 : 0), line);
+            jmpList.add(emitJmp(line));
+            freeRegs(saveFree);
+        }
+
+        void compileIf(Statements.IfStmt is) {
+            IntVector exitJmps = new IntVector(Math.max(2, is.branches().size()));
             for (int i = 0; i < is.branches().size(); i++) {
                 Statements.IfBranch branch = is.branches().get(i);
-                int falseJmp = emitConditionFalseJump(branch.condition(), branch.thenLine());
+                IntVector falseJmps = new IntVector(4);
+                emitConditionJump(branch.condition(), false, falseJmps, branch.thenLine());
                 compileBlock(branch.block());
                 // In Lua 5.4 (lparser.c: test_then_block), only emit jump over following else/elseif,
                 // and use the line of the last statement in the 'then' block.
@@ -944,21 +1045,19 @@ public final class BytecodeCompiler {
                             : branch.thenLine();
                     exitJmps.add(emitJmp(exitLine));
                 }
-                patchJmp(falseJmp, code.size());
+                patchJmpList(falseJmps, code.size());
             }
             if (is.elseBlock() != null) {
                 compileBlock(is.elseBlock());
             }
-            int endPc = code.size();
-            for (int jmp : exitJmps) {
-                patchJmp(jmp, endPc);
-            }
+            patchJmpList(exitJmps, code.size());
         }
 
         void compileWhile(Statements.WhileStmt ws) {
             clearDeadSlotsAtLoopEntry(ws.line());
             int loopStart = code.size();
-            int falseJmp = emitConditionFalseJump(ws.condition(), ws.line());
+            IntVector falseJmps = new IntVector(4);
+            emitConditionJump(ws.condition(), false, falseJmps, ws.line());
 
             LoopInfo loop = new LoopInfo(loopStart, locals.size());
             loopStack.push(loop);
@@ -973,7 +1072,7 @@ public final class BytecodeCompiler {
             patchJmp(backJmp, loopStart);
 
             int loopEnd = code.size();
-            patchJmp(falseJmp, loopEnd);
+            patchJmpList(falseJmps, loopEnd);
             patchBreakList(loop, loopEnd);
             loopStack.pop();
         }
@@ -1043,8 +1142,9 @@ public final class BytecodeCompiler {
                 // condition is false" (luaK_goiftrue), so this is exactly the
                 // same compare + JMP shape as an if-condition, not an
                 // inverted one.
-                int repeatJmp = emitConditionFalseJump(rs.condition(), condLine);
-                patchJmp(repeatJmp, loopStart);
+                IntVector repeatJmps = new IntVector(4);
+                emitConditionJump(rs.condition(), false, repeatJmps, condLine);
+                patchJmpList(repeatJmps, loopStart);
             }
 
             closeLocalsTo(baseLocals, condLine);
@@ -1609,32 +1709,43 @@ public final class BytecodeCompiler {
                 freeRegs(Math.max(saveFreereg, targetReg + 1));
                 return;
             }
-            if (be.operator() == TokenType.TILDE_EQUAL) {
+            if (be.operator() == TokenType.EQUAL_EQUAL || be.operator() == TokenType.TILDE_EQUAL) {
+                int k = (be.operator() == TokenType.TILDE_EQUAL) ? 1 : 0;
+                Expression right = org.luava.midend.optimizer.ConstantFolder.fold(be.right());
+                if (right instanceof Expressions.IntegerLiteral cil
+                        && cil.value() >= -Instruction.OFFSET_sC
+                        && cil.value() <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
+                    int rb = compileExprToAnyReg(be.left(), be.line());
+                    emit(Instruction.encodeABCsBk(OpCode.OP_EQI, rb, (int) cil.value(), k), be.line());
+                    emit(Instruction.encodeABC(OpCode.OP_LFALSESKIP, targetReg, 0, 0), be.line());
+                    emit(Instruction.encodeABC(OpCode.OP_LOADTRUE, targetReg, 0, 0), be.line());
+                    freeRegs(Math.max(saveFreereg, targetReg + 1));
+                    return;
+                }
+                int rConst = constIndexOf(right);
+                if (rConst >= 0 && rConst <= 255) {
+                    int rb = compileExprToAnyReg(be.left(), be.line());
+                    emit(Instruction.encodeABC(OpCode.OP_EQK, rb, rConst, 0, k), be.line());
+                    emit(Instruction.encodeABC(OpCode.OP_LFALSESKIP, targetReg, 0, 0), be.line());
+                    emit(Instruction.encodeABC(OpCode.OP_LOADTRUE, targetReg, 0, 0), be.line());
+                    freeRegs(Math.max(saveFreereg, targetReg + 1));
+                    return;
+                }
                 int b = compileExprToAnyReg(be.left(), be.line());
-                int c = compileExprToAnyReg(be.right());
-                emit(Instruction.encodeABC(OpCode.OP_EQ, b, c, 0, 1), be.line());
+                int c = compileExprToAnyReg(right);
+                emit(Instruction.encodeABC(OpCode.OP_EQ, b, c, 0, k), be.line());
                 emit(Instruction.encodeABC(OpCode.OP_LFALSESKIP, targetReg, 0, 0), be.line());
                 emit(Instruction.encodeABC(OpCode.OP_LOADTRUE, targetReg, 0, 0), be.line());
                 freeRegs(Math.max(saveFreereg, targetReg + 1));
                 return;
             }
-            // PUC lcode.c codeorder/codeorderI: ordered comparisons against a
-            // small integer immediate use OP_LTI/LEI/GTI/GEI (and equality uses
-            // OP_EQI), avoiding a register load for the constant. The value is
-            // still materialised as a boolean here (same LFALSESKIP/LOADTRUE
-            // shape as the register form).
             if (be.right() instanceof Expressions.IntegerLiteral cil) {
                 long iv = cil.value();
                 if (iv >= -Instruction.OFFSET_sC && iv <= (Instruction.MASK_C - Instruction.OFFSET_sC)) {
                     int cmpOp = compareIOpcode(be.operator());
-                    boolean eqOp = be.operator() == TokenType.EQUAL_EQUAL;
-                    if (cmpOp >= 0 || eqOp) {
+                    if (cmpOp >= 0) {
                         int rb = compileExprToAnyReg(be.left(), be.line());
-                        if (eqOp) {
-                            emit(Instruction.encodeABCsB(OpCode.OP_EQI, rb, (int) iv), be.line());
-                        } else {
-                            emit(Instruction.encodeABCsB(cmpOp, rb, (int) iv), be.line());
-                        }
+                        emit(Instruction.encodeABCsB(cmpOp, rb, (int) iv), be.line());
                         emit(Instruction.encodeABC(OpCode.OP_LFALSESKIP, targetReg, 0, 0), be.line());
                         emit(Instruction.encodeABC(OpCode.OP_LOADTRUE, targetReg, 0, 0), be.line());
                         freeRegs(Math.max(saveFreereg, targetReg + 1));

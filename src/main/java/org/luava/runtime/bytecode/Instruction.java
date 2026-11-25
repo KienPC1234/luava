@@ -114,6 +114,11 @@ public final class Instruction {
         return encodeABC(op, a, sb + OFFSET_sC, 0, 0);
     }
 
+    /** Encode an iABC with a signed B-field immediate and an explicit {@code k} polarity flag. */
+    public static int encodeABCsBk(int op, int a, int sb, int k) {
+        return encodeABC(op, a, sb + OFFSET_sC, 0, k);
+    }
+
     public static int encodeABx(int op, int a, int bx) {
         return ((op & MASK_OP) << POS_OP)
                 | ((a & MASK_A) << POS_A)
