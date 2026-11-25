@@ -2025,7 +2025,7 @@ public final class BytecodeVM {
                     int oldLine = (ctx.proto.lineInfo != null && ctx.oldpc >= 0 && ctx.oldpc < ctx.proto.lineInfo.length)
                             ? ctx.proto.lineInfo[ctx.oldpc] : -1;
                     if (ctx.varargPrepRan || ctx.oldpc < 0 || instPc <= ctx.oldpc || curLine != oldLine) {
-                        if (curLine > 0) {
+                        if (curLine > 0 || (ctx.closure != null && ctx.closure.isStripped())) {
                             // Stamp the frame: hook observers (getlocal/traceback) read it.
                             if (curFrame != null) {
                                 curFrame.pc = instPc;

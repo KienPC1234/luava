@@ -1,0 +1,15 @@
+{
+  "commit_sha": "head",
+  "timestamp_utc": "2026-11-25T13:29:57.383433917Z",
+  "mode": "ab",
+  "forks": 2,
+  "warmup_iterations": 2,
+  "measurement_iterations": 4,
+  "iteration_time_ms": 250,
+  "jvm_args_jit_on": "-Xms512m -Xmx2g -XX:+UseG1GC -Dluava.jit=true -Dluava.jit.sync=true",
+  "jvm_args_jit_off": "-Xms512m -Xmx2g -XX:+UseG1GC -Dluava.jit=false",
+  "jdk": "OpenJDK 64-Bit Server VM 21.0.13.1+2-1-26.04.1-Ubuntu",
+  "os": "Linux 7.0.0-43-generic (amd64)",
+  "cpu": "Intel(R) Xeon(R) Gold 5120T CPU @ 2.20GHz",
+  "available_processors": 56
+}

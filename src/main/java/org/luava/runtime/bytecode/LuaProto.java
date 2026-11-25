@@ -32,8 +32,43 @@ public final class LuaProto {
 
     public record LocVarInfo(String name, int reg, int startPc, int endPc) {}
     public final LocVarInfo[] locVarInfos;
-    public String rawSource;
-    public org.luava.frontend.ast.Statements.BlockStmt body;
+
+    /** Estimates retained Java heap bytes for this proto tree (used by bounded {@code protoCache}). */
+    public long estimatedRetainedBytes() {
+        long bytes = 96L
+                + (long) code.length * 4L
+                + (long) lineInfo.length * 4L
+                + (long) constants.length * 24L
+                + (long) upvalues.length * 24L
+                + (long) locVars.length * 16L
+                + (long) locVarInfos.length * 32L;
+        for (LuaValue c : constants) {
+            if (c instanceof org.luava.runtime.LuaString ls && !ls.isCanonical()) {
+                bytes += 32L + ls.rawLength();
+            }
+        }
+        FieldIC[] ic = this.fieldIc;
+        if (ic != null) {
+            bytes += (long) ic.length * 8L;
+        }
+        for (LuaProto child : protos) {
+            bytes += child.estimatedRetainedBytes();
+        }
+        return bytes;
+    }
+
+    /** True when this proto or any descendant has accumulated call hotness or JIT code. */
+    public boolean isWarmOrCompiledTree() {
+        if (hotCount > 0 || loopCompileRequested || jitCode != null || guardedJitCode != null) {
+            return true;
+        }
+        for (LuaProto child : protos) {
+            if (child.isWarmOrCompiledTree()) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // Hybrid tiered JIT state (plan.md). The interpreter remains
     // the default engine; these fields only accelerate hot integer kernels.

@@ -40,6 +40,7 @@ resource caps (one state per thread or tenant).
 
 ## Execution Model & Tiered JIT
 
+- **Compact Frontend & Zero-AST Retention**: `Lexer.scanStream()` feeds a compact `TokenStream` into `Parser` and `BytecodeCompiler` without intermediate `Token` allocations (while preserving the public Java 21 `Token` record on `scanTokens()`). `LuaProto` retains zero AST nodes or raw source strings; `string.dump`/`load` serialize and bounds-verify `LuaProto` trees directly, and per-state `protoCache` enforces both entry (`256`) and byte-weight (`8 MiB`) caps with hot/cold second-chance eviction.
 - **Unboxed Bytecode VM**: 84 opcodes using parallel `long[]`, `byte[]`, and `LuaValue[]` register stacks, unboxed `LuaTable` numeric array lanes and inline string-keyed slots with Bloom membership checks, per-instruction field inline caches, and byte-slice `LuaString` / `LuaPattern` execution.
 - **Guarded Tiered JIT**: Hot functions and loops compile to JVM bytecode (`MethodHandles.Lookup.defineHiddenClassWithClassData`) bounded by a 512-entry second-chance LRU cache, with constant-folded `LuaString` keys, static `TYPE_INT` lanes, loop register promotion, and `SelfCache` dispatch for tables and strings. Guarded execution (`timeout`, `instructionLimit` >= 8192, `cancellable`) runs guarded JIT kernels checking `LoopGuard.tick()` at back-edges; debug hooks, `maxCallDepth`, and sub-8192 instruction budgets stay in the interpreter.
 - **Stackless & Virtual-Thread Coroutines**: Pure-Lua coroutines execute stacklessly on caller frames (with `VarHandle` state transitions, lazy yield-frame materialization, and JIT-inlined `coroutine.resume` slices) and graduate automatically to Java virtual threads across Java callbacks or protected boundaries.
@@ -47,9 +48,14 @@ resource caps (one state per thread or tenant).
 
 ## Verification & Benchmarks
 
-- **Conformance**: 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` suites pass (`OfficialSuiteEvaluationTest`), alongside 417 unit, lifecycle, adversarial security, and PUC 5.4 differential tests (418 JUnit tests total) across sync JIT (`-Dluava.jit.sync=true`), async JIT (`-Dluava.jit.sync=false`), and JIT OFF (`-Dluava.jit=false`), plus standalone JMH frontend/JIT pipeline benchmarks (`benchmarks/frontend-jmh`).
+- **Conformance & Differential Fuzzing**: 31/31 runnable PUC-Rio `tests/lua-5.4.9-tests/*.lua` suites pass (`OfficialSuiteEvaluationTest`), alongside 425 unit, lifecycle, adversarial security, and PUC 5.4 differential fuzz tests (426 JUnit tests total, including 2,600 seeded differential executions across Interpreter, Sync JIT, Guarded JIT, and PUC Lua 5.4) across sync JIT (`-Dluava.jit.sync=true`), async JIT (`-Dluava.jit.sync=false`), and JIT OFF (`-Dluava.jit=false`).
+
+### Runtime Execution vs PUC Lua 5.4.8 C
 
 Reproducible paired benchmark via `benchmarks/harness/audit_bench.sh` (11 interleaved pairs, 6 warmup, 10 iters, OpenJDK 21.0.13.1 `-Dluava.jit.sync=true -XX:+UseG1GC -Xmx1g` on Intel Xeon Gold 5120T vs PUC Lua 5.4.8 C):
+- **Default JVM scheduling (`Exec`, `core=none`)**: **10/10** `Exec` workloads faster under the measured default JVM scheduling configuration (**2.08x** geometric mean).
+- **Single-core pinned (`Exec 1-Core`, `taskset -c 0`)**: **8/10** workloads faster (**1.60x** geometric mean) when pinning the entire JVM including HotSpot C2 and G1GC threads onto one CPU core (`03_table_ops` at `0.96x`, `04_string_concat` at `0.83x`; virtual-thread `06_coroutines` runs unpinned per harness).
+- **Cold compile + execute (`E2E 1-Core`)**: **3/10** workloads faster (**0.70x** geometric mean) when compiling a fresh `CompiledChunk`, executing it once, and closing it every iteration.
 
 | Task | Exec: Luava (ms / IQR) | Exec: Lua 5.4.8 C (ms / IQR) | Exec LuaC/Luava | Exec 1-Core: Luava (LuaC/Luava) | E2E 1-Core: Luava (ms) | E2E 1-Core: Lua C (ms) | E2E LuaC/Luava |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -65,7 +71,25 @@ Reproducible paired benchmark via `benchmarks/harness/audit_bench.sh` (11 interl
 | `10_sieve` | 93.78 / 1.34 | 145.62 / 0.80 | 1.55x | 94.47 (1.55x) | 266.44 | 147.62 | 0.55x |
 | **Geomean / Total** | **736.05 ms** | **1536.38 ms** | **2.08x** | **822.12 ms (1.60x)** | **1711.26 ms** | **1536.25 ms** | **0.70x** |
 
-`Exec` measures precompiled chunk execution (`LuaState.compileChunk` / `luaL_loadbuffer`) under default JVM scheduling (`core=none`, 10/10 tasks faster than PUC Lua 5.4.8 C, 2.08x geometric mean); `Exec 1-Core` pins the entire JVM including HotSpot C2 and G1GC threads onto core 0 (`taskset -c 0`, except virtual-thread coroutines). `E2E 1-Core` compiles a fresh `CompiledChunk`, executes it once, and closes it on every iteration; isolated Lexer, Parser, BytecodeCompiler, and JIT compilation stages are benchmarked in `benchmarks/frontend-jmh`. Raw pair CSVs and metadata can be regenerated with `benchmarks/harness/audit_bench.sh`.
+### Frontend Compilation & Retained-Heap A/B (`0f0a935` v0.2.7 vs `HEAD`)
+
+Measured with `benchmarks/frontend-jmh` (`2` forks, `-Xms512m -Xmx2g -XX:+UseG1GC`, 10-workload corpus from `87` tokens to `600 KB` / `234,636` tokens; raw CSVs and metadata in [`benchmarks/frontend-jmh/results/baseline-0f0a935/`](benchmarks/frontend-jmh/results/baseline-0f0a935/) and [`benchmarks/frontend-jmh/results/head/`](benchmarks/frontend-jmh/results/head/)):
+
+| Stage / Probe | Scope | `0f0a935` Total / Heap | `HEAD` Total / Heap | Geomean Speedup / Delta | Alloc / Op Geomean |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| `lexOnly` | 10 workloads (`scanTokens`) | 34.76 ms | 21.13 ms | **1.49x** | -45.2% |
+| `parseOnly` | 10 workloads (AST build) | 17.18 ms | 11.39 ms | **1.87x** | -60.5% |
+| `bytecodeOnly` | 10 workloads (`LuaProto`) | 20.80 ms | 11.70 ms | **1.68x** | -29.3% |
+| `frontendCompileOnly` | 10 workloads (`compileChunk`) | 83.16 ms | 47.20 ms | **1.59x** | -41.1% |
+| `compileAndLoad` | 10 workloads (chunk lifecycle) | 80.84 ms | 46.45 ms | **1.54x** | -41.0% |
+| `compileCached` | 10 workloads (`protoCache` hit) | 0.378 ms | 0.001 ms | **133.03x** | -99.1% |
+| `jitCompile` | `jit_kernel`, `jit_oop_ctor` | 0.637 ms | 0.734 ms | **0.86x** | -17.0% |
+| `coldExecute` / `warmExecute` | 3 kernel/OOP/table workloads | 524.14 / 283.74 ms | 437.59 / 191.43 ms | **1.49x / 2.02x** | -33.7% / -38.6% |
+| Retained: `16x large_600kb` | Live `CompiledChunk` heap | 216.69 MiB | 37.02 MiB | **-82.9%** (5.85x lower) | - |
+| Retained: `32x 1MB comments` | Live `CompiledChunk` heap | 32.02 MiB | 0.01 MiB | **-99.97%** | - |
+| Retained: `1500x 8KB` churn | Per-state `protoCache` heap | 28.81 MiB | 14.43 MiB | **-49.9%** (`<= 8 MiB` cap) | - |
+
+`jitCompile` invests ~48 us/kernel in static `TYPE_INT`, backward-liveness, and loop-promotion passes (`0` rejected JIT attempts) to drive the `1.49x` cold and `2.02x` warm execution gains. Regenerate with `benchmarks/frontend-jmh/run_stage0.sh` and `benchmarks/harness/audit_bench.sh`.
 
 ## License
 

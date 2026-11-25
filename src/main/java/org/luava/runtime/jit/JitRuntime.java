@@ -168,7 +168,7 @@ public final class JitRuntime {
     private static JitCode resolveCalleeSlow(LuaClosure closure, org.luava.runtime.bytecode.LuaProto proto,
             int resumePc, boolean resultUsed) throws DeoptSignal {
         org.luava.runtime.LuaState st = closure.getState();
-        if (st != null && org.luava.runtime.bytecode.BytecodeVM.jitBlockedByGuard(st)) {
+        if (st != null && (st.hasActiveHooks || org.luava.runtime.bytecode.BytecodeVM.jitBlockedByGuard(st))) {
             throw new DeoptSignal(resumePc, true);
         }
         boolean guarded = st != null && st.loopGuard != null;
@@ -330,6 +330,10 @@ public final class JitRuntime {
      */
     public static long invokeTailSnap(JitCode jc, LuaClosure callee, long[] p, byte[] t, LuaValue[] o,
             int base, int a, int nArgs, int callerMaxStack) throws Throwable {
+        org.luava.runtime.LuaState st = callee.getState();
+        if (st != null && st.hasActiveHooks) {
+            throw new DeoptSignal(0, true);
+        }
         int argBase = base + a + 1;
         if (jc.leafNoWindow && nArgs == jc.numParams && argBase + jc.maxStack <= p.length) {
             if (jc.entry != null) {
@@ -357,6 +361,10 @@ public final class JitRuntime {
     /** Object-returning variant of {@link #invokeTailSnap}. */
     public static LuaValue invokeTailObjSnap(JitCode jc, LuaClosure callee, long[] p, byte[] t, LuaValue[] o,
             int base, int a, int nArgs, int callerMaxStack) throws Throwable {
+        org.luava.runtime.LuaState st = callee.getState();
+        if (st != null && st.hasActiveHooks) {
+            throw new DeoptSignal(0, true);
+        }
         int argBase = base + a + 1;
         if (jc.leafNoWindow && nArgs == jc.numParams && argBase + jc.maxStack <= p.length) {
             if (jc.entry != null) {
@@ -384,6 +392,10 @@ public final class JitRuntime {
     /** Direct-slot variant of {@link #invokeTailSnap} for zero-box {@code callInto} callers. */
     public static void invokeTailInto(JitCode jc, LuaClosure callee, long[] p, byte[] t, LuaValue[] o,
             int base, int a, int nArgs, int callerMaxStack, int dst) throws Throwable {
+        org.luava.runtime.LuaState st = callee.getState();
+        if (st != null && st.hasActiveHooks) {
+            throw new DeoptSignal(0, true);
+        }
         int argBase = base + a + 1;
         if (jc.leafNoWindow && nArgs == jc.numParams && argBase + jc.maxStack <= p.length) {
             if (jc.returnsInt) {

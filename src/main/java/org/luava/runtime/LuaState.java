@@ -167,6 +167,17 @@ public final class LuaState implements AutoCloseable {
         }
     }
 
+    private static final class CachedProtoEntry {
+        final org.luava.runtime.bytecode.LuaProto proto;
+        final long estimatedBytes;
+        boolean secondChance;
+
+        CachedProtoEntry(org.luava.runtime.bytecode.LuaProto proto, long estimatedBytes) {
+            this.proto = proto;
+            this.estimatedBytes = estimatedBytes;
+        }
+    }
+
     /**
      * Bounded cache of compiled {@code LuaProto} trees keyed by
      * {@code (chunkName, source)}. A server that evaluates the same
@@ -175,19 +186,80 @@ public final class LuaState implements AutoCloseable {
      * documented "eval again per request never tiers up" limitation).
      * Reusing the proto tree lets hotness accumulate across evaluations.
      *
-     * <p>Per-state (no cross-tenant sharing) and LRU-bounded so script data
-     * cannot grow it without limit. Protos are immutable after compilation
-     * except for JIT state, which is exactly what must persist.
+     * <p>Per-state (no cross-tenant sharing), bounded by both entry count and
+     * estimated retained bytes, with second-chance protection for warm/compiled
+     * protos and automatic JIT kernel invalidation upon eviction.
      */
-    private final Map<ProtoCacheKey, org.luava.runtime.bytecode.LuaProto> protoCache =
-            new java.util.LinkedHashMap<>(64, 0.75f, true) {
-                @Override
-                protected boolean removeEldestEntry(Map.Entry<ProtoCacheKey, org.luava.runtime.bytecode.LuaProto> eldest) {
-                    return size() > PROTO_CACHE_MAX;
-                }
-            };
+    private final java.util.LinkedHashMap<ProtoCacheKey, CachedProtoEntry> protoCache =
+            new java.util.LinkedHashMap<>(64, 0.75f, true);
+    private long protoCacheBytes = 0L;
 
-    private static final int PROTO_CACHE_MAX = 256;
+    private static final int PROTO_CACHE_MAX =
+            Math.max(16, Integer.getInteger("luava.protoCache.maxEntries", 256));
+    private static final long PROTO_CACHE_MAX_BYTES =
+            Math.max(64L * 1024L, Long.getLong("luava.protoCache.maxBytes", 8L * 1024L * 1024L));
+    private static final long PROTO_CACHE_MAX_SINGLE_BYTES =
+            Math.max(16L * 1024L, Long.getLong("luava.protoCache.maxEntryBytes", 4L * 1024L * 1024L));
+
+    private void cacheCompiledProto(ProtoCacheKey key, org.luava.runtime.bytecode.LuaProto proto) {
+        long entryBytes = 64L
+                + ((long) key.chunkName.length() << 1)
+                + key.source.length()
+                + proto.estimatedRetainedBytes();
+        if (entryBytes > PROTO_CACHE_MAX_SINGLE_BYTES || entryBytes > PROTO_CACHE_MAX_BYTES) {
+            return;
+        }
+        List<org.luava.runtime.bytecode.LuaProto> evicted = null;
+        synchronized (protoCache) {
+            CachedProtoEntry prev = protoCache.remove(key);
+            if (prev != null) {
+                protoCacheBytes = Math.max(0L, protoCacheBytes - prev.estimatedBytes);
+            }
+            int spins = 0;
+            while (!protoCache.isEmpty()
+                    && (protoCache.size() >= PROTO_CACHE_MAX
+                            || protoCacheBytes + entryBytes > PROTO_CACHE_MAX_BYTES)) {
+                java.util.Iterator<Map.Entry<ProtoCacheKey, CachedProtoEntry>> it =
+                        protoCache.entrySet().iterator();
+                Map.Entry<ProtoCacheKey, CachedProtoEntry> eldest = it.next();
+                ProtoCacheKey candKey = eldest.getKey();
+                CachedProtoEntry candVal = eldest.getValue();
+                it.remove();
+                if ((candVal.secondChance || candVal.proto.isWarmOrCompiledTree())
+                        && spins++ < protoCache.size() + 1) {
+                    candVal.secondChance = false;
+                    protoCache.put(candKey, candVal);
+                } else {
+                    protoCacheBytes = Math.max(0L, protoCacheBytes - candVal.estimatedBytes);
+                    if (evicted == null) {
+                        evicted = new ArrayList<>(4);
+                    }
+                    evicted.add(candVal.proto);
+                }
+            }
+            protoCache.put(key, new CachedProtoEntry(proto, entryBytes));
+            protoCacheBytes += entryBytes;
+        }
+        if (evicted != null) {
+            for (org.luava.runtime.bytecode.LuaProto victim : evicted) {
+                org.luava.runtime.jit.JitCompiler.invalidateTree(victim);
+            }
+        }
+    }
+
+    /** Current number of entries in this state's compiled proto cache. */
+    public int cachedProtoCount() {
+        synchronized (protoCache) {
+            return protoCache.size();
+        }
+    }
+
+    /** Estimated retained byte weight of this state's compiled proto cache. */
+    public long cachedProtoBytes() {
+        synchronized (protoCache) {
+            return protoCacheBytes;
+        }
+    }
 
     /**
      * Cooperative VM guard, checked once per instruction while non-null.
@@ -1288,7 +1360,6 @@ public final class LuaState implements AutoCloseable {
             Statements.BlockStmt block = parser.parse();
             org.luava.runtime.bytecode.LuaProto proto =
                     org.luava.runtime.bytecode.BytecodeCompiler.compile(block, effectiveName);
-            proto.rawSource = luaSource;
             return new CompiledChunk(proto);
         } catch (org.luava.frontend.parser.ParseException pe) {
             throw new LuaException(pe.format(chunkName != null ? chunkName : luaSource));
@@ -1506,15 +1577,17 @@ public final class LuaState implements AutoCloseable {
         // that eval's the same script per request accumulate JIT hotness
         // instead of rebuilding a cold proto every time.
         ProtoCacheKey key = new ProtoCacheKey(chunkName != null ? chunkName : "chunk", luaSource);
-        org.luava.runtime.bytecode.LuaProto proto;
+        org.luava.runtime.bytecode.LuaProto proto = null;
         synchronized (protoCache) {
-            proto = protoCache.get(key);
+            CachedProtoEntry cached = protoCache.get(key);
+            if (cached != null) {
+                cached.secondChance = true;
+                proto = cached.proto;
+            }
         }
         if (proto == null) {
             proto = compileChunk(luaSource, chunkName).proto;
-            synchronized (protoCache) {
-                protoCache.put(key, proto);
-            }
+            cacheCompiledProto(key, proto);
             statsInstructions.addAndGet(treeCodeSize(proto));
         }
         org.luava.runtime.eval.Upvalue envUpval = new org.luava.runtime.eval.Upvalue("_ENV", chunkEnvVal);
@@ -1815,8 +1888,8 @@ public final class LuaState implements AutoCloseable {
         long jitHits = 0;
         long deopts = 0;
         synchronized (protoCache) {
-            for (org.luava.runtime.bytecode.LuaProto proto : protoCache.values()) {
-                long[] scanned = scanJitGauges(proto);
+            for (CachedProtoEntry entry : protoCache.values()) {
+                long[] scanned = scanJitGauges(entry.proto);
                 jitHits += scanned[0];
                 deopts += scanned[1];
             }
@@ -1971,8 +2044,12 @@ public final class LuaState implements AutoCloseable {
         }
         List<org.luava.runtime.bytecode.LuaProto> protos;
         synchronized (protoCache) {
-            protos = new ArrayList<>(protoCache.values());
+            protos = new ArrayList<>(protoCache.size());
+            for (CachedProtoEntry entry : protoCache.values()) {
+                protos.add(entry.proto);
+            }
             protoCache.clear();
+            protoCacheBytes = 0L;
         }
         for (org.luava.runtime.bytecode.LuaProto proto : protos) {
             org.luava.runtime.jit.JitCompiler.invalidateTree(proto);

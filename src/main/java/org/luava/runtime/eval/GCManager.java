@@ -787,8 +787,10 @@ public final class GCManager {
             liveSet.add(val);
 
             if (val instanceof LuaTable tbl) {
-                if (tbl.getMetatable() != null) {
-                    worklist.add(tbl.getMetatable());
+                LuaTable mt = tbl.getMetatable();
+                if (mt != null) {
+                    worklist.add(mt);
+                    tbl.syncWeakModeIfNeeded(mt);
                 }
                 if (tbl.isWeakKeys() && tbl.isWeakValues()) {
                     tbl.forEach((k, v) -> {

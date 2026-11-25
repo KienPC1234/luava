@@ -617,6 +617,18 @@ public final class LuaTable extends LuaValue {
         noteStringKeyMeta(ks);
         boolean isNil = (tag == BytecodeVM.TYPE_NIL)
                 || (tag == BytecodeVM.TYPE_OBJECT && (obj == null || obj == LuaNil.NIL || obj.isNil()));
+        HashMap<LuaValue, LuaValue> existingMap = hashMap();
+        if (existingMap != null) {
+            if (isNil) {
+                if (existingMap.containsKey(ks)) {
+                    existingMap.put(ks, LuaNil.NIL);
+                }
+            } else {
+                hashKeyBloom |= (1L << (ks.fastHash() & 63));
+                putHashEntry(existingMap, ks, BytecodeVM.getLuaValueFromRaw(prim, tag, obj));
+            }
+            return;
+        }
         int slot = findInlineSlot(ks);
         if (slot >= 0) {
             writeInlineRaw(slot, tag, prim, obj);
@@ -667,10 +679,7 @@ public final class LuaTable extends LuaValue {
 
     private void putInlineValue(LuaString ks, LuaValue value) {
         if (value == null || value == LuaNil.NIL || value.isNil()) {
-            int slot = findInlineSlot(ks);
-            if (slot >= 0) {
-                writeInlineRaw(slot, BytecodeVM.TYPE_NIL, 0L, null);
-            }
+            putInlineRaw(ks, BytecodeVM.TYPE_NIL, 0L, null);
             return;
         }
         if (value instanceof LuaInteger li) {
@@ -695,7 +704,7 @@ public final class LuaTable extends LuaValue {
         if (tag == BytecodeVM.TYPE_NIL) {
             if (k0 == ks) { t0 = BytecodeVM.TYPE_NIL; p0 = 0L; o0 = null; bumpModCount(); }
             else if (k1 == ks) { t1 = BytecodeVM.TYPE_NIL; p1 = 0L; o1 = null; bumpModCount(); }
-            else if (hashOrOverflow != null) { bumpModCount(); putInlineValue(ks, LuaNil.NIL); }
+            else if (hashOrOverflow != null) { bumpModCount(); putInlineRaw(ks, BytecodeVM.TYPE_NIL, 0L, null); }
             return;
         }
         LuaValue obj = null;
@@ -705,7 +714,7 @@ public final class LuaTable extends LuaValue {
             if (obj == null || obj == LuaNil.NIL || obj.isNil()) {
                 if (k0 == ks) { t0 = BytecodeVM.TYPE_NIL; p0 = 0L; o0 = null; bumpModCount(); }
                 else if (k1 == ks) { t1 = BytecodeVM.TYPE_NIL; p1 = 0L; o1 = null; bumpModCount(); }
-                else if (hashOrOverflow != null) { bumpModCount(); putInlineValue(ks, LuaNil.NIL); }
+                else if (hashOrOverflow != null) { bumpModCount(); putInlineRaw(ks, BytecodeVM.TYPE_NIL, 0L, null); }
                 return;
             }
         } else {
@@ -741,7 +750,7 @@ public final class LuaTable extends LuaValue {
         if (val == null || val == LuaNil.NIL || val.isNil()) {
             if (k0 == ks) { t0 = BytecodeVM.TYPE_NIL; p0 = 0L; o0 = null; bumpModCount(); }
             else if (k1 == ks) { t1 = BytecodeVM.TYPE_NIL; p1 = 0L; o1 = null; bumpModCount(); }
-            else if (hashOrOverflow != null) { bumpModCount(); putInlineValue(ks, LuaNil.NIL); }
+            else if (hashOrOverflow != null) { bumpModCount(); putInlineRaw(ks, BytecodeVM.TYPE_NIL, 0L, null); }
             return;
         }
         byte tag;
@@ -880,24 +889,113 @@ public final class LuaTable extends LuaValue {
                 || val instanceof org.luava.runtime.concurrency.LuaCoroutine);
     }
 
+    public void syncWeakModeIfNeeded(LuaTable mt) {
+        if (mt == null) {
+            if ((flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) != 0) {
+                transitionWeakFlags(false, false);
+            }
+            return;
+        }
+        if ((mt.flags & (FLAG_LAZY_PENDING | FLAG_MAY_HAVE_GC_OR_MODE)) == 0
+                && (flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) == 0) {
+            return;
+        }
+        updateWeakMode();
+    }
+
+    private void transitionWeakFlags(boolean wk, boolean wv) {
+        boolean wasWeakKeys = (flags & FLAG_WEAK_KEYS) != 0;
+        boolean wasWeakValues = (flags & FLAG_WEAK_VALUES) != 0;
+        boolean lostWeakKeys = wasWeakKeys && !wk;
+        boolean lostWeakValues = wasWeakValues && !wv;
+        flags = (byte) ((flags & ~(FLAG_WEAK_KEYS | FLAG_WEAK_VALUES))
+                | (wk ? FLAG_WEAK_KEYS : 0)
+                | (wv ? FLAG_WEAK_VALUES : 0));
+        if (lostWeakKeys || lostWeakValues) {
+            unwrapWeakEntries(lostWeakKeys, lostWeakValues);
+        }
+        if (wk || wv) {
+            org.luava.runtime.eval.GCManager.registerWeakTable(this);
+            convertToWeak();
+        }
+    }
+
+    private void unwrapWeakEntries(boolean unwrapKeys, boolean unwrapValues) {
+        if (unwrapValues && arrO != null) {
+            for (int i = 0; i < arrLen; i++) {
+                if (arrT[i] == BytecodeVM.TYPE_OBJECT && arrO[i] instanceof WeakVal wv) {
+                    LuaValue actual = wv.get();
+                    if (actual == null) {
+                        arrT[i] = BytecodeVM.TYPE_NIL;
+                        arrP[i] = 0L;
+                        arrO[i] = null;
+                    } else {
+                        arrO[i] = actual;
+                    }
+                }
+            }
+        }
+        HashMap<LuaValue, LuaValue> hashPart = hashMap();
+        if (hashPart == null || hashPart.isEmpty()) {
+            return;
+        }
+        if (unwrapValues && !unwrapKeys) {
+            Iterator<Map.Entry<LuaValue, LuaValue>> it = hashPart.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<LuaValue, LuaValue> entry = it.next();
+                if (entry.getValue() instanceof WeakVal wv) {
+                    LuaValue actual = wv.get();
+                    if (actual == null) {
+                        it.remove();
+                    } else {
+                        entry.setValue(actual);
+                    }
+                }
+            }
+            return;
+        }
+        if (unwrapKeys) {
+            HashMap<LuaValue, LuaValue> rebuilt = new HashMap<>(Math.max(16, hashPart.size() * 2));
+            for (Map.Entry<LuaValue, LuaValue> entry : hashPart.entrySet()) {
+                LuaValue k = entry.getKey();
+                if (k instanceof WeakKey wk) {
+                    k = wk.get();
+                    if (k == null) {
+                        continue;
+                    }
+                }
+                LuaValue v = entry.getValue();
+                if (v == null || v.isNil()) {
+                    continue;
+                }
+                if (v instanceof WeakVal wv) {
+                    LuaValue actual = wv.get();
+                    if (actual == null) {
+                        continue;
+                    }
+                    if (unwrapValues) {
+                        v = actual;
+                    }
+                }
+                rebuilt.put(k, v);
+            }
+            hashPart.clear();
+            hashPart.putAll(rebuilt);
+        }
+    }
+
     public void updateWeakMode() {
         if (metatable != null) {
             LuaValue mode = metatable.rawget(LuaValue.Meta.MODE);
             if (mode.isString()) {
                 String s = mode.toLuaString();
-                boolean wk = s.contains("k");
-                boolean wv = s.contains("v");
-                flags = (byte) ((flags & ~(FLAG_WEAK_KEYS | FLAG_WEAK_VALUES))
-                        | (wk ? FLAG_WEAK_KEYS : 0)
-                        | (wv ? FLAG_WEAK_VALUES : 0));
-                if (wk || wv) {
-                    org.luava.runtime.eval.GCManager.registerWeakTable(this);
-                    convertToWeak();
-                }
+                transitionWeakFlags(s.contains("k"), s.contains("v"));
                 return;
             }
         }
-        flags &= ~(FLAG_WEAK_KEYS | FLAG_WEAK_VALUES);
+        if ((flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) != 0) {
+            transitionWeakFlags(false, false);
+        }
     }
 
     private void convertToWeak() {
@@ -1023,12 +1121,10 @@ public final class LuaTable extends LuaValue {
         if (this.aux != null) {
             this.aux.indexHop = null;
         }
-        if (mt == null) {
-            flags &= ~(FLAG_WEAK_KEYS | FLAG_WEAK_VALUES);
-            return;
-        }
-        if ((mt.flags & (FLAG_LAZY_PENDING | FLAG_MAY_HAVE_GC_OR_MODE)) == 0) {
-            flags &= ~(FLAG_WEAK_KEYS | FLAG_WEAK_VALUES);
+        if (mt == null || (mt.flags & (FLAG_LAZY_PENDING | FLAG_MAY_HAVE_GC_OR_MODE)) == 0) {
+            if ((flags & (FLAG_WEAK_KEYS | FLAG_WEAK_VALUES)) != 0) {
+                transitionWeakFlags(false, false);
+            }
             return;
         }
         updateWeakMode();

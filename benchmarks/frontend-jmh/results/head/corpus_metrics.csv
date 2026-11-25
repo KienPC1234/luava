@@ -1,0 +1,14 @@
+commit_sha,workload,source_bytes,tokens,ast_nodes,bytecode_insts,protos
+head,small_3kb,3062,1260,912,462,13
+head,medium_50kb,47654,19416,14084,7048,191
+head,large_600kb,583274,234636,170224,87162,2301
+head,many_locals,88595,23967,19805,4903,21
+head,nested_closures,9140,2387,1545,1193,141
+head,table_constructors,45972,17769,7686,7805,1
+head,escaped_strings,11685,1329,1106,225,1
+head,deep_exprs,32279,18819,15208,6966,1
+head,heavy_comments,30285,907,905,183,1
+head,jit_kernel,326,87,59,35,2
+head,jit_oop_ctor,104,32,19,13,2
+head,exec_table_ops,232,55,38,30,1
+head,exec_oop_metatables,604,184,133,87,5

@@ -46,7 +46,7 @@ public final class Stage0Runner {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("Usage: Stage0Runner <outDir> <commitSha> [quick|ab|full]");
+            System.err.println("Usage: Stage0Runner <outDir> <commitSha> [quick|ab|full|probes]");
             System.exit(2);
         }
         Path outDir = Path.of(args[0]);
@@ -54,6 +54,7 @@ public final class Stage0Runner {
         String mode = args.length > 2 ? args[2].toLowerCase(Locale.ROOT) : "full";
         boolean quick = "quick".equals(mode);
         boolean ab = "ab".equals(mode);
+        boolean probesOnly = "probes".equals(mode);
         Files.createDirectories(outDir);
 
         new LuaState().close();
@@ -68,6 +69,11 @@ public final class Stage0Runner {
         int warmIters = (quick || ab) ? 2 : 3;
         int measIters = quick ? 3 : (ab ? 4 : 5);
         int iterMs = quick ? 400 : (ab ? 250 : 800);
+        writeMetadataJson(outDir.resolve("metadata.json"), commitSha, mode, forks, warmIters, measIters, iterMs);
+        writeRetainedHeapProbeCsv(outDir.resolve("retained_heap_probe.csv"), commitSha);
+        if (probesOnly) {
+            return;
+        }
 
         Path rawCsv = outDir.resolve("frontend_jmh_raw.csv");
         Path probeCsv = outDir.resolve("independent_probes.csv");
@@ -307,6 +313,137 @@ public final class Stage0Runner {
                         "%s,%s,%d,%d,%d,%d,%d%n",
                         commitSha, m.name(), m.sourceBytes(), m.tokenCount(), m.astNodeCount(), m.bytecodeCount(), m.protoCount()));
             }
+        }
+    }
+
+    private static void writeMetadataJson(
+            Path path, String commitSha, String mode, int forks, int warmIters, int measIters, int iterMs)
+            throws IOException {
+        String cpuModel = detectCpuModel();
+        String osInfo = System.getProperty("os.name") + " " + System.getProperty("os.version")
+                + " (" + System.getProperty("os.arch") + ")";
+        String javaInfo = System.getProperty("java.vm.name") + " " + System.getProperty("java.runtime.version");
+        try (BufferedWriter w = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            w.write("{\n");
+            w.write("  \"commit_sha\": \"" + escapeJson(commitSha) + "\",\n");
+            w.write("  \"timestamp_utc\": \"" + java.time.Instant.now().toString() + "\",\n");
+            w.write("  \"mode\": \"" + escapeJson(mode) + "\",\n");
+            w.write("  \"forks\": " + forks + ",\n");
+            w.write("  \"warmup_iterations\": " + warmIters + ",\n");
+            w.write("  \"measurement_iterations\": " + measIters + ",\n");
+            w.write("  \"iteration_time_ms\": " + iterMs + ",\n");
+            w.write("  \"jvm_args_jit_on\": \"-Xms512m -Xmx2g -XX:+UseG1GC -Dluava.jit=true -Dluava.jit.sync=true\",\n");
+            w.write("  \"jvm_args_jit_off\": \"-Xms512m -Xmx2g -XX:+UseG1GC -Dluava.jit=false\",\n");
+            w.write("  \"jdk\": \"" + escapeJson(javaInfo) + "\",\n");
+            w.write("  \"os\": \"" + escapeJson(osInfo) + "\",\n");
+            w.write("  \"cpu\": \"" + escapeJson(cpuModel) + "\",\n");
+            w.write("  \"available_processors\": " + Runtime.getRuntime().availableProcessors() + "\n");
+            w.write("}\n");
+        }
+    }
+
+    private static String detectCpuModel() {
+        Path cpuinfo = Path.of("/proc/cpuinfo");
+        if (Files.isReadable(cpuinfo)) {
+            try {
+                for (String line : Files.readAllLines(cpuinfo, StandardCharsets.UTF_8)) {
+                    if (line.startsWith("model name")) {
+                        int colon = line.indexOf(':');
+                        if (colon >= 0) {
+                            return line.substring(colon + 1).trim();
+                        }
+                    }
+                }
+            } catch (IOException ignored) {
+            }
+        }
+        return "unknown";
+    }
+
+    private static String escapeJson(String s) {
+        return s == null ? "" : s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    private static long settledUsedHeapBytes() {
+        Runtime rt = Runtime.getRuntime();
+        for (int i = 0; i < 4; i++) {
+            System.gc();
+            try {
+                Thread.sleep(25L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        return rt.totalMemory() - rt.freeMemory();
+    }
+
+    private static void writeRetainedHeapProbeCsv(Path path, String commitSha) throws IOException {
+        String largeTemplate = CorpusLoader.sourceFor("large_600kb");
+        LuaState.compileChunk("return 1", "@warm.lua").close();
+        try (BufferedWriter w = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+            w.write("commit_sha,scenario,retained_heap_mb,cached_entries,cached_bytes_mb\n");
+
+            long base1 = settledUsedHeapBytes();
+            CompiledChunk[] largeChunks = new CompiledChunk[16];
+            for (int i = 0; i < largeChunks.length; i++) {
+                String unsharedSrc = new String(largeTemplate + "\n-- instance " + i + "\n");
+                largeChunks[i] = LuaState.compileChunk(unsharedSrc, "@large_" + i + ".lua");
+            }
+            long retainedLarge = Math.max(0L, settledUsedHeapBytes() - base1);
+            w.write(String.format(Locale.ROOT, "%s,compiled_chunks_16x_large_600kb,%.2f,16,NaN%n",
+                    commitSha, retainedLarge / (1024.0 * 1024.0)));
+            if (largeChunks[0] == null) {
+                throw new IllegalStateException();
+            }
+            for (CompiledChunk c : largeChunks) {
+                c.close();
+            }
+            largeChunks = null;
+
+            String commentPad = ("-- " + "0123456789abcdef".repeat(60) + "\n").repeat(1000);
+            long base2 = settledUsedHeapBytes();
+            CompiledChunk[] commentChunks = new CompiledChunk[32];
+            for (int i = 0; i < commentChunks.length; i++) {
+                String unsharedComments = new String(commentPad + "return " + i + "\n");
+                commentChunks[i] = LuaState.compileChunk(unsharedComments, "@comments_" + i + ".lua");
+            }
+            long retainedComments = Math.max(0L, settledUsedHeapBytes() - base2);
+            w.write(String.format(Locale.ROOT, "%s,compiled_chunks_32x_1mb_comments,%.2f,32,NaN%n",
+                    commitSha, retainedComments / (1024.0 * 1024.0)));
+            for (CompiledChunk c : commentChunks) {
+                c.close();
+            }
+            commentChunks = null;
+
+            long base3 = settledUsedHeapBytes();
+            try (LuaState st = new LuaState()) {
+                String bodyPad = "do local a = 1; local b = 2; local c = a + b end\n".repeat(180);
+                for (int i = 0; i < 1500; i++) {
+                    String script = bodyPad + "return " + i + "\n";
+                    st.eval(script, "@churn_" + i + ".lua");
+                }
+                long retainedCache = Math.max(0L, settledUsedHeapBytes() - base3);
+                long cachedCount = invokeOptionalStateGetter(st, "cachedProtoCount", false);
+                long cachedBytes = invokeOptionalStateGetter(st, "cachedProtoBytes", true);
+                w.write(String.format(
+                        Locale.ROOT,
+                        "%s,proto_cache_churn_1500x_8kb,%.2f,%s,%s%n",
+                        commitSha,
+                        retainedCache / (1024.0 * 1024.0),
+                        cachedCount >= 0 ? Long.toString(cachedCount) : "NaN",
+                        cachedBytes >= 0 ? String.format(Locale.ROOT, "%.2f", cachedBytes / (1024.0 * 1024.0)) : "NaN"));
+            }
+        }
+    }
+
+    private static long invokeOptionalStateGetter(LuaState st, String methodName, boolean returnsLong) {
+        try {
+            MethodType mt = MethodType.methodType(returnsLong ? long.class : int.class);
+            MethodHandle mh = MethodHandles.publicLookup().findVirtual(LuaState.class, methodName, mt);
+            return returnsLong ? (long) mh.invokeExact(st) : (int) mh.invokeExact(st);
+        } catch (Throwable ignored) {
+            return -1L;
         }
     }
 }

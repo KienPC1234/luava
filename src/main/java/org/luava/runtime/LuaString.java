@@ -237,6 +237,24 @@ public final class LuaString extends LuaValue {
         return new LuaString(bytes, 0, bytes.length);
     }
 
+    /**
+     * Reuses an already-interned canonical {@link LuaString} if present without
+     * inserting untrusted strings into {@link #INTERN_POOL}; otherwise wraps
+     * {@code bytes} as a non-canonical owned {@link LuaString}.
+     */
+    public static LuaString probeCanonicalOrOwned(byte[] bytes) {
+        if (bytes == null || bytes.length == 0) return EMPTY;
+        if (bytes.length == 1) return ASCII_CACHE[bytes[0] & 0xFF];
+        if (bytes.length <= MAX_SHORT_STRING) {
+            String latin1 = new String(bytes, java.nio.charset.StandardCharsets.ISO_8859_1);
+            LuaString hit = INTERN_POOL.get(latin1);
+            if (hit != null) {
+                return hit;
+            }
+        }
+        return new LuaString(bytes, 0, bytes.length);
+    }
+
     /** Copies a slice out of a mutable buffer into a fresh LuaString. */
     public static LuaString copyOfRange(byte[] src, int off, int len) {
         if (len <= 0) return EMPTY;

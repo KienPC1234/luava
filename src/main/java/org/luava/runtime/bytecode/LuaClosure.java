@@ -37,13 +37,6 @@ public final class LuaClosure extends LuaFunction {
         // authoritative for the VM (replaceUpvalue keeps both in sync once
         // materialized).
         this.upvalues = null;
-        this.rawSource = proto.rawSource;
-        this.body = proto.body;
-        // Do NOT eagerly build the params name list: closure creation is a
-        // hot path (100k+ allocations in closure benchmarks) and debug/
-        // serialization rarely read it. Nulled like upvalues; getParams()
-        // materializes lazily from the proto. setParams() keeps working by
-        // materializing first (lazily-created list replaces null).
         this.params = null;
         if (proto.name != null) {
             this.name = proto.name;
@@ -122,6 +115,11 @@ public final class LuaClosure extends LuaFunction {
             state = new LuaState();
         }
         LuaState previous = LuaValue.pushBasicState(state);
+        org.luava.runtime.concurrency.LuaCoroutine prevCoro =
+                org.luava.runtime.concurrency.LuaCoroutine.running();
+        if (prevCoro == null) {
+            org.luava.runtime.concurrency.LuaCoroutine.setCurrent(state.getMainThread());
+        }
         try {
             LuaValue[] res = BytecodeVM.execute(state, this, args);
             // Lua 5.4: bare 'return' yields zero values (not one nil).
@@ -130,6 +128,9 @@ public final class LuaClosure extends LuaFunction {
             if (res.length == 1) return res[0];
             return org.luava.runtime.Varargs.of(res);
         } finally {
+            if (prevCoro == null) {
+                org.luava.runtime.concurrency.LuaCoroutine.setCurrent(null);
+            }
             LuaValue.popBasicState(previous);
         }
     }

@@ -54,9 +54,7 @@ public final class BytecodeCompiler {
         fs.compileBlock(block);
         fs.checkUnresolvedGotos();
         fs.emit(Instruction.encodeABC(OpCode.OP_RETURN0, 0, 0, 0), block != null ? block.endLine() : 1);
-        LuaProto proto = fs.toProto();
-        proto.body = block;
-        return proto;
+        return fs.toProto();
     }
 
     /** Primitive growable {@code int} buffer avoiding Integer boxing in bytecode emission. */
@@ -1415,9 +1413,7 @@ public final class BytecodeCompiler {
             child.compileBlock(body);
             child.checkUnresolvedGotos();
             child.emit(Instruction.encodeABC(OpCode.OP_RETURN0, 0, 0, 0), lastLineDefined);
-            LuaProto proto = child.toProto();
-            proto.body = body;
-            return proto;
+            return child.toProto();
         }
 
         int exprEndLine(Expression expr) {
@@ -1875,73 +1871,77 @@ public final class BytecodeCompiler {
 
         void compileTableConstructor(Expressions.TableConstructorExpr tce, int targetReg) {
             int nFields = tce.fields().size();
-            emit(Instruction.encodeABC(OpCode.OP_NEWTABLE, targetReg,
+            int saveFreereg = freereg;
+            int tblReg = (targetReg + 1 >= saveFreereg) ? targetReg : allocReg();
+            emit(Instruction.encodeABC(OpCode.OP_NEWTABLE, tblReg,
                     constructorArrayHint(tce), constructorHashHint(tce), 0), tce.line());
             emit(Instruction.encodeAx(OpCode.OP_EXTRAARG, nFields), tce.line());
 
+            int listBase = tblReg + 1;
             int arrayIdx = 0;
-            int saveFreereg = freereg;
-            List<Expressions.TableField> pendingList = new ArrayList<>();
+            int pendingCount = 0;
 
             for (int i = 0; i < nFields; i++) {
                 Expressions.TableField tf = tce.fields().get(i);
                 if (tf.key() != null) {
-                    flushListFields(targetReg, pendingList, arrayIdx, tce.line());
-                    arrayIdx += pendingList.size();
-                    pendingList.clear();
-
-                    int regStart = freereg;
+                    int regStart = listBase + pendingCount;
+                    setFreereg(regStart);
                     if (tf.key() instanceof Expressions.IntegerLiteral il && il.value() >= 0 && il.value() <= 255) {
                         int valReg = compileExprToAnyReg(tf.value());
-                        emit(Instruction.encodeABC(OpCode.OP_SETI, targetReg, (int) il.value(), valReg, 0), tce.line());
+                        emit(Instruction.encodeABC(OpCode.OP_SETI, tblReg, (int) il.value(), valReg, 0), tce.line());
                     } else if (tf.key() instanceof Expressions.StringLiteral sl) {
                         int kKey = addConst(sl.luaString());
                         if (kKey <= 255) {
                             int valReg = compileExprToAnyReg(tf.value());
-                            emit(Instruction.encodeABC(OpCode.OP_SETFIELD, targetReg, kKey, valReg, 0), tce.line());
+                            emit(Instruction.encodeABC(OpCode.OP_SETFIELD, tblReg, kKey, valReg, 0), tce.line());
                         } else {
                             int keyReg = compileExprToAnyReg(tf.key());
                             int valReg = compileExprToAnyReg(tf.value());
-                            emit(Instruction.encodeABC(OpCode.OP_SETTABLE, targetReg, keyReg, valReg, 0), tce.line());
+                            emit(Instruction.encodeABC(OpCode.OP_SETTABLE, tblReg, keyReg, valReg, 0), tce.line());
                         }
                     } else {
                         int keyReg = compileExprToAnyReg(tf.key());
                         int valReg = compileExprToAnyReg(tf.value());
-                        emit(Instruction.encodeABC(OpCode.OP_SETTABLE, targetReg, keyReg, valReg, 0), tce.line());
+                        emit(Instruction.encodeABC(OpCode.OP_SETTABLE, tblReg, keyReg, valReg, 0), tce.line());
                     }
-                    // Free key and value registers immediately so freereg does not exhaust 8-bit instruction operand limit (>255)
                     freeRegs(regStart);
                 } else {
                     boolean isLast = (i == nFields - 1);
-                    boolean isMultret = isLast && (tf.value() instanceof Expressions.FunctionCallExpr || tf.value() instanceof Expressions.VarargLiteral);
+                    boolean isMultret = isLast
+                            && (tf.value() instanceof Expressions.FunctionCallExpr
+                                    || tf.value() instanceof Expressions.VarargLiteral);
 
                     if (isMultret) {
-                        flushListFields(targetReg, pendingList, arrayIdx, tce.line());
-                        arrayIdx += pendingList.size();
-                        pendingList.clear();
-
-                        int nextReg = targetReg + 1;
-                        setFreereg(nextReg);
-                        if (tf.value() instanceof Expressions.FunctionCallExpr fce) {
-                            compileFunctionCall(fce, nextReg, -1);
-                        } else {
-                            emit(Instruction.encodeABC(OpCode.OP_VARARG, nextReg, 0, 0), tce.line());
+                        if (pendingCount > 0) {
+                            emitSetList(tblReg, pendingCount, arrayIdx, tce.line());
+                            arrayIdx += pendingCount;
+                            pendingCount = 0;
                         }
-                        emitSetList(targetReg, 0, arrayIdx, tce.line());
+                        setFreereg(listBase);
+                        if (tf.value() instanceof Expressions.FunctionCallExpr fce) {
+                            compileFunctionCall(fce, listBase, -1);
+                        } else {
+                            emit(Instruction.encodeABC(OpCode.OP_VARARG, listBase, 0, 0), tce.line());
+                        }
+                        emitSetList(tblReg, 0, arrayIdx, tce.line());
                     } else {
-                        pendingList.add(tf);
-                        if (pendingList.size() == 50) {
-                            flushListFields(targetReg, pendingList, arrayIdx, tce.line());
+                        int elemReg = listBase + pendingCount;
+                        setFreereg(elemReg + 1);
+                        compileExprToReg(tf.value(), elemReg);
+                        pendingCount++;
+                        if (pendingCount == 50) {
+                            emitSetList(tblReg, 50, arrayIdx, tce.line());
                             arrayIdx += 50;
-                            pendingList.clear();
+                            pendingCount = 0;
                         }
                     }
                 }
             }
-            if (!pendingList.isEmpty()) {
-                flushListFields(targetReg, pendingList, arrayIdx, tce.line());
-                arrayIdx += pendingList.size();
-                pendingList.clear();
+            if (pendingCount > 0) {
+                emitSetList(tblReg, pendingCount, arrayIdx, tce.line());
+            }
+            if (tblReg != targetReg) {
+                emit(Instruction.encodeABC(OpCode.OP_MOVE, targetReg, tblReg, 0), tce.line());
             }
             freeRegs(saveFreereg);
         }
@@ -1989,26 +1989,6 @@ public final class BytecodeCompiler {
                 }
             }
             return Math.min(hashItems, Instruction.MASK_C);
-        }
-
-        void flushListFields(int targetReg, List<Expressions.TableField> list, int arrayIdx, int line) {
-            if (list.isEmpty()) return;
-            int n = list.size();
-            int baseReg = targetReg + 1;
-            // Each element must land in a consecutive register: SETLIST reads
-            // R[targetReg+1 .. targetReg+n]. Compiling an element allocates
-            // its own temporaries (e.g. a global read `math.maxinteger`
-            // allocates a register for the table before the GETFIELD); those
-            // start at freereg and are not always freed. Position each element
-            // explicitly and reserve the slot above it so temporaries can
-            // never clobber the destination or scatter the values.
-            for (int i = 0; i < n; i++) {
-                int r = baseReg + i;
-                setFreereg(r + 1);
-                compileExprToReg(list.get(i).value(), r);
-            }
-            emitSetList(targetReg, n, arrayIdx, line);
-            setFreereg(baseReg);
         }
 
         void emitSetList(int targetReg, int tostore, int nelems, int line) {
