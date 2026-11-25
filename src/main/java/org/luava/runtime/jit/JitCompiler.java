@@ -263,6 +263,10 @@ public final class JitCompiler {
                     }
                     return null;
                 }
+                // Conservative yield rule: the JIT subset has no global/table
+                // writes through metamethods, no varargs and no yield-capable calls
+                // (only pure self/monomorphic targets, resolved with guards), so it
+                // can never reach coroutine.yield.
                 proto.mayYield = false;
                 LuaToJvmTranslator.Info info = analysis.info();
                 String name = "org/luava/runtime/jit/Gen$" + CLASS_SEQ.getAndIncrement();
@@ -379,19 +383,6 @@ public final class JitCompiler {
                 return;
             }
         }
-    }
-
-    static boolean eligible(LuaProto proto) {
-        if (!LuaToJvmTranslator.eligible(proto)) {
-            return false;
-        }
-        // Conservative yield rule: the JIT subset has no global/table
-        // writes through metamethods, no varargs and no yield-capable calls
-        // (only pure self/monomorphic targets, resolved with guards), so it
-        // can never reach coroutine.yield. TAILCALL is supported by the
-        // translator under the same purity contract as CALL.
-        proto.mayYield = false;
-        return true;
     }
 
     public static int cacheSize() {

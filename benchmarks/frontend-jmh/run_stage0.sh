@@ -26,13 +26,13 @@ echo "Running Stage 0 JMH suite ($MODE) -> $OUT_DIR"
 java -Xms512m -Xmx2g -XX:+UseG1GC -cp "$LUAVA_JAR:$JMH_JAR" \
     org.luava.bench.Stage0Runner "$OUT_DIR" "$GIT_SHA" "$MODE"
 
-echo "Running JFR allocation & CPU profile on compileCold..."
+echo "Running JFR allocation & CPU profile on frontendCompileOnly..."
 JFR_FILE="$OUT_DIR/compile_cold.jfr"
 java -Xms512m -Xmx2g -XX:+UseG1GC -Dluava.jit=true -Dluava.jit.sync=true \
     -XX:StartFlightRecording=filename="$JFR_FILE",settings=profile,dumponexit=true \
     -cp "$LUAVA_JAR:$JMH_JAR" \
     org.openjdk.jmh.Main -f 0 -wi 2 -i 3 -w 500ms -r 500ms \
-    "org.luava.bench.FrontendPipelineBenchmark\.compileCold" \
+    "org.luava.bench.FrontendPipelineBenchmark\.frontendCompileOnly" \
     -p workload=large_600kb,many_locals,escaped_strings >/dev/null
 
 jfr summary "$JFR_FILE" > "$OUT_DIR/jfr_summary.txt" || true

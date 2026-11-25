@@ -116,3 +116,34 @@ jobs:
           name: surefire-reports-async-jit
           path: target/surefire-reports/
           if-no-files-found: ignore
+
+  benchmark-smoke:
+    name: Frontend JMH harness smoke (Java 21)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Package shaded engine and JMH harness
+        run: |
+          mvn -B -ntp package -DskipTests
+          mvn -B -ntp -f benchmarks/frontend-jmh/pom.xml package
+
+      - name: List JMH benchmarks and run smoke test
+        run: |
+          java -cp target/luava-0.2.7.jar:benchmarks/frontend-jmh/target/jmh-benchmarks.jar \
+            org.openjdk.jmh.Main -l
+          java -Xms256m -Xmx1g -Dluava.jit=true -Dluava.jit.sync=true \
+            -cp target/luava-0.2.7.jar:benchmarks/frontend-jmh/target/jmh-benchmarks.jar \
+            org.openjdk.jmh.Main -f 0 -wi 1 -i 1 -w 50ms -r 50ms \
+            "org.luava.bench.FrontendPipelineBenchmark\.(lexOnly|frontendCompileOnly|compileAndLoad|jitCompile)" \
+            -p workload=jit_kernel

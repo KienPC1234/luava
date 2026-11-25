@@ -348,7 +348,7 @@ public final class Lexer {
                 String value = (sb == null)
                         ? source.substring(contentStart, current - 1)
                         : sb.toString();
-                return new Token(TokenType.STRING_LITERAL, null, value, line, getColumn());
+                return new Token(TokenType.STRING_LITERAL, source, start, current, value, line, getColumn());
             }
             if (p == '\n' || p == '\r') {
                 throw new ParseException("unfinished string near '" + errorSnippet() + "'", line, getColumn());
@@ -510,19 +510,18 @@ public final class Lexer {
             for (int i = start; i < current; i++) {
                 val = val * 10 + (source.charAt(i) - '0');
             }
-            return new Token(TokenType.INTEGER_LITERAL, null, val, line, getColumn());
+            return new Token(TokenType.INTEGER_LITERAL, source, start, current, val, line, getColumn());
         }
 
-        String raw = source.substring(start, current);
-        LuaValue num = LuaValue.parseNumber(raw, 0, raw.length());
+        LuaValue num = LuaValue.parseNumber(source, start, current);
         if (num == null) {
-            throw new ParseException("malformed number near '" + raw + "'", line, getColumn());
+            throw new ParseException("malformed number near '" + source.substring(start, current) + "'", line, getColumn());
         }
 
         if (num.isInteger()) {
-            return new Token(TokenType.INTEGER_LITERAL, raw, num.toLong(), line, getColumn());
+            return new Token(TokenType.INTEGER_LITERAL, source, start, current, num.toLong(), line, getColumn());
         } else {
-            return new Token(TokenType.FLOAT_LITERAL, raw, num.toDouble(), line, getColumn());
+            return new Token(TokenType.FLOAT_LITERAL, source, start, current, num.toDouble(), line, getColumn());
         }
     }
 

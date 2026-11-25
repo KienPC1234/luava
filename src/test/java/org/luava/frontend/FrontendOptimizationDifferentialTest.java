@@ -8,13 +8,19 @@
 package org.luava.frontend;
 
 import org.junit.jupiter.api.Test;
+import org.luava.frontend.lexer.Lexer;
+import org.luava.frontend.lexer.Token;
+import org.luava.frontend.lexer.TokenType;
 import org.luava.runtime.LuaException;
 import org.luava.runtime.LuaFunction;
 import org.luava.runtime.LuaState;
 import org.luava.runtime.LuaValue;
 import org.luava.runtime.Varargs;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -132,5 +138,26 @@ public class FrontendOptimizationDifferentialTest {
             assertEquals("@chunkA", a1.getSource());
             assertEquals("@chunkB", b1.getSource());
         }
+    }
+
+    @Test
+    void tokenLexemeContractPreservedForAllTokenKinds() {
+        String src = "local x = 42 + 007 + 1.000 + 0x10 .. 'abc' .. \"x\\ny\" .. [[long]]";
+        List<Token> tokens = new Lexer(src, false).scanTokens();
+        String[] expectedLexemes = {
+                "local", "x", "=", "42", "+", "007", "+", "1.000", "+", "0x10",
+                "..", "'abc'", "..", "\"x\\ny\"", "..", "[[long]]", ""
+        };
+        assertEquals(expectedLexemes.length, tokens.size());
+        for (int i = 0; i < expectedLexemes.length; i++) {
+            assertNotNull(tokens.get(i).lexeme());
+            assertEquals(expectedLexemes[i], tokens.get(i).lexeme());
+        }
+        assertEquals(TokenType.INTEGER_LITERAL, tokens.get(3).type());
+        assertEquals(42L, tokens.get(3).literal());
+        assertEquals(TokenType.FLOAT_LITERAL, tokens.get(7).type());
+        assertEquals(1.0, tokens.get(7).literal());
+        assertEquals(TokenType.STRING_LITERAL, tokens.get(11).type());
+        assertEquals("abc", tokens.get(11).literal());
     }
 }

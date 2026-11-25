@@ -12,6 +12,8 @@ import org.luava.runtime.bytecode.LuaClosure;
 import org.luava.runtime.bytecode.LuaProto;
 import org.luava.runtime.jit.JitCode;
 import org.luava.runtime.jit.JitCompiler;
+import org.luava.runtime.jit.LuaToJvmTranslator;
+import org.openjdk.jmh.annotations.AuxCounters;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -37,6 +39,13 @@ import java.util.concurrent.TimeUnit;
 public class FrontendPipelineBenchmark {
 
     @State(Scope.Thread)
+    @AuxCounters(AuxCounters.Type.EVENTS)
+    public static class JitCounters {
+        public long jitSucceeded;
+        public long jitRejected;
+    }
+
+    @State(Scope.Thread)
     public static class CompileState {
         @Param({
                 "small_3kb",
@@ -47,7 +56,8 @@ public class FrontendPipelineBenchmark {
                 "table_constructors",
                 "escaped_strings",
                 "deep_exprs",
-                "heavy_comments"
+                "heavy_comments",
+                "jit_kernel"
         })
         public String workload;
 
@@ -77,11 +87,9 @@ public class FrontendPipelineBenchmark {
 
     @State(Scope.Thread)
     public static class JitCompileState {
-        @Param({"jit_kernel", "small_3kb"})
+        @Param({"jit_kernel", "jit_oop_ctor"})
         public String workload;
 
-        Statements.BlockStmt ast;
-        String chunkName;
         LuaProto[] protos;
         int idx;
 
@@ -89,15 +97,19 @@ public class FrontendPipelineBenchmark {
         public void setupIteration() {
             new LuaState().close();
             String src = CorpusLoader.sourceFor(workload);
-            chunkName = "@" + workload + ".lua";
+            String chunkName = "@" + workload + ".lua";
             List<Token> tokens = new Lexer(src, false).scanTokens();
-            ast = new Parser(tokens).parse();
+            Statements.BlockStmt ast = new Parser(tokens).parse();
             LuaProto root = BytecodeCompiler.compile(ast, chunkName);
-            // Collect child protos if root is just the wrapper chunk (e.g. jit_kernel has sum_step)
             if (root.protos != null && root.protos.length > 0) {
                 protos = root.protos;
             } else {
                 protos = new LuaProto[] {root};
+            }
+            for (LuaProto p : protos) {
+                if (!LuaToJvmTranslator.eligible(p)) {
+                    throw new IllegalStateException("Workload " + workload + " proto " + p.name + " is not JIT-eligible");
+                }
             }
             idx = 0;
         }
@@ -128,7 +140,6 @@ public class FrontendPipelineBenchmark {
             chunkName = "@" + workload + ".lua";
             state = new LuaState();
             warmChunk = LuaState.compileChunk(source, chunkName);
-            // Warm up compilation/JIT tier-up prior to warmExecute
             for (int i = 0; i < 5; i++) {
                 state.eval(warmChunk);
             }
@@ -160,8 +171,17 @@ public class FrontendPipelineBenchmark {
         return BytecodeCompiler.compile(s.ast, s.chunkName);
     }
 
+    /** Pure frontend compilation (Lexer -> Parser -> BytecodeCompiler) without LuaState.load/close. */
     @Benchmark
-    public LuaProto compileCold(CompileState s) {
+    public LuaProto frontendCompileOnly(CompileState s) {
+        List<Token> tokens = new Lexer(s.source, false).scanTokens();
+        Statements.BlockStmt block = new Parser(tokens).parse();
+        return BytecodeCompiler.compile(block, s.chunkName);
+    }
+
+    /** Full public compileChunk + closure load + chunk close lifecycle. */
+    @Benchmark
+    public LuaProto compileAndLoad(CompileState s) {
         try (CompiledChunk chunk = LuaState.compileChunk(s.source, s.chunkName)) {
             return ((LuaClosure) s.cachedState.load(chunk)).proto;
         }
@@ -173,9 +193,16 @@ public class FrontendPipelineBenchmark {
     }
 
     @Benchmark
-    public JitCode jitCompile(JitCompileState s) {
+    public JitCode jitCompile(JitCompileState s, JitCounters counters) {
         LuaProto target = s.protos[s.idx % s.protos.length];
-        return JitCompiler.tryCompile(target, false);
+        JitCode code = JitCompiler.tryCompile(target, false);
+        if (code != null) {
+            counters.jitSucceeded++;
+        } else {
+            counters.jitRejected++;
+            throw new IllegalStateException("Expected JIT compilation to succeed for " + s.workload);
+        }
+        return code;
     }
 
     @Benchmark

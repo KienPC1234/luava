@@ -181,6 +181,7 @@ public final class CorpusLoader {
         m.put("deep_exprs", generateDeepExprs(80));
         m.put("heavy_comments", generateHeavyComments(180));
         m.put("jit_kernel", generateJitKernel());
+        m.put("jit_oop_ctor", generateJitOopCtor());
         m.put("exec_table_ops", loadBenchLua("03_table_ops.lua"));
         m.put("exec_oop_metatables", loadBenchLua("08_oop_metatables.lua"));
         return m;
@@ -346,6 +347,15 @@ public final class CorpusLoader {
                     total = total + sum_step(1000, k)
                 end
                 return total
+                """;
+    }
+
+    private static String generateJitOopCtor() {
+        return """
+                local function make_point(x, y)
+                    return { x = x, y = y, norm = x * x + y * y }
+                end
+                return make_point
                 """;
     }
 }
