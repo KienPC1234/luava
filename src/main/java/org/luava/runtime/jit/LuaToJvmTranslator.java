@@ -3438,6 +3438,10 @@ public final class LuaToJvmTranslator implements Opcodes {
     private static void emitIdivK(MethodVisitor mv, LuaProto proto, int a, int b, int c, int pc,
             int[][] types, LoopOpt activeLoop) {
         long kv = ((LuaInteger) proto.constants[c]).toLong();
+        if (kv == 0L) {
+            emitDeopt(mv, pc, false, activeLoop);
+            return;
+        }
         if (!isStaticInt(types, pc, b)) {
             emitGuardInt(mv, b, pc, activeLoop);
         }
@@ -3454,6 +3458,10 @@ public final class LuaToJvmTranslator implements Opcodes {
     private static void emitModK(MethodVisitor mv, LuaProto proto, int a, int b, int c, int pc,
             int[][] types, LoopOpt activeLoop) {
         long kv = ((LuaInteger) proto.constants[c]).toLong();
+        if (kv == 0L) {
+            emitDeopt(mv, pc, false, activeLoop);
+            return;
+        }
         if (!isStaticInt(types, pc, b)) {
             emitGuardInt(mv, b, pc, activeLoop);
         }

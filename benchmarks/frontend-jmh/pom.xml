@@ -6,13 +6,13 @@
 
     <groupId>io.github.kienpc1234</groupId>
     <artifactId>luava-frontend-jmh</artifactId>
-    <version>${luava.version}</version>
+    <version>0.3.0</version>
 
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <luava.version>0.2.7</luava.version>
+        <luava.version>0.3.0</luava.version>
         <jmh.version>1.37</jmh.version>
     </properties>
 

@@ -16,14 +16,25 @@ if [ ! -f "$JMH_JAR" ]; then
     echo "Missing built JMH jar: $JMH_JAR" >&2
     exit 1
 fi
+GIT_SHA_FULL="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
 GIT_SHA="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ -z "$(git -C "$ROOT_DIR" status --porcelain 2>/dev/null)" ]; then
+    TREE_CLEAN="true"
+else
+    TREE_CLEAN="false"
+fi
+ENGINE_JAR="$ROOT_DIR/target/luava-${LUAVA_VERSION}.jar"
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT_DIR="$ROOT_DIR/benchmarks/harness/results/frontend-${RUN_TS}-${TAG}-${GIT_SHA}"
 mkdir -p "$OUT_DIR"
 
-echo "Running Stage 0 JMH suite ($MODE, version $LUAVA_VERSION) -> $OUT_DIR"
-java -Xms512m -Xmx2g -XX:+UseG1GC -cp "$JMH_JAR" \
-    org.luava.bench.Stage0Runner "$OUT_DIR" "$GIT_SHA" "$MODE"
+echo "Running Stage 0 JMH suite ($MODE, version $LUAVA_VERSION, commit $GIT_SHA_FULL) -> $OUT_DIR"
+java -Xms512m -Xmx2g -XX:+UseG1GC \
+    -Dluava.bench.treeClean="$TREE_CLEAN" \
+    -Dluava.bench.engineJar="$ENGINE_JAR" \
+    -Dluava.bench.repoRoot="$ROOT_DIR" \
+    -cp "$JMH_JAR" \
+    org.luava.bench.Stage0Runner "$OUT_DIR" "$GIT_SHA_FULL" "$MODE"
 
 for WL in large_600kb many_locals escaped_strings; do
     echo "Running isolated JFR profile on frontendCompileOnly ($WL)..."

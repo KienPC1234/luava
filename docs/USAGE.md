@@ -10,13 +10,13 @@ If you only want to run scripts or poke at Lua 5.4 syntax, the engine jar is
 executable:
 
 ```bash
-java -jar luava-0.2.7.jar script.lua arg1 arg2   # run a file (arg[0] = script name)
-java -jar luava-0.2.7.jar -e "print(1 + 2)"      # evaluate a string
-java -jar luava-0.2.7.jar -i script.lua          # run, then enter the REPL
-java -jar luava-0.2.7.jar                        # interactive multi-line REPL
-java -jar luava-0.2.7.jar -v                     # version (e.g. "Luava 0.2.7 Bastion (Lua 5.4)")
-java -jar luava-0.2.7.jar -h                     # usage
-java -jar luava-0.2.7.jar --sandbox --profile script.lua   # prod smoke-test
+java -jar luava-0.3.0.jar script.lua arg1 arg2   # run a file (arg[0] = script name)
+java -jar luava-0.3.0.jar -e "print(1 + 2)"      # evaluate a string
+java -jar luava-0.3.0.jar -i script.lua          # run, then enter the REPL
+java -jar luava-0.3.0.jar                        # interactive multi-line REPL
+java -jar luava-0.3.0.jar -v                     # version (e.g. "Luava 0.3.0 Vanguard (Lua 5.4)")
+java -jar luava-0.3.0.jar -h                     # usage
+java -jar luava-0.3.0.jar --sandbox --profile script.lua   # prod smoke-test
 ```
 
 Flags (only the first argument is inspected, so pass flags before the script):
@@ -566,7 +566,23 @@ JitCompiler.prewarm((org.luava.runtime.bytecode.LuaClosure) chunk);
 
 Repeated `eval` of the same chunk name and source reuses the compiled proto
 tree, so a per-request `eval` of an unchanged script still accumulates JIT
-hotness.
+hotness. The per-state `protoCache` defaults to `256` entries (`-Dluava.protoCache.maxEntries=256`)
+and an `8 MiB` **estimated cache-byte budget** (`-Dluava.protoCache.maxBytes=8388608`,
+`-Dluava.protoCache.maxEntryBytes=4194304`). Because this byte budget estimates
+cached source keys and `LuaProto` arrays rather than full JVM object headers,
+JIT hidden classes, or auxiliary structures, combine it with `state.maxMemoryBytes(...)`
+and process `-Xmx` flags for strict host memory bounds.
+
+## Binary chunks (`string.dump` and `load`)
+
+`string.dump(fn[, strip])` and `load(bytes, name, "b")` use Luava's internal
+bounds-verified `LP\x02\x00` `LuaProto` container (prefixed by the standard Lua
+5.4 header for mode/diagnostic compatibility, with backward-compatible loading
+of Luava `v0.2.7` binary chunks). Binary chunks are **not** interchangeable
+with PUC-Rio `luac` C bytecode: `luac`-compiled files are rejected cleanly with
+a `LuaException` (`nil, err` from `load`), and PUC Lua cannot load Luava dumps.
+For portable cross-engine persistence, ship Lua source text or precompile at
+host startup via `LuaState.compileChunk(src, name)`.
 
 ## EmmyLua stubs for IDEs
 

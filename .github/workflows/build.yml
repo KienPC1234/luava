@@ -117,6 +117,43 @@ jobs:
           path: target/surefire-reports/
           if-no-files-found: ignore
 
+  differential-fuzz-puc:
+    name: Differential fuzz vs PUC Lua 5.4 C & binary verifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Install PUC-Rio Lua 5.4 C reference toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.4
+          lua5.4 -v
+          luac5.4 -v
+
+      - name: Run mandatory PUC 5.4 differential fuzz and binary verifier suites
+        run: |
+          mvn -B -ntp test \
+            -Dtest=RuntimeJitDifferentialFuzzTest,ChunkSerializerVerifierFuzzTest \
+            -Dluava.test.requirePuc=true
+
+      - name: Upload surefire reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: surefire-reports-differential-puc
+          path: target/surefire-reports/
+          if-no-files-found: ignore
+
   benchmark-smoke:
     name: Frontend JMH harness smoke (Java 21)
     runs-on: ubuntu-latest

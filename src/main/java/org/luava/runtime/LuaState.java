@@ -187,8 +187,14 @@ public final class LuaState implements AutoCloseable {
      * Reusing the proto tree lets hotness accumulate across evaluations.
      *
      * <p>Per-state (no cross-tenant sharing), bounded by both entry count and
-     * estimated retained bytes, with second-chance protection for warm/compiled
-     * protos and automatic JIT kernel invalidation upon eviction.
+     * an estimated cache-byte budget ({@code luava.protoCache.maxBytes}, default
+     * {@code 8 MiB}), with second-chance protection for warm/compiled protos and
+     * automatic JIT kernel invalidation upon eviction. Because the byte weight
+     * is an estimate over source keys and {@code LuaProto} arrays (excluding full
+     * JVM object headers, JIT classes, and auxiliary caches), treat it as a
+     * cache-sizing budget rather than a hard JVM heap or Metaspace cap; combine
+     * with {@link #maxMemoryBytes(long)} and process {@code -Xmx} limits for
+     * strict sandbox isolation.
      */
     private final java.util.LinkedHashMap<ProtoCacheKey, CachedProtoEntry> protoCache =
             new java.util.LinkedHashMap<>(64, 0.75f, true);

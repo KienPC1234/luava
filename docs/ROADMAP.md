@@ -1,7 +1,7 @@
 # ROADMAP — Luava expansion plan
 
-Status: 2026-11-20, 0.2.7 ("Bastion").
-Conformance 31/31 PUC Lua 5.4.9 suites, 411 unit/security/conformance tests, JIT sync/async/off green.
+Status: 2026-11-26, 0.3.0 ("Vanguard").
+Conformance 31/31 PUC Lua 5.4.9 suites, 433 JUnit tests (including mandatory PUC Lua 5.4 C differential and binary-verifier fuzzing), JIT sync/async/off green.
 
 This document covers **what to build next and in what order**. Measurement
 logs and per-item evidence stay in `plan.md` (maintainer notes, not shipped).
@@ -106,6 +106,13 @@ inlining and loop opts. Effort is better spent on Track A.
 
 Release train:
 
+* **0.3.0 ("Vanguard")** - shipped: compact `TokenStream` frontend (`1.64x`
+  `compileChunk`, `-40.9%` alloc/op), zero-AST `LuaProto` retention (`-82.9%`
+  live chunk heap), bounds-verified `LP\x02\x00` binary chunk serializer, `8 MiB`
+  estimated-byte `protoCache` with second-chance eviction, unboxed `LuaTable`
+  inline/Bloom/array lanes, loop register promotion and table-constructor JIT
+  lowering (`2.08x` default / `1.60x` 1-core `Exec` geomean vs PUC Lua 5.4.8 C),
+  and mandatory PUC Lua 5.4 C differential + binary-verifier CI fuzzing.
 * **0.2.7 ("Bastion")** — shipped: `ExecutionPolicy` pool guard enforcement,
   `ISOLATED`/`STATEFUL` pool accounting and cross-pool ownership, `JavaCapability`
   return attenuation with pre-allocation bounds, ordered `evalAsync` completion,

@@ -37,6 +37,7 @@ import org.luava.runtime.jit.JitCompiler;
  */
 public class RuntimeJitDifferentialFuzzTest {
 
+    private static final boolean REQUIRE_PUC = Boolean.getBoolean("luava.test.requirePuc");
     private static final String PUC_LUA_BIN = detectPucLua54();
 
     private static String detectPucLua54() {
@@ -62,6 +63,15 @@ public class RuntimeJitDifferentialFuzzTest {
             }
         }
         return null;
+    }
+
+    @Test
+    void pucReferenceBinaryRequirementEnforcedWhenConfigured() {
+        if (REQUIRE_PUC) {
+            assertNotNull(
+                    PUC_LUA_BIN,
+                    "PUC Lua 5.4 C binary is required (-Dluava.test.requirePuc=true) but neither lua5.4 nor lua (5.4) was found on PATH");
+        }
     }
 
     private static void prewarmTree(LuaState state) {
@@ -116,6 +126,9 @@ public class RuntimeJitDifferentialFuzzTest {
         }
         assertEquals(interpOut, jitOut, "Sync JIT diverged from interpreter");
         assertEquals(interpOut, guardedOut, "Guarded JIT diverged from interpreter");
+        if (REQUIRE_PUC) {
+            assertNotNull(PUC_LUA_BIN, "PUC Lua 5.4 binary required by -Dluava.test.requirePuc=true");
+        }
         if (PUC_LUA_BIN != null) {
             String pucOut = runPucSingle(script);
             assertEquals(pucOut, jitOut, "Luava diverged from PUC Lua 5.4");
@@ -713,8 +726,14 @@ public class RuntimeJitDifferentialFuzzTest {
             scripts.add(generateFuzzProgram(rng, i));
         }
 
+        if (REQUIRE_PUC) {
+            assertNotNull(
+                    PUC_LUA_BIN,
+                    "PUC Lua 5.4 binary is required (-Dluava.test.requirePuc=true) for differential fuzzing");
+        }
         List<String> pucExpected = PUC_LUA_BIN != null ? runPucBatch(scripts) : null;
         int totalExecutions = 0;
+        int pucComparedCount = 0;
 
         try (LuaState interp = new LuaState().jitEnabled(false);
              LuaState jitSync = new LuaState().jitEnabled(true);
@@ -738,16 +757,22 @@ public class RuntimeJitDifferentialFuzzTest {
                 assertEquals(rInterp, rGuarded, "Guarded JIT mismatch at fuzz case #" + i + ":\n" + src);
                 if (pucExpected != null) {
                     totalExecutions++;
+                    pucComparedCount++;
                     assertEquals(pucExpected.get(i), rJit, "PUC 5.4 mismatch at fuzz case #" + i + ":\n" + src);
                 } else {
-                    // Run a second warm invocation on Sync JIT when PUC binary is absent in CI
                     String rJitWarm2 = evalOutcome(jitSync, src, name, false);
                     totalExecutions++;
                     assertEquals(rInterp, rJitWarm2, "Warm JIT mismatch at fuzz case #" + i);
                 }
             }
         }
+        System.out.printf(
+                "[DifferentialFuzz] programs=%d, totalExecutions=%d, pucCompared=%d, luaBin=%s%n",
+                programCount, totalExecutions, pucComparedCount, PUC_LUA_BIN != null ? PUC_LUA_BIN : "NONE");
         assertTrue(totalExecutions >= 2600, "Expected at least 2600 differential executions, ran " + totalExecutions);
+        if (PUC_LUA_BIN != null || REQUIRE_PUC) {
+            assertEquals(programCount, pucComparedCount, "Every generated fuzz program must be compared against PUC Lua 5.4");
+        }
     }
 
     private static String evalOutcome(LuaState state, String script, String chunkName, boolean prewarm) {
@@ -926,5 +951,48 @@ public class RuntimeJitDifferentialFuzzTest {
             assertEquals(hotClosure.proto, hotAfter.proto, "Hot handler proto should survive cold churn");
             assertNotNull(hotAfter.proto.protos[0].jitCode, "Hot handler JIT kernel should remain intact");
         }
+    }
+
+    @Test
+    void sustainedProtoCacheChurnSettlesHeapWithinEnvelope() throws InterruptedException {
+        try (LuaState st = new LuaState().jitEnabled(true)) {
+            String hotRoute = "local function route(x) local acc = 0 for i = 1, 32 do acc = acc + i * x end return acc end return route(3)";
+            for (int i = 0; i < 60; i++) {
+                assertEquals(1584L, st.eval(hotRoute, "@steady_route.lua").toLong());
+            }
+            String bodyPad = "do local a = 1; local b = 2; local c = a + b end\n".repeat(120);
+            long heapAt1000 = 0L;
+            int totalChunks = 6000;
+            for (int i = 1; i <= totalChunks; i++) {
+                String cold = bodyPad + "return " + i + "\n";
+                assertEquals(i, st.eval(cold, "@long_churn_" + i + ".lua").toLong());
+                if ((i & 63) == 0) {
+                    assertEquals(1584L, st.eval(hotRoute, "@steady_route.lua").toLong());
+                }
+                if (i == 1000) {
+                    heapAt1000 = settledHeapBytes();
+                }
+            }
+            long heapAt6000 = settledHeapBytes();
+            long driftBytes = Math.max(0L, heapAt6000 - heapAt1000);
+            assertTrue(st.cachedProtoCount() <= 256, "protoCache entries exceeded 256: " + st.cachedProtoCount());
+            assertTrue(
+                    st.cachedProtoBytes() <= 8L * 1024L * 1024L,
+                    "protoCache estimated bytes exceeded 8 MiB: " + st.cachedProtoBytes());
+            // 5,000 additional ~5.6 KB chunks + protos without eviction would retain > 45 MiB;
+            // bounded eviction keeps settled post-GC heap drift well within a 32 MiB envelope.
+            assertTrue(
+                    driftBytes < 32L * 1024L * 1024L,
+                    "Unexpected post-GC heap growth across 5,000 evicted chunks: " + (driftBytes / (1024 * 1024)) + " MiB");
+        }
+    }
+
+    private static long settledHeapBytes() throws InterruptedException {
+        Runtime rt = Runtime.getRuntime();
+        for (int i = 0; i < 4; i++) {
+            System.gc();
+            Thread.sleep(20L);
+        }
+        return rt.totalMemory() - rt.freeMemory();
     }
 }

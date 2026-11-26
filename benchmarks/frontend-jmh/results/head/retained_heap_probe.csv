@@ -1,4 +1,4 @@
 commit_sha,scenario,retained_heap_mb,cached_entries,cached_bytes_mb
-head,compiled_chunks_16x_large_600kb,37.02,16,NaN
-head,compiled_chunks_32x_1mb_comments,0.01,32,NaN
-head,proto_cache_churn_1500x_8kb,14.43,256,7.49
+fb3666c7b32efa7e5a963a16783667574dd774c6,compiled_chunks_16x_large_600kb,37.07,16,NaN
+fb3666c7b32efa7e5a963a16783667574dd774c6,compiled_chunks_32x_1mb_comments,0.01,32,NaN
+fb3666c7b32efa7e5a963a16783667574dd774c6,proto_cache_churn_1500x_8kb,14.47,256,7.49

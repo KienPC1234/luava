@@ -584,7 +584,7 @@ public final class ChunkSerializer {
                         OpCode.OP_RETURN1,
                         OpCode.OP_MMBINI -> maxReg = Math.max(maxReg, checkReg(a));
                 case OpCode.OP_LFALSESKIP -> {
-                    if (pc + 2 > len) throw new LuaException("corrupt binary chunk");
+                    if (pc + 2 >= len) throw new LuaException("corrupt binary chunk");
                     maxReg = Math.max(maxReg, checkReg(a));
                 }
                 case OpCode.OP_LOADK -> {
@@ -697,11 +697,11 @@ public final class ChunkSerializer {
                 }
                 case OpCode.OP_JMP -> checkJumpTarget(pc + 1 + Instruction.getsJ(inst), len);
                 case OpCode.OP_EQ, OpCode.OP_LT, OpCode.OP_LE, OpCode.OP_TESTSET -> {
-                    if (pc + 1 >= len) throw new LuaException("corrupt binary chunk");
+                    if (pc + 2 >= len) throw new LuaException("corrupt binary chunk");
                     maxReg = Math.max(maxReg, checkRegs2(a, b));
                 }
                 case OpCode.OP_EQK -> {
-                    if (pc + 1 >= len) throw new LuaException("corrupt binary chunk");
+                    if (pc + 2 >= len) throw new LuaException("corrupt binary chunk");
                     checkIndex(b, constLen);
                     maxReg = Math.max(maxReg, checkReg(a));
                 }
@@ -711,7 +711,7 @@ public final class ChunkSerializer {
                         OpCode.OP_GTI,
                         OpCode.OP_GEI,
                         OpCode.OP_TEST -> {
-                    if (pc + 1 >= len) throw new LuaException("corrupt binary chunk");
+                    if (pc + 2 >= len) throw new LuaException("corrupt binary chunk");
                     maxReg = Math.max(maxReg, checkReg(a));
                 }
                 case OpCode.OP_CALL, OpCode.OP_TAILCALL -> {
@@ -746,7 +746,7 @@ public final class ChunkSerializer {
                 }
                 case OpCode.OP_TFORPREP -> {
                     maxReg = Math.max(maxReg, checkReg(a + 3));
-                    checkJumpTarget(pc + 2 + bx, len);
+                    checkJumpTarget(pc + 1 + bx, len);
                 }
                 case OpCode.OP_TFORCALL -> {
                     if (pc + 1 >= len) throw new LuaException("corrupt binary chunk");
@@ -801,11 +801,24 @@ public final class ChunkSerializer {
     private static LuaFunction decodeLegacyPayload(
             byte[] bytes, int offset, int length, String chunkName, LuaValue envVal, LuaTable globals)
             throws IOException {
+        if (length < 22) {
+            throw new LuaException("truncated binary chunk");
+        }
         ByteArrayInputStream bais = new ByteArrayInputStream(bytes, offset, length);
         DataInputStream in = new DataInputStream(bais);
-        boolean isVararg = in.readBoolean();
-        boolean isStripped = in.readBoolean();
+        long maxAllowedBytes = Math.min(MAX_CHUNK_BYTES, LuaState.allocationLimit());
+        long[] budget = new long[] {maxAllowedBytes};
+
+        int rawVararg = in.readUnsignedByte();
+        int rawStripped = in.readUnsignedByte();
+        if ((rawVararg & ~1) != 0 || (rawStripped & ~1) != 0) {
+            throw new LuaException(
+                    "incompatible binary chunk (PUC Lua C bytecode is not supported; Luava requires internal LP format)");
+        }
+        boolean isVararg = rawVararg == 1;
+        boolean isStripped = rawStripped == 1;
         String source = in.readUTF();
+        chargeBudget(budget, source.length());
         int lineDefined = in.readInt();
         int lastLineDefined = in.readInt();
 
@@ -816,10 +829,13 @@ public final class ChunkSerializer {
         if (paramCount * 2L > bais.available()) {
             throw new LuaException("truncated binary chunk");
         }
+        chargeBudget(budget, paramCount * 16L);
         List<String> params = new ArrayList<>(paramCount);
         for (int i = 0; i < paramCount; i++) {
             LuaState.checkGuard();
-            params.add(in.readUTF());
+            String p = in.readUTF();
+            chargeBudget(budget, p.length());
+            params.add(p);
         }
 
         int upCount = in.readInt();
@@ -829,22 +845,25 @@ public final class ChunkSerializer {
         if (upCount * 2L > bais.available()) {
             throw new LuaException("truncated binary chunk");
         }
+        chargeBudget(budget, upCount * 16L);
         List<String> upvalueNames = new ArrayList<>(upCount);
         for (int i = 0; i < upCount; i++) {
             LuaState.checkGuard();
-            upvalueNames.add(in.readUTF());
+            String u = in.readUTF();
+            chargeBudget(budget, u.length());
+            upvalueNames.add(u);
         }
 
         int codeLen = in.readInt();
         if (codeLen < 0 || codeLen > bais.available()) {
             throw new LuaException("truncated binary chunk");
         }
-        long maxAllowedBytes = Math.min(MAX_CHUNK_BYTES, LuaState.allocationLimit());
-        if (codeLen > maxAllowedBytes) {
-            throw new LuaException("corrupt binary chunk (allocation limit exceeded)");
-        }
+        chargeBudget(budget, codeLen);
         byte[] codeBytes = new byte[codeLen];
         in.readFully(codeBytes);
+        if (bais.available() != 0) {
+            throw new LuaException("corrupted chunk: trailing bytes");
+        }
         String code = new String(codeBytes, StandardCharsets.UTF_8);
 
         LuaState.checkGuard();
@@ -969,7 +988,7 @@ public final class ChunkSerializer {
                 throw le;
             } catch (EOFException e) {
                 throw new LuaException("truncated binary chunk");
-            } catch (Throwable e) {
+            } catch (IOException | RuntimeException e) {
                 throw new LuaException("corrupted chunk: " + e.getMessage());
             }
         }
@@ -984,7 +1003,7 @@ public final class ChunkSerializer {
             throw le;
         } catch (EOFException e) {
             throw new LuaException("truncated binary chunk");
-        } catch (Throwable e) {
+        } catch (IOException | RuntimeException e) {
             throw new LuaException("corrupted chunk: " + e.getMessage());
         }
     }

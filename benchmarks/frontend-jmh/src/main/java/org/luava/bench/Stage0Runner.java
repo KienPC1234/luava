@@ -8,14 +8,22 @@ import java.lang.invoke.MethodType;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryPoolMXBean;
 import java.lang.management.MemoryType;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.CodeSource;
+import java.security.MessageDigest;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.stream.Stream;
 import org.luava.bench.CorpusLoader.WorkloadMetrics;
 import org.luava.frontend.ast.Statements;
 import org.luava.frontend.lexer.Lexer;
@@ -57,6 +65,7 @@ public final class Stage0Runner {
         boolean probesOnly = "probes".equals(mode);
         Files.createDirectories(outDir);
 
+        Instant startedAt = Instant.now();
         new LuaState().close();
 
         Map<String, WorkloadMetrics> metricsMap = new LinkedHashMap<>();
@@ -69,9 +78,20 @@ public final class Stage0Runner {
         int warmIters = (quick || ab) ? 2 : 3;
         int measIters = quick ? 3 : (ab ? 4 : 5);
         int iterMs = quick ? 400 : (ab ? 250 : 800);
-        writeMetadataJson(outDir.resolve("metadata.json"), commitSha, mode, forks, warmIters, measIters, iterMs);
         writeRetainedHeapProbeCsv(outDir.resolve("retained_heap_probe.csv"), commitSha);
         if (probesOnly) {
+            Instant finishedProbes = Instant.now();
+            writeMetadataJson(
+                    outDir.resolve("metadata.json"),
+                    commitSha,
+                    mode,
+                    forks,
+                    warmIters,
+                    measIters,
+                    iterMs,
+                    args,
+                    startedAt,
+                    finishedProbes);
             return;
         }
 
@@ -88,6 +108,18 @@ public final class Stage0Runner {
             runSuite(jmhWriter, probeWriter, commitSha, "JIT_OFF", false, forks, warmIters, measIters, iterMs, metricsMap,
                     "org.luava.bench.FrontendPipelineBenchmark\\.(frontendCompileOnly|compileAndLoad|coldExecute|warmExecute)");
         }
+        Instant finishedAt = Instant.now();
+        writeMetadataJson(
+                outDir.resolve("metadata.json"),
+                commitSha,
+                mode,
+                forks,
+                warmIters,
+                measIters,
+                iterMs,
+                args,
+                startedAt,
+                finishedAt);
     }
 
     private static void runSuite(
@@ -317,16 +349,53 @@ public final class Stage0Runner {
     }
 
     private static void writeMetadataJson(
-            Path path, String commitSha, String mode, int forks, int warmIters, int measIters, int iterMs)
+            Path path,
+            String commitSha,
+            String mode,
+            int forks,
+            int warmIters,
+            int measIters,
+            int iterMs,
+            String[] mainArgs,
+            Instant startedAt,
+            Instant finishedAt)
             throws IOException {
         String cpuModel = detectCpuModel();
         String osInfo = System.getProperty("os.name") + " " + System.getProperty("os.version")
                 + " (" + System.getProperty("os.arch") + ")";
         String javaInfo = System.getProperty("java.vm.name") + " " + System.getProperty("java.runtime.version");
+        String shortSha = commitSha != null && commitSha.length() > 12 ? commitSha.substring(0, 7) : commitSha;
+        String treeCleanProp = System.getProperty("luava.bench.treeClean", "unknown");
+        String engineJarProp = System.getProperty("luava.bench.engineJar", "");
+        String repoRootProp = System.getProperty("luava.bench.repoRoot", "");
+        String engineJarSha256 = !engineJarProp.isBlank() ? sha256File(Path.of(engineJarProp)) : "unknown";
+        Path jmhJarPath = detectOwnJarPath();
+        String jmhJarSha256 = jmhJarPath != null ? sha256File(jmhJarPath) : "unknown";
+        String srcTreeSha256 = !repoRootProp.isBlank()
+                ? sha256SourceTree(Path.of(repoRootProp).resolve("src/main/java"))
+                : "unknown";
+        String jvmInputArgs = String.join(" ", ManagementFactory.getRuntimeMXBean().getInputArguments());
+        String cmdLine = ("java " + jvmInputArgs + " org.luava.bench.Stage0Runner " + String.join(" ", mainArgs))
+                .trim()
+                .replaceAll("\\s+", " ");
+        double elapsedSec = Duration.between(startedAt, finishedAt).toMillis() / 1000.0;
+
         try (BufferedWriter w = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
             w.write("{\n");
             w.write("  \"commit_sha\": \"" + escapeJson(commitSha) + "\",\n");
-            w.write("  \"timestamp_utc\": \"" + java.time.Instant.now().toString() + "\",\n");
+            w.write("  \"commit_short\": \"" + escapeJson(shortSha) + "\",\n");
+            if ("true".equalsIgnoreCase(treeCleanProp) || "false".equalsIgnoreCase(treeCleanProp)) {
+                w.write("  \"working_tree_clean\": " + Boolean.parseBoolean(treeCleanProp) + ",\n");
+            } else {
+                w.write("  \"working_tree_clean\": \"" + escapeJson(treeCleanProp) + "\",\n");
+            }
+            w.write("  \"src_main_tree_sha256\": \"" + escapeJson(srcTreeSha256) + "\",\n");
+            w.write("  \"engine_jar_sha256\": \"" + escapeJson(engineJarSha256) + "\",\n");
+            w.write("  \"jmh_jar_sha256\": \"" + escapeJson(jmhJarSha256) + "\",\n");
+            w.write("  \"started_at_utc\": \"" + startedAt.toString() + "\",\n");
+            w.write("  \"finished_at_utc\": \"" + finishedAt.toString() + "\",\n");
+            w.write(String.format(Locale.ROOT, "  \"elapsed_seconds\": %.3f,%n", elapsedSec));
+            w.write("  \"command_line\": \"" + escapeJson(cmdLine) + "\",\n");
             w.write("  \"mode\": \"" + escapeJson(mode) + "\",\n");
             w.write("  \"forks\": " + forks + ",\n");
             w.write("  \"warmup_iterations\": " + warmIters + ",\n");
@@ -339,6 +408,56 @@ public final class Stage0Runner {
             w.write("  \"cpu\": \"" + escapeJson(cpuModel) + "\",\n");
             w.write("  \"available_processors\": " + Runtime.getRuntime().availableProcessors() + "\n");
             w.write("}\n");
+        }
+    }
+
+    private static Path detectOwnJarPath() {
+        try {
+            CodeSource cs = Stage0Runner.class.getProtectionDomain().getCodeSource();
+            if (cs != null && cs.getLocation() != null) {
+                URI uri = cs.getLocation().toURI();
+                Path p = Path.of(uri);
+                if (Files.isRegularFile(p)) {
+                    return p;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private static String sha256File(Path file) {
+        if (file == null || !Files.isRegularFile(file)) {
+            return "unknown";
+        }
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            md.update(Files.readAllBytes(file));
+            return HexFormat.of().formatHex(md.digest());
+        } catch (Exception e) {
+            return "unknown";
+        }
+    }
+
+    private static String sha256SourceTree(Path srcRoot) {
+        if (srcRoot == null || !Files.isDirectory(srcRoot)) {
+            return "unknown";
+        }
+        try (Stream<Path> walk = Files.walk(srcRoot)) {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            List<Path> files = walk.filter(Files::isRegularFile)
+                    .sorted(Comparator.comparing(p -> srcRoot.relativize(p).toString().replace('\\', '/')))
+                    .toList();
+            for (Path f : files) {
+                String rel = srcRoot.relativize(f).toString().replace('\\', '/');
+                md.update(rel.getBytes(StandardCharsets.UTF_8));
+                md.update((byte) 0);
+                md.update(Files.readAllBytes(f));
+                md.update((byte) 0);
+            }
+            return HexFormat.of().formatHex(md.digest());
+        } catch (Exception e) {
+            return "unknown";
         }
     }
 
